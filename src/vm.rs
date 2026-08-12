@@ -120,6 +120,11 @@ impl Vm {
                     frame = Some(self.schema(&name)?.lazy());
                 }
 
+                Instruction::Cast(dtype) => {
+                    let expr = pop1(&mut stack)?;
+                    stack.push(expr.cast(polars_dtype(&dtype)?));
+                }
+
                 Instruction::Result => {
                     let lf = require_frame(&mut frame)?;
                     return lf.collect()
@@ -166,6 +171,24 @@ fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
             let strs: Vec<&str> = v.iter().map(String::as_str).collect();
             Series::new("".into(), strs.as_slice()).lit()
         }
+    })
+}
+
+fn polars_dtype(name: &str) -> Result<DataType, QplError> {
+    Ok(match name {
+        "f64" | "float"  => DataType::Float64,
+        "f32"            => DataType::Float32,
+        "i64" | "int"    => DataType::Int64,
+        "i32"            => DataType::Int32,
+        "i16"            => DataType::Int16,
+        "i8"             => DataType::Int8,
+        "u64"            => DataType::UInt64,
+        "u32"            => DataType::UInt32,
+        "u16"            => DataType::UInt16,
+        "u8"             => DataType::UInt8,
+        "bool"           => DataType::Boolean,
+        "str" | "string" => DataType::String,
+        _ => return Err(QplError::Runtime(format!("unknown cast type '{name}'"))),
     })
 }
 

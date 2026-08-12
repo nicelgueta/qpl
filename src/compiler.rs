@@ -77,6 +77,10 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
             }
             out.push(Instruction::Call { func: func.clone(), args_count: args.len() });
         }
+        Expr::Cast { dtype, expr } => {
+            compile_expr(expr, out)?;
+            out.push(Instruction::Cast(dtype.clone()));
+        }
     }
     Ok(())
 }

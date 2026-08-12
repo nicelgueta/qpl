@@ -137,6 +137,16 @@ impl Parser {
 
         // bin op: left op right where right is the entire expr cos q is right to left eval
         if let TokenKind::Op(op) = self.peek().clone() {
+            // cast: type$expr  e.g. f64$qty
+            if op == "$" {
+                let dtype = match &left {
+                    Expr::ColRef(name) => name.clone(),
+                    _ => return Err(QplError::Parse(format!("expected type name before '$', got {left:?}"))),
+                };
+                self.next();
+                let expr = self.parse_expr()?;
+                return Ok(Expr::Cast { dtype, expr: Box::new(expr) });
+            }
             self.next();
             let right = self.parse_expr()?;
             return Ok(Expr::BinOp {

@@ -20,6 +20,7 @@ pub enum Expr {
     IColRef, // virtual i col (for indexing like: select i, col1, col2 from df)
     BinOp { left: Box<Expr>, op: String, right: Box<Expr>,},
     Call { func: String, args: Vec<Expr>,}, //  used for agg funcs like sum etc
+    Cast { dtype: String, expr: Box<Expr> },
 }
 
 
