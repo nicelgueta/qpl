@@ -1,0 +1,3 @@
+t: scan trades.csv
+thr: 500 * 0.5
+select from t where size > thr
