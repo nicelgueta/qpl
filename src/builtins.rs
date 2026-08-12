@@ -4,6 +4,6 @@ use std::collections::HashMap;
 
 pub type BuiltinFn = fn(Vec<Value>) -> Result<Value, QplError>;
 
-pub fn get_builtins() -> HashMap<String, BuiltinFn> {
+// pub fn get_builtins() -> HashMap<String, BuiltinFn> {
 
-}
+// }

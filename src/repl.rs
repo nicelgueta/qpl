@@ -1,6 +1,6 @@
 use crate::compiler::Compiler;
 use crate::errors::QplError;
-use crate::lexer::Lexer;
+use crate::lexer::tokenise;
 use crate::parser::Parser;
 use crate::vm::{Value, Vm};
 use rustyline::DefaultEditor;
@@ -25,8 +25,9 @@ pub fn start() {
 }
 
 fn eval(source: &str, vm: &mut Vm) -> Result<Value, QplError> {
-    let tokens = Lexer::new(source).tokenize()?;
-    let program = Parser::new(tokens).parse()?;
-    let bytecode = Compiler::new().compile(program)?;
-    vm.run(bytecode)
+    let tokens = tokenise(source)?;
+    // let program = Parser::new(tokens).parse()?;
+    // let bytecode = Compiler::new().compile(program)?;
+    // vm.run(bytecode)
+    Ok(Value::Nil)
 }

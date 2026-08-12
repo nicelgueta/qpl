@@ -1,4 +1,4 @@
-use crate::builtins::get_builtins;
+// use crate::builtins::get_builtins;
 use crate::compiler::Bytecode;
 use crate::errors::QplError;
 use crate::opcodes::Opcode;
