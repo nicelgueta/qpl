@@ -32,14 +32,20 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 i += 1;
                 let mut buf = String::new();
                 while i < n && chars[i] != '"' {
-                    if chars[i] == '\\' {
+                    if chars[i] == '\\' && i + 1 < n {
                         i += 1;
-                    }
-                    if i < n {
+                        buf.push(match chars[i] {
+                            'n'  => '\n',
+                            't'  => '\t',
+                            'r'  => '\r',
+                            '"'  => '"',
+                            '\\' => '\\',
+                            other => other,
+                        });
+                    } else {
                         buf.push(chars[i]);
-                        i += 1;
                     }
-
+                    i += 1;
                 }
                 if i < n && chars[i] == '"' {
                     i += 1;
@@ -59,14 +65,17 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 }
                 let name: String = chars[s..i].iter().collect();
                 tokens.push(Token {
-
-                    kind: TokenKind::Name(name),
+                    kind: TokenKind::Symbol(name),
                     pos: start,
                 });
             }
             '0'..='9' => {
                 let mut j = i;
-                // bit vector literal
+                // consume all leading digits first
+                while j < n && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
+                // bool or bool-vec: all digits 0/1 followed by 'b'
                 if j < n && chars[j] == 'b' && chars[i..j].iter().all(|&c| c == '0' || c == '1') {
                     let bits: Vec<bool> = chars[i..j].iter().map(|&c| c == '1').collect();
                     let kind = if bits.len() == 1 {
@@ -78,7 +87,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     tokens.push(Token { kind, pos: start });
                     continue;
                 }
-                // float ?
+                // float: decimal point after integer digits
                 if j < n && chars[j] == '.' {
                     j += 1;
                     while j < n && chars[j].is_ascii_digit() {
@@ -95,10 +104,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     i = j;
                     continue;
                 }
-                // int
-                while j < n && chars[j].is_ascii_digit() {
-                    j += 1;
-                }
+                // integer
                 let int_str: String = chars[i..j].iter().collect();
                 let int_val: i64 = int_str.parse().map_err(|_| {
                     QplError::Lex(format!("Invalid integer literal: {}", int_str))
@@ -425,7 +431,8 @@ mod tests {
         let src = "select px: price, qty from trades where sym = `AAPL";
         assert_eq!(kinds(src), vec![
             TokenKind::Select,
-
+            TokenKind::Name("px".into()),
+            TokenKind::Colon,
             TokenKind::Name("price".into()),
             TokenKind::Comma,
             TokenKind::Name("qty".into()),
