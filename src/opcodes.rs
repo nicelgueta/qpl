@@ -17,6 +17,7 @@ pub enum Instruction {
     BuildProj(usize), // pop n expr into a projection list
     Select,
     SelectBy,
+    ColsOf(String),
     Result,
 
 }
@@ -36,6 +37,7 @@ impl fmt::Display for Instruction {
             Instruction::BuildProj(n)     => write!(f, "BUILD_PROJ {n}"),
             Instruction::Select           => write!(f, "SELECT"),
             Instruction::SelectBy         => write!(f, "SELECT_BY"),
+            Instruction::ColsOf(name)     => write!(f, "COLS_OF {name}"),
             Instruction::Result           => write!(f, "RESULT"),
         }
     }

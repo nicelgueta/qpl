@@ -49,5 +49,6 @@ pub struct SelectStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Select(SelectStmt),
+    Cols(String),
     Assign { name: String, body: Box<Stmt> },
 }

@@ -10,7 +10,8 @@ pub fn compile(stmt: &Stmt) -> Result<Vec<Instruction>, QplError> {
 
 fn compile_stmt(stmt: &Stmt, out: &mut Vec<Instruction>) -> Result<(), QplError> {
     match stmt {
-        Stmt::Select(sel) => compile_select(sel, out),
+        Stmt::Select(sel)       => compile_select(sel, out),
+        Stmt::Cols(name)        => { out.push(Instruction::ColsOf(name.clone())); out.push(Instruction::Result); Ok(()) }
         // assignment: compile the body; workspace binding is handled by the VM
         Stmt::Assign { body, .. } => compile_stmt(body, out),
     }

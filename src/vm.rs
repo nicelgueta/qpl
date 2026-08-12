@@ -13,6 +13,16 @@ impl Vm {
         Self { tables: HashMap::new() }
     }
 
+    /// Returns a two-column table: `column` (name) and `dtype` for every field in `table_name`.
+    pub fn schema(&self, table_name: &str) -> Result<DataFrame, QplError> {
+        let df = self.tables.get(table_name)
+            .ok_or_else(|| QplError::Runtime(format!("unknown table '{table_name}'")))?;
+        let names: Vec<String> = df.get_column_names().iter().map(|s| s.to_string()).collect();
+        let types: Vec<String> = df.dtypes().iter().map(|d| d.to_string()).collect();
+        df!["column" => names, "dtype" => types]
+            .map_err(|e| QplError::Runtime(e.to_string()))
+    }
+
     /// Executes a compiled program. Builds a LazyFrame plan for every
     /// instruction and materialises it only at `Result`.
     pub fn eval(&self, program: Vec<Instruction>) -> Result<DataFrame, QplError> {
@@ -99,6 +109,10 @@ impl Vm {
                         lf.group_by(std::mem::take(&mut keys))
                           .agg(std::mem::take(&mut proj))
                     );
+                }
+
+                Instruction::ColsOf(name) => {
+                    frame = Some(self.schema(&name)?.lazy());
                 }
 
                 Instruction::Result => {

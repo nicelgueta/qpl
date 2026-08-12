@@ -57,8 +57,13 @@ impl Parser {
 
     fn parse_body(&mut self) -> Result<Stmt, QplError> {
         match self.peek() {
-            TokenKind::Select => {
-                Ok(Stmt::Select(self.parse_query()?))
+            TokenKind::Select => Ok(Stmt::Select(self.parse_query()?)),
+            TokenKind::Cols => {
+                self.next(); // consume 'cols'
+                match self.next() {
+                    TokenKind::Name(n) => Ok(Stmt::Cols(n)),
+                    other => Err(QplError::Parse(format!("expected table name after 'cols', got {other:?}"))),
+                }
             }
             _ => Err(QplError::Parse(format!("Unexpected token: {:?}", self.tokens[self.i].kind))),
         }

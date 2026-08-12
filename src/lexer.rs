@@ -181,9 +181,10 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     let kind = match name.as_str() {
                         // key words
                         "select" => TokenKind::Select,
-                        "by" => TokenKind::By,
-                        "from" => TokenKind::From,
-                        "where" => TokenKind::Where,
+                        "by"     => TokenKind::By,
+                        "from"   => TokenKind::From,
+                        "where"  => TokenKind::Where,
+                        "cols"   => TokenKind::Cols,
                         _ => TokenKind::Name(name),
                     };
                     tokens.push(Token { kind, pos: start });

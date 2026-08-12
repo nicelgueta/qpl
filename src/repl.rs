@@ -2,6 +2,7 @@ use crate::ast::Stmt;
 use crate::compiler::compile;
 use crate::errors::QplError;
 use crate::lexer::tokenise;
+use crate::opcodes::disassemble_instructions;
 use crate::parser::parse;
 use crate::vm::Vm;
 use polars::prelude::*;
@@ -12,8 +13,8 @@ pub fn start() {
     let mut vm = Vm::new();
     load_demo_tables(&mut vm);
 
-    println!("qpl  –  demo tables: trades, quotes");
-    println!("      try: select avg price by sym from trades where size>100");
+    println!("qpl  –  polars made easy");
+    println!("");
 
     loop {
         match rl.readline("qpl) ") {
@@ -23,6 +24,13 @@ pub fn start() {
                     continue;
                 }
                 let _ = rl.add_history_entry(&line);
+                if let Some(src) = line.strip_prefix("\\d").map(str::trim) {
+                    match disassemble(src) {
+                        Ok(listing) => println!("{listing}"),
+                        Err(e) => eprintln!("{e}"),
+                    }
+                    continue;
+                }
                 match eval(&line, &mut vm) {
                     Ok(EvalResult::Table(df)) => println!("{df}"),
                     Ok(EvalResult::Stored(name)) => println!("`{name}"),
@@ -58,6 +66,13 @@ fn load_demo_tables(vm: &mut Vm) {
 enum EvalResult {
     Table(DataFrame),
     Stored(String),
+}
+
+fn disassemble(source: &str) -> Result<String, QplError> {
+    let tokens = tokenise(source)?;
+    let stmt   = parse(tokens)?;
+    let prog   = compile(&stmt)?;
+    Ok(disassemble_instructions(&prog).join("\n"))
 }
 
 fn eval(source: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
