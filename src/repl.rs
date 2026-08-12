@@ -128,4 +128,3 @@ fn eval(source: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
         _ => EvalResult::Table(df),
     })
 }
-
