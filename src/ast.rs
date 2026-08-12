@@ -1,55 +1,53 @@
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
+pub enum Value {
     Int(i64),
     Float(f64),
     Str(String),
     Bool(bool),
-    Nil,
-    Ident(String),
-    Prefix {
-        op: String,
-        right: Box<Expr>,
-    },
-    Infix {
-        left: Box<Expr>,
-        op: String,
-        right: Box<Expr>,
-    },
-    Call {
-        callee: Box<Expr>,
-        args: Vec<Expr>,
-    },
-    Index {
-        object: Box<Expr>,
-        index: Box<Expr>,
-    },
+    IntVec(Vec<i64>),
+    FloatVec(Vec<f64>),
+    SymVec(Vec<String>),
+    BoolVec(Vec<bool>),
+}
+
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Lit(Value),
+    Sym(String),
+    ColRef(String),
+    IColRef, // virtual i col (for indexing like: select i, col1, col2 from df)
+    BinOp { left: Box<Expr>, op: String, right: Box<Expr>,},
+    Call { func: String, args: Vec<Expr>,}, //  used for agg funcs like sum etc
+}
+
+
+/// used for aliasing columns in select statements
+#[derive(Debug, Clone, PartialEq)]
+pub struct Alias {
+    pub name: Option<String>, // might not always have an alias, e.g. select col1 from df
+    pub expr: Expr,
+}
+
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableSource {
+    InMem(String),
+    // Scan {path: String}, // later when we read parquets etc
+}
+
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectStmt {
+    pub cols: Vec<Alias>,
+    pub from: TableSource,
+    pub by: Option<Vec<Alias>>,
+    pub where_: Option<Vec<Expr>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
-    Let {
-        name: String,
-        value: Expr,
-    },
-    Return(Expr),
-    Expr(Expr),
-    If {
-        condition: Expr,
-        then_block: Vec<Stmt>,
-        else_block: Option<Vec<Stmt>>,
-    },
-    While {
-        condition: Expr,
-        body: Vec<Stmt>,
-    },
-    FnDef {
-        name: String,
-        params: Vec<String>,
-        body: Vec<Stmt>,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct Program {
-    pub stmts: Vec<Stmt>,
+    Select(SelectStmt),
+    Assign { name: String, body: Box<Stmt> },
 }

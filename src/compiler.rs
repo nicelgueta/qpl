@@ -1,4 +1,4 @@
-use crate::ast::{Expr, Program, Stmt};
+use crate::ast::{Expr, Stmt};
 use crate::errors::QplError;
 use crate::opcodes::Opcode;
 
@@ -20,8 +20,8 @@ impl Compiler {
         }
     }
 
-    pub fn compile(&mut self, program: Program) -> Result<Bytecode, QplError> {
-        for stmt in program.stmts {
+    pub fn compile(&mut self, stmts: Vec<Stmt>) -> Result<Bytecode, QplError> {
+        for stmt in stmts {
             self.compile_stmt(stmt)?;
         }
         Ok(Bytecode {
