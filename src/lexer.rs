@@ -159,7 +159,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     });
                 }
             }
-            '<' | '>' | '=' | '+' | '-' | '*' | '/' => {
+            '<' | '>' | '=' | '+' | '-' | '*' | '/' | '%' => {
                 let mut j = i + 1;
                 while j < n && "+-*/=<>!".contains(chars[j]) {
                     j += 1;

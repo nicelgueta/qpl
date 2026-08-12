@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-polars = { version = "0.55.2", features = ["lazy", "parquet", "strings", "is_in"] }
+polars = { version = "0.55.2", features = ["lazy", "parquet", "strings", "is_in", "abs"] }
 rustyline = "18.0.1"
