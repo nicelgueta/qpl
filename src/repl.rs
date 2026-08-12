@@ -1,4 +1,4 @@
-use crate::ast::Stmt;
+use crate::ast::{self, Stmt};
 use crate::compiler::compile;
 use crate::errors::QplError;
 use crate::lexer::tokenise;
@@ -18,8 +18,9 @@ pub fn run_script(path: &str, vm: &mut Vm) -> Result<(), QplError> {
             continue;
         }
         match eval(line, vm) {
-            Ok(EvalResult::Table(df)) => println!("{df}"),
-            Ok(EvalResult::Stored(name)) => println!("`{name}"),
+            Ok(EvalResult::Table(df))         => println!("{df}"),
+            Ok(EvalResult::Stored(name))      => println!("`{name}"),
+            Ok(EvalResult::Scalar(_, val))        => println!("{}", fmt_val(&val)),
             Err(e) => {
                 return Err(QplError::Runtime(format!("{}:{}: {e}", path, lineno + 1)));
             }
@@ -50,8 +51,9 @@ pub fn start(vm: &mut Vm) {
                     continue;
                 }
                 match eval(&line, vm) {
-                    Ok(EvalResult::Table(df)) => println!("{df}"),
-                    Ok(EvalResult::Stored(name)) => println!("`{name}"),
+                    Ok(EvalResult::Table(df))        => println!("{df}"),
+                    Ok(EvalResult::Stored(name))     => println!("`{name}"),
+                    Ok(EvalResult::Scalar(_, val))    => println!("{}", fmt_val(&val)),
                     Err(e) => eprintln!("{e}"),
                 }
             }
@@ -84,6 +86,17 @@ pub fn load_demo_tables(vm: &mut Vm) {
 enum EvalResult {
     Table(DataFrame),
     Stored(String),
+    Scalar(String, ast::Value),
+}
+
+fn fmt_val(v: &ast::Value) -> String {
+    match v {
+        ast::Value::Int(n)   => format!("i64: {n}"),
+        ast::Value::Float(f) => format!("f64: {f}"),
+        ast::Value::Str(s)   => format!("str: \"{s}\""),
+        ast::Value::Bool(b)  => format!("bool: {b}"),
+        other                => format!("{other:?}"),
+    }
 }
 
 fn disassemble(source: &str) -> Result<String, QplError> {
@@ -96,6 +109,14 @@ fn disassemble(source: &str) -> Result<String, QplError> {
 fn eval(source: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
     let tokens  = tokenise(source)?;
     let stmt    = parse(tokens)?;
+
+    // scalar assignments bypass the compile/eval pipeline entirely
+    if let Stmt::ScalarAssign { name, expr } = &stmt {
+        let val = vm.eval_scalar(expr)?;
+        vm.globals.insert(name.clone(), val.clone());
+        return Ok(EvalResult::Scalar(name.clone(), val));
+    }
+
     let program = compile(&stmt)?;
     let df      = vm.eval(program)?;
 

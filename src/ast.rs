@@ -52,4 +52,5 @@ pub enum Stmt {
     Select(SelectStmt),
     Cols(String),
     Assign { name: String, body: Box<Stmt> },
+    ScalarAssign { name: String, expr: Expr },
 }

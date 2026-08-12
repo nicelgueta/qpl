@@ -48,8 +48,17 @@ impl Parser {
                 unreachable!()
             };
             self.eat(&TokenKind::Colon)?;
-            let stmt = self.parse_body()?;
-            Ok(Stmt::Assign { name, body: Box::new(stmt) })
+            // query keywords produce a table result; anything else is a scalar expression
+            match self.peek() {
+                TokenKind::Select | TokenKind::Cols | TokenKind::Scan => {
+                    let stmt = self.parse_body()?;
+                    Ok(Stmt::Assign { name, body: Box::new(stmt) })
+                }
+                _ => {
+                    let expr = self.parse_expr()?;
+                    Ok(Stmt::ScalarAssign { name, expr })
+                }
+            }
         } else {
             Ok(self.parse_body()?)
         }

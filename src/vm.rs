@@ -6,11 +6,12 @@ use std::collections::HashMap;
 
 pub struct Vm {
     pub tables: HashMap<String, DataFrame>,
+    pub globals: HashMap<String, ast::Value>,
 }
 
 impl Vm {
     pub fn new() -> Self {
-        Self { tables: HashMap::new() }
+        Self { tables: HashMap::new(), globals: HashMap::new() }
     }
 
     /// Returns a two-column table: `column` (name) and `dtype` for every field in `table_name`.
@@ -21,6 +22,23 @@ impl Vm {
         let types: Vec<String> = df.dtypes().iter().map(|d| d.to_string()).collect();
         df!["column" => names, "dtype" => types]
             .map_err(|e| QplError::Runtime(e.to_string()))
+    }
+
+    /// Evaluates a constant expression using only literals and globals (no DataFrame).
+    pub fn eval_scalar(&self, expr: &ast::Expr) -> Result<ast::Value, QplError> {
+        match expr {
+            ast::Expr::Lit(v) => Ok(v.clone()),
+            ast::Expr::ColRef(name) => self.globals.get(name)
+                .cloned()
+                .ok_or_else(|| QplError::Runtime(format!("undefined variable '{name}'"))),
+            ast::Expr::BinOp { left, op, right } => {
+                scalar_binop(self.eval_scalar(left)?, self.eval_scalar(right)?, op)
+            }
+            ast::Expr::Cast { dtype, expr } => {
+                scalar_cast(self.eval_scalar(expr)?, dtype)
+            }
+            other => Err(QplError::Runtime(format!("not supported in scalar context: {other:?}"))),
+        }
     }
 
     /// Executes a compiled program. Builds a LazyFrame plan for every
@@ -54,7 +72,12 @@ impl Vm {
                 }
 
                 Instruction::PushColRef(name) => {
-                    stack.push(col(name.as_str()));
+                    // globals shadow column names, substituting a literal into the lazy plan
+                    if let Some(val) = self.globals.get(&name) {
+                        stack.push(ast_val_to_expr(val.clone())?);
+                    } else {
+                        stack.push(col(name.as_str()));
+                    }
                 }
 
                 Instruction::PushIColRef => {
@@ -171,6 +194,52 @@ fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
             let strs: Vec<&str> = v.iter().map(String::as_str).collect();
             Series::new("".into(), strs.as_slice()).lit()
         }
+    })
+}
+
+fn scalar_binop(l: ast::Value, r: ast::Value, op: &str) -> Result<ast::Value, QplError> {
+    use ast::Value::*;
+    // promote int to float when mixed
+    let (l, r) = match (l, r) {
+        (Int(a),   Float(b)) => (Float(a as f64), Float(b)),
+        (Float(a), Int(b))   => (Float(a), Float(b as f64)),
+        pair => pair,
+    };
+    Ok(match (l, r, op) {
+        (Int(a),   Int(b),   "+")        => Int(a + b),
+        (Int(a),   Int(b),   "-")        => Int(a - b),
+        (Int(a),   Int(b),   "*")        => Int(a * b),
+        (Int(a),   Int(b),   "%")        => Int(a / b),
+        (Int(a),   Int(b),   "=")        => Bool(a == b),
+        (Int(a),   Int(b),   "<")        => Bool(a < b),
+        (Int(a),   Int(b),   ">")        => Bool(a > b),
+        (Int(a),   Int(b),   "<=")       => Bool(a <= b),
+        (Int(a),   Int(b),   ">=")       => Bool(a >= b),
+        (Int(a),   Int(b),   "<>" | "!=")=> Bool(a != b),
+        (Float(a), Float(b), "+")        => Float(a + b),
+        (Float(a), Float(b), "-")        => Float(a - b),
+        (Float(a), Float(b), "*")        => Float(a * b),
+        (Float(a), Float(b), "%")        => Float(a / b),
+        (Float(a), Float(b), "=")        => Bool(a == b),
+        (Float(a), Float(b), "<")        => Bool(a < b),
+        (Float(a), Float(b), ">")        => Bool(a > b),
+        (Float(a), Float(b), "<=")       => Bool(a <= b),
+        (Float(a), Float(b), ">=")       => Bool(a >= b),
+        (Str(a),   Str(b),   "+")        => Str(a + &b),
+        (l, r, op) => return Err(QplError::Runtime(
+            format!("cannot apply '{op}' to {l:?} and {r:?}"))),
+    })
+}
+
+fn scalar_cast(val: ast::Value, dtype: &str) -> Result<ast::Value, QplError> {
+    use ast::Value::*;
+    Ok(match (val, dtype) {
+        (Int(n),   "f64" | "float" | "f32") => Float(n as f64),
+        (Float(f), "i64" | "int"  | "i32" | "i16" | "i8") => Int(f as i64),
+        (Int(n),   "str" | "string") => Str(n.to_string()),
+        (Float(f), "str" | "string") => Str(f.to_string()),
+        (Bool(b),  "str" | "string") => Str(b.to_string()),
+        (v, t) => return Err(QplError::Runtime(format!("cannot cast {v:?} to '{t}'"))),
     })
 }
 
