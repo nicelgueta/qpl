@@ -44,6 +44,11 @@ impl Vm {
                     frame = Some(if needs_i { lf.with_row_index("i", None) } else { lf });
                 }
 
+                Instruction::ScanFile(path) => {
+                    let lf = scan_file(&path)?;
+                    frame = Some(if needs_i { lf.with_row_index("i", None) } else { lf });
+                }
+
                 Instruction::PushConst(val) => {
                     stack.push(ast_val_to_expr(val)?);
                 }
@@ -162,6 +167,21 @@ fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
             Series::new("".into(), strs.as_slice()).lit()
         }
     })
+}
+
+fn scan_file(path: &str) -> Result<LazyFrame, QplError> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "parquet" => LazyFrame::scan_parquet(path.into(), ScanArgsParquet::default())
+            .map_err(|e| QplError::Runtime(e.to_string())),
+        "csv" => LazyCsvReader::new(path.into()).finish()
+            .map_err(|e| QplError::Runtime(e.to_string())),
+        other => Err(QplError::Runtime(format!("unsupported file format '.{other}' (supported: parquet, csv)"))),
+    }
 }
 
 fn apply_binop(left: Expr, right: Expr, op: &str) -> Result<Expr, QplError> {

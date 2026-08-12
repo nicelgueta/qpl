@@ -36,7 +36,7 @@ impl Parser {
             self.i += 1;
             Ok(())
         } else {
-            Err(QplError::Parse(format!("Unexpected token: {:?}, expected: {:?}", self.tokens[self.i].kind, kind)))
+            Err(QplError::Parse(format!("expected {kind:?}, got {:?}", self.peek())))
         }
     }
 
@@ -58,6 +58,19 @@ impl Parser {
     fn parse_body(&mut self) -> Result<Stmt, QplError> {
         match self.peek() {
             TokenKind::Select => Ok(Stmt::Select(self.parse_query()?)),
+            TokenKind::Scan => {
+                // standalone: scan "path" → select all from the file
+                self.next();
+                match self.next() {
+                    TokenKind::Str(path) => Ok(Stmt::Select(SelectStmt {
+                        cols: vec![],
+                        from: TableSource::Scan(path),
+                        by: None,
+                        where_: None,
+                    })),
+                    other => Err(QplError::Parse(format!("expected file path after 'scan', got {other:?}"))),
+                }
+            }
             TokenKind::Cols => {
                 self.next(); // consume 'cols'
                 match self.next() {
@@ -65,7 +78,7 @@ impl Parser {
                     other => Err(QplError::Parse(format!("expected table name after 'cols', got {other:?}"))),
                 }
             }
-            _ => Err(QplError::Parse(format!("Unexpected token: {:?}", self.tokens[self.i].kind))),
+            _ => Err(QplError::Parse(format!("Unexpected token: {:?}", self.peek()))),
         }
     }
 
@@ -147,10 +160,13 @@ impl Parser {
     }
 
     fn parse_tbl_expr(&mut self) -> Result<TableSource, QplError> {
-        if let TokenKind::Name(name) = self.next() {
-            Ok(TableSource::InMem(name))
-        } else {
-            Err(QplError::Parse(format!("Unexpected token: {:?}", self.tokens[self.i].kind)))
+        match self.next() {
+            TokenKind::Name(name) => Ok(TableSource::InMem(name)),
+            TokenKind::Scan => match self.next() {
+                TokenKind::Str(path) => Ok(TableSource::Scan(path)),
+                other => Err(QplError::Parse(format!("expected file path after 'scan', got {other:?}"))),
+            },
+            other => Err(QplError::Parse(format!("expected table name or scan expression, got {other:?}"))),
         }
     }
 

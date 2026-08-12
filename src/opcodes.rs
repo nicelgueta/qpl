@@ -18,6 +18,7 @@ pub enum Instruction {
     Select,
     SelectBy,
     ColsOf(String),
+    ScanFile(String),
     Result,
 
 }
@@ -38,6 +39,7 @@ impl fmt::Display for Instruction {
             Instruction::Select           => write!(f, "SELECT"),
             Instruction::SelectBy         => write!(f, "SELECT_BY"),
             Instruction::ColsOf(name)     => write!(f, "COLS_OF {name}"),
+            Instruction::ScanFile(path)   => write!(f, "SCAN_FILE {path}"),
             Instruction::Result           => write!(f, "RESULT"),
         }
     }

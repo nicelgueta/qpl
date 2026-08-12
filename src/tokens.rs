@@ -7,6 +7,7 @@ pub enum TokenKind {
     From,
     Where,
     Cols,
+    Scan,
 
     //literals
     Name(String),

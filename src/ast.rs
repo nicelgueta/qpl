@@ -34,7 +34,7 @@ pub struct Alias {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableSource {
     InMem(String),
-    // Scan {path: String}, // later when we read parquets etc
+    Scan(String),
 }
 
 

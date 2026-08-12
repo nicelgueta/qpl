@@ -21,6 +21,7 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
     // From phrase
     match &sel.from {
         TableSource::InMem(name) => out.push(Instruction::FromTable(name.clone())),
+        TableSource::Scan(path)  => out.push(Instruction::ScanFile(path.clone())),
     }
 
     // Where phrase: each subphrase is a successive filter (spec: evaluated left-to-right)
