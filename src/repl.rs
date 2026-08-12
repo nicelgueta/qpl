@@ -8,12 +8,30 @@ use crate::vm::Vm;
 use polars::prelude::*;
 use rustyline::{DefaultEditor, error::ReadlineError};
 
-pub fn start() {
-    let mut rl = DefaultEditor::new().expect("failed to create line editor");
-    let mut vm = Vm::new();
-    load_demo_tables(&mut vm);
+/// Run a `.qpl` script file, printing results. Returns Err on the first failure.
+pub fn run_script(path: &str, vm: &mut Vm) -> Result<(), QplError> {
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| QplError::Runtime(format!("cannot read '{path}': {e}")))?;
+    for (lineno, raw) in src.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('/') {
+            continue;
+        }
+        match eval(line, vm) {
+            Ok(EvalResult::Table(df)) => println!("{df}"),
+            Ok(EvalResult::Stored(name)) => println!("`{name}"),
+            Err(e) => {
+                return Err(QplError::Runtime(format!("{}:{}: {e}", path, lineno + 1)));
+            }
+        }
+    }
+    Ok(())
+}
 
-    println!("qpl  –  polars made easy");
+pub fn start(vm: &mut Vm) {
+    let mut rl = DefaultEditor::new().expect("failed to create line editor");
+
+    println!("qpl (Quick Polars Query Language) REPL - \\d to disassemble");
     println!("");
 
     loop {
@@ -31,7 +49,7 @@ pub fn start() {
                     }
                     continue;
                 }
-                match eval(&line, &mut vm) {
+                match eval(&line, vm) {
                     Ok(EvalResult::Table(df)) => println!("{df}"),
                     Ok(EvalResult::Stored(name)) => println!("`{name}"),
                     Err(e) => eprintln!("{e}"),
@@ -43,7 +61,7 @@ pub fn start() {
     }
 }
 
-fn load_demo_tables(vm: &mut Vm) {
+pub fn load_demo_tables(vm: &mut Vm) {
     let trades = df![
         "sym"   => ["AAPL","AAPL","MSFT","MSFT","GOOG","GOOG","AAPL","MSFT"],
         "price" => [182.3f64, 183.1, 415.2, 416.0, 140.5, 141.2, 184.0, 414.8],
