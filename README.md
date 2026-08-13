@@ -39,6 +39,7 @@ qpl -i script.qpl
 select <cols> from <table> [by <keys>] [where <preds>]
 ```
 
+(the interactive REPL comes with some demo tables `quotes` and `trades` for you to play around with)
 ```
 select from trades
 select sym, price from trades
@@ -46,6 +47,12 @@ select px: price, qty: size from trades
 select avg price by sym from trades
 select from trades where size > 100
 select total: sum size by sym from trades where side = "buy"
+
+/ also use str vars a symbols (maybe change this but easy to write for now)
+select total: sum size by sym from trades where side = `buy
+
+/ using bool vecs
+select from trades where 10100000b
 ```
 
 ### Assignments
