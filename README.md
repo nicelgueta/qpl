@@ -1,7 +1,12 @@
 # qpl — Quick Polars Query Language
 
-A qsql/kdb+-inspired query language that compiles to Polars lazy frames.
-Write concise q-style select statements; Polars executes them efficiently.
+An agent-friendly qsql/kdb+-inspired query language that compiles to Polars lazy frames.
+Write concise q-style select statements; Polars executes them efficiently. Great for use without having python or polars installed by humans or AI agents.
+
+## Why?
+Because using AI agents a lot to query data I thought it would be great to give them unfettered access
+to query data using something as a efficient as polars but have the liberty to write code without approvals
+or even needing a specific python environment.
 
 ## Install
 
@@ -157,3 +162,8 @@ transparently with column expressions.
 
 Binaries are built automatically on every version bump via GitHub Actions
 for Linux (gnu + musl), Linux ARM64, macOS (x86 + ARM).
+
+
+## TODO
+>aside from obviously expanding the language further...
+- WASM (so this can be used directly in a web browser)
