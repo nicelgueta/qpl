@@ -1,5 +1,5 @@
 use polars::prelude::*;
-use crate::ast;
+use crate::ast::{self, TableSource};
 use crate::errors::QplError;
 use crate::opcodes::Instruction;
 use std::collections::HashMap;
@@ -53,18 +53,22 @@ impl Vm {
 
         for instr in program {
             match instr {
-                Instruction::FromTable(name) => {
-                    let lf = self.tables
-                        .get(&name)
-                        .ok_or_else(|| QplError::Runtime(format!("unknown table '{name}'")))?
-                        .clone()
-                        .lazy();
-                    frame = Some(if needs_i { lf.with_row_index("i", None) } else { lf });
-                }
+                Instruction::FromSrc(tbl_source) => {
+                    match tbl_source {
+                        TableSource::InMem(name) => {
+                            let lf = self.tables
+                                .get(&name)
+                                .ok_or_else(|| QplError::Runtime(format!("unknown table '{name}'")))?
+                                .clone()
+                                .lazy();
+                            frame = Some(if needs_i { lf.with_row_index("i", None) } else { lf });
+                        }
+                        TableSource::Scan(path) => {
+                            let lf = scan_file(&path)?;
+                            frame = Some(if needs_i { lf.with_row_index("i", None) } else { lf });
+                        }
 
-                Instruction::ScanFile(path) => {
-                    let lf = scan_file(&path)?;
-                    frame = Some(if needs_i { lf.with_row_index("i", None) } else { lf });
+                    }
                 }
 
                 Instruction::PushConst(val) => {

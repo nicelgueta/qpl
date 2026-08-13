@@ -20,7 +20,7 @@ pub fn run_script(path: &str, vm: &mut Vm) -> Result<(), QplError> {
         match eval(line, vm) {
             Ok(EvalResult::Table(df))         => println!("{df}"),
             Ok(EvalResult::Stored(name))      => println!("`{name}"),
-            Ok(EvalResult::Scalar(_, val))        => println!("{}", fmt_val(&val)),
+            Ok(EvalResult::Scalar(val))        => println!("{}", fmt_val(&val)),
             Err(e) => {
                 return Err(QplError::Runtime(format!("{}:{}: {e}", path, lineno + 1)));
             }
@@ -53,7 +53,7 @@ pub fn start(vm: &mut Vm) {
                 match eval(&line, vm) {
                     Ok(EvalResult::Table(df))        => println!("{df}"),
                     Ok(EvalResult::Stored(name))     => println!("`{name}"),
-                    Ok(EvalResult::Scalar(_, val))    => println!("{}", fmt_val(&val)),
+                    Ok(EvalResult::Scalar(val))    => println!("{}", fmt_val(&val)),
                     Err(e) => eprintln!("{e}"),
                 }
             }
@@ -86,7 +86,7 @@ pub fn load_demo_tables(vm: &mut Vm) {
 enum EvalResult {
     Table(DataFrame),
     Stored(String),
-    Scalar(String, ast::Value),
+    Scalar(ast::Value),
 }
 
 fn fmt_val(v: &ast::Value) -> String {
@@ -114,7 +114,7 @@ fn eval(source: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
     if let Stmt::ScalarAssign { name, expr } = &stmt {
         let val = vm.eval_scalar(expr)?;
         vm.globals.insert(name.clone(), val.clone());
-        return Ok(EvalResult::Scalar(name.clone(), val));
+        return Ok(EvalResult::Scalar(val));
     }
 
     let program = compile(&stmt)?;

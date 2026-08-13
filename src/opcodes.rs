@@ -1,9 +1,9 @@
 use std::fmt;
-use crate::ast::Value;
+use crate::ast::{Value, TableSource};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Instruction {
-    FromTable(String),
+    FromSrc(TableSource),
     PushConst(Value),
     PushColRef(String),
     PushIColRef,
@@ -18,7 +18,6 @@ pub enum Instruction {
     Select,
     SelectBy,
     ColsOf(String),
-    ScanFile(String),
     Cast(String),
     Result,
 
@@ -27,7 +26,7 @@ pub enum Instruction {
 impl fmt::Display for Instruction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Instruction::FromTable(name)  => write!(f, "FROM_TABLE {name}"),
+            Instruction::FromSrc(tbl_src)  => write!(f, "FROM_SRC {tbl_src:?}"),
             Instruction::PushConst(val)   => write!(f, "PUSH_CONST {val:?}"),
             Instruction::PushColRef(name) => write!(f, "PUSH_COL_REF {name}"),
             Instruction::PushIColRef      => write!(f, "PUSH_I_COL_REF"),
@@ -40,7 +39,6 @@ impl fmt::Display for Instruction {
             Instruction::Select           => write!(f, "SELECT"),
             Instruction::SelectBy         => write!(f, "SELECT_BY"),
             Instruction::ColsOf(name)     => write!(f, "COLS_OF {name}"),
-            Instruction::ScanFile(path)   => write!(f, "SCAN_FILE {path}"),
             Instruction::Cast(dtype)      => write!(f, "CAST {dtype}"),
             Instruction::Result           => write!(f, "RESULT"),
         }
