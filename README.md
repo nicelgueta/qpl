@@ -8,6 +8,8 @@ Because using AI agents a lot to query data I thought it would be great to give 
 to query data using something as a efficient as polars but have the liberty to write code without approvals
 or even needing a specific python environment.
 
+Also I don't know that much kdb+/q so thought it would be a good way to try to learn some of the language by writing an interpreter for a language inspired by it with its own syntactic sugar.
+
 ## Install
 
 ```bash
