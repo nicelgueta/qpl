@@ -25,7 +25,6 @@ pub enum TokenKind {
     RParen,
     Op(String),
     Eof,
-
 }
 
 
