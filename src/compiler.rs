@@ -13,7 +13,7 @@ fn compile_stmt(stmt: &Stmt, out: &mut Vec<Instruction>) -> Result<(), QplError>
         Stmt::Select(sel)       => compile_select(sel, out),
         Stmt::Cols(name)        => { out.push(Instruction::ColsOf(name.clone())); out.push(Instruction::Result); Ok(()) }
         // assignment: compile the body; workspace binding is handled by the VM
-        Stmt::Assign { body, .. } => compile_stmt(body, out),
+        Stmt::Assign { name, body, .. } => { compile_stmt(body, out)?; out.push(Instruction::Assign(name.clone())); Ok(()) },
         // scalar assigns are evaluated by the REPL before reaching the compiler
         Stmt::ScalarAssign { name, expr } => { out.push(Instruction::Eval(expr.clone())); out.push(Instruction::Assign(name.clone())); Ok(()) }
     }
@@ -262,17 +262,6 @@ mod tests {
             col("px"), call("sum", 1), alias("px"), BuildProj(1),
             SelectBy, Result,
         ]);
-    }
-
-    // --- assignment wraps the inner stmt ---
-
-    #[test]
-    fn assign_compiles_inner() {
-        // assignment itself emits no extra instructions yet
-        assert_eq!(
-            compile_src("t: select px from trades"),
-            compile_src("select px from trades"),
-        );
     }
 
     // --- full example from spec ---
