@@ -176,4 +176,4 @@ for Linux (gnu + musl), Linux ARM64, macOS (x86 + ARM).
 ## TODO
 >aside from obviously expanding the language further...
 - WASM (so this can be used directly in a web browser)
-- binary size is non-trivial (100MB). This is because it has the whole polars lib bundled in. Probs don't need to reduce for this reason but should at least support a pareto-optimal set of features from Polars to make it worth it. 
+- binary size is non-trivial (100MB). Likely because it has the whole polars lib + other deps bundled in. should find a way to reduce this. 
