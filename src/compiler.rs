@@ -15,7 +15,7 @@ fn compile_stmt(stmt: &Stmt, out: &mut Vec<Instruction>) -> Result<(), QplError>
         // assignment: compile the body; workspace binding is handled by the VM
         Stmt::Assign { body, .. } => compile_stmt(body, out),
         // scalar assigns are evaluated by the REPL before reaching the compiler
-        Stmt::ScalarAssign { .. } => Err(QplError::Compile("scalar assign cannot be compiled".into())),
+        Stmt::ScalarAssign { name, expr } => { out.push(Instruction::Eval(expr.clone())); out.push(Instruction::Assign(name.clone())); Ok(()) }
     }
 }
 

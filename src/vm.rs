@@ -1,5 +1,8 @@
 use polars::prelude::*;
 use crate::ast::{self, TableSource};
+use crate::lexer::tokenise;
+use crate::parser::parse;
+use crate::compiler::compile;
 use crate::errors::QplError;
 use crate::opcodes::Instruction;
 use std::collections::HashMap;
@@ -7,6 +10,40 @@ use std::collections::HashMap;
 pub struct Vm {
     pub tables: HashMap<String, DataFrame>,
     pub globals: HashMap<String, ast::Value>,
+}
+
+enum StackObj {
+    Expr(Expr),
+    Frame(LazyFrame),
+    Scalar(ast::Value),
+}
+impl StackObj {
+    fn unwrap_expr(&self) -> Result<Expr, QplError> {
+        match self {
+            StackObj::Expr(e) => Ok(e.clone()),
+            _ => Err(QplError::Runtime(format!("Expected Expr on stack, got {}", self.type_name()))),
+        }
+    }
+    fn unwrap_frame(&self) -> Result<LazyFrame, QplError> {
+        match self {
+            StackObj::Frame(f) => Ok(f.clone()),
+            _ => Err(QplError::Runtime(format!("Expected Frame on stack, got {}", self.type_name()))),
+        }
+    }
+    fn unwrap_scalar(&self) -> Result<ast::Value, QplError> {
+        match self {
+            StackObj::Scalar(s) => Ok(s.clone()),
+            _ => Err(QplError::Runtime(format!("Expected Scalar on stack, got {}", self.type_name()))),
+        }
+    }
+
+    fn type_name(&self) -> &'static str {
+        match self {
+            StackObj::Expr(_) => "Expr",
+            StackObj::Frame(_) => "Frame",
+            StackObj::Scalar(_) => "Scalar",
+        }
+    }
 }
 
 impl Vm {
@@ -43,10 +80,10 @@ impl Vm {
 
     /// Executes a compiled program. Builds a LazyFrame plan for every
     /// instruction and materialises it only at `Result`.
-    pub fn eval(&self, program: Vec<Instruction>) -> Result<DataFrame, QplError> {
+    pub fn eval(&mut self, program: Vec<Instruction>) -> Result<EvalResult, QplError> {
         let needs_i = program.iter().any(|i| matches!(i, Instruction::PushIColRef));
 
-        let mut stack: Vec<Expr> = Vec::new();
+        let mut stack: Vec<StackObj> = Vec::new();
         let mut frame: Option<LazyFrame> = None;
         let mut keys:  Vec<Expr> = Vec::new();
         let mut proj:  Vec<Expr> = Vec::new();
@@ -72,38 +109,46 @@ impl Vm {
                 }
 
                 Instruction::PushConst(val) => {
-                    stack.push(ast_val_to_expr(val)?);
+                    stack.push(StackObj::Expr(ast_val_to_expr(val)?));
                 }
 
                 Instruction::PushColRef(name) => {
                     // globals shadow column names, substituting a literal into the lazy plan
                     if let Some(val) = self.globals.get(&name) {
-                        stack.push(ast_val_to_expr(val.clone())?);
+                        stack.push(StackObj::Expr(ast_val_to_expr(val.clone())?));
                     } else {
-                        stack.push(col(name.as_str()));
+                        stack.push(StackObj::Expr(col(name.as_str())));
                     }
                 }
 
                 Instruction::PushIColRef => {
-                    stack.push(col("i"));
+                    stack.push(StackObj::Expr(col("i")));
                 }
 
                 Instruction::BinOp(op) => {
-                    let right = pop1(&mut stack)?;
-                    let left  = pop1(&mut stack)?;
-                    stack.push(apply_binop(left, right, &op)?);
+                    let right = pop1(&mut stack)?.unwrap_expr()?;
+                    let left  = pop1(&mut stack)?.unwrap_expr()?;
+                    stack.push(StackObj::Expr(apply_binop(left, right, &op)?));
                 }
 
                 Instruction::Call { func, args_count } => {
-                    let args = popn(&mut stack, args_count)?;
-                    stack.push(apply_call(&func, args)?);
+                    let args = popn(&mut stack, args_count)?.into_iter()
+                        .map(|o| o.unwrap_expr())
+                        .collect::<Result<Vec<_>, _>>()?;
+                    stack.push(StackObj::Expr(apply_call(&func, args)?));
                 }
 
                 Instruction::Alias { name } => {
                     let expr = pop1(&mut stack)?;
                     stack.push(match name {
-                        Some(n) => expr.alias(n.as_str()),
-                        None    => expr,
+                        Some(n) => match expr {
+                            StackObj::Expr(e) => StackObj::Expr(e.alias(n.as_str())),
+                            _ => return Err(QplError::Runtime("Expected expression on stack".into())),
+                        },
+                        None => match expr {
+                            StackObj::Expr(e) => StackObj::Expr(e),
+                            _ => return Err(QplError::Runtime("Expected expression on stack".into())),
+                        },
                     });
                 }
 
@@ -112,17 +157,21 @@ impl Vm {
                     let preds = popn(&mut stack, n)?;
                     let mut lf = require_frame(&mut frame)?;
                     for pred in preds {
-                        lf = lf.filter(pred);
+                        lf = lf.filter(pred.unwrap_expr()?);
                     }
                     frame = Some(lf);
                 }
 
                 Instruction::BuildKeys(n) => {
-                    keys = popn(&mut stack, n)?;
+                    keys = popn(&mut stack, n)?.into_iter()
+                        .map(|o| o.unwrap_expr())
+                        .collect::<Result<Vec<_>, _>>()?;
                 }
 
                 Instruction::BuildProj(n) => {
-                    proj = popn(&mut stack, n)?;
+                    proj = popn(&mut stack, n)?.into_iter()
+                        .map(|o| o.unwrap_expr())
+                        .collect::<Result<Vec<_>, _>>()?;
                 }
 
                 Instruction::Select => {
@@ -148,20 +197,59 @@ impl Vm {
                 }
 
                 Instruction::Cast(dtype) => {
-                    let expr = pop1(&mut stack)?;
-                    stack.push(expr.cast(polars_dtype(&dtype)?));
+                    let expr = pop1(&mut stack)?.unwrap_expr()?;
+                    stack.push(StackObj::Expr(expr.cast(polars_dtype(&dtype)?)));
+                }
+
+                Instruction::Eval(expr) => {
+                    let val = self.eval_scalar(&expr)?;
+                    stack.push(StackObj::Scalar(val));
                 }
 
                 Instruction::Result => {
                     let lf = require_frame(&mut frame)?;
-                    return lf.collect()
-                        .map_err(|e| QplError::Runtime(e.to_string()));
+                    stack.push(StackObj::Frame(lf.collect()
+                        .map_err(|e| QplError::Runtime(e.to_string()))?.lazy()));
+                }
+
+                Instruction::Assign(name) => {
+                    match pop1(&mut stack)? {
+                        StackObj::Scalar(s) => {
+                            self.globals.insert(name.clone(), s.clone());
+                        }
+                        StackObj::Frame(lf) => {
+                            self.tables.insert(name, lf.collect()
+                                .map_err(|e| QplError::Runtime(e.to_string()))?);
+                        }
+                        typ => return Err(QplError::Runtime(format!("Cannot assign '{}' to type {}: expected a table or scalar on stack", name, typ.type_name()))),
+                    }
                 }
             }
         }
-
-        Err(QplError::Runtime("program ended without Result instruction".into()))
+        if !stack.is_empty() {
+            let last_item = stack.pop().unwrap();
+            match last_item {
+                StackObj::Frame(lf) => Ok(EvalResult::Table(lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?)),
+                StackObj::Scalar(s) => Ok(EvalResult::Scalar(s)),
+                typ => Err(QplError::Runtime(format!("Unexpected type on stack: {}", typ.type_name()))),
+            }
+        } else {
+            Ok(EvalResult::Stored)
+        }
     }
+}
+
+pub enum EvalResult {
+    Table(DataFrame),
+    Stored,
+    Scalar(ast::Value),
+}
+
+pub fn run_vm(source: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
+    let tokens  = tokenise(source)?;
+    let stmt    = parse(tokens)?;
+    let program = compile(&stmt)?;
+    vm.eval(program)
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -170,11 +258,11 @@ fn require_frame(f: &mut Option<LazyFrame>) -> Result<LazyFrame, QplError> {
     f.take().ok_or_else(|| QplError::Runtime("no active frame".into()))
 }
 
-fn pop1(stack: &mut Vec<Expr>) -> Result<Expr, QplError> {
+fn pop1(stack: &mut Vec<StackObj>) -> Result<StackObj, QplError> {
     stack.pop().ok_or_else(|| QplError::Runtime("stack underflow".into()))
 }
 
-fn popn(stack: &mut Vec<Expr>, n: usize) -> Result<Vec<Expr>, QplError> {
+fn popn(stack: &mut Vec<StackObj>, n: usize) -> Result<Vec<StackObj>, QplError> {
     if stack.len() < n {
         return Err(QplError::Runtime(format!(
             "stack underflow: need {n}, have {}",
@@ -341,11 +429,19 @@ mod tests {
         vm
     }
 
-    fn run(vm: &Vm, src: &str) -> DataFrame {
+    fn run_instructions(mut vm: Vm, src: &str) -> EvalResult {
         let tokens = tokenise(src).expect("lex");
         let stmt   = parse(tokens).expect("parse");
         let prog   = compile(&stmt).expect("compile");
         vm.eval(prog).expect("eval")
+    }
+
+    fn run(vm: Vm, src: &str) -> DataFrame {
+        match run_instructions(vm, src) {
+            EvalResult::Table(df) => df,
+            EvalResult::Stored => panic!("expected table result"),
+            EvalResult::Scalar(s) => panic!("expected table result, got scalar {s:?}"),
+        }
     }
 
     fn i64s(df: &DataFrame, name: &str) -> Vec<i64> {
@@ -365,18 +461,40 @@ mod tests {
         df.sort([by], SortMultipleOptions::default()).unwrap()
     }
 
+    // scalars
+
+    #[test]
+    fn eval_int() {
+        let vm = make_vm();
+        let val = vm.eval_scalar(&ast::Expr::Lit(ast::Value::Int(42))).expect("eval");
+        assert_eq!(val, ast::Value::Int(42));
+    }
+
+    // scalar eval and assignment via instructions
+    #[test]
+    fn eval_assign_scalar() {
+        let src = "x: 42";
+        let tokens = tokenise(src).expect("lex");
+        let stmt   = parse(tokens).expect("parse");
+        let prog   = compile(&stmt).expect("compile");
+        let mut vm = make_vm();
+        vm.eval(prog).expect("eval");
+        let val = vm.globals.get("x").expect("x exists");
+        assert_eq!(val, &ast::Value::Int(42));
+    }
+
     // --- basic projections ---
 
     #[test]
     fn select_single_col() {
-        let df = run(&make_vm(), "select c2 from t");
+        let df = run(make_vm(), "select c2 from t");
         assert_eq!(df.width(), 1);
         assert_eq!(i64s(&df, "c2"), vec![10, 20, 30, 15]);
     }
 
     #[test]
     fn select_multi_col() {
-        let df = run(&make_vm(), "select c1, c2 from t");
+        let df = run(make_vm(), "select c1, c2 from t");
         assert_eq!(df.width(), 2);
         assert_eq!(strs(&df, "c1"), vec!["a", "b", "a", "c"]);
         assert_eq!(i64s(&df, "c2"), vec![10, 20, 30, 15]);
@@ -384,7 +502,7 @@ mod tests {
 
     #[test]
     fn select_all_cols() {
-        let df = run(&make_vm(), "select from t");
+        let df = run(make_vm(), "select from t");
         assert_eq!(df.height(), 4);
         assert_eq!(df.width(), 3);
     }
@@ -393,21 +511,21 @@ mod tests {
 
     #[test]
     fn explicit_alias() {
-        let df = run(&make_vm(), "select x: c2 from t");
+        let df = run(make_vm(), "select x: c2 from t");
         assert!(df.column("x").is_ok(), "column 'x' missing");
         assert_eq!(i64s(&df, "x"), vec![10, 20, 30, 15]);
     }
 
     #[test]
     fn implicit_alias_colref() {
-        let df = run(&make_vm(), "select c2 from t");
+        let df = run(make_vm(), "select c2 from t");
         assert!(df.column("c2").is_ok());
     }
 
     #[test]
     fn implicit_alias_binop_leftmost_leaf() {
         // leftmost leaf of c3*2.0 is c3 → result column is named "c3"
-        let df = run(&make_vm(), "select c3*2.0 from t");
+        let df = run(make_vm(), "select c3*2.0 from t");
         assert!(df.column("c3").is_ok());
     }
 
@@ -415,26 +533,26 @@ mod tests {
 
     #[test]
     fn op_mul() {
-        let df = run(&make_vm(), "select dbl: c3*2.0 from t");
+        let df = run(make_vm(), "select dbl: c3*2.0 from t");
         assert_eq!(f64s(&df, "dbl"), vec![2.0, 4.0, 6.0, 8.0]);
     }
 
     #[test]
     fn op_add() {
-        let df = run(&make_vm(), "select s: c2+c2 from t");
+        let df = run(make_vm(), "select s: c2+c2 from t");
         assert_eq!(i64s(&df, "s"), vec![20, 40, 60, 30]);
     }
 
     #[test]
     fn op_sub() {
-        let df = run(&make_vm(), "select r: c2-5 from t");
+        let df = run(make_vm(), "select r: c2-5 from t");
         assert_eq!(i64s(&df, "r"), vec![5, 15, 25, 10]);
     }
 
     #[test]
     fn op_div() {
         // q uses % for division
-        let df = run(&make_vm(), "select h: c2%2 from t");
+        let df = run(make_vm(), "select h: c2%2 from t");
         assert_eq!(i64s(&df, "h"), vec![5, 10, 15, 7]);
     }
 
@@ -442,33 +560,33 @@ mod tests {
 
     #[test]
     fn where_gt() {
-        let df = run(&make_vm(), "select c1 from t where c2>15");
+        let df = run(make_vm(), "select c1 from t where c2>15");
         assert_eq!(strs(&df, "c1"), vec!["b", "a"]);
     }
 
     #[test]
     fn where_lt() {
-        let df = run(&make_vm(), "select c1 from t where c2<20");
+        let df = run(make_vm(), "select c1 from t where c2<20");
         assert_eq!(strs(&df, "c1"), vec!["a", "c"]);
     }
 
     #[test]
     fn where_eq_string_literal() {
-        let df = run(&make_vm(), r#"select c2 from t where c1="a""#);
+        let df = run(make_vm(), r#"select c2 from t where c1="a""#);
         assert_eq!(i64s(&df, "c2"), vec![10, 30]);
     }
 
     #[test]
     fn where_eq_symbol() {
         // backtick symbol compiles to the same string literal at runtime
-        let df = run(&make_vm(), "select c2 from t where c1=`a");
+        let df = run(make_vm(), "select c2 from t where c1=`a");
         assert_eq!(i64s(&df, "c2"), vec![10, 30]);
     }
 
     #[test]
     fn where_multiple_successive() {
         // c2>10 removes the row where c2=10; c2<30 then removes c2=30
-        let df = run(&make_vm(), "select c2 from t where c2>10, c2<30");
+        let df = run(make_vm(), "select c2 from t where c2>10, c2<30");
         let mut v = i64s(&df, "c2");
         v.sort();
         assert_eq!(v, vec![15, 20]);
@@ -478,37 +596,37 @@ mod tests {
 
     #[test]
     fn agg_sum() {
-        let df = run(&make_vm(), "select n: sum c2 from t");
+        let df = run(make_vm(), "select n: sum c2 from t");
         assert_eq!(i64s(&df, "n"), vec![75]);
     }
 
     #[test]
     fn agg_min() {
-        let df = run(&make_vm(), "select n: min c2 from t");
+        let df = run(make_vm(), "select n: min c2 from t");
         assert_eq!(i64s(&df, "n"), vec![10]);
     }
 
     #[test]
     fn agg_max() {
-        let df = run(&make_vm(), "select n: max c2 from t");
+        let df = run(make_vm(), "select n: max c2 from t");
         assert_eq!(i64s(&df, "n"), vec![30]);
     }
 
     #[test]
     fn agg_mean() {
-        let df = run(&make_vm(), "select n: avg c2 from t");
+        let df = run(make_vm(), "select n: avg c2 from t");
         assert_eq!(f64s(&df, "n"), vec![18.75]);
     }
 
     #[test]
     fn agg_first() {
-        let df = run(&make_vm(), "select n: first c1 from t");
+        let df = run(make_vm(), "select n: first c1 from t");
         assert_eq!(strs(&df, "n"), vec!["a"]);
     }
 
     #[test]
     fn agg_last() {
-        let df = run(&make_vm(), "select n: last c1 from t");
+        let df = run(make_vm(), "select n: last c1 from t");
         assert_eq!(strs(&df, "n"), vec!["c"]);
     }
 
@@ -516,14 +634,14 @@ mod tests {
 
     #[test]
     fn by_sum() {
-        let df = sorted(run(&make_vm(), "select total: sum c2 by c1 from t"), "c1");
+        let df = sorted(run(make_vm(), "select total: sum c2 by c1 from t"), "c1");
         assert_eq!(strs(&df, "c1"),    vec!["a", "b", "c"]);
         assert_eq!(i64s(&df, "total"), vec![40, 20, 15]);
     }
 
     #[test]
     fn by_count() {
-        let df = sorted(run(&make_vm(), "select n: count c2 by c1 from t"), "c1");
+        let df = sorted(run(make_vm(), "select n: count c2 by c1 from t"), "c1");
         let ns: Vec<u32> = df.column("n").unwrap().u32().unwrap()
             .into_no_null_iter().collect();
         assert_eq!(strs(&df, "c1"), vec!["a", "b", "c"]);
@@ -532,7 +650,7 @@ mod tests {
 
     #[test]
     fn by_max() {
-        let df = sorted(run(&make_vm(), "select hi: max c2 by c1 from t"), "c1");
+        let df = sorted(run(make_vm(), "select hi: max c2 by c1 from t"), "c1");
         assert_eq!(strs(&df, "c1"), vec!["a", "b", "c"]);
         assert_eq!(i64s(&df, "hi"),  vec![30, 20, 15]);
     }
@@ -541,7 +659,7 @@ mod tests {
 
     #[test]
     fn select_icol() {
-        let df = run(&make_vm(), "select i from t");
+        let df = run(make_vm(), "select i from t");
         // IColRef gets implicit alias "x"; polars adds it as u32
         let xs: Vec<u32> = df.column("x").unwrap().u32().unwrap()
             .into_no_null_iter().collect();
@@ -555,7 +673,7 @@ mod tests {
         // select total: sum c2 by c1 from t where c2>15
         // rows passing c2>15: b/20, a/30  →  grouped: a→30, b→20
         let df = sorted(
-            run(&make_vm(), "select total: sum c2 by c1 from t where c2>15"),
+            run(make_vm(), "select total: sum c2 by c1 from t where c2>15"),
             "c1",
         );
         assert_eq!(strs(&df, "c1"),    vec!["a", "b"]);
@@ -566,7 +684,7 @@ mod tests {
 
     #[test]
     fn unknown_table_is_runtime_error() {
-        let vm = make_vm();
+        let mut vm = make_vm();
         let prog = compile(&parse(tokenise("select c1 from nope").unwrap()).unwrap()).unwrap();
         assert!(matches!(vm.eval(prog), Err(QplError::Runtime(_))));
     }

@@ -1,10 +1,10 @@
-use crate::ast::{self, Stmt};
+use crate::ast::self;
 use crate::compiler::compile;
 use crate::errors::QplError;
 use crate::lexer::tokenise;
-use crate::opcodes::disassemble_instructions;
 use crate::parser::parse;
-use crate::vm::Vm;
+use crate::opcodes::disassemble_instructions;
+use crate::vm::{Vm, run_vm, EvalResult};
 use polars::prelude::*;
 use rustyline::{DefaultEditor, error::ReadlineError};
 
@@ -17,7 +17,7 @@ pub fn run_script(path: &str, vm: &mut Vm) -> Result<(), QplError> {
         if line.is_empty() || line.starts_with('/') {
             continue;
         }
-        match_eval(line, vm, path, lineno)?;
+        match_run_vm(line, vm, path, lineno)?;
     }
     Ok(())
 }
@@ -42,7 +42,7 @@ pub fn start(vm: &mut Vm) {
                     }
                     continue;
                 }
-                if let Err(e) = match_eval(&line, vm, "<main>", 0) {
+                if let Err(e) = match_run_vm(&line, vm, "<main>", 0) {
                     eprintln!("{:?}", e)
                 };
             }
@@ -72,14 +72,8 @@ pub fn load_demo_tables(vm: &mut Vm) {
     vm.tables.insert("quotes".into(), quotes);
 }
 
-enum EvalResult {
-    Table(DataFrame),
-    Stored,
-    Scalar(ast::Value),
-}
-
-fn match_eval(line: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<(), QplError> {
-    match eval(line, vm) {
+fn match_run_vm(line: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<(), QplError> {
+    match run_vm(line, vm) {
         Ok(EvalResult::Table(df))    => println!("{df}"),
         Ok(EvalResult::Stored)                  => {},
         Ok(EvalResult::Scalar(val))      => println!("{}", fmt_val(&val)),
@@ -107,25 +101,3 @@ fn disassemble(source: &str) -> Result<String, QplError> {
     Ok(disassemble_instructions(&prog).join("\n"))
 }
 
-fn eval(source: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
-    let tokens  = tokenise(source)?;
-    let stmt    = parse(tokens)?;
-
-    // scalar assignments bypass the compile/eval pipeline entirely
-    if let Stmt::ScalarAssign { name, expr } = &stmt {
-        let val = vm.eval_scalar(expr)?;
-        vm.globals.insert(name.clone(), val.clone());
-        return Ok(EvalResult::Scalar(val));
-    }
-
-    let program = compile(&stmt)?;
-    let df      = vm.eval(program)?;
-
-    Ok(match &stmt {
-        Stmt::Assign { name, .. } => {
-            vm.tables.insert(name.clone(), df);
-            EvalResult::Stored
-        }
-        _ => EvalResult::Table(df),
-    })
-}
