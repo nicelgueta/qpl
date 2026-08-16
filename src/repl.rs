@@ -17,14 +17,7 @@ pub fn run_script(path: &str, vm: &mut Vm) -> Result<(), QplError> {
         if line.is_empty() || line.starts_with('/') {
             continue;
         }
-        match eval(line, vm) {
-            Ok(EvalResult::Table(df))         => println!("{df}"),
-            Ok(EvalResult::Stored(name))      => println!("`{name}"),
-            Ok(EvalResult::Scalar(val))        => println!("{}", fmt_val(&val)),
-            Err(e) => {
-                return Err(QplError::Runtime(format!("{}:{}: {e}", path, lineno + 1)));
-            }
-        }
+        match_eval(line, vm, path, lineno)?;
     }
     Ok(())
 }
@@ -33,7 +26,6 @@ pub fn start(vm: &mut Vm) {
     let mut rl = DefaultEditor::new().expect("failed to create line editor");
 
     println!("qpl (Quick Polars Query Language) REPL - \\d to disassemble");
-    println!("");
 
     loop {
         match rl.readline("qpl) ") {
@@ -50,12 +42,9 @@ pub fn start(vm: &mut Vm) {
                     }
                     continue;
                 }
-                match eval(&line, vm) {
-                    Ok(EvalResult::Table(df))        => println!("{df}"),
-                    Ok(EvalResult::Stored(name))     => println!("`{name}"),
-                    Ok(EvalResult::Scalar(val))    => println!("{}", fmt_val(&val)),
-                    Err(e) => eprintln!("{e}"),
-                }
+                if let Err(e) = match_eval(&line, vm, "<main>", 0) {
+                    eprintln!("{:?}", e)
+                };
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
             Err(e) => { eprintln!("readline error: {e}"); break; }
@@ -85,8 +74,20 @@ pub fn load_demo_tables(vm: &mut Vm) {
 
 enum EvalResult {
     Table(DataFrame),
-    Stored(String),
+    Stored,
     Scalar(ast::Value),
+}
+
+fn match_eval(line: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<(), QplError> {
+    match eval(line, vm) {
+        Ok(EvalResult::Table(df))    => println!("{df}"),
+        Ok(EvalResult::Stored)                  => {},
+        Ok(EvalResult::Scalar(val))      => println!("{}", fmt_val(&val)),
+        Err(e) => {
+            return Err(QplError::Runtime(format!("{}:{}: {e}", path, lineno + 1)));
+        }
+    };
+    Ok(())
 }
 
 fn fmt_val(v: &ast::Value) -> String {
@@ -123,7 +124,7 @@ fn eval(source: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
     Ok(match &stmt {
         Stmt::Assign { name, .. } => {
             vm.tables.insert(name.clone(), df);
-            EvalResult::Stored(name.clone())
+            EvalResult::Stored
         }
         _ => EvalResult::Table(df),
     })

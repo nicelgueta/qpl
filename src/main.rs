@@ -9,7 +9,7 @@ pub mod repl;
 mod tokens;
 mod vm;
 
-use clap::Parser;
+use clap::{ArgAction::SetTrue, Parser};
 
 #[derive(Parser)]
 #[command(name = "qpl", about = "Quick Polars Query Language", version)]
@@ -20,13 +20,20 @@ struct Cli {
     /// Run script then drop into the REPL
     #[arg(short = 'i', requires = "file")]
     interactive: bool,
+
+    #[arg(long = "load-demo", action = SetTrue)]
+    load_demo: bool
+
 }
 
 fn main() {
     let cli = Cli::parse();
     let mut vm = vm::Vm::new();
-    repl::load_demo_tables(&mut vm);
-
+    
+    if cli.load_demo {
+        println!("Loading demo tables `trades` and `quotes`");
+        repl::load_demo_tables(&mut vm)
+    };
     match cli.file {
         None => repl::start(&mut vm),
         Some(ref path) => {
