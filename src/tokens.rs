@@ -6,8 +6,10 @@ pub enum TokenKind {
     By,
     From,
     Where,
-    Cols,
     Scan,
+    // builtin keywords
+    Cols,
+    Show,
 
     //literals
     Name(String),

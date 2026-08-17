@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::builtins::BuiltIn;
 use crate::errors::QplError;
 use crate::tokens::{Token, TokenKind};
 
@@ -83,8 +84,22 @@ impl Parser {
             TokenKind::Cols => {
                 self.next(); // consume 'cols'
                 match self.next() {
-                    TokenKind::Name(n) => Ok(Stmt::Cols(n)),
+                    TokenKind::Name(n) => Ok(Stmt::BuiltIn(BuiltIn::Cols(n))),
                     other => Err(QplError::Parse(format!("expected table name after 'cols', got {other:?}"))),
+                }
+            }
+            TokenKind::Show => {
+                self.next(); // consume 'show'
+                match self.next() {
+                    TokenKind::Name(tbl_name) => {
+                        Ok(Stmt::BuiltIn(BuiltIn::Show(SelectStmt { 
+                            cols: vec![], 
+                            from: TableSource::InMem(tbl_name), 
+                            by: None, 
+                            where_: None
+                        })))
+                    },
+                    other => Err(QplError::Parse(format!("expected table name after 'show', got {other:?}")))
                 }
             }
             TokenKind::Name(_name) => {

@@ -1,4 +1,5 @@
 use crate::ast::{Expr, SelectStmt, Stmt, Value};
+use crate::builtins::BuiltIn;
 use crate::errors::QplError;
 use crate::opcodes::Instruction;
 
@@ -11,7 +12,15 @@ pub fn compile(stmt: &Stmt) -> Result<Vec<Instruction>, QplError> {
 fn compile_stmt(stmt: &Stmt, out: &mut Vec<Instruction>) -> Result<(), QplError> {
     match stmt {
         Stmt::Select(sel)       => compile_select(sel, out),
-        Stmt::Cols(name)        => { out.push(Instruction::ColsOf(name.clone())); out.push(Instruction::Result); Ok(()) }
+        Stmt::BuiltIn(func)        => { 
+            match func {
+                BuiltIn::Cols(name) => {
+                    out.push(Instruction::ColsOf(name.clone())); 
+                    out.push(Instruction::Result); Ok(()) 
+                }
+                BuiltIn::Show(sel) => compile_select(sel, out),
+            }
+        }
         // assignment: compile the body; workspace binding is handled by the VM
         Stmt::Assign { name, body, .. } => { compile_stmt(body, out)?; out.push(Instruction::Assign(name.clone())); Ok(()) },
         // scalar assigns are evaluated by the REPL before reaching the compiler

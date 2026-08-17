@@ -1,1 +1,8 @@
-// Aggregate and scalar builtins are implemented in vm::apply_call.
+use crate::ast::SelectStmt;
+
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BuiltIn {
+    Cols(String),
+    Show(SelectStmt),
+}

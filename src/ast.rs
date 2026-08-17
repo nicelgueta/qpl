@@ -1,3 +1,5 @@
+use crate::builtins::BuiltIn;
+
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -50,7 +52,7 @@ pub struct SelectStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Select(SelectStmt),
-    Cols(String),
+    BuiltIn(BuiltIn),
     Assign { name: String, body: Box<Stmt> },
     ScalarAssign { name: String, expr: Expr },
     // single var on its own - this just evals and prints in repl

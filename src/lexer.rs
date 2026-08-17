@@ -186,6 +186,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         "where"  => TokenKind::Where,
                         "cols"   => TokenKind::Cols,
                         "scan"   => TokenKind::Scan,
+                        "show"   => TokenKind::Show,
                         _ => TokenKind::Name(name),
                     };
                     tokens.push(Token { kind, pos: start });
