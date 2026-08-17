@@ -53,4 +53,6 @@ pub enum Stmt {
     Cols(String),
     Assign { name: String, body: Box<Stmt> },
     ScalarAssign { name: String, expr: Expr },
+    // single var on its own - this just evals and prints in repl
+    SingleVar(Expr)
 }

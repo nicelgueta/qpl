@@ -87,6 +87,9 @@ impl Parser {
                     other => Err(QplError::Parse(format!("expected table name after 'cols', got {other:?}"))),
                 }
             }
+            TokenKind::Name(_name) => {
+                Ok(Stmt::SingleVar(self.parse_expr()?))
+            }
             _ => Err(QplError::Parse(format!("Unexpected token: {:?}", self.peek()))),
         }
     }
