@@ -1,7 +1,7 @@
 # qpl — Quick Polars Query Language
 
 An agent-friendly qsql/kdb+-inspired query language that compiles to Polars lazy frames.
-Write concise q-style select statements; Polars executes them efficiently. Great for use without having python or polars installed by humans or AI agents.
+Write concise q-style select statements; Polars executes them efficiently. Great for use without having python or polars installed.
 
 ## Why?
 I often need to quickly query large data in parquet format on cloud storage under high time-pressure as well as write quick transformation jobs. DuckDB is brilliant for that kind of thing but I always forget the syntax and can't really knock something up more quickly than typing a prompt into Claude, which sometimes takes longer than I want to get the result I need or goes off on a tangent and provdies fluff I wasn't looking for.
