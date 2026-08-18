@@ -101,8 +101,8 @@ impl Vm {
                                 .lazy();
                             frame = Some(if needs_i { lf.with_row_index("i", None) } else { lf });
                         }
-                        TableSource::Scan(path) => {
-                            let lf = scan_file(&path)?;
+                        TableSource::Load(path) => {
+                            let lf = load_file(&path)?;
                             frame = Some(if needs_i { lf.with_row_index("i", None) } else { lf });
                         }
 
@@ -366,7 +366,7 @@ fn polars_dtype(name: &str) -> Result<DataType, QplError> {
     })
 }
 
-fn scan_file(path: &str) -> Result<LazyFrame, QplError> {
+fn load_file(path: &str) -> Result<LazyFrame, QplError> {
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
@@ -396,12 +396,12 @@ fn sink_file(lf: LazyFrame, path: &str) -> Result<(), QplError> {
     .sink(
         SinkDestination::File { target: SinkTarget::Path(path.into()) },
         file_write_format,
-        UnifiedSinkArgs { 
-            mkdir: true, 
-            maintain_order: true, 
-            sync_on_close: SyncOnCloseType::None, 
-            cloud_options: None, 
-            sinked_paths_callback: None 
+        UnifiedSinkArgs {
+            mkdir: true,
+            maintain_order: true,
+            sync_on_close: SyncOnCloseType::None,
+            cloud_options: None,
+            sinked_paths_callback: None
         }
     )
     .map_err(|e| QplError::Runtime(e.to_string()))?

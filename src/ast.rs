@@ -37,7 +37,7 @@ pub struct Alias {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableSource {
     InMem(String),
-    Scan(String),
+    Load(String),
 }
 
 

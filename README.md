@@ -4,11 +4,45 @@ An agent-friendly qsql/kdb+-inspired query language that compiles to Polars lazy
 Write concise q-style select statements; Polars executes them efficiently. Great for use without having python or polars installed by humans or AI agents.
 
 ## Why?
-Because using AI agents a lot to query data I thought it would be great to give them unfettered access
-to query data using something as a efficient as polars but have the liberty to write code without approvals
-or even needing a specific python environment.
+I often need to quickly query large data in parquet format on cloud storage under high time-pressure as well as write quick transformation jobs. DuckDB is brilliant for that kind of thing but I always forget the syntax and can't really knock something up more quickly than typing a prompt into Claude, which sometimes takes longer than I want to get the result I need or goes off on a tangent and provdies fluff I wasn't looking for.
 
-Also I don't know that much kdb+/q so thought it would be a good way to try to learn some of the language by writing an interpreter for a language inspired by it with its own syntactic sugar.
+So I wanted to see if I could create a language/interface that is faster to write than writing a prompt into Claude, but just as efficient as something like DuckDB.
+
+Of course the added benefit is that, inevitably using AI agents a lot to query data and debug issues, we can have a language that can actualyl be easily used by LLM agents too (that can't do that much damage whether in a sandbox, webUI or running free on your machine) but is efficient as polars or DuckDB - especially as it's zero dependency without even needing a python runtime.
+
+### Polars
+I'm also actually kinda cheating here.
+
+Although the goal was to write something of similar efficiency to DuckDB (which is obviously not gonna happen by myself from scratch as that is an incredible piece of software crafted by absolute pros over many years), I can cheat if I use something well established as the backend for my language. I had thought about just writing a dialect translator from this new language to DuckDB but that didn't excite me. Since I love Rust however, this meant Polars (an also brilliant DataFrame library mostly used in the python world but actually written in Rust) was an option.
+Given it has such a neat API - all my lazy self had to do was write a VM that implements instructions as Polars queries and voilá - I can then go crazy with my front-end in what ever I want.
+
+Given I have been lightly introduced to kdb+/q at work - and I don't know that much about the language, but am very impressed with its syntactic sugar as lack of verbosity. I thought this could be a good way to try to learn some of the language by writing the front-end interpreter for this language in this style, but still get to satisfy my Rust cravings.
+
+Thus: `qpl`.
+
+
+### Example:
+DuckDB - loading table from parquet, transforming into another table and then saving to another parquet
+```sql
+SET VARIABLE thr = 2 * 45;
+CREATE TEMP TABLE t AS
+SELECT
+    sym,
+    side,
+    CAST(-AVG(size) AS BIGINT) AS r,
+    SUM(size * price) AS total_market_value
+FROM read_parquet('my_trades.parq')
+WHERE price < thr
+GROUP BY sym, side;
+
+COPY t TO 'output.parquet' (FORMAT PARQUET);
+```
+qpl equivalent:
+```q
+thr: 3 * 45
+t: select r: i64$neg mean size, total_market_value: sum size * price by sym, side from << `my_trades.parq where price > thr
+t >> `output.parquet
+```
 
 ## Install
 
@@ -66,27 +100,27 @@ threshold: 150
 select from trades where size > threshold
 ```
 
-### scan — load files lazily
+### load — load files lazily
 
 ```
 / parquet
-select avg price by sym from scan "data/trades.parquet"
-t: scan "data/trades.parquet"
+select avg price by sym from load `data/trades.parquet
+t: load `data/trades.parquet
 / also use special operator <<
-t: << "data/trades.parquet"
+t: << `data/trades.parquet
 
 / csv
-select from << "data/quotes.csv"
+select from << `data/quotes.csv
 ```
 
 ### sink — write to file
 
 ```
 t: select total_size: sum size, apx: mean price, total_value: sum price * size by sym, side from trades
-t sink "summary.parquet"
+t sink `summary.parquet
 
 / also with operator >>
-t >> "summary.parquet"
+t >> `summary.parquet
 ```
 
 ### cols — inspect schema

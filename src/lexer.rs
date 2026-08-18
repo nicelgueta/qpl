@@ -9,6 +9,10 @@ fn is_name_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
 }
 
+fn is_valid_symbol_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || '/' == c
+}
+
 pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
     let chars: Vec<char> = src.chars().collect();
     let n: usize = chars.len();
@@ -60,7 +64,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
             '`' => {
                 i += 1;
                 let s = i;
-                while i < n && is_name_char(chars[i]) {
+                while i < n && is_valid_symbol_char(chars[i]) {
                     i += 1;
                 }
                 let name: String = chars[s..i].iter().collect();
@@ -161,8 +165,8 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
             }
             '<' | '>' | '=' | '+' | '-' | '*' | '%' | '$' => {
                 let mut j = i + 1;
-                // handle special cases for sink and scan operators
-                // '>>' is the sink operator, and '<<' is the scan operator
+                // handle special cases for sink and load operators
+                // '>>' is the sink operator, and '<<' is the load operator
                 if chars[i] == '>' && chars[j] == '>' {
                     tokens.push(Token {
                         kind: TokenKind::Sink,
@@ -172,7 +176,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     continue;
                 } else if chars[i] == '<' && chars[j] == '<' {
                     tokens.push(Token {
-                        kind: TokenKind::Scan,
+                        kind: TokenKind::Load,
                         pos: start,
                     });
                     i = j + 1;
@@ -203,7 +207,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         "from"   => TokenKind::From,
                         "where"  => TokenKind::Where,
                         "cols"   => TokenKind::Cols,
-                        "scan"   => TokenKind::Scan,
+                        "load"   => TokenKind::Load,
                         "sink"   => TokenKind::Sink,
                         "show"   => TokenKind::Show,
                         _ => TokenKind::Name(name),

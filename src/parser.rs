@@ -51,7 +51,7 @@ impl Parser {
             self.eat(&TokenKind::Colon)?;
             // query keywords produce a table result; anything else is a scalar expression
             match self.peek() {
-                TokenKind::Select | TokenKind::Cols | TokenKind::Scan => {
+                TokenKind::Select | TokenKind::Cols | TokenKind::Load => {
                     let stmt = self.parse_body()?;
                     Ok(Stmt::Assign { name, body: Box::new(stmt) })
                 }
@@ -68,17 +68,17 @@ impl Parser {
     fn parse_body(&mut self) -> Result<Stmt, QplError> {
         match self.peek() {
             TokenKind::Select => Ok(Stmt::Select(self.parse_query()?)),
-            TokenKind::Scan => {
-                // standalone: scan "path" → select all from the file
+            TokenKind::Load => {
+                // standalone: load "path" → select all from the file
                 self.next();
                 match self.next() {
-                    TokenKind::Str(path) => Ok(Stmt::Select(SelectStmt {
+                    TokenKind::Symbol(path) => Ok(Stmt::Select(SelectStmt {
                         cols: vec![],
-                        from: TableSource::Scan(path),
+                        from: TableSource::Load(path),
                         by: None,
                         where_: None,
                     })),
-                    other => Err(QplError::Parse(format!("expected file path after 'scan', got {other:?}"))),
+                    other => Err(QplError::Parse(format!("expected file path after 'load', got {other:?}"))),
                 }
             }
             TokenKind::Cols => {
@@ -92,10 +92,10 @@ impl Parser {
                 self.next(); // consume 'show'
                 match self.next() {
                     TokenKind::Name(tbl_name) => {
-                        Ok(Stmt::BuiltIn(BuiltIn::Show(SelectStmt { 
-                            cols: vec![], 
-                            from: TableSource::InMem(tbl_name), 
-                            by: None, 
+                        Ok(Stmt::BuiltIn(BuiltIn::Show(SelectStmt {
+                            cols: vec![],
+                            from: TableSource::InMem(tbl_name),
+                            by: None,
                             where_: None
                         })))
                     },
@@ -107,11 +107,11 @@ impl Parser {
                     if let TokenKind::Name(name) = self.next() { // consume name
                         self.next(); //consume sink
                         let res = match self.peek() {
-                            TokenKind::Str(path) => {
+                            TokenKind::Symbol(path) => {
                                 Ok(
                                     Stmt::BuiltIn(
-                                        BuiltIn::Sink { 
-                                            name: TableSource::InMem(name), 
+                                        BuiltIn::Sink {
+                                            name: TableSource::InMem(name),
                                             path: Value::Str(path.clone())
                                         }
                                     )
@@ -222,11 +222,11 @@ impl Parser {
     fn parse_tbl_expr(&mut self) -> Result<TableSource, QplError> {
         match self.next() {
             TokenKind::Name(name) => Ok(TableSource::InMem(name)),
-            TokenKind::Scan => match self.next() {
-                TokenKind::Str(path) => Ok(TableSource::Scan(path)),
-                other => Err(QplError::Parse(format!("expected file path after 'scan', got {other:?}"))),
+            TokenKind::Load => match self.next() {
+                TokenKind::Symbol(path) => Ok(TableSource::Load(path)),
+                other => Err(QplError::Parse(format!("expected file path after 'load', got {other:?}"))),
             },
-            other => Err(QplError::Parse(format!("expected table name or scan expression, got {other:?}"))),
+            other => Err(QplError::Parse(format!("expected table name or load expression, got {other:?}"))),
         }
     }
 
