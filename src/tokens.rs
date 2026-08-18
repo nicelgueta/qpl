@@ -7,6 +7,7 @@ pub enum TokenKind {
     From,
     Where,
     Scan,
+    Sink,
     // builtin keywords
     Cols,
     Show,

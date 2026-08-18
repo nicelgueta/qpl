@@ -16,9 +16,16 @@ fn compile_stmt(stmt: &Stmt, out: &mut Vec<Instruction>) -> Result<(), QplError>
             match func {
                 BuiltIn::Cols(name) => {
                     out.push(Instruction::ColsOf(name.clone())); 
-                    out.push(Instruction::Result); Ok(()) 
+                    out.push(Instruction::Result); 
+                    Ok(()) 
                 }
                 BuiltIn::Show(sel) => compile_select(sel, out),
+                BuiltIn::Sink { name, path } => {
+                    out.push(Instruction::FromSrc(name.clone()));
+                    out.push(Instruction::PushScalar(path.clone()));
+                    out.push(Instruction::Sink);
+                    Ok(())
+                }
             }
         }
         // assignment: compile the body; workspace binding is handled by the VM

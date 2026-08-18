@@ -77,6 +77,13 @@ t: scan "data/trades.parquet"
 select from scan "data/quotes.csv"
 ```
 
+### sink — write to file
+
+```
+t: select total_size: sum size, apx: mean price, total_value: sum price * size by sym, side from trades
+t sink "summary.parquet"
+```
+
 ### cols — inspect schema
 
 ```

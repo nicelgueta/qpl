@@ -7,11 +7,13 @@ pub enum Instruction {
     PushConst(Value),
     PushColRef(String),
     PushIColRef,
+    PushScalar(Value),
     BinOp(String),
     Assign(String),
     Call { func: String, args_count: usize },
     Alias { name: Option<String> },
     Eval(ast::Expr),
+    Sink,
 
     // structural
     Filter(usize), // pop n predicates and push filtered df
@@ -31,6 +33,7 @@ impl fmt::Display for Instruction {
             Instruction::FromSrc(tbl_src)             => write!(f, "FROM_SRC {tbl_src:?}"),
             Instruction::PushConst(val)                     => write!(f, "PUSH_CONST {val:?}"),
             Instruction::PushColRef(name)                  => write!(f, "PUSH_COL_REF {name}"),
+            Instruction::PushScalar(name)                   => write!(f, "PUSH_SCALAR {name:?}"),
             Instruction::PushIColRef                                => write!(f, "PUSH_I_COL_REF"),
             Instruction::BinOp(op)                         => write!(f, "BIN_OP {op}"),
             Instruction::Call { func, args_count } => write!(f, "CALL {func} {args_count}"),
@@ -45,6 +48,7 @@ impl fmt::Display for Instruction {
             Instruction::Result                                     => write!(f, "RESULT"),
             Instruction::Assign(name )                     => write!(f, "ASSIGN {name}"),
             Instruction::Eval(expr)                          => write!(f, "EVAL {expr:?}"),
+            Instruction::Sink                                       => write!(f, "SINK"),
         }
     }
 }

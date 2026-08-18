@@ -103,7 +103,30 @@ impl Parser {
                 }
             }
             TokenKind::Name(_name) => {
-                Ok(Stmt::SingleVar(self.parse_expr()?))
+                if matches!(self.peek2(), TokenKind::Sink) {
+                    if let TokenKind::Name(name) = self.next() { // consume name
+                        self.next(); //consume sink
+                        let res = match self.peek() {
+                            TokenKind::Str(path) => {
+                                Ok(
+                                    Stmt::BuiltIn(
+                                        BuiltIn::Sink { 
+                                            name: TableSource::InMem(name), 
+                                            path: Value::Str(path.clone())
+                                        }
+                                    )
+                                )
+                            }
+                            _ => Err(QplError::Parse(format!("Unexpected token: {:?}", self.peek())))
+                        };
+                        self.next(); // consume the path
+                        res
+                    } else {
+                        unreachable!()
+                    }
+                } else {
+                    Ok(Stmt::SingleVar(self.parse_expr()?))
+                }
             }
             _ => Err(QplError::Parse(format!("Unexpected token: {:?}", self.peek()))),
         }

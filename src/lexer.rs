@@ -186,6 +186,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         "where"  => TokenKind::Where,
                         "cols"   => TokenKind::Cols,
                         "scan"   => TokenKind::Scan,
+                        "sink"   => TokenKind::Sink,
                         "show"   => TokenKind::Show,
                         _ => TokenKind::Name(name),
                     };

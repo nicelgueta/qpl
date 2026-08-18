@@ -1,5 +1,6 @@
+use polars::io::utils::sync_on_close::SyncOnCloseType;
 use polars::prelude::*;
-use crate::ast::{self, TableSource};
+use crate::ast::{self, TableSource, Value};
 use crate::lexer::tokenise;
 use crate::parser::parse;
 use crate::compiler::compile;
@@ -106,6 +107,18 @@ impl Vm {
                         }
 
                     }
+                }
+                Instruction::Sink => {
+                    let path = pop1(&mut stack)?.unwrap_scalar()?;
+                    let path_str = match path {
+                        Value::Str(s) => s,
+                        _ => return Err(QplError::Runtime(format!("expected string path for sink, got {path:?}"))),
+                    };
+                    let lf = require_frame(&mut frame)?;
+                    sink_file(lf, &path_str)?
+                }
+                Instruction::PushScalar(name) => {
+                    stack.push(StackObj::Scalar(name))
                 }
 
                 Instruction::PushConst(val) => {
@@ -360,13 +373,43 @@ fn scan_file(path: &str) -> Result<LazyFrame, QplError> {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "parquet" => LazyFrame::scan_parquet(path.into(), ScanArgsParquet::default())
+        "parquet" | "pq" | "parq" => LazyFrame::scan_parquet(path.into(), ScanArgsParquet::default())
             .map_err(|e| QplError::Runtime(e.to_string())),
         "csv" => LazyCsvReader::new(path.into()).finish()
             .map_err(|e| QplError::Runtime(e.to_string())),
         other => Err(QplError::Runtime(format!("unsupported file format '.{other}' (supported: parquet, csv)"))),
     }
 }
+
+fn sink_file(lf: LazyFrame, path: &str) -> Result<(), QplError> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let file_write_format = match ext.as_str() {
+        "parquet" | "pq" | "parq" => FileWriteFormat::Parquet(Arc::new(ParquetWriteOptions::default())),
+        "csv" => FileWriteFormat::Csv(Default::default()),
+        other => return Err(QplError::Runtime(format!("unsupported file format '.{other}' (supported: parquet, csv)"))),
+    };
+    lf
+    .sink(
+        SinkDestination::File { target: SinkTarget::Path(path.into()) },
+        file_write_format,
+        UnifiedSinkArgs { 
+            mkdir: true, 
+            maintain_order: true, 
+            sync_on_close: SyncOnCloseType::None, 
+            cloud_options: None, 
+            sinked_paths_callback: None 
+        }
+    )
+    .map_err(|e| QplError::Runtime(e.to_string()))?
+    .collect_with_engine(Engine::Streaming)
+    .map_err(|e| QplError::Runtime(e.to_string()))?;
+    Ok(())
+}
+            
 
 fn apply_binop(left: Expr, right: Expr, op: &str) -> Result<Expr, QplError> {
     Ok(match op {
