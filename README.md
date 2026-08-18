@@ -40,7 +40,7 @@ select <cols> from <table> [by <keys>] [where <preds>]
 ```
 
 (the interactive REPL comes with some demo tables `quotes` and `trades` for you to play around with)
-```
+```q
 select from trades
 select sym, price from trades
 select px: price, qty: size from trades
@@ -72,9 +72,11 @@ select from trades where size > threshold
 / parquet
 select avg price by sym from scan "data/trades.parquet"
 t: scan "data/trades.parquet"
+/ also use special operator <<
+t: << "data/trades.parquet"
 
 / csv
-select from scan "data/quotes.csv"
+select from << "data/quotes.csv"
 ```
 
 ### sink — write to file
@@ -82,6 +84,9 @@ select from scan "data/quotes.csv"
 ```
 t: select total_size: sum size, apx: mean price, total_value: sum price * size by sym, side from trades
 t sink "summary.parquet"
+
+/ also with operator >>
+t >> "summary.parquet"
 ```
 
 ### cols — inspect schema
@@ -183,4 +188,4 @@ for Linux (gnu + musl), Linux ARM64, macOS (x86 + ARM).
 ## TODO
 >aside from obviously expanding the language further...
 - WASM (so this can be used directly in a web browser)
-- binary size is non-trivial (100MB). Likely because it has the whole polars lib + other deps bundled in. should find a way to reduce this. 
+- binary size is non-trivial (100MB). Likely because it has the whole polars lib + other deps bundled in. should find a way to reduce this.

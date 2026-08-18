@@ -161,6 +161,24 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
             }
             '<' | '>' | '=' | '+' | '-' | '*' | '%' | '$' => {
                 let mut j = i + 1;
+                // handle special cases for sink and scan operators
+                // '>>' is the sink operator, and '<<' is the scan operator
+                if chars[i] == '>' && chars[j] == '>' {
+                    tokens.push(Token {
+                        kind: TokenKind::Sink,
+                        pos: start,
+                    });
+                    i = j + 1;
+                    continue;
+                } else if chars[i] == '<' && chars[j] == '<' {
+                    tokens.push(Token {
+                        kind: TokenKind::Scan,
+                        pos: start,
+                    });
+                    i = j + 1;
+                    continue;
+
+                };
                 while j < n && "+-*/=<>!".contains(chars[j]) {
                     j += 1;
                 }
