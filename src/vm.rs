@@ -409,7 +409,6 @@ fn sink_file(lf: LazyFrame, path: &str) -> Result<(), QplError> {
     .map_err(|e| QplError::Runtime(e.to_string()))?;
     Ok(())
 }
-            
 
 fn apply_binop(left: Expr, right: Expr, op: &str) -> Result<Expr, QplError> {
     Ok(match op {
