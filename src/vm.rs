@@ -131,6 +131,10 @@ impl Vm {
                     stack.push(StackObj::Scalar(name))
                 }
 
+                Instruction::PushPolarsArg(arg) => {
+                    stack.push(StackObj::PolarsArg(arg));
+                }
+
                 Instruction::PushConst(val) => {
                     stack.push(StackObj::Expr(ast_val_to_expr(val)?));
                 }
@@ -196,7 +200,7 @@ impl Vm {
                                 .map(|o| o.unwrap_expr())
                                 .collect::<Result<Vec<_>, _>>()?;
                             let join_arg = pop1(&mut stack)?.unwrap_polars_arg()?;
-                            let left = require_frame(&mut frame)?;
+                            let left = pop1(&mut stack)?.unwrap_frame()?;
                             match join_arg {
                                 PolarsStackArg::Join(join_type) => {
                                     frame = Some(
@@ -260,8 +264,8 @@ impl Vm {
 
                 Instruction::Result => {
                     let lf = require_frame(&mut frame)?;
-                    stack.push(StackObj::Frame(lf.collect()
-                        .map_err(|e| QplError::Runtime(e.to_string()))?.lazy()));
+                    stack.push(StackObj::Frame(lf));
+                    frame = None; // clear frame so we don't accidentally use it after Result
                 }
 
                 Instruction::Assign(name) => {

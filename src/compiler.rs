@@ -1,4 +1,6 @@
+
 use crate::ast::{Expr, SelectStmt, Stmt, Value};
+use crate::enums::PolarsStackArg;
 use crate::builtins::BuiltIn;
 use crate::enums::PolarsFrameExpr;
 use crate::errors::QplError;
@@ -38,8 +40,39 @@ fn compile_stmt(stmt: &Stmt, out: &mut Vec<Instruction>) -> Result<(), QplError>
 }
 
 fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), QplError> {
-    // From phrase
-    out.push(Instruction::FromSrc(sel.from.clone()));
+    
+    // Join phrase - done first so that the join is applied before any where clause filters
+    if let Some((join_src, left_on, right_on, join_type)) = &sel.join {
+        out.push(Instruction::FromSrc(sel.from.clone()));
+        out.push(Instruction::Result); // get the left frame onto the stack for the join
+        out.push(Instruction::PushPolarsArg(PolarsStackArg::Join(join_type.clone())));
+        let mut left_count: usize = 0;
+        let mut right_count: usize = 0;
+        if let Value::SymVec(s) = left_on {
+            left_count = s.len();
+            for s in s {
+                out.push(Instruction::PushColRef(s.clone()));
+            }
+        } else {
+            return Err(QplError::Runtime(format!("Expected symbol for left_on, got {:?}", left_on)));
+        }
+        
+        if let Value::SymVec(s) = right_on {
+            right_count = s.len();
+            for s in s {
+                out.push(Instruction::PushColRef(s.clone()));
+            }
+        } else {
+            return Err(QplError::Runtime(format!("Expected symbol for right_on, got {:?}", right_on)));
+        }
+        
+        out.push(Instruction::FromSrc(join_src.clone()));
+        out.push(Instruction::Result); // get the right frame onto the stack for the join
+        out.push(Instruction::FrameExpr(PolarsFrameExpr::Join { l: left_count, r: right_count }));
+    } else {
+        // From phrase
+        out.push(Instruction::FromSrc(sel.from.clone()));
+    }
 
     // Where phrase: each subphrase is a successive filter (spec: evaluated left-to-right)
     if let Some(preds) = &sel.where_ {

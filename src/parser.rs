@@ -1,3 +1,5 @@
+use polars::prelude::JoinType;
+
 use crate::ast::*;
 use crate::builtins::BuiltIn;
 use crate::errors::QplError;
@@ -77,6 +79,7 @@ impl Parser {
                         from: TableSource::Load(path),
                         by: None,
                         where_: None,
+                        join: None,
                     })),
                     other => Err(QplError::Parse(format!("expected file path after 'load', got {other:?}"))),
                 }
@@ -96,7 +99,8 @@ impl Parser {
                             cols: vec![],
                             from: TableSource::InMem(tbl_name),
                             by: None,
-                            where_: None
+                            where_: None,
+                            join: None,
                         })))
                     },
                     other => Err(QplError::Parse(format!("expected table name after 'show', got {other:?}")))
@@ -142,6 +146,10 @@ impl Parser {
         }
         self.eat(&TokenKind::From)?;
         let from = self.parse_tbl_expr()?;
+        let mut join = None;
+        if matches!(self.peek(), TokenKind::Symbol(_)) {
+            join = Some(self.parse_join()?);
+        };
         let mut where_ = None;
         if self.peek() == &TokenKind::Where {
             self.next();
@@ -152,6 +160,7 @@ impl Parser {
             from,
             by,
             where_,
+            join,
         })
     }
 
@@ -240,6 +249,41 @@ impl Parser {
         Ok(Some(where_clause))
     }
 
+    /// format for the join phrase is: select ... from tbl1`id`name lj|ij|rj tbl2`id`f_name
+    /// returns (join_src, left_on, right_on, join_type)
+    fn parse_join(&mut self) -> Result<(TableSource, Value, Value, JoinType), QplError> {
+        let mut left_on = Vec::new();
+        let mut right_on = Vec::new();
+        while matches!(self.peek(), TokenKind::Symbol(_)) {
+            if let TokenKind::Symbol(s) = self.next() {
+                left_on.push(s);
+            } else {
+                unreachable!()
+            }
+        }
+        let left_on = Value::SymVec(left_on);
+        let join_type = match self.next() {
+            TokenKind::Name(n) => match n.as_str() {
+                "lj" => JoinType::Left,
+                "ij" => JoinType::Inner,
+                "rj" => JoinType::Right,
+                other => return Err(QplError::Parse(format!("expected join type (lj|ij|rj), got {other}"))),
+            },
+            other => return Err(QplError::Parse(format!("expected join type (lj|ij|rj), got {:?}", other))),
+        };
+        let join_src = self.parse_tbl_expr()?;
+        while matches!(self.peek(), TokenKind::Symbol(_)) {
+            if let TokenKind::Symbol(s) = self.next() {
+                right_on.push(s);
+            } else {
+                unreachable!()
+            }
+        }
+        let right_on = Value::SymVec(right_on);
+        Ok((join_src, left_on, right_on, join_type))
+    }
+
+
     fn parse_primary(&mut self) -> Result<Expr, QplError> {
         match self.next() {
             TokenKind::Int(n)      => Ok(Expr::Lit(Value::Int(n))),
@@ -254,11 +298,10 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 self.eat(&TokenKind::RParen)?;
                 Ok(expr)
-            }
+            },
             other => Err(QplError::Parse(format!("Unexpected token in primary: {:?}", other))),
         }
     }
-
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Stmt, QplError> {

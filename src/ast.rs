@@ -1,3 +1,5 @@
+use polars::prelude::JoinType;
+
 use crate::builtins::BuiltIn;
 
 
@@ -47,6 +49,7 @@ pub struct SelectStmt {
     pub from: TableSource,
     pub by: Option<Vec<Alias>>,
     pub where_: Option<Vec<Expr>>,
+    pub join: Option<(TableSource, Value, Value, JoinType)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

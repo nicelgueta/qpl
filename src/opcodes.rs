@@ -1,12 +1,13 @@
 use std::fmt;
 use crate::ast::{self, TableSource, Value};
-use crate::enums::PolarsFrameExpr;
+use crate::enums::{PolarsFrameExpr, PolarsStackArg};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Instruction {
     FromSrc(TableSource),
     PushConst(Value),
     PushColRef(String),
+    PushPolarsArg(PolarsStackArg),
     PushIColRef,
     PushScalar(Value),
     BinOp(String),
@@ -36,6 +37,7 @@ impl fmt::Display for Instruction {
             Instruction::PushColRef(name)                  => write!(f, "PUSH_COL_REF {name}"),
             Instruction::PushScalar(name)                   => write!(f, "PUSH_SCALAR {name:?}"),
             Instruction::PushIColRef                                => write!(f, "PUSH_I_COL_REF"),
+            Instruction::PushPolarsArg(arg)        => write!(f, "PUSH_POLARS_ARG {arg:?}"),
             Instruction::BinOp(op)                         => write!(f, "BIN_OP {op}"),
             Instruction::Call { func, args_count } => write!(f, "CALL {func} {args_count}"),
             Instruction::Alias { name }            => write!(f, "ALIAS {:?}", name),
