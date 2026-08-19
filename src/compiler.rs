@@ -1,5 +1,6 @@
 use crate::ast::{Expr, SelectStmt, Stmt, Value};
 use crate::builtins::BuiltIn;
+use crate::enums::PolarsFrameExpr;
 use crate::errors::QplError;
 use crate::opcodes::Instruction;
 
@@ -46,7 +47,7 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
         for expr in preds {
             compile_expr(expr, out)?;
         }
-        out.push(Instruction::Filter(n));
+        out.push(Instruction::FrameExpr(PolarsFrameExpr::Filter(n)));
     }
 
     // By phrase
@@ -230,7 +231,7 @@ mod tests {
     fn where_single_pred() {
         assert_eq!(compile_src("select px from trades where qty > 0"), vec![
             from_table("trades"),
-            col("qty"), int(0), op(">"), Filter(1),
+            col("qty"), int(0), op(">"), FrameExpr(PolarsFrameExpr::Filter(1)),
             col("px"), alias("px"), BuildProj(1),
             Select, Result,
         ]);
@@ -240,7 +241,7 @@ mod tests {
     fn where_symbol_eq() {
         assert_eq!(compile_src("select px from trades where sym = `AAPL"), vec![
             from_table("trades"),
-            col("sym"), sym("AAPL"), op("="), Filter(1),
+            col("sym"), sym("AAPL"), op("="), FrameExpr(PolarsFrameExpr::Filter(1)),
             col("px"), alias("px"), BuildProj(1),
             Select, Result,
         ]);
@@ -253,7 +254,7 @@ mod tests {
             from_table("trades"),
             col("sym"), sym("AAPL"), op("="),
             col("qty"), int(0), op(">"),
-            Filter(2),
+            FrameExpr(PolarsFrameExpr::Filter(2)),
             col("px"), alias("px"), BuildProj(1),
             Select, Result,
         ]);
@@ -288,7 +289,7 @@ mod tests {
         // select dbl: c3*2 by c1 from t where c2>15
         assert_eq!(compile_src("select dbl: c3*2 by c1 from t where c2>15"), vec![
             from_table("t"),
-            col("c2"), int(15), op(">"), Filter(1),
+            col("c2"), int(15), op(">"), FrameExpr(PolarsFrameExpr::Filter(1)),
             col("c1"), alias("c1"), BuildKeys(1),
             col("c3"), int(2), op("*"), alias("dbl"), BuildProj(1),
             SelectBy, Result,

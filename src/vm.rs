@@ -1,6 +1,7 @@
 use polars::io::utils::sync_on_close::SyncOnCloseType;
 use polars::prelude::*;
 use crate::ast::{self, TableSource, Value};
+use crate::enums::{PolarsFrameExpr, PolarsStackArg};
 use crate::lexer::tokenise;
 use crate::parser::parse;
 use crate::compiler::compile;
@@ -17,7 +18,9 @@ enum StackObj {
     Expr(Expr),
     Frame(LazyFrame),
     Scalar(ast::Value),
+    PolarsArg(PolarsStackArg)
 }
+
 impl StackObj {
     fn unwrap_expr(&self) -> Result<Expr, QplError> {
         match self {
@@ -37,12 +40,19 @@ impl StackObj {
             _ => Err(QplError::Runtime(format!("Expected Scalar on stack, got {}", self.type_name()))),
         }
     }
+    fn unwrap_polars_arg(&self) -> Result<PolarsStackArg, QplError> {
+        match self {
+            StackObj::PolarsArg(a) => Ok(a.clone()),
+            _ => Err(QplError::Runtime(format!("Expected PolarsArg on stack, got {}", self.type_name()))),
+        }
+    }
 
     fn type_name(&self) -> &'static str {
         match self {
             StackObj::Expr(_) => "Expr",
             StackObj::Frame(_) => "Frame",
             StackObj::Scalar(_) => "Scalar",
+            StackObj::PolarsArg(_) => "PolarsArg",
         }
     }
 }
@@ -166,13 +176,42 @@ impl Vm {
                 }
 
                 // per spec: subphrases are successive filters (not a single AND)
-                Instruction::Filter(n) => {
-                    let preds = popn(&mut stack, n)?;
-                    let mut lf = require_frame(&mut frame)?;
-                    for pred in preds {
-                        lf = lf.filter(pred.unwrap_expr()?);
-                    }
-                    frame = Some(lf);
+                Instruction::FrameExpr(expr) => {
+                    match expr {
+                        PolarsFrameExpr::Filter(n) => {
+                            let preds = popn(&mut stack, n)?;
+                            let mut lf = require_frame(&mut frame)?;
+                            for pred in preds {
+                                lf = lf.filter(pred.unwrap_expr()?);
+                            }
+                            frame = Some(lf);
+                        },
+                        PolarsFrameExpr::Join{ l, r } => {
+                            let right = pop1(&mut stack)?.unwrap_frame()?;
+                            let right_on = popn(&mut stack, r)?
+                            .into_iter()
+                                .map(|o| o.unwrap_expr())
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let left_on = popn(&mut stack, l)?.into_iter()
+                                .map(|o| o.unwrap_expr())
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let join_arg = pop1(&mut stack)?.unwrap_polars_arg()?;
+                            let left = require_frame(&mut frame)?;
+                            match join_arg {
+                                PolarsStackArg::Join(join_type) => {
+                                    frame = Some(
+                                        left.join(
+                                            right, 
+                                            left_on,
+                                            right_on,
+                                            JoinArgs::new(join_type)
+                                        )
+                                    );
+                                }
+                            }
+                        },
+                        _ => return Err(QplError::Runtime("Unsupported frame expression".into())),
+                    };
                 }
 
                 Instruction::BuildKeys(n) => {

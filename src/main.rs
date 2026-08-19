@@ -5,6 +5,7 @@ mod errors;
 mod lexer;
 mod opcodes;
 mod parser;
+mod enums;
 pub mod repl;
 mod tokens;
 mod vm;

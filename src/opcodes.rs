@@ -1,5 +1,6 @@
 use std::fmt;
 use crate::ast::{self, TableSource, Value};
+use crate::enums::PolarsFrameExpr;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Instruction {
@@ -16,7 +17,7 @@ pub enum Instruction {
     Sink,
 
     // structural
-    Filter(usize), // pop n predicates and push filtered df
+    FrameExpr(PolarsFrameExpr), // pop n predicates and push filtered df
     BuildKeys(usize), // pop n expr into a key list
     BuildProj(usize), // pop n expr into a projection list
     Select,
@@ -38,7 +39,7 @@ impl fmt::Display for Instruction {
             Instruction::BinOp(op)                         => write!(f, "BIN_OP {op}"),
             Instruction::Call { func, args_count } => write!(f, "CALL {func} {args_count}"),
             Instruction::Alias { name }            => write!(f, "ALIAS {:?}", name),
-            Instruction::Filter(n)                          => write!(f, "FILTER {n}"),
+            Instruction::FrameExpr(expr)          => write!(f, "FRAME_EXPR {expr:?}"),
             Instruction::BuildKeys(n)                       => write!(f, "BUILD_KEYS {n}"),
             Instruction::BuildProj(n)                       => write!(f, "BUILD_PROJ {n}"),
             Instruction::Select                                     => write!(f, "SELECT"),
@@ -129,7 +130,7 @@ mod tests {
 
     #[test]
     fn display_filter() {
-        assert_eq!(disp(Instruction::Filter(3)), "FILTER 3");
+        assert_eq!(disp(Instruction::FrameExpr(PolarsFrameExpr::Filter(3))), "FRAME_EXPR Filter(3)");
     }
 
     #[test]
