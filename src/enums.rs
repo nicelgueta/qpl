@@ -1,13 +1,21 @@
 use polars::{self, prelude::JoinType};
 
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PolarsStackArg {
     Join(JoinType)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SortDirection {
+    Asc,
+    Desc
 }
 
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PolarsFrameExpr {
     Filter(usize),
-    Join{ l: usize, r: usize }
+    Join{ l: usize, r: usize },
+    Sort(SortDirection)
 }

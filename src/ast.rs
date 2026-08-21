@@ -53,9 +53,14 @@ pub struct SelectStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Stmt {
+pub enum TableExpr {
     Select(SelectStmt),
     BuiltIn(BuiltIn),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stmt {
+    RetTable(TableExpr),
     Assign { name: String, body: Box<Stmt> },
     ScalarAssign { name: String, expr: Expr },
     // single var on its own - this just evals and prints in repl

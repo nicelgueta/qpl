@@ -6,11 +6,13 @@ pub enum TokenKind {
     By,
     From,
     Where,
+    // builtin func keywords
     Load,
     Sink,
-    // builtin keywords
     Cols,
     Show,
+    Asc,
+    Desc,
 
     //literals
     Name(String),

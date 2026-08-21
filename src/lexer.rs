@@ -165,6 +165,14 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
             }
             '<' | '>' | '=' | '+' | '-' | '*' | '%' | '$' => {
                 let mut j = i + 1;
+                if j >= n {
+                    tokens.push(Token {
+                        kind: TokenKind::Op(chars[i].to_string()),
+                        pos: start,
+                    });
+                    i = j;
+                    continue;
+                }
                 // handle special cases for sink and load operators
                 // '>>' is the sink operator, and '<<' is the load operator
                 if chars[i] == '>' && chars[j] == '>' {
@@ -210,6 +218,8 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         "load"   => TokenKind::Load,
                         "sink"   => TokenKind::Sink,
                         "show"   => TokenKind::Show,
+                        "asc"    => TokenKind::Asc,
+                        "desc"   => TokenKind::Desc,
                         _ => TokenKind::Name(name),
                     };
                     tokens.push(Token { kind, pos: start });

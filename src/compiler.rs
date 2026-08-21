@@ -1,6 +1,6 @@
 
-use crate::ast::{Expr, SelectStmt, Stmt, Value};
-use crate::enums::PolarsStackArg;
+use crate::ast::{Expr, TableExpr, SelectStmt, Stmt, Value};
+use crate::enums::{PolarsStackArg, SortDirection};
 use crate::builtins::BuiltIn;
 use crate::enums::PolarsFrameExpr;
 use crate::errors::QplError;
@@ -14,28 +14,51 @@ pub fn compile(stmt: &Stmt) -> Result<Vec<Instruction>, QplError> {
 
 fn compile_stmt(stmt: &Stmt, out: &mut Vec<Instruction>) -> Result<(), QplError> {
     match stmt {
-        Stmt::Select(sel)       => compile_select(sel, out),
-        Stmt::BuiltIn(func)        => { 
-            match func {
-                BuiltIn::Cols(name) => {
-                    out.push(Instruction::ColsOf(name.clone())); 
-                    out.push(Instruction::Result); 
-                    Ok(()) 
-                }
-                BuiltIn::Show(sel) => compile_select(sel, out),
-                BuiltIn::Sink { name, path } => {
-                    out.push(Instruction::FromSrc(name.clone()));
-                    out.push(Instruction::PushScalar(path.clone()));
-                    out.push(Instruction::Sink);
-                    Ok(())
-                }
-            }
-        }
+        Stmt::RetTable(tbl_expr) => {
+            compile_tbl_expr(tbl_expr, out)?;
+            out.push(Instruction::Result);
+            Ok(())
+        },
         // assignment: compile the body; workspace binding is handled by the VM
         Stmt::Assign { name, body, .. } => { compile_stmt(body, out)?; out.push(Instruction::Assign(name.clone())); Ok(()) },
         // scalar assigns are evaluated by the REPL before reaching the compiler
         Stmt::ScalarAssign { name, expr } => { out.push(Instruction::Eval(expr.clone())); out.push(Instruction::Assign(name.clone())); Ok(()) },
         Stmt::SingleVar(expr) => { out.push(Instruction::Eval(expr.clone())); Ok(())}
+    }
+}
+
+fn compile_tbl_expr(tbl_expr: &TableExpr, out: &mut Vec<Instruction>) -> Result<(), QplError> {
+    match tbl_expr {
+        TableExpr::Select(sel) => compile_select(sel, out),
+        TableExpr::BuiltIn(func) => compile_builtin(func, out)
+    }
+}
+
+fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), QplError> {
+    match builtin {
+        BuiltIn::Cols(name) => {
+            out.push(Instruction::ColsOf(name.clone())); 
+            Ok(()) 
+        }
+        BuiltIn::Show(sel) => compile_select(sel, out),
+        BuiltIn::Sink { name, path } => {
+            out.push(Instruction::FromSrc(name.clone()));
+            out.push(Instruction::PushScalar(path.clone()));
+            out.push(Instruction::Sink);
+            Ok(())
+        }
+        BuiltIn::Asc(tbl_expr, col_ref) => {
+            compile_tbl_expr(tbl_expr.as_ref(), out)?;
+            out.push(Instruction::PushColRef(col_ref.clone()));
+            out.push(Instruction::FrameExpr(PolarsFrameExpr::Sort(SortDirection::Asc)));
+            Ok(())
+        }
+        BuiltIn::Desc(tbl_expr, col_ref) => {
+            compile_tbl_expr(tbl_expr.as_ref(), out)?;
+            out.push(Instruction::PushColRef(col_ref.clone()));
+            out.push(Instruction::FrameExpr(PolarsFrameExpr::Sort(SortDirection::Desc)));
+            Ok(())
+        }
     }
 }
 
@@ -105,7 +128,6 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
     out.push(Instruction::BuildProj(sel.cols.len()));
 
     out.push(if has_by { Instruction::SelectBy } else { Instruction::Select });
-    out.push(Instruction::Result);
     Ok(())
 }
 

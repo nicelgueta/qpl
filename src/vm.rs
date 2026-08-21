@@ -1,7 +1,7 @@
 use polars::io::utils::sync_on_close::SyncOnCloseType;
 use polars::prelude::*;
 use crate::ast::{self, TableSource, Value};
-use crate::enums::{PolarsFrameExpr, PolarsStackArg};
+use crate::enums::{PolarsFrameExpr, PolarsStackArg, SortDirection};
 use crate::lexer::tokenise;
 use crate::parser::parse;
 use crate::compiler::compile;
@@ -159,6 +159,7 @@ impl Vm {
                 }
 
                 Instruction::Call { func, args_count } => {
+                    // TODO support calls on lazyframes
                     let args = popn(&mut stack, args_count)?.into_iter()
                         .map(|o| o.unwrap_expr())
                         .collect::<Result<Vec<_>, _>>()?;
@@ -213,8 +214,20 @@ impl Vm {
                                     );
                                 }
                             }
-                        },
-                        _ => return Err(QplError::Runtime("Unsupported frame expression".into())),
+                        }
+                        PolarsFrameExpr::Sort(direction) => {
+                            let col = pop1(&mut stack)?.unwrap_expr()?;
+                            let lf = require_frame(&mut frame)?;
+                            let sorted_lf = match direction {
+                                SortDirection::Asc => lf.sort_by_exprs(vec![col], Default::default()),
+                                SortDirection::Desc => lf.sort_by_exprs(
+                                    vec![col],
+                                    SortMultipleOptions::new()
+                                        .with_order_descending(true)
+                                ),
+                            };
+                            frame = Some(sorted_lf);
+                        }
                     };
                 }
 
@@ -471,6 +484,8 @@ fn apply_binop(left: Expr, right: Expr, op: &str) -> Result<Expr, QplError> {
     })
 }
 
+// fn ap
+
 fn apply_call(func: &str, mut args: Vec<Expr>) -> Result<Expr, QplError> {
     if args.is_empty() {
         return Err(QplError::Runtime(format!("'{func}' called with no args")));
@@ -490,7 +505,6 @@ fn apply_call(func: &str, mut args: Vec<Expr>) -> Result<Expr, QplError> {
         "abs"                   => arg.abs(),
         "neg"                   => -arg,
         "not"                   => arg.not(),
-        "string"                => arg.cast(DataType::String),
         "distinct" | "n_unique" => arg.n_unique(),
         _ => return Err(QplError::Runtime(format!("unknown function '{func}'"))),
     })

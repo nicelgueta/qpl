@@ -43,6 +43,7 @@ impl Parser {
         }
     }
 
+    // main entry point
     fn parse_stmt(&mut self) -> Result<Stmt, QplError> {
         if matches!(self.peek(), TokenKind::Name(_)) && self.peek2() == &TokenKind::Colon {
             let name = if let TokenKind::Name(name) = self.next() {
@@ -53,7 +54,11 @@ impl Parser {
             self.eat(&TokenKind::Colon)?;
             // query keywords produce a table result; anything else is a scalar expression
             match self.peek() {
-                TokenKind::Select | TokenKind::Cols | TokenKind::Load => {
+                TokenKind::Select 
+                | TokenKind::Cols 
+                | TokenKind::Load  
+                | TokenKind::Asc 
+                | TokenKind::Desc => {
                     let stmt = self.parse_body()?;
                     Ok(Stmt::Assign { name, body: Box::new(stmt) })
                 }
@@ -68,13 +73,63 @@ impl Parser {
     }
 
     fn parse_body(&mut self) -> Result<Stmt, QplError> {
+        if is_table_expr_start(self.peek()) {
+            let tbl_expr = self.parse_table_expr()?;
+            Ok(Stmt::RetTable(tbl_expr))
+        } else {
+            self.parse_scalar_stmt()
+        }
+    }
+
+    fn parse_scalar_stmt(&mut self) -> Result<Stmt, QplError> {
         match self.peek() {
-            TokenKind::Select => Ok(Stmt::Select(self.parse_query()?)),
+            TokenKind::Name(name) => {
+                // currently, only sinks are statements that 
+                // start with a name variable
+                // TODO: need to make more expandable
+                if matches!(self.peek2(), TokenKind::Sink) {
+                    if let TokenKind::Name(name) = self.next() { // consume name
+                        self.next(); //consume sink
+                        let res = match self.peek() {
+                            TokenKind::Symbol(path) => {
+                                Ok(
+                                    Stmt::RetTable(
+                                        TableExpr::BuiltIn(
+                                            BuiltIn::Sink {
+                                                name: TableSource::InMem(name),
+                                                path: Value::Str(path.clone())
+                                            }
+                                        )
+                                    )
+                                )
+                            }
+                            _ => Err(QplError::Parse(format!("Unexpected token: {:?}", self.peek())))
+                        };
+                        self.next(); // consume the path
+                        res
+                    } else {
+                        unreachable!()
+                    }
+                } else if matches!(self.peek2(), TokenKind::Eof) {
+                    // just var on its own - no expr to evaluate
+                    Ok(Stmt::SingleVar(Expr::Sym(name.clone())))
+                } else {
+                    Ok(Stmt::SingleVar(self.parse_expr()?))
+                }
+            }
+            _ => Err(QplError::Parse(format!("Unexpected token: {:?}", self.peek()))),
+        }
+    }
+
+    fn parse_table_expr(&mut self) -> Result<TableExpr, QplError> {
+        let peek = self.peek().clone();
+        match peek {
+            TokenKind::Select => Ok(TableExpr::Select(self.parse_query()?)),
             TokenKind::Load => {
                 // standalone: load "path" → select all from the file
                 self.next();
                 match self.next() {
-                    TokenKind::Symbol(path) => Ok(Stmt::Select(SelectStmt {
+                    TokenKind::Symbol(path) => Ok(TableExpr::Select(SelectStmt {
                         cols: vec![],
                         from: TableSource::Load(path),
                         by: None,
@@ -87,7 +142,7 @@ impl Parser {
             TokenKind::Cols => {
                 self.next(); // consume 'cols'
                 match self.next() {
-                    TokenKind::Name(n) => Ok(Stmt::BuiltIn(BuiltIn::Cols(n))),
+                    TokenKind::Name(n) => Ok(TableExpr::BuiltIn(BuiltIn::Cols(n))),
                     other => Err(QplError::Parse(format!("expected table name after 'cols', got {other:?}"))),
                 }
             }
@@ -95,7 +150,7 @@ impl Parser {
                 self.next(); // consume 'show'
                 match self.next() {
                     TokenKind::Name(tbl_name) => {
-                        Ok(Stmt::BuiltIn(BuiltIn::Show(SelectStmt {
+                        Ok(TableExpr::BuiltIn(BuiltIn::Show(SelectStmt {
                             cols: vec![],
                             from: TableSource::InMem(tbl_name),
                             by: None,
@@ -106,33 +161,23 @@ impl Parser {
                     other => Err(QplError::Parse(format!("expected table name after 'show', got {other:?}")))
                 }
             }
-            TokenKind::Name(_name) => {
-                if matches!(self.peek2(), TokenKind::Sink) {
-                    if let TokenKind::Name(name) = self.next() { // consume name
-                        self.next(); //consume sink
-                        let res = match self.peek() {
-                            TokenKind::Symbol(path) => {
-                                Ok(
-                                    Stmt::BuiltIn(
-                                        BuiltIn::Sink {
-                                            name: TableSource::InMem(name),
-                                            path: Value::Str(path.clone())
-                                        }
-                                    )
-                                )
-                            }
-                            _ => Err(QplError::Parse(format!("Unexpected token: {:?}", self.peek())))
-                        };
-                        self.next(); // consume the path
-                        res
-                    } else {
-                        unreachable!()
+            TokenKind::Symbol(s) => {
+                self.next(); // consume the symbol
+                match self.peek() {
+                    TokenKind::Asc => {
+                        self.next(); //consume the asc
+                        let tbl_expr = self.parse_table_expr()?;
+                        Ok(TableExpr::BuiltIn(BuiltIn::Asc(Box::new(tbl_expr), s.clone())))
                     }
-                } else {
-                    Ok(Stmt::SingleVar(self.parse_expr()?))
+                    TokenKind::Desc => {
+                        self.next(); // consume 'desc'
+                        let tbl_expr = self.parse_table_expr()?;
+                        Ok(TableExpr::BuiltIn(BuiltIn::Desc(Box::new(tbl_expr), s.clone())))
+                    }
+                    _ => Err(QplError::Parse(format!("expected 'asc' or 'desc' after symbol, got {:?}", self.peek()))),
                 }
             }
-            _ => Err(QplError::Parse(format!("Unexpected token: {:?}", self.peek()))),
+            _ => Err(QplError::Parse(format!("invalid token for table expression, got {:?}", self.peek()))),
         }
     }
 
@@ -145,7 +190,7 @@ impl Parser {
             by = Some(self.parse_phrase(&[TokenKind::From])?);
         }
         self.eat(&TokenKind::From)?;
-        let from = self.parse_tbl_expr()?;
+        let from = self.parse_tbl_src_expr()?;
         let mut join = None;
         if matches!(self.peek(), TokenKind::Symbol(_)) {
             join = Some(self.parse_join()?);
@@ -228,7 +273,7 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_tbl_expr(&mut self) -> Result<TableSource, QplError> {
+    fn parse_tbl_src_expr(&mut self) -> Result<TableSource, QplError> {
         match self.next() {
             TokenKind::Name(name) => Ok(TableSource::InMem(name)),
             TokenKind::Load => match self.next() {
@@ -271,7 +316,7 @@ impl Parser {
             },
             other => return Err(QplError::Parse(format!("expected join type (lj|ij|rj), got {:?}", other))),
         };
-        let join_src = self.parse_tbl_expr()?;
+        let join_src = self.parse_tbl_src_expr()?;
         while matches!(self.peek(), TokenKind::Symbol(_)) {
             if let TokenKind::Symbol(s) = self.next() {
                 right_on.push(s);
@@ -324,6 +369,18 @@ fn is_noun_start(token: &TokenKind) -> bool {
     )
 }
 
+fn is_table_expr_start(token: &TokenKind) -> bool {
+    matches!(token,
+        TokenKind::Select
+        | TokenKind::Load
+        | TokenKind::Cols
+        | TokenKind::Show
+        | TokenKind::Asc
+        | TokenKind::Desc
+        | TokenKind::Symbol(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,7 +393,10 @@ mod tests {
 
     fn sel(src: &str) -> SelectStmt {
         match p(src) {
-            Stmt::Select(s) => s,
+            Stmt::RetTable(tbl_expr) => match tbl_expr {
+                TableExpr::Select(sel) => sel,
+                other => panic!("expected Select, got {other:?}"),
+            },
             other => panic!("expected Select, got {other:?}"),
         }
     }
@@ -512,7 +572,7 @@ mod tests {
         match p("t: select px from trades") {
             Stmt::Assign { name, body } => {
                 assert_eq!(name, "t");
-                assert!(matches!(*body, Stmt::Select(_)));
+                assert!(matches!(*body, Stmt::RetTable(_)));
             }
             other => panic!("expected Assign, got {other:?}"),
         }
