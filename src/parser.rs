@@ -110,9 +110,6 @@ impl Parser {
                     } else {
                         unreachable!()
                     }
-                } else if matches!(self.peek2(), TokenKind::Eof) {
-                    // just var on its own - no expr to evaluate
-                    Ok(Stmt::SingleVar(Expr::Sym(name.clone())))
                 } else {
                     Ok(Stmt::SingleVar(self.parse_expr()?))
                 }
@@ -136,30 +133,18 @@ impl Parser {
                         where_: None,
                         join: None,
                     })),
-                    other => Err(QplError::Parse(format!("expected file path after 'load', got {other:?}"))),
+                    other => Err(QplError::Parse(format!("expected file path symbol after 'load', got {other:?}"))),
                 }
             }
             TokenKind::Cols => {
                 self.next(); // consume 'cols'
-                match self.next() {
-                    TokenKind::Name(n) => Ok(TableExpr::BuiltIn(BuiltIn::Cols(n))),
-                    other => Err(QplError::Parse(format!("expected table name after 'cols', got {other:?}"))),
-                }
+                let tbl_expr = self.parse_table_expr()?;
+                Ok(TableExpr::BuiltIn(BuiltIn::Cols(Box::new(tbl_expr))))
             }
             TokenKind::Show => {
                 self.next(); // consume 'show'
-                match self.next() {
-                    TokenKind::Name(tbl_name) => {
-                        Ok(TableExpr::BuiltIn(BuiltIn::Show(SelectStmt {
-                            cols: vec![],
-                            from: TableSource::InMem(tbl_name),
-                            by: None,
-                            where_: None,
-                            join: None,
-                        })))
-                    },
-                    other => Err(QplError::Parse(format!("expected table name after 'show', got {other:?}")))
-                }
+                let tbl_expr = self.parse_table_expr()?;
+                Ok(TableExpr::BuiltIn(BuiltIn::Show(Box::new(tbl_expr))))
             }
             TokenKind::Symbol(s) => {
                 self.next(); // consume the symbol
@@ -174,6 +159,16 @@ impl Parser {
                         let tbl_expr = self.parse_table_expr()?;
                         Ok(TableExpr::BuiltIn(BuiltIn::Desc(Box::new(tbl_expr), s.clone())))
                     }
+                    TokenKind::Eof => {
+                        let tbl_expr = TableExpr::Select(SelectStmt {
+                            cols: vec![],
+                            from: TableSource::InMem(s),
+                            by: None,
+                            where_: None,
+                            join: None,
+                        });
+                        Ok(TableExpr::BuiltIn(BuiltIn::Show(Box::new(tbl_expr))))
+                    } 
                     _ => Err(QplError::Parse(format!("expected 'asc' or 'desc' after symbol, got {:?}", self.peek()))),
                 }
             }

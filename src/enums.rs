@@ -17,5 +17,6 @@ pub enum SortDirection {
 pub enum PolarsFrameExpr {
     Filter(usize),
     Join{ l: usize, r: usize },
-    Sort(SortDirection)
+    Sort(SortDirection),
+    Cols
 }

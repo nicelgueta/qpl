@@ -63,11 +63,14 @@ impl Vm {
     }
 
     /// Returns a two-column table: `column` (name) and `dtype` for every field in `table_name`.
-    pub fn schema(&self, table_name: &str) -> Result<DataFrame, QplError> {
-        let df = self.tables.get(table_name)
-            .ok_or_else(|| QplError::Runtime(format!("unknown table '{table_name}'")))?;
-        let names: Vec<String> = df.get_column_names().iter().map(|s| s.to_string()).collect();
-        let types: Vec<String> = df.dtypes().iter().map(|d| d.to_string()).collect();
+    pub fn schema(&self, mut lf: LazyFrame) -> Result<DataFrame, QplError> {
+        let schema = lf.collect_schema()
+            .map_err(|e| QplError::Runtime(e.to_string()))?;
+        let names = schema
+            .iter_names_and_dtypes()
+            .map(|(name, dtype)| (name.to_string(), dtype.to_string()))
+            .collect::<Vec<(String, String)>>();
+        let (names, types): (Vec<String>, Vec<String>) = names.into_iter().unzip();
         df!["column" => names, "dtype" => types]
             .map_err(|e| QplError::Runtime(e.to_string()))
     }
@@ -179,8 +182,6 @@ impl Vm {
                         },
                     });
                 }
-
-                // per spec: subphrases are successive filters (not a single AND)
                 Instruction::FrameExpr(expr) => {
                     match expr {
                         PolarsFrameExpr::Filter(n) => {
@@ -228,7 +229,11 @@ impl Vm {
                             };
                             frame = Some(sorted_lf);
                         }
-                    };
+                        PolarsFrameExpr::Cols => {
+                            let df = self.schema(frame.take().unwrap())?;
+                            frame = Some(df.lazy());
+                        }
+                    }
                 }
 
                 Instruction::BuildKeys(n) => {
@@ -259,10 +264,6 @@ impl Vm {
                         lf.group_by(std::mem::take(&mut keys))
                           .agg(std::mem::take(&mut proj))
                     );
-                }
-
-                Instruction::ColsOf(name) => {
-                    frame = Some(self.schema(&name)?.lazy());
                 }
 
                 Instruction::Cast(dtype) => {

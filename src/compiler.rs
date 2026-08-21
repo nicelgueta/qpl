@@ -36,11 +36,15 @@ fn compile_tbl_expr(tbl_expr: &TableExpr, out: &mut Vec<Instruction>) -> Result<
 
 fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), QplError> {
     match builtin {
-        BuiltIn::Cols(name) => {
-            out.push(Instruction::ColsOf(name.clone())); 
-            Ok(()) 
+        BuiltIn::Cols(tbl_expr) => {
+            compile_tbl_expr(tbl_expr, out)?;
+            out.push(Instruction::FrameExpr(PolarsFrameExpr::Cols));
+            Ok(())
         }
-        BuiltIn::Show(sel) => compile_select(sel, out),
+        BuiltIn::Show(tbl_expr) => {
+            compile_tbl_expr(tbl_expr.as_ref(), out)?;
+            Ok(())
+        }
         BuiltIn::Sink { name, path } => {
             out.push(Instruction::FromSrc(name.clone()));
             out.push(Instruction::PushScalar(path.clone()));
@@ -69,26 +73,22 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
         out.push(Instruction::FromSrc(sel.from.clone()));
         out.push(Instruction::Result); // get the left frame onto the stack for the join
         out.push(Instruction::PushPolarsArg(PolarsStackArg::Join(join_type.clone())));
-        let mut left_count: usize = 0;
-        let mut right_count: usize = 0;
-        if let Value::SymVec(s) = left_on {
-            left_count = s.len();
+        let left_count = if let Value::SymVec(s) = left_on {
             for s in s {
                 out.push(Instruction::PushColRef(s.clone()));
-            }
+            };
+            s.len()
         } else {
             return Err(QplError::Runtime(format!("Expected symbol for left_on, got {:?}", left_on)));
-        }
-        
-        if let Value::SymVec(s) = right_on {
-            right_count = s.len();
+        };
+        let right_count = if let Value::SymVec(s) = right_on {
             for s in s {
                 out.push(Instruction::PushColRef(s.clone()));
-            }
+            };
+            s.len()
         } else {
             return Err(QplError::Runtime(format!("Expected symbol for right_on, got {:?}", right_on)));
-        }
-        
+        };
         out.push(Instruction::FromSrc(join_src.clone()));
         out.push(Instruction::Result); // get the right frame onto the stack for the join
         out.push(Instruction::FrameExpr(PolarsFrameExpr::Join { l: left_count, r: right_count }));
