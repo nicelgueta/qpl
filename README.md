@@ -125,9 +125,16 @@ t >> `summary.parquet
 
 ### cols — inspect schema
 
+```q
+cols `trades
+cols `t
 ```
-cols trades
-cols t
+
+### sorting — pass a map of column names to bools (true = ascending, false = descending) to sort by
+
+```q
+`sym`price!01b `trades
+sorted: `sym`price!01b select from trades where size > 100
 ```
 
 ### Type casts

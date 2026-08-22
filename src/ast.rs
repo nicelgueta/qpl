@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use polars::prelude::JoinType;
 
 use crate::builtins::BuiltIn;
@@ -21,6 +23,7 @@ pub enum Expr {
     Lit(Value),
     Sym(String),
     ColRef(String),
+    Dict(HashMap<String, Value>),
     IColRef, // virtual i col (for indexing like: select i, col1, col2 from df)
     BinOp { left: Box<Expr>, op: String, right: Box<Expr>,},
     Call { func: String, args: Vec<Expr>,}, //  used for agg funcs like sum etc

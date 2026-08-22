@@ -51,16 +51,9 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), 
             out.push(Instruction::Sink);
             Ok(())
         }
-        BuiltIn::Asc(tbl_expr, col_ref) => {
+        BuiltIn::Sort(tbl_expr, sort_map) => {
             compile_tbl_expr(tbl_expr.as_ref(), out)?;
-            out.push(Instruction::PushColRef(col_ref.clone()));
-            out.push(Instruction::FrameExpr(PolarsFrameExpr::Sort(SortDirection::Asc)));
-            Ok(())
-        }
-        BuiltIn::Desc(tbl_expr, col_ref) => {
-            compile_tbl_expr(tbl_expr.as_ref(), out)?;
-            out.push(Instruction::PushColRef(col_ref.clone()));
-            out.push(Instruction::FrameExpr(PolarsFrameExpr::Sort(SortDirection::Desc)));
+            out.push(Instruction::FrameExpr(PolarsFrameExpr::Sort(sort_map.to_owned())));
             Ok(())
         }
     }
@@ -153,6 +146,7 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
             compile_expr(expr, out)?;
             out.push(Instruction::Cast(dtype.clone()));
         }
+        Expr::Dict(_) => return Err(QplError::Runtime("Dict expressions are not supported in select statements (yet)".into())),
     }
     Ok(())
 }

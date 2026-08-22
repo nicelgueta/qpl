@@ -216,17 +216,15 @@ impl Vm {
                                 }
                             }
                         }
-                        PolarsFrameExpr::Sort(direction) => {
-                            let col = pop1(&mut stack)?.unwrap_expr()?;
+                        PolarsFrameExpr::Sort(sort_map) => {
+                            let cols = sort_map.keys().cloned().collect::<Vec<_>>();
+                            let ascs = sort_map.values().cloned().collect::<Vec<_>>();
                             let lf = require_frame(&mut frame)?;
-                            let sorted_lf = match direction {
-                                SortDirection::Asc => lf.sort_by_exprs(vec![col], Default::default()),
-                                SortDirection::Desc => lf.sort_by_exprs(
-                                    vec![col],
+                            let sorted_lf = lf.sort_by_exprs(
+                                    cols.iter().map(|c| col(c.as_str())).collect::<Vec<_>>().as_slice(),
                                     SortMultipleOptions::new()
-                                        .with_order_descending(true)
-                                ),
-                            };
+                                        .with_order_descending_multi(ascs)
+                            );
                             frame = Some(sorted_lf);
                         }
                         PolarsFrameExpr::Cols => {

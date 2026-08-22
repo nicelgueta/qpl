@@ -67,11 +67,39 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 while i < n && is_valid_symbol_char(chars[i]) {
                     i += 1;
                 }
-                let name: String = chars[s..i].iter().collect();
+                if ! (i < n && chars[i] == '`'){
+                    let name: String = chars[s..i].iter().collect();
+                    tokens.push(Token {
+                        kind: TokenKind::Symbol(name),
+                        pos: start,
+                    });
+                    continue
+                }
+                
+                // this looks like a symbol vector
+                // this should be a list of symbols separated by backticks, e.g. `a`b`c
+                let mut symbols = Vec::new();
+                let mut j = s;
+                while j < n {
+                    let k = j;
+                    while j < n && is_valid_symbol_char(chars[j]){
+                        j += 1;
+                    }
+                    let sym: String = chars[k..j].iter().collect();
+                    symbols.push(sym);
+
+                    // check if next is a backtick, if so, continue, else break
+                    if j < n && chars[j] == '`' {
+                        j += 1; // skip the backtick
+                    } else {
+                        break;
+                    }
+                }
                 tokens.push(Token {
-                    kind: TokenKind::Symbol(name),
+                    kind: TokenKind::SymbolVec(symbols),
                     pos: start,
                 });
+                i = j;    
             }
             '0'..='9' => {
                 let mut j = i;
@@ -158,7 +186,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     i += 1;
                 } else {
                     tokens.push(Token {
-                        kind: TokenKind::Op("!".to_string()),
+                        kind: TokenKind::Bang,
                         pos: start,
                     });
                 }
@@ -218,8 +246,6 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         "load"   => TokenKind::Load,
                         "sink"   => TokenKind::Sink,
                         "show"   => TokenKind::Show,
-                        "asc"    => TokenKind::Asc,
-                        "desc"   => TokenKind::Desc,
                         _ => TokenKind::Name(name),
                     };
                     tokens.push(Token { kind, pos: start });
@@ -341,6 +367,25 @@ mod tests {
             TokenKind::Symbol("a".into()),
             TokenKind::Symbol("b".into()),
             TokenKind::Symbol("c".into()),
+        ]);
+    }
+
+    #[test]
+    fn dict_basic() {
+        assert_eq!(kinds("`a`b!1 2"), vec![
+            TokenKind::SymbolVec(vec!["a".into(), "b".into()]),
+            TokenKind::Bang,
+            TokenKind::Int(1),
+            TokenKind::Int(2),
+        ]);
+    }
+
+    #[test]
+    fn dict_bool_vec() {
+        assert_eq!(kinds("`a`b`c!101b"), vec![
+            TokenKind::SymbolVec(vec!["a".into(), "b".into(), "c".into()]),
+            TokenKind::Bang,
+            TokenKind::BoolVec(vec![true, false, true]),
         ]);
     }
 

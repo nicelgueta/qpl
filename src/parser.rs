@@ -56,9 +56,10 @@ impl Parser {
             match self.peek() {
                 TokenKind::Select 
                 | TokenKind::Cols 
-                | TokenKind::Load  
-                | TokenKind::Asc 
-                | TokenKind::Desc => {
+                | TokenKind::Load
+                | TokenKind::Show
+                | TokenKind::Symbol(_)
+                | TokenKind::SymbolVec(_)=> {
                     let stmt = self.parse_body()?;
                     Ok(Stmt::Assign { name, body: Box::new(stmt) })
                 }
@@ -83,7 +84,7 @@ impl Parser {
 
     fn parse_scalar_stmt(&mut self) -> Result<Stmt, QplError> {
         match self.peek() {
-            TokenKind::Name(name) => {
+            TokenKind::Name(_name) => {
                 // currently, only sinks are statements that 
                 // start with a name variable
                 // TODO: need to make more expandable
@@ -149,16 +150,6 @@ impl Parser {
             TokenKind::Symbol(s) => {
                 self.next(); // consume the symbol
                 match self.peek() {
-                    TokenKind::Asc => {
-                        self.next(); //consume the asc
-                        let tbl_expr = self.parse_table_expr()?;
-                        Ok(TableExpr::BuiltIn(BuiltIn::Asc(Box::new(tbl_expr), s.clone())))
-                    }
-                    TokenKind::Desc => {
-                        self.next(); // consume 'desc'
-                        let tbl_expr = self.parse_table_expr()?;
-                        Ok(TableExpr::BuiltIn(BuiltIn::Desc(Box::new(tbl_expr), s.clone())))
-                    }
                     TokenKind::Eof => {
                         let tbl_expr = TableExpr::Select(SelectStmt {
                             cols: vec![],
@@ -168,8 +159,50 @@ impl Parser {
                             join: None,
                         });
                         Ok(TableExpr::BuiltIn(BuiltIn::Show(Box::new(tbl_expr))))
-                    } 
+                    }
+                    TokenKind::Bang => {
+                        // single symbol with a bang should actually 
+                        // be a symvec with a single element
+                        self.next(); // consume '!'
+                        // TODO also make the use of a dict generic not just to sort
+                        // so a sort in the compiler is pushing the map onto the stack
+                        // and calling sort 
+                        let peek = self.peek().clone();
+                        match peek {
+                            TokenKind::BoolVec(b) => {
+                                self.next(); // consume the bool vector
+                                let tbl_expr = self.parse_table_expr()?;
+                                let sort_map = vec![(s, b[0])].into_iter().collect();
+                                Ok(TableExpr::BuiltIn(BuiltIn::Sort(Box::new(tbl_expr), sort_map)))
+                            }
+                            TokenKind::Bool(b) => {
+                                self.next(); // consume the bool
+                                let tbl_expr = self.parse_table_expr()?;
+                                let sort_map = vec![(s, b)].into_iter().collect();
+                                Ok(TableExpr::BuiltIn(BuiltIn::Sort(Box::new(tbl_expr), sort_map)))
+                            }
+                            _ => Err(QplError::Parse(format!("expected bool vector after '!', got {:?}", self.peek()))),
+                        }
+                    }
                     _ => Err(QplError::Parse(format!("expected 'asc' or 'desc' after symbol, got {:?}", self.peek()))),
+                }
+            }
+            TokenKind::SymbolVec(v) => {
+                self.next(); // consume the symbol vector
+                let peek = self.peek().clone();
+                if matches!(peek, TokenKind::Bang) {
+                    self.next(); // consume '!'
+                    let peek = self.peek().clone();
+                    if let TokenKind::BoolVec(b) = peek {
+                        self.next(); // consume the bool vector
+                        let tbl_expr = self.parse_table_expr()?;
+                        let sort_map = v.iter().zip(b.iter()).map(|(s, b)| (s.clone(), *b)).collect();
+                        Ok(TableExpr::BuiltIn(BuiltIn::Sort(Box::new(tbl_expr), sort_map)))
+                    } else {
+                        Err(QplError::Parse(format!("expected bool vector after '!', got {:?}", self.peek())))
+                    }
+                } else {
+                    Err(QplError::Parse(format!("expected '!' after symbol vector, got {:?}", self.peek())))
                 }
             }
             _ => Err(QplError::Parse(format!("invalid token for table expression, got {:?}", self.peek()))),
@@ -370,8 +403,7 @@ fn is_table_expr_start(token: &TokenKind) -> bool {
         | TokenKind::Load
         | TokenKind::Cols
         | TokenKind::Show
-        | TokenKind::Asc
-        | TokenKind::Desc
+        | TokenKind::SymbolVec(_)
         | TokenKind::Symbol(_)
     )
 }

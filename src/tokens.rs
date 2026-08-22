@@ -11,23 +11,26 @@ pub enum TokenKind {
     Sink,
     Cols,
     Show,
-    Asc,
-    Desc,
 
     //literals
     Name(String),
     Int(i64),
+    IntVec(Vec<i64>),
     Float(f64),
+    FloatVec(Vec<f64>),
     Symbol(String),
+    SymbolVec(Vec<String>),
     Bool(bool),
     BoolVec(Vec<bool>),
     Str(String),
+    StrVec(Vec<String>),
 
     // punc
     Colon,
     Comma,
     LParen,
     RParen,
+    Bang,
     Op(String),
     Eof,
 }
