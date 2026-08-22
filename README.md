@@ -91,7 +91,7 @@ select from trades where 10100000b
 
 ### Assignments
 
-```
+```q
 / table variable
 t: select from trades where size > 100
 
@@ -102,7 +102,7 @@ select from trades where size > threshold
 
 ### load — load files lazily
 
-```
+```q
 / parquet
 select avg price by sym from load `data/trades.parquet
 t: load `data/trades.parquet
@@ -115,7 +115,7 @@ select from << `data/quotes.csv
 
 ### sink — write to file
 
-```
+```q
 t: select total_size: sum size, apx: mean price, total_value: sum price * size by sym, side from trades
 t sink `summary.parquet
 
@@ -130,7 +130,7 @@ cols `trades
 cols `t
 ```
 
-### sorting — pass a map of column names to bools (true = ascending, false = descending) to sort by
+### sorting — pass a map of column names to bools (false = ascending, true = descending) to sort by
 
 ```q
 `sym`price!01b `trades
@@ -170,7 +170,7 @@ Supported types: `f64`/`float`, `f32`, `i64`/`int`, `i32`, `i16`, `i8`,
 
 `i` is the row index. It is aliased to `x` in the result (q convention).
 
-```
+```q
 select i, sym from trades
 select from trades where i < 5
 ```
@@ -179,7 +179,7 @@ select from trades where i < 5
 
 Lines beginning with `/` are comments (in scripts and in subexpressions).
 
-```
+```q
 / this is a comment
 select from trades  / inline comment
 ```
