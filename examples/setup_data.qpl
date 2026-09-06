@@ -1,0 +1,9 @@
+/ Regenerates the sample parquet inputs used by the other example scripts.
+/ The generated files are committed, so you only need this if you want to
+/ recreate them.
+/
+/ Run from the repo root:
+/   cargo run -- --load-demo examples/setup_data.qpl
+
+trades >> `examples/data/trades.parquet
+quotes >> `examples/data/quotes.parquet

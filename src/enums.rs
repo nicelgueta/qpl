@@ -6,12 +6,6 @@ pub enum PolarsStackArg {
     Join(JoinType)
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum SortDirection {
-    Asc,
-    Desc
-}
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PolarsFrameExpr {

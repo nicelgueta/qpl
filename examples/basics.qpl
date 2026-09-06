@@ -1,0 +1,28 @@
+/ ─────────────────────────────────────────────────────────────────────────────
+/ A quick tour of the core query language.
+/
+/ Run from the repo root:
+/   cargo run -- examples/basics.qpl
+/ ─────────────────────────────────────────────────────────────────────────────
+
+/ load is lazy; a bare select prints the plan, so collect it into a table first
+trades: collect load `examples/data/trades.parquet
+
+/ projection + aliasing
+select sym, px: price, qty: size from trades
+
+/ scalar variable, reused in a later query
+thr: 150
+select from trades where size > thr
+
+/ where with multiple successive filters
+select sym, price from trades where size > 100, price < 400
+
+/ group-by aggregation
+select traded: sum size, apx: avg price by sym, side from trades
+
+/ conditional column via $[...] case
+select sym, tier: $[price > 400; `high; price > 180; `mid; `low] from trades
+
+/ order + type cast (order by columns that survive the projection)
+select sym, sz: f64$size from trades order sym asc, sz desc

@@ -65,6 +65,8 @@ qpl script.qpl
 qpl -i script.qpl
 ```
 
+Runnable scripts live in [`examples/`](examples/) — `qpl examples/lazy_join_pipeline.qpl`.
+
 ## Language
 
 ### Select
@@ -168,25 +170,57 @@ name instead of a materialised table. Nothing runs until you `collect` it
 (materialise to a DataFrame) or `sink` it to a file.
 
 ```q
-/ build a plan, don't run it
+/ build a plan, don't run it — no IO happens here
 t: lazy load `trades.parquet
-
-/ extend the plan by re-assigning the binding
-t: update notional: price * size from t
-t: delete from t where size < 100
-
-/ materialise when ready
-tm: collect t
-
-/ or stream straight to a file without ever building a table
-t >> `out.parquet
+/ `lazy` works on any table expression, not just load
+q: lazy select sym, bid, ask from load `quotes.parquet
 ```
 
-Reading from a lazy binding is contagious: `select ... from t` on a lazy `t`
-yields another lazy plan (the REPL prints it) until you `collect`. `cols` still
-shows the schema as a table.
+Extend a plan by **re-assigning the binding**. Each step is still just plan
+nodes; the file is never touched:
 
-Assignment uses `:` (`tm: collect t`), same as everywhere else in qpl.
+```q
+t: select sym, side, price, size from t where size > 100
+t: update notional: price * size from t
+t: update band: $[notional > 50000; `big; `small] from t
+```
+
+Reading a lazy binding without collecting is contagious — the result is another
+lazy plan, and the REPL prints it rather than a table:
+
+```q
+select from t
+/ SELECT [col("sym"), col("side"), col("price"), col("size"), ...]
+/   Parquet SCAN [trades.parquet]
+/   SELECTION: col("size") > 100
+```
+
+Joins, `by` aggregation, `order`, `distinct` and `limit` all compose lazily too:
+
+```q
+j: select sym, side, price, size, bid, ask from t `sym lj q `sym
+j: select traded: sum notional, n: count price by sym, side from j
+```
+
+`collect` runs the plan once and binds the result as a normal table:
+
+```q
+tm: collect j
+select from tm where side = `buy
+```
+
+...or skip the table entirely and stream the plan straight to a file:
+
+```q
+j >> `summary.parquet
+```
+
+`cols` always resolves to a table, even on a lazy binding. Assignment uses `:`
+(`tm: collect t`), same as everywhere else in qpl.
+
+See [`examples/`](examples/) for runnable scripts, including
+[`lazy_join_pipeline.qpl`](examples/lazy_join_pipeline.qpl) — a two-input,
+join + aggregate pipeline that is sunk to parquet without ever being collected.
 
 ### cols — inspect schema
 

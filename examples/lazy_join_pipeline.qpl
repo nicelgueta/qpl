@@ -1,0 +1,31 @@
+/ ─────────────────────────────────────────────────────────────────────────────
+/ Fully lazy end-to-end pipeline.
+/
+/ Reads two parquet files, joins them, derives columns, aggregates, sorts, and
+/ streams the result straight to another parquet file. Nothing is ever
+/ materialised into an in-memory table — every binding stays a lazy plan and the
+/ only execution happens when `>>` sinks the final plan to disk.
+/
+/ Run from the repo root:
+/   cargo run -- examples/lazy_join_pipeline.qpl
+/ ─────────────────────────────────────────────────────────────────────────────
+
+/ 1. scan both inputs as lazy plans (no IO yet)
+trades: lazy load `examples/data/trades.parquet
+quotes: lazy load `examples/data/quotes.parquet
+
+/ 2. left-join quotes onto trades by sym (still lazy — the join is just plan nodes)
+enriched: select sym, side, price, size, bid, ask from trades `sym lj quotes `sym
+
+/ 3. derive spread + notional, keep the frame lazy by re-assigning the binding
+enriched: update spread: ask - bid, notional: price * size from enriched
+
+/ 4. tag each row as a wide or tight market
+enriched: update band: $[spread > 0.4; `wide; `tight] from enriched
+
+/ 5. aggregate per sym/side/band, then sort — all lazy
+summary: select traded: sum notional, avg_spread: avg spread, n: count price by sym, side, band from enriched
+summary: `traded`sym!10b select from summary
+
+/ 6. the ONLY execution: stream the final plan to parquet without collecting
+summary >> `examples/data/market_summary.parquet

@@ -1,0 +1,5 @@
+# Render qpl scripts with q syntax highlighting in the GitHub UI
+*.qpl linguist-language=q
+
+# Sample data for the examples: don't count it in language stats
+examples/data/*.parquet linguist-generated=true

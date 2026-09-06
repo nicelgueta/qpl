@@ -1,0 +1,24 @@
+/ ─────────────────────────────────────────────────────────────────────────────
+/ `lazy` / `collect` basics.
+/
+/ Run from the repo root:
+/   cargo run -- examples/lazy_and_collect.qpl
+/ ─────────────────────────────────────────────────────────────────────────────
+
+/ `lazy` as the first token stores the query PLAN under a name, not a table.
+/ Nothing touches the file yet.
+t: lazy load `examples/data/trades.parquet
+
+/ Extend the plan by re-assigning the binding. Still lazy, still no execution.
+t: select sym, side, price, size from t where size > 100
+t: update notional: price * size from t
+
+/ Reading a lazy binding without collecting just prints its (optimised) plan.
+select from t
+
+/ `collect` runs the plan once and binds the result as a normal in-memory table.
+tm: collect t
+select sym, notional from tm where side = `buy
+
+/ `cols` always resolves to a table, even on a lazy binding.
+cols `t

@@ -1,1 +1,4 @@
 /target
+
+# output written by examples/lazy_join_pipeline.qpl
+/examples/data/market_summary.parquet
