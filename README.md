@@ -120,8 +120,6 @@ distinct select sym from trades
 10#select from trades
 10#`trades
 
-```
-
 / also use str vars a symbols (maybe change this but easy to write for now)
 select total: sum size by sym from trades where side = `buy
 
