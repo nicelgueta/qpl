@@ -36,8 +36,11 @@ pub enum TokenKind {
     // punc
     Colon,
     Comma,
+    Semicolon,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Bang,
     Hash,
     Op(String),

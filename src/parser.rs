@@ -385,6 +385,24 @@ impl Parser {
         Ok(left)
     }
 
+    fn parse_case(&mut self) -> Result<Expr, QplError> {
+        self.eat(&TokenKind::LBracket)?;
+        let mut terms = vec![self.parse_expr()?];
+        while self.peek() == &TokenKind::Semicolon {
+            self.next();
+            terms.push(self.parse_expr()?);
+        }
+        self.eat(&TokenKind::RBracket)?;
+        if terms.len() < 3 || terms.len() % 2 == 0 {
+            return Err(QplError::Parse("case expression requires condition/value pairs and a default".into()));
+        }
+        let default = Box::new(terms.pop().unwrap());
+        let branches = terms.chunks_exact(2)
+            .map(|pair| (pair[0].clone(), pair[1].clone()))
+            .collect();
+        Ok(Expr::Case { branches, default })
+    }
+
     fn parse_tbl_src_expr(&mut self) -> Result<TableSource, QplError> {
         match self.next() {
             TokenKind::Name(name) => Ok(TableSource::InMem(name)),
@@ -473,6 +491,7 @@ impl Parser {
             TokenKind::Symbol(s)   => Ok(Expr::Sym(s)),
             TokenKind::Name(n) if n == "i" => Ok(Expr::IColRef),
             TokenKind::Name(n)     => Ok(Expr::ColRef(n)),
+            TokenKind::Op(op) if op == "$" => self.parse_case(),
             TokenKind::LParen      => {
                 let expr = self.parse_expr()?;
                 self.eat(&TokenKind::RParen)?;
@@ -745,6 +764,13 @@ mod tests {
             }
             other => panic!("expected delete select, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn case_expression_parses() {
+        let s = sel("select price_bin: $[price>100;`large;price>50;`med;`small] from data");
+        assert_eq!(s.cols[0].name, Some("price_bin".into()));
+        assert!(matches!(&s.cols[0].expr, Expr::Case { branches, .. } if branches.len() == 2));
     }
 
     // --- by clause ---

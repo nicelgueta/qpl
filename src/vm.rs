@@ -169,6 +169,19 @@ impl Vm {
                     stack.push(StackObj::Expr(apply_call(&func, args)?));
                 }
 
+                Instruction::Case { branches } => {
+                    let values = popn(&mut stack, branches * 2 + 1)?
+                        .into_iter()
+                        .map(|obj| obj.unwrap_expr())
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let default = values.last().cloned().ok_or_else(|| QplError::Runtime("case expression has no default".into()))?;
+                    let mut case_expr = default;
+                    for pair in values[..values.len() - 1].chunks_exact(2).rev() {
+                        case_expr = when(pair[0].clone()).then(pair[1].clone()).otherwise(case_expr);
+                    }
+                    stack.push(StackObj::Expr(case_expr));
+                }
+
                 Instruction::Alias { name } => {
                     let expr = pop1(&mut stack)?;
                     stack.push(match name {
@@ -702,6 +715,12 @@ mod tests {
         let df = run(make_vm(), "delete `c2 from t");
         let names: Vec<&str> = df.get_column_names().iter().map(|name| name.as_str()).collect();
         assert_eq!(names, vec!["c1", "c3"]);
+    }
+
+    #[test]
+    fn case_expression_returns_first_matching_value() {
+        let df = run(make_vm(), "select bin: $[c2>20;`high;c2>10;`mid;`low] from t");
+        assert_eq!(strs(&df, "bin"), vec!["low", "mid", "high", "mid"]);
     }
 
     #[test]

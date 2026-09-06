@@ -162,6 +162,10 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 });
                 i += 1;
             }
+            ';' => {
+                tokens.push(Token { kind: TokenKind::Semicolon, pos: start });
+                i += 1;
+            }
             '#' => {
                 tokens.push(Token {
                     kind: TokenKind::Hash,
@@ -181,6 +185,14 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     kind: TokenKind::RParen,
                     pos: start,
                 });
+                i += 1;
+            }
+            '[' => {
+                tokens.push(Token { kind: TokenKind::LBracket, pos: start });
+                i += 1;
+            }
+            ']' => {
+                tokens.push(Token { kind: TokenKind::RBracket, pos: start });
                 i += 1;
             }
             '!' => {
@@ -437,6 +449,28 @@ mod tests {
     #[test]
     fn keyword_delete() {
         assert_eq!(kinds("delete"), vec![TokenKind::Delete]);
+    }
+
+    #[test]
+    fn case_punctuation() {
+        assert_eq!(kinds("$[a>1;`large;a>0;`small;`none]"), vec![
+            TokenKind::Op("$".into()),
+            TokenKind::LBracket,
+            TokenKind::Name("a".into()),
+            TokenKind::Op(">".into()),
+            TokenKind::Int(1),
+            TokenKind::Semicolon,
+            TokenKind::Symbol("large".into()),
+            TokenKind::Semicolon,
+            TokenKind::Name("a".into()),
+            TokenKind::Op(">".into()),
+            TokenKind::Int(0),
+            TokenKind::Semicolon,
+            TokenKind::Symbol("small".into()),
+            TokenKind::Semicolon,
+            TokenKind::Symbol("none".into()),
+            TokenKind::RBracket,
+        ]);
     }
 
     // --- identifiers ---

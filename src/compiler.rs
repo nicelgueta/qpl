@@ -220,6 +220,14 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
             compile_expr(expr, out)?;
             out.push(Instruction::Cast(dtype.clone()));
         }
+        Expr::Case { branches, default } => {
+            for (condition, value) in branches {
+                compile_expr(condition, out)?;
+                compile_expr(value, out)?;
+            }
+            compile_expr(default, out)?;
+            out.push(Instruction::Case { branches: branches.len() });
+        }
         Expr::Dict(_) => return Err(QplError::Runtime("Dict expressions are not supported in select statements (yet)".into())),
     }
     Ok(())
@@ -423,6 +431,12 @@ mod tests {
             FrameExpr(PolarsFrameExpr::Filter(1)),
             BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select, Result,
         ]);
+    }
+
+    #[test]
+    fn case_expression_compiles() {
+        let program = compile_src("select bin: $[c2>20;`high;c2>10;`mid;`low] from t");
+        assert!(program.iter().any(|instruction| matches!(instruction, Case { branches: 2 })));
     }
 
     // --- by clause ---

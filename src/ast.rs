@@ -28,6 +28,7 @@ pub enum Expr {
     BinOp { left: Box<Expr>, op: String, right: Box<Expr>,},
     Call { func: String, args: Vec<Expr>,}, //  used for agg funcs like sum etc
     Cast { dtype: String, expr: Box<Expr> },
+    Case { branches: Vec<(Expr, Expr)>, default: Box<Expr> },
 }
 
 
