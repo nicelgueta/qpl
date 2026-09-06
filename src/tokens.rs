@@ -19,6 +19,8 @@ pub enum TokenKind {
     Sink,
     Cols,
     Show,
+    Lazy,
+    Collect,
 
     //literals
     Name(String),

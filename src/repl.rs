@@ -77,6 +77,7 @@ fn match_run_vm(line: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<()
         Ok(EvalResult::Table(df))    => println!("{df}"),
         Ok(EvalResult::Stored)                  => {},
         Ok(EvalResult::Scalar(val))      => println!("{}", fmt_val(&val)),
+        Ok(EvalResult::Lazy(plan))       => println!("{plan}"),
         Err(e) => {
             if path == "<main>" {
                 return Err(e);

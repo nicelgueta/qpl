@@ -273,6 +273,8 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         "load"   => TokenKind::Load,
                         "sink"   => TokenKind::Sink,
                         "show"   => TokenKind::Show,
+                        "lazy"    => TokenKind::Lazy,
+                        "collect" => TokenKind::Collect,
                         _ => TokenKind::Name(name),
                     };
                     tokens.push(Token { kind, pos: start });
@@ -449,6 +451,11 @@ mod tests {
     #[test]
     fn keyword_delete() {
         assert_eq!(kinds("delete"), vec![TokenKind::Delete]);
+    }
+
+    #[test]
+    fn keyword_lazy_and_collect() {
+        assert_eq!(kinds("lazy collect"), vec![TokenKind::Lazy, TokenKind::Collect]);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 pub struct Vm {
     pub tables: HashMap<String, DataFrame>,
+    pub lazy_frames: HashMap<String, LazyFrame>,
     pub globals: HashMap<String, ast::Value>,
 }
 
@@ -59,7 +60,7 @@ impl StackObj {
 
 impl Vm {
     pub fn new() -> Self {
-        Self { tables: HashMap::new(), globals: HashMap::new() }
+        Self { tables: HashMap::new(), lazy_frames: HashMap::new(), globals: HashMap::new() }
     }
 
     /// Returns a two-column table: `column` (name) and `dtype` for every field in `table_name`.
@@ -102,16 +103,27 @@ impl Vm {
         let mut keys:  Vec<Expr> = Vec::new();
         let mut proj:  Vec<Expr> = Vec::new();
 
+        // `lazy_mode` means the final result stays a LazyFrame plan instead of
+        // being collected into a DataFrame.
+        let mut lazy_mode = false;
+
         for instr in program {
             match instr {
                 Instruction::FromSrc(tbl_source) => {
                     match tbl_source {
                         TableSource::InMem(name) => {
-                            let lf = self.tables
-                                .get(&name)
-                                .ok_or_else(|| QplError::Runtime(format!("unknown table '{name}'")))?
-                                .clone()
-                                .lazy();
+                            let lf = if let Some(lf) = self.lazy_frames.get(&name) {
+                                // reading from a lazy binding is contagious: the
+                                // result stays lazy unless explicitly collected.
+                                lazy_mode = true;
+                                lf.clone()
+                            } else {
+                                self.tables
+                                    .get(&name)
+                                    .ok_or_else(|| QplError::Runtime(format!("unknown table '{name}'")))?
+                                    .clone()
+                                    .lazy()
+                            };
                             frame = Some(if needs_i { lf.with_row_index("i", None) } else { lf });
                         }
                         TableSource::Load(path) => {
@@ -130,6 +142,13 @@ impl Vm {
                     let lf = require_frame(&mut frame)?;
                     sink_file(lf, &path_str)?
                 }
+                Instruction::Lazy => {
+                    lazy_mode = true;
+                }
+                Instruction::Collect => {
+                    lazy_mode = false;
+                }
+
                 Instruction::PushScalar(name) => {
                     stack.push(StackObj::Scalar(name))
                 }
@@ -255,6 +274,8 @@ impl Vm {
                         PolarsFrameExpr::Cols => {
                             let df = self.schema(frame.take().unwrap())?;
                             frame = Some(df.lazy());
+                            // `cols` fully resolves the schema; always show it as a table.
+                            lazy_mode = false;
                         }
                     }
                 }
@@ -333,8 +354,15 @@ impl Vm {
                             self.globals.insert(name.clone(), s.clone());
                         }
                         StackObj::Frame(lf) => {
-                            self.tables.insert(name, lf.collect()
-                                .map_err(|e| QplError::Runtime(e.to_string()))?);
+                            if lazy_mode {
+                                // keep the plan lazy under this name
+                                self.tables.remove(&name);
+                                self.lazy_frames.insert(name, lf);
+                            } else {
+                                self.lazy_frames.remove(&name);
+                                self.tables.insert(name, lf.collect()
+                                    .map_err(|e| QplError::Runtime(e.to_string()))?);
+                            }
                         }
                         typ => return Err(QplError::Runtime(format!("Cannot assign '{}' to type {}: expected a table or scalar on stack", name, typ.type_name()))),
                     }
@@ -344,7 +372,12 @@ impl Vm {
         if !stack.is_empty() {
             let last_item = stack.pop().unwrap();
             match last_item {
-                StackObj::Frame(lf) => Ok(EvalResult::Table(lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?)),
+                StackObj::Frame(lf) => {
+                    if lazy_mode {
+                        return Ok(EvalResult::Lazy(explain_plan(&lf)));
+                    }
+                    Ok(EvalResult::Table(lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?))
+                }
                 StackObj::Scalar(s) => Ok(EvalResult::Scalar(s)),
                 typ => Err(QplError::Runtime(format!("Unexpected type on stack: {}", typ.type_name()))),
             }
@@ -358,6 +391,14 @@ pub enum EvalResult {
     Table(DataFrame),
     Stored,
     Scalar(ast::Value),
+    /// a bare lazy table expression: carries the (optimised) query plan text.
+    Lazy(String),
+}
+
+fn explain_plan(lf: &LazyFrame) -> String {
+    lf.clone()
+        .explain(true)
+        .unwrap_or_else(|e| format!("<could not explain plan: {e}>"))
 }
 
 pub fn run_vm(source: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
@@ -586,6 +627,7 @@ mod tests {
             EvalResult::Table(df) => df,
             EvalResult::Stored => panic!("expected table result"),
             EvalResult::Scalar(s) => panic!("expected table result, got scalar {s:?}"),
+            EvalResult::Lazy(_) => panic!("expected table result, got lazy plan"),
         }
     }
 
@@ -910,6 +952,53 @@ mod tests {
         );
         assert_eq!(strs(&df, "c1"),    vec!["a", "b"]);
         assert_eq!(i64s(&df, "total"), vec![30, 20]);
+    }
+
+    // --- lazy / collect ---
+
+    #[test]
+    fn lazy_assign_stores_a_plan_not_a_table() {
+        let mut vm = make_vm();
+        assert!(matches!(run_vm("l: lazy select from t", &mut vm), Ok(EvalResult::Stored)));
+        assert!(vm.lazy_frames.contains_key("l"));
+        assert!(!vm.tables.contains_key("l"));
+    }
+
+    #[test]
+    fn bare_lazy_expr_returns_a_plan() {
+        let mut vm = make_vm();
+        run_vm("l: lazy select from t", &mut vm).unwrap();
+        assert!(matches!(run_vm("select c2 from l", &mut vm), Ok(EvalResult::Lazy(_))));
+    }
+
+    #[test]
+    fn collect_materialises_a_lazy_binding() {
+        let mut vm = make_vm();
+        run_vm("l: lazy select from t", &mut vm).unwrap();
+        assert!(matches!(run_vm("m: collect l", &mut vm), Ok(EvalResult::Stored)));
+        assert!(vm.tables.contains_key("m"));
+        assert!(!vm.lazy_frames.contains_key("m"));
+        let df = run(vm, "select c2 from m");
+        assert_eq!(i64s(&df, "c2"), vec![10, 20, 30, 15]);
+    }
+
+    #[test]
+    fn update_assigned_back_to_a_lazy_binding_stays_lazy_and_extends_the_plan() {
+        let mut vm = make_vm();
+        run_vm("l: lazy select from t", &mut vm).unwrap();
+        // explicit re-assignment is the only way to extend a lazy plan
+        assert!(matches!(run_vm("l: update c2: c2 * 2 from l", &mut vm), Ok(EvalResult::Stored)));
+        assert!(vm.lazy_frames.contains_key("l"));
+        assert!(!vm.tables.contains_key("l"));
+        run_vm("tm: collect l", &mut vm).unwrap();
+        let df = run(vm, "select c2 from tm");
+        assert_eq!(i64s(&df, "c2"), vec![20, 40, 60, 30]);
+    }
+
+    #[test]
+    fn collect_over_eager_table_is_noop_passthrough() {
+        let df = run(make_vm(), "collect select c2 from t");
+        assert_eq!(i64s(&df, "c2"), vec![10, 20, 30, 15]);
     }
 
     // --- error cases ---

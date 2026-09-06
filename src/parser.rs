@@ -54,13 +54,15 @@ impl Parser {
             self.eat(&TokenKind::Colon)?;
             // query keywords produce a table result; anything else is a scalar expression
             match self.peek() {
-                TokenKind::Select 
+                TokenKind::Select
                 | TokenKind::Update
                 | TokenKind::Delete
                 | TokenKind::Distinct
-                | TokenKind::Cols 
+                | TokenKind::Cols
                 | TokenKind::Load
                 | TokenKind::Show
+                | TokenKind::Lazy
+                | TokenKind::Collect
                 | TokenKind::Symbol(_)
                 | TokenKind::SymbolVec(_)=> {
                     let stmt = self.parse_body()?;
@@ -175,6 +177,14 @@ impl Parser {
                 self.next(); // consume 'show'
                 let tbl_expr = self.parse_table_expr()?;
                 Ok(TableExpr::BuiltIn(BuiltIn::Show(Box::new(tbl_expr))))
+            }
+            TokenKind::Lazy => {
+                self.next(); // consume 'lazy'
+                Ok(TableExpr::BuiltIn(BuiltIn::Lazy(Box::new(self.parse_lazy_operand()?))))
+            }
+            TokenKind::Collect => {
+                self.next(); // consume 'collect'
+                Ok(TableExpr::BuiltIn(BuiltIn::Collect(Box::new(self.parse_lazy_operand()?))))
             }
             TokenKind::Symbol(s) => {
                 self.next(); // consume the symbol
@@ -403,6 +413,25 @@ impl Parser {
         Ok(Expr::Case { branches, default })
     }
 
+    /// operand of `lazy` / `collect`: either a bare table variable name
+    /// (`collect t`) or a full table expression (`lazy load \`x.parquet`).
+    fn parse_lazy_operand(&mut self) -> Result<TableExpr, QplError> {
+        if let TokenKind::Name(name) = self.peek().clone() {
+            self.next();
+            return Ok(TableExpr::Select(SelectStmt {
+                cols: vec![],
+                from: TableSource::InMem(name),
+                by: None,
+                where_: None,
+                order: None,
+                join: None,
+                update: false,
+                delete: false,
+            }));
+        }
+        self.parse_table_expr()
+    }
+
     fn parse_tbl_src_expr(&mut self) -> Result<TableSource, QplError> {
         match self.next() {
             TokenKind::Name(name) => Ok(TableSource::InMem(name)),
@@ -532,6 +561,8 @@ fn is_table_expr_start(token: &TokenKind) -> bool {
         | TokenKind::Load
         | TokenKind::Cols
         | TokenKind::Show
+        | TokenKind::Lazy
+        | TokenKind::Collect
         | TokenKind::SymbolVec(_)
         | TokenKind::Symbol(_)
     )
@@ -763,6 +794,39 @@ mod tests {
                 assert!(query.where_.is_some());
             }
             other => panic!("expected delete select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lazy_wraps_a_table_expr() {
+        match p("t: lazy load `x.parquet") {
+            Stmt::Assign { name, body } => {
+                assert_eq!(name, "t");
+                assert!(matches!(
+                    *body,
+                    Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Lazy(_)))
+                ));
+            }
+            other => panic!("expected lazy assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_takes_a_bare_var_name() {
+        match p("tm: collect t") {
+            Stmt::Assign { name, body } => {
+                assert_eq!(name, "tm");
+                match *body {
+                    Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Collect(inner))) => {
+                        assert!(matches!(
+                            *inner,
+                            TableExpr::Select(SelectStmt { from: TableSource::InMem(ref n), .. }) if n == "t"
+                        ));
+                    }
+                    other => panic!("expected collect body, got {other:?}"),
+                }
+            }
+            other => panic!("expected collect assign, got {other:?}"),
         }
     }
 

@@ -16,6 +16,10 @@ fn compile_stmt(stmt: &Stmt, out: &mut Vec<Instruction>) -> Result<(), QplError>
     match stmt {
         Stmt::RetTable(tbl_expr) => {
             compile_tbl_expr(tbl_expr, out)?;
+            // `sink` is terminal: it consumes the frame and leaves no result.
+            if matches!(tbl_expr, TableExpr::BuiltIn(BuiltIn::Sink { .. })) {
+                return Ok(());
+            }
             out.push(Instruction::Result);
             Ok(())
         },
@@ -69,6 +73,16 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), 
         BuiltIn::Drop(columns, tbl_expr) => {
             compile_tbl_expr(tbl_expr.as_ref(), out)?;
             out.push(Instruction::FrameExpr(PolarsFrameExpr::Drop(columns.clone())));
+            Ok(())
+        }
+        BuiltIn::Lazy(tbl_expr) => {
+            out.push(Instruction::Lazy);
+            compile_tbl_expr(tbl_expr.as_ref(), out)?;
+            Ok(())
+        }
+        BuiltIn::Collect(tbl_expr) => {
+            compile_tbl_expr(tbl_expr.as_ref(), out)?;
+            out.push(Instruction::Collect);
             Ok(())
         }
     }
@@ -430,6 +444,33 @@ mod tests {
             col("size"), int(100), op(">"), call("not", 1),
             FrameExpr(PolarsFrameExpr::Filter(1)),
             BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select, Result,
+        ]);
+    }
+
+    #[test]
+    fn lazy_prefixes_the_plan_and_stays_uncollected() {
+        assert_eq!(compile_src("l: lazy select from trades"), vec![
+            Lazy,
+            from_table("trades"),
+            BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
+            Result, Assign("l".into()),
+        ]);
+    }
+
+    #[test]
+    fn collect_appends_a_collect_instruction() {
+        assert_eq!(compile_src("tm: collect t"), vec![
+            from_table("t"),
+            BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
+            Collect, Result, Assign("tm".into()),
+        ]);
+    }
+
+    #[test]
+    fn sink_is_terminal_without_trailing_result() {
+        let prog = compile_src("t >> `out.parquet");
+        assert_eq!(prog, vec![
+            from_table("t"), PushScalar(Value::Str("out.parquet".into())), Sink,
         ]);
     }
 

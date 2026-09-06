@@ -17,6 +17,11 @@ pub enum Instruction {
     Alias { name: Option<String> },
     Eval(ast::Expr),
     Sink,
+    /// mark the current statement as lazy: its result is stored/returned as a
+    /// LazyFrame plan rather than collected into a DataFrame.
+    Lazy,
+    /// force the current lazy plan to materialise into a DataFrame.
+    Collect,
 
     // structural
     FrameExpr(PolarsFrameExpr), // pop n predicates and push filtered df
@@ -52,6 +57,8 @@ impl fmt::Display for Instruction {
             Instruction::Assign(name )                     => write!(f, "ASSIGN {name}"),
             Instruction::Eval(expr)                          => write!(f, "EVAL {expr:?}"),
             Instruction::Sink                                       => write!(f, "SINK"),
+            Instruction::Lazy                                       => write!(f, "LAZY"),
+            Instruction::Collect                                    => write!(f, "COLLECT"),
         }
     }
 }

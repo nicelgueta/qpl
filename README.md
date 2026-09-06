@@ -161,6 +161,33 @@ t sink `summary.parquet
 t >> `summary.parquet
 ```
 
+### lazy / collect — defer materialisation
+
+`lazy` as the first token of a table expression stores the **query plan** under a
+name instead of a materialised table. Nothing runs until you `collect` it
+(materialise to a DataFrame) or `sink` it to a file.
+
+```q
+/ build a plan, don't run it
+t: lazy load `trades.parquet
+
+/ extend the plan by re-assigning the binding
+t: update notional: price * size from t
+t: delete from t where size < 100
+
+/ materialise when ready
+tm: collect t
+
+/ or stream straight to a file without ever building a table
+t >> `out.parquet
+```
+
+Reading from a lazy binding is contagious: `select ... from t` on a lazy `t`
+yields another lazy plan (the REPL prints it) until you `collect`. `cols` still
+shows the schema as a table.
+
+Assignment uses `:` (`tm: collect t`), same as everywhere else in qpl.
+
 ### cols — inspect schema
 
 ```q
