@@ -85,6 +85,7 @@ select from trades where size > 100
 select total: sum size by sym from trades where side = "buy"
 select from trades order sym asc, price desc
 select price_bin: $[price>400;`high;price>200;`mid;`low] from trades
+```
 
 ### Update
 
