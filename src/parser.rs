@@ -55,6 +55,7 @@ impl Parser {
             // query keywords produce a table result; anything else is a scalar expression
             match self.peek() {
                 TokenKind::Select 
+                | TokenKind::Update
                 | TokenKind::Distinct
                 | TokenKind::Cols 
                 | TokenKind::Load
@@ -130,7 +131,8 @@ impl Parser {
     fn parse_table_expr(&mut self) -> Result<TableExpr, QplError> {
         let peek = self.peek().clone();
         match peek {
-            TokenKind::Select => Ok(TableExpr::Select(self.parse_query()?)),
+            TokenKind::Select => Ok(TableExpr::Select(self.parse_query(false)?)),
+            TokenKind::Update => Ok(TableExpr::Select(self.parse_query(true)?)),
             TokenKind::Distinct => {
                 self.next();
                 Ok(TableExpr::BuiltIn(BuiltIn::Distinct(Box::new(self.parse_table_expr()?))))
@@ -156,6 +158,7 @@ impl Parser {
                         where_: None,
                         order: None,
                         join: None,
+                        update: false,
                     })),
                     other => Err(QplError::Parse(format!("expected file path symbol after 'load', got {other:?}"))),
                 }
@@ -181,6 +184,7 @@ impl Parser {
                             where_: None,
                             order: None,
                             join: None,
+                            update: false,
                         });
                         Ok(TableExpr::BuiltIn(BuiltIn::Show(Box::new(tbl_expr))))
                     }
@@ -244,9 +248,13 @@ impl Parser {
         }
     }
 
-    fn parse_query(&mut self) -> Result<SelectStmt, QplError> {
-        self.eat(&TokenKind::Select)?;
-        let select = self.parse_phrase(&[TokenKind::By, TokenKind::From])?;
+    fn parse_query(&mut self, update: bool) -> Result<SelectStmt, QplError> {
+        if update {
+            self.eat(&TokenKind::Update)?;
+        } else {
+            self.eat(&TokenKind::Select)?;
+        }
+        let cols = self.parse_phrase(&[TokenKind::By, TokenKind::From])?;
         let mut by = None;
         if self.peek() == &TokenKind::By {
             self.next();
@@ -255,26 +263,27 @@ impl Parser {
         self.eat(&TokenKind::From)?;
         let from = self.parse_tbl_src_expr()?;
         let mut join = None;
-        if matches!(self.peek(), TokenKind::Symbol(_)) {
+        if !update && matches!(self.peek(), TokenKind::Symbol(_)) {
             join = Some(self.parse_join()?);
-        };
+        }
         let mut where_ = None;
         if self.peek() == &TokenKind::Where {
             self.next();
             where_ = self.parse_where()?;
         }
         let mut order = None;
-        if self.peek() == &TokenKind::Order {
+        if !update && self.peek() == &TokenKind::Order {
             self.next();
             order = Some(self.parse_order()?);
         }
         Ok(SelectStmt {
-            cols: select,
+            cols,
             from,
             by,
             where_,
             order,
             join,
+            update,
         })
     }
 
@@ -463,6 +472,7 @@ fn is_noun_start(token: &TokenKind) -> bool {
 fn is_table_expr_start(token: &TokenKind) -> bool {
     matches!(token,
         TokenKind::Select
+        | TokenKind::Update
         | TokenKind::Distinct
         | TokenKind::Int(_)
         | TokenKind::Load
@@ -674,6 +684,19 @@ mod tests {
                 p(source),
                 Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Drop(columns, _))) if columns == vec!["price"]
             ));
+        }
+    }
+
+    #[test]
+    fn update_uses_select_query_shape() {
+        match p("update price: price * 2 by sym from trades where size > 100") {
+            Stmt::RetTable(TableExpr::Select(query)) => {
+                assert!(query.update);
+                assert_eq!(query.cols.len(), 1);
+                assert!(query.by.is_some());
+                assert!(query.where_.is_some());
+            }
+            other => panic!("expected update select, got {other:?}"),
         }
     }
 

@@ -255,6 +255,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         "distinct" => TokenKind::Distinct,
                         "limit" => TokenKind::Limit,
                         "drop" => TokenKind::Drop,
+                        "update" => TokenKind::Update,
                         "cols"   => TokenKind::Cols,
                         "load"   => TokenKind::Load,
                         "sink"   => TokenKind::Sink,

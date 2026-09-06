@@ -75,6 +75,37 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), 
 }
 
 fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), QplError> {
+    if sel.update {
+        out.push(Instruction::FromSrc(sel.from.clone()));
+        if let Some(preds) = &sel.where_ {
+            for expr in preds {
+                compile_expr(expr, out)?;
+            }
+        }
+        if let Some(keys) = &sel.by {
+            for alias in keys {
+                compile_expr(&alias.expr, out)?;
+                out.push(Instruction::Alias {
+                    name: alias.name.clone().or_else(|| implicit_alias(&alias.expr)),
+                });
+            }
+            out.push(Instruction::BuildKeys(keys.len()));
+        }
+        for alias in &sel.cols {
+            compile_expr(&alias.expr, out)?;
+            out.push(Instruction::Alias { name: alias.name.clone() });
+        }
+        let columns = sel.cols.iter().map(|alias| {
+            alias.name.clone().ok_or_else(|| QplError::Compile("update expressions require column aliases".into()))
+        }).collect::<Result<Vec<_>, _>>()?;
+        out.push(Instruction::BuildProj {
+            count: sel.cols.len(),
+            exclude: columns,
+            predicates: sel.where_.as_ref().map_or(0, Vec::len),
+        });
+        out.push(Instruction::Select);
+        return Ok(());
+    }
     
     // Join phrase - done first so that the join is applied before any where clause filters
     if let Some((join_src, left_on, right_on, join_type)) = &sel.join {
@@ -133,7 +164,7 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
             name: alias.name.clone().or_else(|| implicit_alias(&alias.expr)),
         });
     }
-    out.push(Instruction::BuildProj(sel.cols.len()));
+    out.push(Instruction::BuildProj { count: sel.cols.len(), exclude: vec![], predicates: 0 });
 
     out.push(if has_by { Instruction::SelectBy } else { Instruction::Select });
     if let Some(order) = &sel.order {
@@ -218,7 +249,7 @@ mod tests {
     #[test]
     fn select_single_col() {
         assert_eq!(compile_src("select px from trades"), vec![
-            from_table("trades"), col("px"), alias("px"), BuildProj(1), Select, Result,
+            from_table("trades"), col("px"), alias("px"), BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
         ]);
     }
 
@@ -228,7 +259,7 @@ mod tests {
             from_table("trades"),
             col("px"),  alias("px"),
             col("qty"), alias("qty"),
-            BuildProj(2), Select, Result,
+            BuildProj { count: 2, exclude: vec![], predicates: 0 }, Select, Result,
         ]);
     }
 
@@ -236,7 +267,7 @@ mod tests {
     fn select_all_cols() {
         // empty select phrase = return all columns
         assert_eq!(compile_src("select from t"), vec![
-            from_table("t"), BuildProj(0), Select, Result,
+            from_table("t"), BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select, Result,
         ]);
     }
 
@@ -245,7 +276,7 @@ mod tests {
     #[test]
     fn explicit_alias() {
         assert_eq!(compile_src("select p: price from trades"), vec![
-            from_table("trades"), col("price"), alias("p"), BuildProj(1), Select, Result,
+            from_table("trades"), col("price"), alias("p"), BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
         ]);
     }
 
@@ -253,7 +284,7 @@ mod tests {
     fn implicit_alias_from_colref() {
         // no alias: column name becomes the implicit alias
         assert_eq!(compile_src("select price from trades"), vec![
-            from_table("trades"), col("price"), alias("price"), BuildProj(1), Select, Result,
+            from_table("trades"), col("price"), alias("price"), BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
         ]);
     }
 
@@ -262,7 +293,7 @@ mod tests {
     #[test]
     fn explicit_alias_binop() {
         assert_eq!(compile_src("select dbl: c3*2 from t"), vec![
-            from_table("t"), col("c3"), int(2), op("*"), alias("dbl"), BuildProj(1), Select, Result,
+            from_table("t"), col("c3"), int(2), op("*"), alias("dbl"), BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
         ]);
     }
 
@@ -270,7 +301,7 @@ mod tests {
     fn implicit_alias_binop_uses_leftmost_leaf() {
         // per spec: leftmost term (c3) becomes the implicit alias
         assert_eq!(compile_src("select c3*2 from t"), vec![
-            from_table("t"), col("c3"), int(2), op("*"), alias("c3"), BuildProj(1), Select, Result,
+            from_table("t"), col("c3"), int(2), op("*"), alias("c3"), BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
         ]);
     }
 
@@ -278,7 +309,7 @@ mod tests {
     fn implicit_alias_call_uses_leftmost_arg() {
         // sum price: leftmost arg is price → alias "price"
         assert_eq!(compile_src("select sum price from t"), vec![
-            from_table("t"), col("price"), call("sum", 1), alias("price"), BuildProj(1), Select, Result,
+            from_table("t"), col("price"), call("sum", 1), alias("price"), BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
         ]);
     }
 
@@ -288,7 +319,7 @@ mod tests {
     fn select_icol() {
         // i is virtual, never a real column name → implicit alias is "x"
         assert_eq!(compile_src("select i from t"), vec![
-            from_table("t"), PushIColRef, alias("x"), BuildProj(1), Select, Result,
+            from_table("t"), PushIColRef, alias("x"), BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
         ]);
     }
 
@@ -299,7 +330,7 @@ mod tests {
         assert_eq!(compile_src("select px from trades where qty > 0"), vec![
             from_table("trades"),
             col("qty"), int(0), op(">"), FrameExpr(PolarsFrameExpr::Filter(1)),
-            col("px"), alias("px"), BuildProj(1),
+            col("px"), alias("px"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
             Select, Result,
         ]);
     }
@@ -309,7 +340,7 @@ mod tests {
         assert_eq!(compile_src("select px from trades where sym = `AAPL"), vec![
             from_table("trades"),
             col("sym"), sym("AAPL"), op("="), FrameExpr(PolarsFrameExpr::Filter(1)),
-            col("px"), alias("px"), BuildProj(1),
+            col("px"), alias("px"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
             Select, Result,
         ]);
     }
@@ -322,7 +353,7 @@ mod tests {
             col("sym"), sym("AAPL"), op("="),
             col("qty"), int(0), op(">"),
             FrameExpr(PolarsFrameExpr::Filter(2)),
-            col("px"), alias("px"), BuildProj(1),
+            col("px"), alias("px"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
             Select, Result,
         ]);
     }
@@ -331,7 +362,7 @@ mod tests {
     fn order_multiple_columns() {
         assert_eq!(compile_src("select from trades order `col1 asc, `col2 desc"), vec![
             from_table("trades"),
-            BuildProj(0), Select,
+            BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
             FrameExpr(PolarsFrameExpr::Sort(vec![("col1".into(), false), ("col2".into(), true)])),
             Result,
         ]);
@@ -340,12 +371,22 @@ mod tests {
     #[test]
     fn distinct_and_limit() {
         assert_eq!(compile_src("distinct select from trades"), vec![
-            from_table("trades"), BuildProj(0), Select,
+            from_table("trades"), BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
             FrameExpr(PolarsFrameExpr::Distinct), Result,
         ]);
         assert_eq!(compile_src("10#select from trades"), vec![
-            from_table("trades"), BuildProj(0), Select,
+            from_table("trades"), BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
             FrameExpr(PolarsFrameExpr::Limit(10)), Result,
+        ]);
+    }
+
+    #[test]
+    fn update_preserves_table_shape() {
+        assert_eq!(compile_src("update price: price * 2 from trades"), vec![
+            from_table("trades"),
+            col("price"), int(2), op("*"), alias("price"),
+            BuildProj { count: 1, exclude: vec!["price".into()], predicates: 0 }, Select,
+            Result,
         ]);
     }
 
@@ -356,7 +397,7 @@ mod tests {
         assert_eq!(compile_src("select sum px by sym from trades"), vec![
             from_table("trades"),
             col("sym"), alias("sym"), BuildKeys(1),
-            col("px"), call("sum", 1), alias("px"), BuildProj(1),
+            col("px"), call("sum", 1), alias("px"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
             SelectBy, Result,
         ]);
     }
@@ -366,7 +407,7 @@ mod tests {
         assert_eq!(compile_src("select sum px by s: sym from trades"), vec![
             from_table("trades"),
             col("sym"), alias("s"), BuildKeys(1),
-            col("px"), call("sum", 1), alias("px"), BuildProj(1),
+            col("px"), call("sum", 1), alias("px"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
             SelectBy, Result,
         ]);
     }
@@ -380,7 +421,7 @@ mod tests {
             from_table("t"),
             col("c2"), int(15), op(">"), FrameExpr(PolarsFrameExpr::Filter(1)),
             col("c1"), alias("c1"), BuildKeys(1),
-            col("c3"), int(2), op("*"), alias("dbl"), BuildProj(1),
+            col("c3"), int(2), op("*"), alias("dbl"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
             SelectBy, Result,
         ]);
     }

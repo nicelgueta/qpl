@@ -83,6 +83,15 @@ select from trades where size > 100
 select total: sum size by sym from trades where side = "buy"
 select from trades order sym asc, price desc
 
+### Update
+
+```q
+update price: price * 2 from trades
+update price: price * 2 by sym from trades where size > 100
+```
+
+Updates return the complete table, retaining columns that are not updated.
+
 ### Column dropping
 
 ```q

@@ -20,7 +20,7 @@ pub enum Instruction {
     // structural
     FrameExpr(PolarsFrameExpr), // pop n predicates and push filtered df
     BuildKeys(usize), // pop n expr into a key list
-    BuildProj(usize), // pop n expr into a projection list
+    BuildProj { count: usize, exclude: Vec<String>, predicates: usize }, // pop expressions into a projection list
     Select,
     SelectBy,
     Cast(String),
@@ -42,7 +42,7 @@ impl fmt::Display for Instruction {
             Instruction::Alias { name }            => write!(f, "ALIAS {:?}", name),
             Instruction::FrameExpr(expr)          => write!(f, "FRAME_EXPR {expr:?}"),
             Instruction::BuildKeys(n)                       => write!(f, "BUILD_KEYS {n}"),
-            Instruction::BuildProj(n)                       => write!(f, "BUILD_PROJ {n}"),
+            Instruction::BuildProj { count, .. }            => write!(f, "BUILD_PROJ {count}"),
             Instruction::Select                                     => write!(f, "SELECT"),
             Instruction::SelectBy                                   => write!(f, "SELECT_BY"),
             Instruction::Cast(dtype)                       => write!(f, "CAST {dtype}"),
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn display_build_proj() {
-        assert_eq!(disp(Instruction::BuildProj(4)), "BUILD_PROJ 4");
+        assert_eq!(disp(Instruction::BuildProj { count: 4, exclude: vec![], predicates: 0 }), "BUILD_PROJ 4");
     }
 
     #[test]

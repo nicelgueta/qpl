@@ -54,6 +54,7 @@ pub struct SelectStmt {
     pub where_: Option<Vec<Expr>>,
     pub order: Option<Vec<(String, bool)>>,
     pub join: Option<(TableSource, Value, Value, JoinType)>,
+    pub update: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

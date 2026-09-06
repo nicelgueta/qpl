@@ -252,10 +252,32 @@ impl Vm {
                         .collect::<Result<Vec<_>, _>>()?;
                 }
 
-                Instruction::BuildProj(n) => {
-                    proj = popn(&mut stack, n)?.into_iter()
+                Instruction::BuildProj { count, exclude, predicates } => {
+                    let expressions = popn(&mut stack, count)?.into_iter()
                         .map(|o| o.unwrap_expr())
                         .collect::<Result<Vec<_>, _>>()?;
+                    let predicates = popn(&mut stack, predicates)?
+                        .into_iter()
+                        .map(|o| o.unwrap_expr())
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if exclude.is_empty() {
+                        proj = expressions;
+                    } else {
+                        let predicate = predicates.into_iter().reduce(|left, right| left.and(right));
+                        proj = expressions.into_iter().zip(exclude.iter()).map(|(expr, name)| {
+                            let expr = if keys.is_empty() {
+                                expr
+                            } else {
+                                expr.over(keys.clone()).map_err(|e| QplError::Runtime(e.to_string()))?
+                            };
+                            Ok(match &predicate {
+                                Some(predicate) => when(predicate.clone()).then(expr).otherwise(col(name.as_str())).alias(name),
+                                None => expr,
+                            })
+                        }).collect::<Result<Vec<_>, QplError>>()?;
+                        let all_except = all().exclude_cols(exclude).as_expr();
+                        proj.insert(0, all_except);
+                    }
                 }
 
                 Instruction::Select => {
@@ -646,6 +668,27 @@ mod tests {
             let names: Vec<&str> = df.get_column_names().iter().map(|name| name.as_str()).collect();
             assert_eq!(names, vec!["c1", "c3"]);
         }
+    }
+
+    #[test]
+    fn update_preserves_unmodified_columns() {
+        let df = run(make_vm(), "update c2: c2 * 2 from t");
+        assert_eq!(df.width(), 3);
+        assert_eq!(strs(&df, "c1"), vec!["a", "b", "a", "c"]);
+        assert_eq!(i64s(&df, "c2"), vec![20, 40, 60, 30]);
+        assert_eq!(f64s(&df, "c3"), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn update_where_preserves_nonmatching_rows() {
+        let df = run(make_vm(), "update c2: c2 * 2 from t where c1 = `a");
+        assert_eq!(i64s(&df, "c2"), vec![20, 20, 60, 15]);
+    }
+
+    #[test]
+    fn update_by_applies_expression_per_group() {
+        let df = run(make_vm(), "update c2: max c2 by c1 from t");
+        assert_eq!(i64s(&df, "c2"), vec![30, 20, 30, 15]);
     }
 
     #[test]
