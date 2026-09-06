@@ -288,7 +288,7 @@ impl Vm {
                                 None => expr,
                             })
                         }).collect::<Result<Vec<_>, QplError>>()?;
-                        let all_except = all().exclude_cols(exclude).as_expr();
+                        let all_except = (all() - by_name(exclude.clone(), false, false)).as_expr();
                         proj.insert(0, all_except);
                     }
                 }
@@ -690,6 +690,13 @@ mod tests {
         assert_eq!(strs(&df, "c1"), vec!["a", "b", "a", "c"]);
         assert_eq!(i64s(&df, "c2"), vec![20, 40, 60, 30]);
         assert_eq!(f64s(&df, "c3"), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn update_can_add_new_case_column() {
+        let df = run(make_vm(), "update band: $[c2>20;`high;c2>10;`mid;`low] from t");
+        assert_eq!(strs(&df, "band"), vec!["low", "mid", "high", "mid"]);
+        assert_eq!(df.width(), 4);
     }
 
     #[test]
