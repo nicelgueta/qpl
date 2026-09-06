@@ -6,6 +6,9 @@ pub enum TokenKind {
     By,
     From,
     Where,
+    Order,
+    Asc,
+    Desc,
     // builtin func keywords
     Load,
     Sink,

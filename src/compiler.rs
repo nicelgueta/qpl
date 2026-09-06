@@ -1,6 +1,6 @@
 
 use crate::ast::{Expr, TableExpr, SelectStmt, Stmt, Value};
-use crate::enums::{PolarsStackArg, SortDirection};
+use crate::enums::PolarsStackArg;
 use crate::builtins::BuiltIn;
 use crate::enums::PolarsFrameExpr;
 use crate::errors::QplError;
@@ -53,7 +53,7 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), 
         }
         BuiltIn::Sort(tbl_expr, sort_map) => {
             compile_tbl_expr(tbl_expr.as_ref(), out)?;
-            out.push(Instruction::FrameExpr(PolarsFrameExpr::Sort(sort_map.to_owned())));
+            out.push(Instruction::FrameExpr(PolarsFrameExpr::Sort(sort_map.clone())));
             Ok(())
         }
     }
@@ -121,6 +121,9 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
     out.push(Instruction::BuildProj(sel.cols.len()));
 
     out.push(if has_by { Instruction::SelectBy } else { Instruction::Select });
+    if let Some(order) = &sel.order {
+        out.push(Instruction::FrameExpr(PolarsFrameExpr::Sort(order.clone())));
+    }
     Ok(())
 }
 
@@ -306,6 +309,16 @@ mod tests {
             FrameExpr(PolarsFrameExpr::Filter(2)),
             col("px"), alias("px"), BuildProj(1),
             Select, Result,
+        ]);
+    }
+
+    #[test]
+    fn order_multiple_columns() {
+        assert_eq!(compile_src("select from trades order `col1 asc, `col2 desc"), vec![
+            from_table("trades"),
+            BuildProj(0), Select,
+            FrameExpr(PolarsFrameExpr::Sort(vec![("col1".into(), false), ("col2".into(), true)])),
+            Result,
         ]);
     }
 

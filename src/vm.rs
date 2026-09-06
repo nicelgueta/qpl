@@ -1,7 +1,7 @@
 use polars::io::utils::sync_on_close::SyncOnCloseType;
 use polars::prelude::*;
 use crate::ast::{self, TableSource, Value};
-use crate::enums::{PolarsFrameExpr, PolarsStackArg, SortDirection};
+use crate::enums::{PolarsFrameExpr, PolarsStackArg};
 use crate::lexer::tokenise;
 use crate::parser::parse;
 use crate::compiler::compile;
@@ -217,8 +217,8 @@ impl Vm {
                             }
                         }
                         PolarsFrameExpr::Sort(sort_map) => {
-                            let cols = sort_map.keys().cloned().collect::<Vec<_>>();
-                            let ascs = sort_map.values().cloned().collect::<Vec<_>>();
+                            let cols = sort_map.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
+                            let ascs = sort_map.iter().map(|(_, descending)| *descending).collect::<Vec<_>>();
                             let lf = require_frame(&mut frame)?;
                             let sorted_lf = lf.sort_by_exprs(
                                     cols.iter().map(|c| col(c.as_str())).collect::<Vec<_>>().as_slice(),
@@ -603,6 +603,22 @@ mod tests {
         let df = run(make_vm(), "select from t");
         assert_eq!(df.height(), 4);
         assert_eq!(df.width(), 3);
+    }
+
+    #[test]
+    fn order_multiple_columns() {
+        let df = run(make_vm(), "select from t order `c1 asc, `c2 desc");
+        assert_eq!(strs(&df, "c1"), vec!["a", "a", "b", "c"]);
+        assert_eq!(i64s(&df, "c2"), vec![30, 10, 20, 15]);
+    }
+
+    #[test]
+    fn dictionary_sort_order_survives_assignment() {
+        let mut vm = make_vm();
+        assert!(matches!(run_vm("t2: `c1`c2!01b `t", &mut vm), Ok(EvalResult::Stored)));
+        let df = run(vm, "select from t2");
+        assert_eq!(strs(&df, "c1"), vec!["a", "a", "b", "c"]);
+        assert_eq!(i64s(&df, "c2"), vec![30, 10, 20, 15]);
     }
 
     // --- aliases ---

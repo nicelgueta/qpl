@@ -70,7 +70,7 @@ qpl -i script.qpl
 ### Select
 
 ```
-select <cols> from <table> [by <keys>] [where <preds>]
+select <cols> from <table> [by <keys>] [where <preds>] [order <column> <asc|desc>, ...]
 ```
 
 (the interactive REPL comes with some demo tables `quotes` and `trades` for you to play around with)
@@ -81,6 +81,7 @@ select px: price, qty: size from trades
 select avg price by sym from trades
 select from trades where size > 100
 select total: sum size by sym from trades where side = "buy"
+select from trades order sym asc, price desc
 
 / also use str vars a symbols (maybe change this but easy to write for now)
 select total: sum size by sym from trades where side = `buy

@@ -132,6 +132,7 @@ impl Parser {
                         from: TableSource::Load(path),
                         by: None,
                         where_: None,
+                        order: None,
                         join: None,
                     })),
                     other => Err(QplError::Parse(format!("expected file path symbol after 'load', got {other:?}"))),
@@ -156,6 +157,7 @@ impl Parser {
                             from: TableSource::InMem(s),
                             by: None,
                             where_: None,
+                            order: None,
                             join: None,
                         });
                         Ok(TableExpr::BuiltIn(BuiltIn::Show(Box::new(tbl_expr))))
@@ -172,13 +174,13 @@ impl Parser {
                             TokenKind::BoolVec(b) => {
                                 self.next(); // consume the bool vector
                                 let tbl_expr = self.parse_table_expr()?;
-                                let sort_map = vec![(s, b[0])].into_iter().collect();
+                                let sort_map = vec![(s, b[0])];
                                 Ok(TableExpr::BuiltIn(BuiltIn::Sort(Box::new(tbl_expr), sort_map)))
                             }
                             TokenKind::Bool(b) => {
                                 self.next(); // consume the bool
                                 let tbl_expr = self.parse_table_expr()?;
-                                let sort_map = vec![(s, b)].into_iter().collect();
+                                let sort_map = vec![(s, b)];
                                 Ok(TableExpr::BuiltIn(BuiltIn::Sort(Box::new(tbl_expr), sort_map)))
                             }
                             _ => Err(QplError::Parse(format!("expected bool vector after '!', got {:?}", self.peek()))),
@@ -228,11 +230,17 @@ impl Parser {
             self.next();
             where_ = self.parse_where()?;
         }
+        let mut order = None;
+        if self.peek() == &TokenKind::Order {
+            self.next();
+            order = Some(self.parse_order()?);
+        }
         Ok(SelectStmt {
             cols: select,
             from,
             by,
             where_,
+            order,
             join,
         })
     }
@@ -320,6 +328,27 @@ impl Parser {
             where_clause.push(expr);
         }
         Ok(Some(where_clause))
+    }
+
+    fn parse_order(&mut self) -> Result<Vec<(String, bool)>, QplError> {
+        let mut order = Vec::new();
+        loop {
+            let column = match self.next() {
+                TokenKind::Name(name) => name,
+                other => return Err(QplError::Parse(format!("expected symbol column after 'order', got {other:?}"))),
+            };
+            let descending = match self.next() {
+                TokenKind::Asc => false,
+                TokenKind::Desc => true,
+                other => return Err(QplError::Parse(format!("expected 'asc' or 'desc' after order column, got {other:?}"))),
+            };
+            order.push((column, descending));
+            if self.peek() != &TokenKind::Comma {
+                break;
+            }
+            self.next();
+        }
+        Ok(order)
     }
 
     /// format for the join phrase is: select ... from tbl1`id`name lj|ij|rj tbl2`id`f_name
@@ -576,6 +605,12 @@ mod tests {
             binop(cref("sym"), "=", Expr::Sym("AAPL".into())),
             binop(cref("qty"), ">", Expr::Lit(Value::Int(0))),
         ]));
+    }
+
+    #[test]
+    fn order_multiple_columns() {
+        let s = sel("select from trades order col1 asc, col2 desc");
+        assert_eq!(s.order, Some(vec![("col1".into(), false), ("col2".into(), true)]));
     }
 
     // --- by clause ---

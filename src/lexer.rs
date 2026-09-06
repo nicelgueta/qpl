@@ -242,6 +242,9 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         "by"     => TokenKind::By,
                         "from"   => TokenKind::From,
                         "where"  => TokenKind::Where,
+                        "order"  => TokenKind::Order,
+                        "asc"    => TokenKind::Asc,
+                        "desc"   => TokenKind::Desc,
                         "cols"   => TokenKind::Cols,
                         "load"   => TokenKind::Load,
                         "sink"   => TokenKind::Sink,
@@ -364,9 +367,7 @@ mod tests {
     #[test]
     fn symbol_list() {
         assert_eq!(kinds("`a`b`c"), vec![
-            TokenKind::Symbol("a".into()),
-            TokenKind::Symbol("b".into()),
-            TokenKind::Symbol("c".into()),
+            TokenKind::SymbolVec(vec!["a".into(), "b".into(), "c".into()]),
         ]);
     }
 
@@ -409,6 +410,11 @@ mod tests {
     #[test]
     fn keyword_where() {
         assert_eq!(kinds("where"), vec![TokenKind::Where]);
+    }
+
+    #[test]
+    fn keyword_order_directions() {
+        assert_eq!(kinds("order asc desc"), vec![TokenKind::Order, TokenKind::Asc, TokenKind::Desc]);
     }
 
     // --- identifiers ---
@@ -523,6 +529,22 @@ mod tests {
             TokenKind::Name("sym".into()),
             TokenKind::Op("=".into()),
             TokenKind::Symbol("AAPL".into()),
+        ]);
+    }
+
+    #[test]
+    fn select_order_query() {
+        let src = "select from trades order `col1 asc, `col2 desc";
+        assert_eq!(kinds(src), vec![
+            TokenKind::Select,
+            TokenKind::From,
+            TokenKind::Name("trades".into()),
+            TokenKind::Order,
+            TokenKind::Symbol("col1".into()),
+            TokenKind::Asc,
+            TokenKind::Comma,
+            TokenKind::Symbol("col2".into()),
+            TokenKind::Desc,
         ]);
     }
 

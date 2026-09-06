@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use polars::{self, prelude::JoinType};
 
 
@@ -19,6 +17,6 @@ pub enum SortDirection {
 pub enum PolarsFrameExpr {
     Filter(usize),
     Join{ l: usize, r: usize },
-    Sort(HashMap<String, bool>), // col name -> asc/desc
+    Sort(Vec<(String, bool)>), // col name -> descending
     Cols
 }
