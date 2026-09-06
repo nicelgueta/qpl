@@ -38,12 +38,12 @@ pub fn start(vm: &mut Vm) {
                 if let Some(src) = line.strip_prefix("\\d").map(str::trim) {
                     match disassemble(src) {
                         Ok(listing) => println!("{listing}"),
-                        Err(e) => eprintln!("{e}"),
+                        Err(e) => eprintln!("{}", fmt_repl_error(&e)),
                     }
                     continue;
                 }
                 if let Err(e) = match_run_vm(&line, vm, "<main>", 0) {
-                    eprintln!("{:?}", e)
+                    eprintln!("{}", fmt_repl_error(&e))
                 };
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
@@ -78,6 +78,9 @@ fn match_run_vm(line: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<()
         Ok(EvalResult::Stored)                  => {},
         Ok(EvalResult::Scalar(val))      => println!("{}", fmt_val(&val)),
         Err(e) => {
+            if path == "<main>" {
+                return Err(e);
+            }
             return Err(QplError::Runtime(format!("{}:{}: {e}", path, lineno + 1)));
         }
     };
@@ -91,6 +94,15 @@ fn fmt_val(v: &ast::Value) -> String {
         ast::Value::Str(s)   => format!("str: \"{s}\""),
         ast::Value::Bool(b)  => format!("bool: {b}"),
         other                => format!("{other:?}"),
+    }
+}
+
+fn fmt_repl_error(error: &QplError) -> String {
+    match error {
+        QplError::Lex(message)
+        | QplError::Parse(message)
+        | QplError::Compile(message)
+        | QplError::Runtime(message) => format!("'{message}"),
     }
 }
 
