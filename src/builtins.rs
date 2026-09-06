@@ -8,4 +8,5 @@ pub enum BuiltIn {
     Sort(Box<TableExpr>, Vec<(String, bool)>),
     Distinct(Box<TableExpr>),
     Limit(Box<TableExpr>, usize),
+    Drop(Vec<String>, Box<TableExpr>),
 }

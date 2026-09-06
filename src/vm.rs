@@ -235,6 +235,10 @@ impl Vm {
                             let lf = require_frame(&mut frame)?;
                             frame = Some(lf.limit(limit as IdxSize));
                         }
+                        PolarsFrameExpr::Drop(columns) => {
+                            let lf = require_frame(&mut frame)?;
+                            frame = Some(lf.drop(cols(columns)));
+                        }
                         PolarsFrameExpr::Cols => {
                             let df = self.schema(frame.take().unwrap())?;
                             frame = Some(df.lazy());
@@ -632,6 +636,15 @@ mod tests {
             let df = run(make_vm(), source);
             assert_eq!(df.height(), 2);
             assert_eq!(strs(&df, "c1"), vec!["a", "b"]);
+        }
+    }
+
+    #[test]
+    fn drop_single_symbol_keyword_and_shorthand() {
+        for source in ["`c2 drop select from t", "`c2 _ `t"] {
+            let df = run(make_vm(), source);
+            let names: Vec<&str> = df.get_column_names().iter().map(|name| name.as_str()).collect();
+            assert_eq!(names, vec!["c1", "c3"]);
         }
     }
 

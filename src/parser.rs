@@ -208,13 +208,24 @@ impl Parser {
                             _ => Err(QplError::Parse(format!("expected bool vector after '!', got {:?}", self.peek()))),
                         }
                     }
+                    TokenKind::Drop if matches!(self.peek(), TokenKind::Drop) => {
+                        self.next();
+                        Ok(TableExpr::BuiltIn(BuiltIn::Drop(vec![s], Box::new(self.parse_table_expr()?))))
+                    }
+                    TokenKind::Name(name) if name == "_" => {
+                        self.next();
+                        Ok(TableExpr::BuiltIn(BuiltIn::Drop(vec![s], Box::new(self.parse_table_expr()?))))
+                    }
                     _ => Err(QplError::Parse(format!("expected 'asc' or 'desc' after symbol, got {:?}", self.peek()))),
                 }
             }
             TokenKind::SymbolVec(v) => {
                 self.next(); // consume the symbol vector
                 let peek = self.peek().clone();
-                if matches!(peek, TokenKind::Bang) {
+                if matches!(peek, TokenKind::Drop) || matches!(&peek, TokenKind::Name(name) if name == "_") {
+                    self.next();
+                    Ok(TableExpr::BuiltIn(BuiltIn::Drop(v, Box::new(self.parse_table_expr()?))))
+                } else if matches!(peek, TokenKind::Bang) {
                     self.next(); // consume '!'
                     let peek = self.peek().clone();
                     if let TokenKind::BoolVec(b) = peek {
@@ -357,6 +368,7 @@ impl Parser {
         loop {
             let column = match self.next() {
                 TokenKind::Name(name) => name,
+                TokenKind::Symbol(name) => name,
                 other => return Err(QplError::Parse(format!("expected symbol column after 'order', got {other:?}"))),
             };
             let descending = match self.next() {
@@ -651,6 +663,16 @@ mod tests {
             assert!(matches!(
                 p(source),
                 Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Limit(_, 10)))
+            ));
+        }
+    }
+
+    #[test]
+    fn drop_single_symbol_keyword_and_shorthand() {
+        for source in ["`price drop select from trades", "`price _ `trades"] {
+            assert!(matches!(
+                p(source),
+                Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Drop(columns, _))) if columns == vec!["price"]
             ));
         }
     }

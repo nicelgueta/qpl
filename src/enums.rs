@@ -20,5 +20,6 @@ pub enum PolarsFrameExpr {
     Sort(Vec<(String, bool)>), // col name -> descending
     Distinct,
     Limit(usize),
+    Drop(Vec<String>),
     Cols
 }

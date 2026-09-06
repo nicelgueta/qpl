@@ -11,6 +11,7 @@ pub enum TokenKind {
     Desc,
     Distinct,
     Limit,
+    Drop,
     // builtin func keywords
     Load,
     Sink,
