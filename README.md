@@ -214,6 +214,8 @@ select from tm where side = `buy
 j >> `summary.parquet
 ```
 
+This whole implpementation uses one of Polars's most powerful features: being able to process **larger than RAM data** in a single pipeline/sequence of statements.
+
 `cols` always resolves to a table, even on a lazy binding. Assignment uses `:`
 (`tm: collect t`), same as everywhere else in qpl.
 
