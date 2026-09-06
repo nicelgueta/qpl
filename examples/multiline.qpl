@@ -1,0 +1,28 @@
+/ ─────────────────────────────────────────────────────────────────────────────
+/ Multi-line statements.
+/
+/ A statement may span several lines: any line indented by a tab or four spaces
+/ continues the statement above it. A statement ends at the next line starting
+/ in column 0, or at a blank line. No line-continuation character is needed.
+/
+/ Run from the repo root:
+/   cargo run -- examples/multiline.qpl
+/ ─────────────────────────────────────────────────────────────────────────────
+
+trades: load `examples/data/trades.parquet
+
+/ a select broken across lines for readability
+summary: 
+    select
+        tot_size: sum size,
+        apx: mean price,
+        value: sum price * size
+        by sym, side
+    from trades
+    where size > 50
+
+select from summary
+    order sym asc, side asc
+
+/ back to a one-liner — the blank line above closed the statement
+select sym, tot_size from summary where tot_size > 300

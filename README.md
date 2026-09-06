@@ -284,11 +284,66 @@ Lines beginning with `/` are comments (in scripts and in subexpressions).
 select from trades  / inline comment
 ```
 
+### Multi-line statements
+
+In a script file a statement may span several lines. Any line indented by a tab
+or four (or more) spaces continues the statement above it; a statement ends at
+the next line that starts in column 0 (or a blank line). No trailing token or
+line-continuation character is needed.
+
+```q
+t: select
+    tot: sum size,
+    apx: mean price
+    by sym
+    from trades
+    where size > 50
+
+select from t order sym asc
+```
+
+### Logging to stdout
+
+`log <expr>` — or just `1 <expr>`, kdb-style — evaluates a scalar expression and
+prints it (raw, with no type prefix). Bare `log` / `1` prints a blank line.
+
+```q
+log "starting run"
+1 "rows above threshold:"
+thr: 150
+log thr * 2
+```
+
+Several space-separated expressions are rendered and **concatenated**, so you can
+build a message inline:
+
+```q
+log "test" "me"                 / testme
+log "test" str$2*3 " that"      / test6 that
+log "rows > " thr ": " n        / rows > 150: 42
+```
+
+Top-level juxtaposition separates items rather than forming a function call;
+wrap a call in parens if you need one (`log (f x) " done"`).
+
+`\1 <path>` redirects stdout to a log file: every line that would be printed —
+`log` output *and* query results — is appended to `<path>` **and** still shown
+on the terminal. Bare `\1` detaches the log. Works in the REPL and in scripts.
+
+```q
+\1 run.log
+log "this is teed to run.log"
+select from trades where size > 100
+\1
+```
+
 ## REPL commands
 
 | Command | Action |
 |---------|--------|
 | `\d <stmt>` | disassemble — show bytecode without executing |
+| `\1 <path>` | mirror all stdout to `<path>` (bare `\1` detaches) |
+| `log <expr>` / `1 <expr>` | print a scalar to stdout (and the log) |
 | `cols <name>` | show column names and types for a table |
 | Ctrl-C / Ctrl-D | exit |
 

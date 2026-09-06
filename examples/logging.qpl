@@ -1,0 +1,30 @@
+/ ─────────────────────────────────────────────────────────────────────────────
+/ Logging to stdout.
+/
+/   log <expr>   /  1 <expr>      print a scalar (raw) to stdout
+/   \1 <path>                     mirror ALL stdout (log lines + query output)
+/                                 to <path>, still printing to the terminal
+/   \1                            detach the log
+/
+/ Run from the repo root:
+/   cargo run -- examples/logging.qpl
+/ ─────────────────────────────────────────────────────────────────────────────
+
+trades: collect load `examples/data/trades.parquet
+
+log "run started"
+thr: 150
+
+/ space-separated expressions are rendered and concatenated
+1 "size threshold: " thr
+log "double is " str$thr*2 " (as text)"
+
+/ tee everything below to run.log as well as the terminal
+\1 run.log
+
+log "big trades:"
+select sym, price, size from trades where size > thr
+
+/ stop mirroring
+\1
+log "run finished (this line is terminal-only)"

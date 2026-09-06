@@ -13,6 +13,9 @@ pub struct Vm {
     pub tables: HashMap<String, DataFrame>,
     pub lazy_frames: HashMap<String, LazyFrame>,
     pub globals: HashMap<String, ast::Value>,
+    /// When set (via the `\1 <path>` command), every line printed through
+    /// [`Vm::emit`] is also appended here — kdb-style stdout redirection.
+    pub stdout_log: Option<std::fs::File>,
 }
 
 enum StackObj {
@@ -60,7 +63,38 @@ impl StackObj {
 
 impl Vm {
     pub fn new() -> Self {
-        Self { tables: HashMap::new(), lazy_frames: HashMap::new(), globals: HashMap::new() }
+        Self {
+            tables: HashMap::new(),
+            lazy_frames: HashMap::new(),
+            globals: HashMap::new(),
+            stdout_log: None,
+        }
+    }
+
+    /// Point stdout logging at `path` (created / appended). Passing an empty
+    /// path detaches any current log.
+    pub fn set_stdout_log(&mut self, path: &str) -> Result<(), QplError> {
+        if path.is_empty() {
+            self.stdout_log = None;
+            return Ok(());
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| QplError::Runtime(format!("cannot open log file '{path}': {e}")))?;
+        self.stdout_log = Some(file);
+        Ok(())
+    }
+
+    /// Print `text` to stdout, mirroring it to the stdout log if one is set.
+    pub fn emit(&mut self, text: &str) {
+        println!("{text}");
+        if let Some(file) = self.stdout_log.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(file, "{text}");
+            let _ = file.flush();
+        }
     }
 
     /// Returns a two-column table: `column` (name) and `dtype` for every field in `table_name`.

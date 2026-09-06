@@ -2,3 +2,6 @@
 
 # output written by examples/lazy_join_pipeline.qpl
 /examples/data/market_summary.parquet
+
+# stdout logs written by examples/logging.qpl (and \1 in general)
+*.log

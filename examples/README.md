@@ -5,6 +5,8 @@ Runnable `.qpl` scripts. All paths assume you run them from the repo root.
 | Script | What it shows |
 |--------|---------------|
 | [`basics.qpl`](basics.qpl) | Core language: projection, aliases, scalar vars, `where`, `by` aggregation, `$[...]` case, `order`, casts |
+| [`multiline.qpl`](multiline.qpl) | Statements spanning multiple lines via tab / 4-space indentation |
+| [`logging.qpl`](logging.qpl) | `log` / `1` stdout writes and `\1 <path>` stdout mirroring |
 | [`lazy_and_collect.qpl`](lazy_and_collect.qpl) | `lazy` to keep a query plan, extend it by re-assignment, print the plan, `collect` to a table |
 | [`lazy_join_pipeline.qpl`](lazy_join_pipeline.qpl) | A full pipeline that scans two parquet files, joins, derives + aggregates + sorts, and sinks to parquet **without ever collecting** |
 | [`setup_data.qpl`](setup_data.qpl) | Regenerates the sample parquet inputs (already committed under `data/`) |

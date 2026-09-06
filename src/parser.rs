@@ -395,6 +395,30 @@ impl Parser {
         Ok(left)
     }
 
+    /// Like [`Parser::parse_expr`] but without trailing juxtaposition-as-call:
+    /// in a `log` argument list `a b` is two items, not `a(b)`. Binary ops and
+    /// casts still compose; wrap an actual function call in parens.
+    fn parse_expr_no_call(&mut self) -> Result<Expr, QplError> {
+        let left = self.parse_primary()?;
+        if let TokenKind::Op(op) = self.peek().clone() {
+            if op == "$" {
+                let dtype = match &left {
+                    Expr::ColRef(name) => name.clone(),
+                    _ => return Err(QplError::Parse(format!("expected type name before '$', got {left:?}"))),
+                };
+                self.next();
+                return Ok(Expr::Cast { dtype, expr: Box::new(self.parse_expr_no_call()?) });
+            }
+            self.next();
+            return Ok(Expr::BinOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(self.parse_expr_no_call()?),
+            });
+        }
+        Ok(left)
+    }
+
     fn parse_case(&mut self) -> Result<Expr, QplError> {
         self.eat(&TokenKind::LBracket)?;
         let mut terms = vec![self.parse_expr()?];
@@ -538,6 +562,19 @@ pub fn parse(tokens: Vec<Token>) -> Result<Stmt, QplError> {
     Ok(stmt)
 }
 
+/// Parse one or more juxtaposed expressions (space-separated), consuming every
+/// token. Used by the `log` / `1` stdout-write, which evaluates each as a scalar
+/// and concatenates the rendered values. Top-level juxtaposition separates
+/// items rather than forming a call — see [`Parser::parse_expr_no_call`].
+pub fn parse_expr_seq(tokens: Vec<Token>) -> Result<Vec<Expr>, QplError> {
+    let mut parser = Parser { tokens, i: 0 };
+    let mut exprs = Vec::new();
+    while !matches!(parser.peek(), TokenKind::Eof) {
+        exprs.push(parser.parse_expr_no_call()?);
+    }
+    Ok(exprs)
+}
+
 fn is_noun_start(token: &TokenKind) -> bool {
     matches!(token,
         TokenKind::Name(_)
@@ -576,6 +613,39 @@ mod tests {
     fn p(src: &str) -> Stmt {
         let tokens = tokenise(src).expect("lex error");
         parse(tokens).expect("parse error")
+    }
+
+    fn seq(src: &str) -> Vec<Expr> {
+        parse_expr_seq(tokenise(src).expect("lex error")).expect("parse error")
+    }
+
+    #[test]
+    fn expr_seq_single() {
+        assert_eq!(seq("\"hi\""), vec![Expr::Lit(Value::Str("hi".into()))]);
+    }
+
+    #[test]
+    fn expr_seq_two_string_literals() {
+        assert_eq!(seq("\"test\" \"me\""), vec![
+            Expr::Lit(Value::Str("test".into())),
+            Expr::Lit(Value::Str("me".into())),
+        ]);
+    }
+
+    #[test]
+    fn expr_seq_mixes_cast_and_binop_between_literals() {
+        // "test" str$2*3 " that"  ->  three items, middle one a cast of 2*3
+        let got = seq("\"test\" str$2*3 \" that\"");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], Expr::Lit(Value::Str("test".into())));
+        assert!(matches!(&got[1], Expr::Cast { dtype, .. } if dtype == "str"));
+        assert_eq!(got[2], Expr::Lit(Value::Str(" that".into())));
+    }
+
+    #[test]
+    fn expr_seq_juxtaposed_names_are_separate_items_not_a_call() {
+        let got = seq("a b");
+        assert_eq!(got, vec![Expr::ColRef("a".into()), Expr::ColRef("b".into())]);
     }
 
     fn sel(src: &str) -> SelectStmt {
