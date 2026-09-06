@@ -13,6 +13,7 @@ pub enum TokenKind {
     Limit,
     Drop,
     Update,
+    Delete,
     // builtin func keywords
     Load,
     Sink,

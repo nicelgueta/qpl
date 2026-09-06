@@ -692,6 +692,19 @@ mod tests {
     }
 
     #[test]
+    fn delete_where_removes_matching_rows() {
+        let df = run(make_vm(), "delete from t where c2 > 15");
+        assert_eq!(i64s(&df, "c2"), vec![10, 15]);
+    }
+
+    #[test]
+    fn delete_columns_reuses_projection_exclusion() {
+        let df = run(make_vm(), "delete `c2 from t");
+        let names: Vec<&str> = df.get_column_names().iter().map(|name| name.as_str()).collect();
+        assert_eq!(names, vec!["c1", "c3"]);
+    }
+
+    #[test]
     fn dictionary_sort_order_survives_assignment() {
         let mut vm = make_vm();
         assert!(matches!(run_vm("t2: `c1`c2!01b `t", &mut vm), Ok(EvalResult::Stored)));

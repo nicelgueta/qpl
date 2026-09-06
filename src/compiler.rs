@@ -75,6 +75,24 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), 
 }
 
 fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), QplError> {
+    if sel.delete {
+        out.push(Instruction::FromSrc(sel.from.clone()));
+        if let Some(preds) = &sel.where_ {
+            for (index, expr) in preds.iter().enumerate() {
+                compile_expr(expr, out)?;
+                if index > 0 {
+                    out.push(Instruction::BinOp("&".into()));
+                }
+            }
+            out.push(Instruction::Call { func: "not".into(), args_count: 1 });
+            out.push(Instruction::FrameExpr(PolarsFrameExpr::Filter(1)));
+        }
+        let columns = sel.cols.iter().map(delete_column_name).collect::<Result<Vec<_>, _>>()?;
+        out.push(Instruction::BuildProj { count: 0, exclude: columns, predicates: 0 });
+        out.push(Instruction::Select);
+        return Ok(());
+    }
+
     if sel.update {
         out.push(Instruction::FromSrc(sel.from.clone()));
         if let Some(preds) = &sel.where_ {
@@ -171,6 +189,13 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
         out.push(Instruction::FrameExpr(PolarsFrameExpr::Sort(order.clone())));
     }
     Ok(())
+}
+
+fn delete_column_name(alias: &crate::ast::Alias) -> Result<String, QplError> {
+    match &alias.expr {
+        Expr::ColRef(name) | Expr::Sym(name) => Ok(name.clone()),
+        other => Err(QplError::Compile(format!("delete expects column names, got {other:?}"))),
+    }
 }
 
 fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError> {
@@ -387,6 +412,16 @@ mod tests {
             col("price"), int(2), op("*"), alias("price"),
             BuildProj { count: 1, exclude: vec!["price".into()], predicates: 0 }, Select,
             Result,
+        ]);
+    }
+
+    #[test]
+    fn delete_rows_uses_negated_filter_and_select() {
+        assert_eq!(compile_src("delete from trades where size > 100"), vec![
+            from_table("trades"),
+            col("size"), int(100), op(">"), call("not", 1),
+            FrameExpr(PolarsFrameExpr::Filter(1)),
+            BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select, Result,
         ]);
     }
 

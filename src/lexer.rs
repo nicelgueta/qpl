@@ -256,6 +256,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         "limit" => TokenKind::Limit,
                         "drop" => TokenKind::Drop,
                         "update" => TokenKind::Update,
+                        "delete" => TokenKind::Delete,
                         "cols"   => TokenKind::Cols,
                         "load"   => TokenKind::Load,
                         "sink"   => TokenKind::Sink,
@@ -431,6 +432,11 @@ mod tests {
     #[test]
     fn keyword_table_operators() {
         assert_eq!(kinds("distinct limit #"), vec![TokenKind::Distinct, TokenKind::Limit, TokenKind::Hash]);
+    }
+
+    #[test]
+    fn keyword_delete() {
+        assert_eq!(kinds("delete"), vec![TokenKind::Delete]);
     }
 
     // --- identifiers ---

@@ -56,6 +56,7 @@ impl Parser {
             match self.peek() {
                 TokenKind::Select 
                 | TokenKind::Update
+                | TokenKind::Delete
                 | TokenKind::Distinct
                 | TokenKind::Cols 
                 | TokenKind::Load
@@ -131,8 +132,9 @@ impl Parser {
     fn parse_table_expr(&mut self) -> Result<TableExpr, QplError> {
         let peek = self.peek().clone();
         match peek {
-            TokenKind::Select => Ok(TableExpr::Select(self.parse_query(false)?)),
-            TokenKind::Update => Ok(TableExpr::Select(self.parse_query(true)?)),
+            TokenKind::Select => Ok(TableExpr::Select(self.parse_query(false, false)?)),
+            TokenKind::Update => Ok(TableExpr::Select(self.parse_query(true, false)?)),
+            TokenKind::Delete => Ok(TableExpr::Select(self.parse_query(false, true)?)),
             TokenKind::Distinct => {
                 self.next();
                 Ok(TableExpr::BuiltIn(BuiltIn::Distinct(Box::new(self.parse_table_expr()?))))
@@ -159,6 +161,7 @@ impl Parser {
                         order: None,
                         join: None,
                         update: false,
+                        delete: false,
                     })),
                     other => Err(QplError::Parse(format!("expected file path symbol after 'load', got {other:?}"))),
                 }
@@ -185,6 +188,7 @@ impl Parser {
                             order: None,
                             join: None,
                             update: false,
+                            delete: false,
                         });
                         Ok(TableExpr::BuiltIn(BuiltIn::Show(Box::new(tbl_expr))))
                     }
@@ -248,13 +252,19 @@ impl Parser {
         }
     }
 
-    fn parse_query(&mut self, update: bool) -> Result<SelectStmt, QplError> {
+    fn parse_query(&mut self, update: bool, delete: bool) -> Result<SelectStmt, QplError> {
         if update {
             self.eat(&TokenKind::Update)?;
+        } else if delete {
+            self.eat(&TokenKind::Delete)?;
         } else {
             self.eat(&TokenKind::Select)?;
         }
-        let cols = self.parse_phrase(&[TokenKind::By, TokenKind::From])?;
+        let cols = if delete {
+            self.parse_delete_columns()?
+        } else {
+            self.parse_phrase(&[TokenKind::By, TokenKind::From])?
+        };
         let mut by = None;
         if self.peek() == &TokenKind::By {
             self.next();
@@ -263,7 +273,7 @@ impl Parser {
         self.eat(&TokenKind::From)?;
         let from = self.parse_tbl_src_expr()?;
         let mut join = None;
-        if !update && matches!(self.peek(), TokenKind::Symbol(_)) {
+        if !update && !delete && matches!(self.peek(), TokenKind::Symbol(_)) {
             join = Some(self.parse_join()?);
         }
         let mut where_ = None;
@@ -272,7 +282,7 @@ impl Parser {
             where_ = self.parse_where()?;
         }
         let mut order = None;
-        if !update && self.peek() == &TokenKind::Order {
+        if !update && !delete && self.peek() == &TokenKind::Order {
             self.next();
             order = Some(self.parse_order()?);
         }
@@ -284,7 +294,31 @@ impl Parser {
             order,
             join,
             update,
+            delete,
         })
+    }
+
+    fn parse_delete_columns(&mut self) -> Result<Vec<Alias>, QplError> {
+        if self.peek() == &TokenKind::From {
+            return Ok(Vec::new());
+        }
+        let mut columns = Vec::new();
+        loop {
+            match self.next() {
+                TokenKind::Name(name) => columns.push(Alias { name: None, expr: Expr::ColRef(name) }),
+                TokenKind::Symbol(name) => columns.push(Alias { name: None, expr: Expr::Sym(name) }),
+                TokenKind::SymbolVec(names) => columns.extend(names.into_iter().map(|name| Alias {
+                    name: None,
+                    expr: Expr::Sym(name),
+                })),
+                other => return Err(QplError::Parse(format!("expected column name after 'delete', got {other:?}"))),
+            }
+            if self.peek() != &TokenKind::Comma {
+                break;
+            }
+            self.next();
+        }
+        Ok(columns)
     }
 
     fn parse_phrase(&mut self, stop_tokens: &[TokenKind]) -> Result<Vec<Alias>, QplError> {
@@ -473,6 +507,7 @@ fn is_table_expr_start(token: &TokenKind) -> bool {
     matches!(token,
         TokenKind::Select
         | TokenKind::Update
+        | TokenKind::Delete
         | TokenKind::Distinct
         | TokenKind::Int(_)
         | TokenKind::Load
@@ -697,6 +732,18 @@ mod tests {
                 assert!(query.where_.is_some());
             }
             other => panic!("expected update select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_uses_select_query_shape() {
+        match p("delete `price`size from trades where size > 100") {
+            Stmt::RetTable(TableExpr::Select(query)) => {
+                assert!(query.delete);
+                assert_eq!(query.cols.len(), 2);
+                assert!(query.where_.is_some());
+            }
+            other => panic!("expected delete select, got {other:?}"),
         }
     }
 

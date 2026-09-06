@@ -55,6 +55,7 @@ pub struct SelectStmt {
     pub order: Option<Vec<(String, bool)>>,
     pub join: Option<(TableSource, Value, Value, JoinType)>,
     pub update: bool,
+    pub delete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

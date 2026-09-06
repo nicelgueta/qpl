@@ -92,6 +92,13 @@ update price: price * 2 by sym from trades where size > 100
 
 Updates return the complete table, retaining columns that are not updated.
 
+### Delete
+
+```q
+delete from trades where size < 100
+delete `price`size from trades
+```
+
 ### Column dropping
 
 ```q
