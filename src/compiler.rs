@@ -56,6 +56,16 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), 
             out.push(Instruction::FrameExpr(PolarsFrameExpr::Sort(sort_map.clone())));
             Ok(())
         }
+        BuiltIn::Distinct(tbl_expr) => {
+            compile_tbl_expr(tbl_expr.as_ref(), out)?;
+            out.push(Instruction::FrameExpr(PolarsFrameExpr::Distinct));
+            Ok(())
+        }
+        BuiltIn::Limit(tbl_expr, limit) => {
+            compile_tbl_expr(tbl_expr.as_ref(), out)?;
+            out.push(Instruction::FrameExpr(PolarsFrameExpr::Limit(*limit)));
+            Ok(())
+        }
     }
 }
 
@@ -319,6 +329,18 @@ mod tests {
             BuildProj(0), Select,
             FrameExpr(PolarsFrameExpr::Sort(vec![("col1".into(), false), ("col2".into(), true)])),
             Result,
+        ]);
+    }
+
+    #[test]
+    fn distinct_and_limit() {
+        assert_eq!(compile_src("distinct select from trades"), vec![
+            from_table("trades"), BuildProj(0), Select,
+            FrameExpr(PolarsFrameExpr::Distinct), Result,
+        ]);
+        assert_eq!(compile_src("10#select from trades"), vec![
+            from_table("trades"), BuildProj(0), Select,
+            FrameExpr(PolarsFrameExpr::Limit(10)), Result,
         ]);
     }
 

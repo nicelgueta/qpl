@@ -9,6 +9,8 @@ pub enum TokenKind {
     Order,
     Asc,
     Desc,
+    Distinct,
+    Limit,
     // builtin func keywords
     Load,
     Sink,
@@ -34,6 +36,7 @@ pub enum TokenKind {
     LParen,
     RParen,
     Bang,
+    Hash,
     Op(String),
     Eof,
 }

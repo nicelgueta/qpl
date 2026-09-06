@@ -162,6 +162,13 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 });
                 i += 1;
             }
+            '#' => {
+                tokens.push(Token {
+                    kind: TokenKind::Hash,
+                    pos: start,
+                });
+                i += 1;
+            }
             '(' => {
                 tokens.push(Token {
                     kind: TokenKind::LParen,
@@ -245,6 +252,8 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         "order"  => TokenKind::Order,
                         "asc"    => TokenKind::Asc,
                         "desc"   => TokenKind::Desc,
+                        "distinct" => TokenKind::Distinct,
+                        "limit" => TokenKind::Limit,
                         "cols"   => TokenKind::Cols,
                         "load"   => TokenKind::Load,
                         "sink"   => TokenKind::Sink,
@@ -415,6 +424,11 @@ mod tests {
     #[test]
     fn keyword_order_directions() {
         assert_eq!(kinds("order asc desc"), vec![TokenKind::Order, TokenKind::Asc, TokenKind::Desc]);
+    }
+
+    #[test]
+    fn keyword_table_operators() {
+        assert_eq!(kinds("distinct limit #"), vec![TokenKind::Distinct, TokenKind::Limit, TokenKind::Hash]);
     }
 
     // --- identifiers ---

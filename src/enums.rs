@@ -18,5 +18,7 @@ pub enum PolarsFrameExpr {
     Filter(usize),
     Join{ l: usize, r: usize },
     Sort(Vec<(String, bool)>), // col name -> descending
+    Distinct,
+    Limit(usize),
     Cols
 }

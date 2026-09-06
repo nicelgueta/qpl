@@ -55,11 +55,16 @@ impl Parser {
             // query keywords produce a table result; anything else is a scalar expression
             match self.peek() {
                 TokenKind::Select 
+                | TokenKind::Distinct
                 | TokenKind::Cols 
                 | TokenKind::Load
                 | TokenKind::Show
                 | TokenKind::Symbol(_)
                 | TokenKind::SymbolVec(_)=> {
+                    let stmt = self.parse_body()?;
+                    Ok(Stmt::Assign { name, body: Box::new(stmt) })
+                }
+                TokenKind::Int(_) if matches!(self.peek2(), TokenKind::Limit | TokenKind::Hash) => {
                     let stmt = self.parse_body()?;
                     Ok(Stmt::Assign { name, body: Box::new(stmt) })
                 }
@@ -74,7 +79,10 @@ impl Parser {
     }
 
     fn parse_body(&mut self) -> Result<Stmt, QplError> {
-        if is_table_expr_start(self.peek()) {
+        if is_table_expr_start(self.peek())
+            || (matches!(self.peek(), TokenKind::Int(_))
+                && matches!(self.peek2(), TokenKind::Limit | TokenKind::Hash))
+        {
             let tbl_expr = self.parse_table_expr()?;
             Ok(Stmt::RetTable(tbl_expr))
         } else {
@@ -123,6 +131,20 @@ impl Parser {
         let peek = self.peek().clone();
         match peek {
             TokenKind::Select => Ok(TableExpr::Select(self.parse_query()?)),
+            TokenKind::Distinct => {
+                self.next();
+                Ok(TableExpr::BuiltIn(BuiltIn::Distinct(Box::new(self.parse_table_expr()?))))
+            }
+            TokenKind::Int(n) => {
+                self.next();
+                let operator = self.next();
+                if !matches!(operator, TokenKind::Limit | TokenKind::Hash) {
+                    return Err(QplError::Parse(format!("expected 'limit' or '#' after row count, got {operator:?}")));
+                }
+                let limit = usize::try_from(n)
+                    .map_err(|_| QplError::Parse(format!("limit must be non-negative, got {n}")))?;
+                Ok(TableExpr::BuiltIn(BuiltIn::Limit(Box::new(self.parse_table_expr()?), limit)))
+            }
             TokenKind::Load => {
                 // standalone: load "path" → select all from the file
                 self.next();
@@ -429,6 +451,8 @@ fn is_noun_start(token: &TokenKind) -> bool {
 fn is_table_expr_start(token: &TokenKind) -> bool {
     matches!(token,
         TokenKind::Select
+        | TokenKind::Distinct
+        | TokenKind::Int(_)
         | TokenKind::Load
         | TokenKind::Cols
         | TokenKind::Show
@@ -611,6 +635,24 @@ mod tests {
     fn order_multiple_columns() {
         let s = sel("select from trades order col1 asc, col2 desc");
         assert_eq!(s.order, Some(vec![("col1".into(), false), ("col2".into(), true)]));
+    }
+
+    #[test]
+    fn distinct_select() {
+        assert!(matches!(
+            p("distinct select from trades"),
+            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Distinct(_)))
+        ));
+    }
+
+    #[test]
+    fn limit_keyword_and_hash() {
+        for source in ["10 limit select from trades", "10#`trades", "10#select from trades"] {
+            assert!(matches!(
+                p(source),
+                Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Limit(_, 10)))
+            ));
+        }
     }
 
     // --- by clause ---

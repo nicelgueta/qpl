@@ -6,4 +6,6 @@ pub enum BuiltIn {
     Show(Box<TableExpr>),
     Sink {name: TableSource, path: Value},
     Sort(Box<TableExpr>, Vec<(String, bool)>),
+    Distinct(Box<TableExpr>),
+    Limit(Box<TableExpr>, usize),
 }

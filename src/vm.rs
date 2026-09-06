@@ -227,6 +227,14 @@ impl Vm {
                             );
                             frame = Some(sorted_lf);
                         }
+                        PolarsFrameExpr::Distinct => {
+                            let lf = require_frame(&mut frame)?;
+                            frame = Some(lf.unique_stable(None, UniqueKeepStrategy::First));
+                        }
+                        PolarsFrameExpr::Limit(limit) => {
+                            let lf = require_frame(&mut frame)?;
+                            frame = Some(lf.limit(limit as IdxSize));
+                        }
                         PolarsFrameExpr::Cols => {
                             let df = self.schema(frame.take().unwrap())?;
                             frame = Some(df.lazy());
@@ -610,6 +618,21 @@ mod tests {
         let df = run(make_vm(), "select from t order `c1 asc, `c2 desc");
         assert_eq!(strs(&df, "c1"), vec!["a", "a", "b", "c"]);
         assert_eq!(i64s(&df, "c2"), vec![30, 10, 20, 15]);
+    }
+
+    #[test]
+    fn distinct_select_removes_duplicate_rows() {
+        let df = run(make_vm(), "distinct select c1 from t");
+        assert_eq!(strs(&df, "c1"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn limit_keyword_and_hash() {
+        for source in ["2 limit select c1 from t", "2#select c1 from t", "2#`t"] {
+            let df = run(make_vm(), source);
+            assert_eq!(df.height(), 2);
+            assert_eq!(strs(&df, "c1"), vec!["a", "b"]);
+        }
     }
 
     #[test]

@@ -83,6 +83,19 @@ select from trades where size > 100
 select total: sum size by sym from trades where side = "buy"
 select from trades order sym asc, price desc
 
+### Table operators
+
+```q
+/ distinct
+distinct select sym from trades
+
+/ limit
+10 limit select from trades
+10#select from trades
+10#`trades
+
+```
+
 / also use str vars a symbols (maybe change this but easy to write for now)
 select total: sum size by sym from trades where side = `buy
 
