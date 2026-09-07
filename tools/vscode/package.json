@@ -1,8 +1,8 @@
 {
   "name": "qpl",
   "displayName": "qpl — Quick Polars Query Language",
-  "description": "Syntax highlighting (and, later, autocomplete) for the qpl query language.",
-  "version": "0.1.0",
+  "description": "Syntax highlighting and an interactive REPL for the qpl query language.",
+  "version": "0.2.0",
   "publisher": "nicelgueta",
   "license": "MIT",
   "repository": {
@@ -14,6 +14,10 @@
   },
   "categories": [
     "Programming Languages"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:qpl"
   ],
   "contributes": {
     "languages": [
@@ -35,6 +39,65 @@
         "scopeName": "source.qpl",
         "path": "./syntaxes/qpl.tmLanguage.json"
       }
-    ]
+    ],
+    "commands": [
+      {
+        "command": "qpl.runFileOrSelection",
+        "title": "Run File or Selection in REPL",
+        "category": "qpl"
+      },
+      {
+        "command": "qpl.startRepl",
+        "title": "Start REPL",
+        "category": "qpl"
+      },
+      {
+        "command": "qpl.restartRepl",
+        "title": "Restart REPL",
+        "category": "qpl"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "qpl.runFileOrSelection",
+        "key": "ctrl+enter",
+        "mac": "cmd+enter",
+        "when": "editorTextFocus && editorLangId == qpl"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "qpl.runFileOrSelection",
+          "when": "editorLangId == qpl",
+          "group": "qpl@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "qpl",
+      "properties": {
+        "qpl.path": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `qpl` executable. When empty, the extension auto-detects: `qpl` on `PATH`, then `target/release/qpl` or `target/debug/qpl` in the workspace, then `cargo run` if a qpl `Cargo.toml` is found."
+        },
+        "qpl.loadDemo": {
+          "type": "boolean",
+          "default": false,
+          "description": "Start the REPL with --load-demo (preloads the demo `trades` / `quotes` tables)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.4.0"
   }
 }

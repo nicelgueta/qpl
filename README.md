@@ -394,10 +394,16 @@ select from trades where size > 100
 | Command | Action |
 |---------|--------|
 | `\d <stmt>` | disassemble — show bytecode without executing |
+| `\l <path>` | run a `.qpl` script in the current session |
 | `\1 <path>` | mirror all stdout to `<path>` (bare `\1` detaches) |
 | `log <expr>` / `1 <expr>` | print a scalar to stdout (and the log) |
 | `cols <name>` | show column names and types for a table |
-| Ctrl-C / Ctrl-D | exit |
+| Ctrl-C | abandon a partial statement (or exit at an empty prompt) |
+| Ctrl-D | exit |
+
+Statements can span several lines: the prompt keeps reading while brackets are
+open, after a trailing `,`, or when input was cut off before the statement was
+complete. A blank line submits whatever has been entered.
 
 ```
 qpl) \d select avg price by sym from trades where size > 100

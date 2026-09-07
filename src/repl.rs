@@ -3,6 +3,7 @@ use crate::compiler::compile;
 use crate::errors::QplError;
 use crate::lexer::tokenise;
 use crate::parser::{parse, parse_expr_seq};
+use crate::tokens::TokenKind;
 use crate::opcodes::disassemble_instructions;
 use crate::vm::{Vm, run_vm, EvalResult};
 use polars::prelude::*;
@@ -59,37 +60,96 @@ fn logical_statements(src: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// Does `src` look like an unfinished statement that should keep reading?
+/// True while `(`/`[` are unbalanced, on a trailing `,`, on a lex error (e.g. an
+/// unterminated string), or when the parse fails specifically because input ran
+/// out (so a genuine syntax error still surfaces immediately). `\` commands are
+/// always single-line.
+fn wants_more(src: &str) -> bool {
+    if src.trim_start().starts_with('\\') {
+        return false;
+    }
+    let toks = match tokenise(src) {
+        Ok(toks) => toks,
+        Err(_) => return true,
+    };
+    let mut depth: i32 = 0;
+    for t in &toks {
+        match t.kind {
+            TokenKind::LBracket | TokenKind::LParen => depth += 1,
+            TokenKind::RBracket | TokenKind::RParen => depth -= 1,
+            _ => {}
+        }
+    }
+    if depth > 0 || matches!(toks.last().map(|t| &t.kind), Some(TokenKind::Comma)) {
+        return true;
+    }
+    match parse(toks) {
+        Ok(_) => false,
+        Err(QplError::Parse(msg)) => msg.contains("got Eof"),
+        Err(_) => false,
+    }
+}
+
 pub fn start(vm: &mut Vm) {
     let mut rl = DefaultEditor::new().expect("failed to create line editor");
 
-    println!("qpl (Quick Polars Query Language) REPL - \\d to disassemble, \\1 <path> to log stdout");
+    println!("qpl (Quick Polars Query Language) REPL - \\d disassemble, \\l <path> run a script, \\1 <path> log stdout");
 
+    let mut buf: Vec<String> = Vec::new();
     loop {
-        match rl.readline("qpl) ") {
+        let prompt = if buf.is_empty() { "qpl) " } else { "  ...  " };
+        match rl.readline(prompt) {
             Ok(line) => {
-                let line = line.trim().to_string();
-                if line.is_empty() || line.starts_with('/') {
+                let blank = line.trim().is_empty();
+                if buf.is_empty() {
+                    if blank || line.trim_start().starts_with('/') {
+                        continue;
+                    }
+                    buf.push(line);
+                } else if !blank {
+                    buf.push(line);
+                }
+                // (a blank line while buf is non-empty force-submits)
+                let src = buf.join("\n");
+                if !blank && wants_more(&src) {
                     continue;
                 }
-                let _ = rl.add_history_entry(&line);
-                if let Some(src) = line.strip_prefix("\\d").map(str::trim) {
-                    match disassemble(src) {
+                buf.clear();
+                let src = src.trim().to_string();
+                if src.is_empty() {
+                    continue;
+                }
+                let _ = rl.add_history_entry(&src);
+                if let Some(inner) = src.strip_prefix("\\d").map(str::trim) {
+                    match disassemble(inner) {
                         Ok(listing) => println!("{listing}"),
                         Err(e) => eprintln!("{}", fmt_repl_error(&e)),
                     }
                     continue;
                 }
-                if let Some(result) = system_command(&line, vm) {
+                if let Some(path) = src.strip_prefix("\\l").map(str::trim) {
+                    if let Err(e) = run_script(path, vm) {
+                        eprintln!("{}", fmt_repl_error(&e));
+                    }
+                    continue;
+                }
+                if let Some(result) = system_command(&src, vm) {
                     if let Err(e) = result {
                         eprintln!("{}", fmt_repl_error(&e));
                     }
                     continue;
                 }
-                if let Err(e) = match_run_vm(&line, vm, "<main>", 0) {
+                if let Err(e) = match_run_vm(&src, vm, "<main>", 0) {
                     eprintln!("{}", fmt_repl_error(&e))
                 };
             }
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
+            Err(ReadlineError::Interrupted) => {
+                // abandon a partial statement, or exit at an empty prompt
+                if buf.is_empty() { break; }
+                buf.clear();
+            }
+            Err(ReadlineError::Eof) => break,
             Err(e) => { eprintln!("readline error: {e}"); break; }
         }
     }
@@ -215,7 +275,29 @@ fn disassemble(source: &str) -> Result<String, QplError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{logical_statements, log_target};
+    use super::{logical_statements, log_target, wants_more};
+
+    #[test]
+    fn wants_more_detects_unfinished_input() {
+        // complete
+        assert!(!wants_more("select from trades"));
+        assert!(!wants_more("x: 1 + 2"));
+        // unbalanced bracket / paren
+        assert!(wants_more("select a: ?[c>1;`x"));
+        assert!(wants_more("select (1 + "));
+        // trailing comma
+        assert!(wants_more("select a: price,"));
+        // cut off before `from`
+        assert!(wants_more("select price"));
+        assert!(wants_more("select price from"));
+        // unterminated string
+        assert!(wants_more("log \"oops"));
+        // a real syntax error is NOT "more" — surface it now
+        assert!(!wants_more("selct from trades"));
+        // `\` commands are always single-line
+        assert!(!wants_more("\\d select a: ?[c>1;`x"));
+        assert!(!wants_more("\\l some/script.qpl"));
+    }
 
     #[test]
     fn log_target_keyword_and_digit() {

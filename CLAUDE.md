@@ -69,7 +69,7 @@ carries across lines because the same `Vm` is reused.
 | `opcodes` | `Instruction` enum + `disassemble_instructions` (the `\d` REPL command). `Display` impls are the disassembly format |
 | `enums` | `PolarsFrameExpr` / `PolarsStackArg` — thin wrappers over Polars ops (join type, filter, sort, distinct, limit, drop) referenced from instructions |
 | `vm` | executes instructions against a `StackObj` stack, building a Polars `LazyFrame`; holds all interpreter state |
-| `repl` | REPL loop, script runner (`logical_statements` folds indented continuation lines into one statement), demo tables, result formatting. Also home to the string-level features that never reach the VM: `\` system commands (`\d`, `\1 <path>` stdout log) and the `log` / `1` stdout-write (`parser::parse_expr_seq` parses its space-separated args, each rendered via `eval_scalar` and concatenated). All printing goes through `Vm::emit`, which mirrors to the stdout log |
+| `repl` | REPL loop, script runner (`logical_statements` folds indented continuation lines into one statement; the interactive loop instead uses `wants_more` — brackets/trailing-comma/parse-cut-off — to decide whether to keep reading), demo tables, result formatting. Also home to the string-level features that never reach the VM: `\` system commands (`\d` disassemble, `\l <path>` run a script, `\1 <path>` stdout log) and the `log` / `1` stdout-write (`parser::parse_expr_seq` parses its space-separated args, each rendered via `eval_scalar` and concatenated). All printing goes through `Vm::emit`, which mirrors to the stdout log |
 | `errors` | `QplError` (Lex/Parse/Compile/Runtime variants) — the single error type threaded everywhere |
 
 ### VM state and evaluation model

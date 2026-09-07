@@ -1,6 +1,9 @@
 .vscode/**
+src/**
+node_modules/**
 test/**
 tsconfig.json
 PLAN.md
+**/*.ts
 **/*.map
 **/.gitignore

@@ -65,10 +65,11 @@ tools/vscode/
 - `keyword.control.qpl` — statement keywords
 - `keyword.other.qpl` — `load sink cols show lazy collect`
 - `support.function.aggregate.qpl` — aggregate names
-- `support.type.cast.qpl` — cast types preceded by `$`
+- `support.function.operator.qpl` — q-style operator functions `? $ :: ! #` (same colour as aggregates)
+- `support.type.cast.qpl` — cast type name in `type$expr`
 - `keyword.operator.join.qpl` — `\b(lj|ij|rj)\b`
-- `keyword.operator.channel.qpl` — `<<` `>>`
-- `keyword.operator.qpl` — arithmetic / comparison / logical
+- `keyword.other.qpl` — `<<` `>>` (with the builtin keywords)
+- `keyword.operator.qpl` — arithmetic / comparison / logical (`+ - * % = < > & | <> != <= >=`)
 - `variable.language.index.qpl` — `\bi\b`
 - `variable.other.qpl` — assignment targets **and** every other bare identifier
   (column names/refs, table refs), so declaration and use share a colour
@@ -116,17 +117,22 @@ One `CompletionItemProvider` for language id `qpl`:
 
 ## Milestones
 
-1. **M1 — Highlighting (no JS):** grammar + language-configuration + package.json.
-   Verify against every `examples/*.qpl`. Ship `0.1.0`.
-2. **M2 — Static completion + snippets:** `vocabulary.ts`, snippets, `$`-gated cast
-   completion, start-of-line keyword completion. `0.2.0`.
-3. **M3 — Document-aware completion:** `docScan.ts`, table-name extraction, context
-   gating. `0.3.0`.
-4. **M4 — Tests + packaging:** `vscode-tmgrammar-test` snapshots, `@vscode/test-electron`
-   tests, `vsce package`, README screenshots. `1.0.0`.
-5. **M5 (optional) — Semantic layer:** compile real `lexer`/`parser` to WASM for a
+1. **M1 — Highlighting (no JS): shipped `0.1.0`.** grammar + language-configuration.
+2. **REPL — shipped `0.2.0`.** `src/extension.ts` (TypeScript build). Ctrl+Enter
+   runs the file/selection in a persistent `qpl REPL` terminal; multi-line input
+   goes through the interpreter's `\l` run-script command. Binary discovery:
+   `qpl.path` → `PATH` → `target/release|debug/qpl` → `cargo run`.
+3. **M2 — Static completion + snippets:** `vocabulary.ts`, snippets, `$`-gated cast
+   completion, start-of-line keyword completion. `0.3.0`.
+4. **M3 — Document-aware completion:** `docScan.ts`, table-name extraction, context
+   gating. `0.4.0`.
+5. **M4 — Tests + packaging:** `vscode-tmgrammar-test` snapshots, `@vscode/test-electron`
+   tests, README screenshots. `1.0.0`.
+6. **M5 (optional) — Semantic layer:** compile real `lexer`/`parser` to WASM for a
    `DocumentSemanticTokensProvider` + `DiagnosticCollection` from `QplError`; optionally
-   shell out to the `qpl` binary (`cols <table>`) for column completions.
+   shell out to the `qpl` binary (`cols <table>`) for column completions. (WASM is
+   only needed for browser VSCode / a web playground — the desktop extension shells
+   out to the native binary.)
 
 ## Testing
 

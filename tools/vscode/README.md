@@ -2,55 +2,68 @@
 
 Editor support for [`qpl`](../../README.md) — the Quick Polars Query Language.
 
-## Status
+## Features
 
-**M1 — syntax highlighting only.** Autocomplete, snippets, and diagnostics are
-planned; see [PLAN.md](PLAN.md).
+### Syntax highlighting
 
-## Features (0.1.0)
+`.qpl` files get highlighting for comments (`/`), double-quoted strings with
+escapes, symbols and symbol vectors (`` `a`b`c ``), integer / float / bool /
+bool-vector literals, statement keywords (`select`, `by`, `from`, `where`,
+`order`, `asc`, `desc`, `distinct`, `limit`, `drop`, `update`, `delete`),
+builtin keywords (`load`, `sink`, `cols`, `show`, `lazy`, `collect`),
+aggregates (`sum`, `avg`, `count`, ...), cast types (`f64$x`), the operator
+functions `?` `$` `::` `!` `#`, join operators (`lj`, `ij`, `rj`), the
+`<<` / `>>` channels, assignments, `\d` / `\l` / `\1` REPL lines, and the
+virtual `i` column. Plus line comments, bracket matching and auto-closing pairs.
 
-- Highlighting for `.qpl` files: comments (`/`), double-quoted strings with
-  escapes, symbols and symbol vectors (`` `a`b`c ``), integer / float / bool /
-  bool-vector literals, statement keywords (`select`, `by`, `from`, `where`,
-  `order`, `asc`, `desc`, `distinct`, `limit`, `drop`, `update`, `delete`),
-  builtin keywords (`load`, `sink`, `cols`, `show`, `lazy`, `collect`),
-  aggregates (`sum`, `avg`, `count`, ...), cast types after `$` (`f64$x`),
-  join operators (`lj`, `ij`, `rj`), the `<<` / `>>` channel operators,
-  assignments (`name: expr`), `\d` / `\1` REPL lines, and the virtual `i`
-  column.
-- Line comments, bracket matching, and auto-closing pairs.
+### Interactive REPL
+
+- **Ctrl+Enter** (Cmd+Enter on macOS) in a `.qpl` file runs the **selection**,
+  or the **whole file** when nothing is selected, in a persistent `qpl REPL`
+  terminal. State (tables, variables) carries across runs, like a Python REPL.
+- Multi-line / multi-statement input is handed to the interpreter via `\l`
+  (run-script), so its own continuation-folding and comment handling apply.
+- Commands (Command Palette): **qpl: Start REPL**, **qpl: Restart REPL**,
+  **qpl: Run File or Selection in REPL**.
+
+#### Finding the `qpl` binary
+
+The extension resolves, in order:
+
+1. the `qpl.path` setting, if set;
+2. `qpl` on your `PATH`;
+3. `target/release/qpl` or `target/debug/qpl` in the workspace;
+4. `cargo run --quiet --manifest-path <workspace>/Cargo.toml --` when a qpl
+   `Cargo.toml` is present (handy while hacking on qpl itself).
+
+Set `qpl.loadDemo` to start the REPL with the demo `trades` / `quotes` tables.
 
 ## Developing
 
 ```bash
 cd tools/vscode
-# open this folder in VSCode and press F5 to launch an Extension Development Host,
-# then open any file under ../../examples/ to see the grammar in action.
+npm install
+npm run compile          # or: npm run watch
+# then press F5 in VSCode to launch an Extension Development Host with the
+# ../../examples folder open. `npm: compile` runs automatically before launch.
 ```
-
-No build step for M1 — the grammar and language configuration are pure JSON.
 
 ## Packaging
 
-`vsce` (Visual Studio Code Extensions) is Microsoft's CLI for turning an
-extension folder into a distributable `.vsix` archive and, optionally,
-publishing it to the Marketplace.
+`vsce` (Visual Studio Code Extensions) turns the folder into a distributable
+`.vsix`:
 
 ```bash
-npm install -g @vscode/vsce   # one-time: install the packaging CLI globally
-vsce package                  # produces qpl-<version>.vsix in this folder
+npm install -g @vscode/vsce   # one-time
+vsce package                  # runs `npm run compile`, then writes qpl-<version>.vsix
 ```
 
-`vsce package` reads [package.json](package.json) (name, version, publisher,
-`engines.vscode`, `contributes`), bundles every file not excluded by
-[.vscodeignore](.vscodeignore), and validates the manifest. The resulting
-`qpl-0.1.0.vsix` can be shared directly and installed with **Extensions view →
-··· → Install from VSIX…** or `code --install-extension qpl-0.1.0.vsix` — no
+`vsce package` reads [package.json](package.json), runs the `vscode:prepublish`
+script (`tsc`), bundles every file not excluded by [.vscodeignore](.vscodeignore),
+and validates the manifest. Install the result with **Extensions view → ··· →
+Install from VSIX…** or `code --install-extension qpl-<version>.vsix` — no
 Marketplace account needed.
 
-To publish to the Marketplace instead, you need a `publisher` matching an Azure
-DevOps organisation and a Personal Access Token: `vsce login <publisher>` then
-`vsce publish` (which also bumps the version if you pass `patch`/`minor`/`major`).
-
-For M1 there is no compile step — the grammar and language configuration are
-plain JSON, so `vsce package` is the entire build.
+To publish to the Marketplace you need a `publisher` matching an Azure DevOps
+organisation and a Personal Access Token: `vsce login <publisher>` then
+`vsce publish`.

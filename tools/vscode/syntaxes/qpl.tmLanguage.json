@@ -82,7 +82,7 @@
       "match": "\\b(f64|float|f32|i64|int|i32|i16|i8|u64|u32|u16|u8|bool|str|string)(\\$)",
       "captures": {
         "1": { "name": "support.type.cast.qpl" },
-        "2": { "name": "keyword.operator.cast.qpl" }
+        "2": { "name": "support.function.operator.qpl" }
       }
     },
     "aggregate": {
@@ -108,8 +108,18 @@
           "match": "<<|>>"
         },
         {
+          "comment": "multi-char comparisons — matched before bare `!` so `!=` wins",
           "name": "keyword.operator.qpl",
-          "match": "::|<>|!=|<=|>=|[-+*%=<>&|$!#?]"
+          "match": "<>|!=|<=|>="
+        },
+        {
+          "comment": "q-style operator functions — coloured like sum / avg",
+          "name": "support.function.operator.qpl",
+          "match": "::|[?$!#]"
+        },
+        {
+          "name": "keyword.operator.qpl",
+          "match": "[-+*%=<>&|]"
         }
       ]
     }
