@@ -96,6 +96,15 @@ impl Parser {
                 && matches!(self.peek2(), TokenKind::Limit | TokenKind::Hash))
         {
             let tbl_expr = self.parse_table_expr()?;
+            // postfix sink: `<table-expr> >> <path>` / `<table-expr> sink <path>`
+            if matches!(self.peek(), TokenKind::Sink) {
+                self.next(); // consume `>>` / `sink`
+                let path = self.parse_expr()?;
+                return Ok(Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink {
+                    src: Box::new(tbl_expr),
+                    path,
+                })));
+            }
             Ok(Stmt::RetTable(tbl_expr))
         } else {
             self.parse_scalar_stmt()
@@ -105,25 +114,13 @@ impl Parser {
     fn parse_scalar_stmt(&mut self) -> Result<Stmt, QplError> {
         match self.peek() {
             TokenKind::Name(_name) => {
-                // currently, only sinks are statements that 
-                // start with a name variable
-                // TODO: need to make more expandable
                 if matches!(self.peek2(), TokenKind::Sink) {
-                    if let TokenKind::Name(name) = self.next() { // consume name
-                        self.next(); //consume sink
-                        // path is any scalar expr: `\`literal`, a string global,
-                        // or `\`$expr` (cast a string to a symbol path)
-                        let path = self.parse_expr()?;
-                        Ok(Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink {
-                            name: TableSource::InMem(name),
-                            path,
-                        })))
-                    } else {
-                        unreachable!()
-                    }
-                } else {
-                    Ok(Stmt::SingleVar(self.parse_expr()?))
+                    return Err(QplError::Parse(
+                        "sink expects a table expression on the left (e.g. `\
+                         `tbl >> `path` or `select … from tbl >> `path`), not a bare name".into(),
+                    ));
                 }
+                Ok(Stmt::SingleVar(self.parse_expr()?))
             }
             _ => Err(QplError::Parse(format!("Unexpected token: {:?}", self.peek()))),
         }
@@ -187,7 +184,9 @@ impl Parser {
             TokenKind::Symbol(s) => {
                 self.next(); // consume the symbol
                 match self.peek() {
-                    TokenKind::Eof => {
+                    // bare `\`tbl` → show it; `\`tbl >> path` → the postfix sink
+                    // in `parse_body` handles the rest, so hand back the plain frame
+                    TokenKind::Eof | TokenKind::Sink => {
                         let tbl_expr = TableExpr::Select(SelectStmt {
                             cols: vec![],
                             from: TableSource::InMem(s),
@@ -198,7 +197,11 @@ impl Parser {
                             update: false,
                             delete: false,
                         });
-                        Ok(TableExpr::BuiltIn(BuiltIn::Show(Box::new(tbl_expr))))
+                        if matches!(self.peek(), TokenKind::Sink) {
+                            Ok(tbl_expr)
+                        } else {
+                            Ok(TableExpr::BuiltIn(BuiltIn::Show(Box::new(tbl_expr))))
+                        }
                     }
                     TokenKind::Bang => {
                         // single symbol with a bang should actually 
@@ -944,9 +947,13 @@ mod tests {
     }
 
     #[test]
-    fn sink_path_is_a_symbol_literal() {
-        match p("t >> `out.parquet") {
-            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink { path, .. })) => {
+    fn sink_takes_a_table_ref_on_the_left_and_a_symbol_path() {
+        match p("`t >> `out.parquet") {
+            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink { src, path })) => {
+                assert!(matches!(
+                    src.as_ref(),
+                    TableExpr::Select(SelectStmt { from: TableSource::InMem(n), .. }) if n == "t"
+                ));
                 assert_eq!(path, Expr::Sym("out.parquet".into()));
             }
             other => panic!("expected sink, got {other:?}"),
@@ -954,9 +961,23 @@ mod tests {
     }
 
     #[test]
+    fn sink_accepts_a_full_select_on_the_left() {
+        assert!(matches!(
+            p("select price from trades >> `out.parquet"),
+            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink { src, .. }))
+                if matches!(src.as_ref(), TableExpr::Select(_))
+        ));
+    }
+
+    #[test]
+    fn sink_rejects_a_bare_identifier_on_the_left() {
+        assert!(parse(tokenise("t >> `out.parquet").unwrap()).is_err());
+    }
+
+    #[test]
     fn sink_path_can_cast_a_string_var_to_a_symbol() {
-        // `\`$o` — cast the string held in `o` to a symbol path
-        match p("t >> `$o") {
+        // `\`$o` — intern the string held in `o` into a symbol path
+        match p("`t >> `$o") {
             Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink { path, .. })) => {
                 assert!(matches!(
                     &path,

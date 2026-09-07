@@ -49,8 +49,8 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), 
             compile_tbl_expr(tbl_expr.as_ref(), out)?;
             Ok(())
         }
-        BuiltIn::Sink { name, path } => {
-            out.push(Instruction::FromSrc(name.clone()));
+        BuiltIn::Sink { src, path } => {
+            compile_tbl_expr(src.as_ref(), out)?;
             out.push(Instruction::Eval(path.clone()));
             out.push(Instruction::Sink);
             Ok(())
@@ -468,10 +468,19 @@ mod tests {
 
     #[test]
     fn sink_is_terminal_without_trailing_result() {
-        let prog = compile_src("t >> `out.parquet");
+        let prog = compile_src("`t >> `out.parquet");
         assert_eq!(prog, vec![
-            from_table("t"), Eval(Expr::Sym("out.parquet".into())), Sink,
+            from_table("t"),
+            BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
+            Eval(Expr::Sym("out.parquet".into())), Sink,
         ]);
+    }
+
+    #[test]
+    fn sink_after_a_select_compiles() {
+        let prog = compile_src("select price from trades >> `out.parquet");
+        assert!(prog.last() == Some(&Sink));
+        assert!(!prog.contains(&Result));
     }
 
     #[test]

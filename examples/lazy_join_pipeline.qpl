@@ -32,6 +32,6 @@ summary: `traded`sym!10b `summary
 
 o: "examples/data/market_summary.parquet"
 / 6. the ONLY execution: stream the final plan to parquet without collecting
-summary >>o
+`summary >> `$o
 
 log "created parquet file: '" o "'"

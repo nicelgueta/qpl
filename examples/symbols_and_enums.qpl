@@ -33,7 +33,7 @@ out: select
 cols `out
 select from out
 
-/ sink to a path held in a string variable — `$ interns it to a symbol
+/ sink a table by reference; the path comes from a string variable (`$ interns it)
 dest: "examples/data/symbols_and_enums.parquet"
-out >> `$dest
+`out >> `$dest
 log "wrote " dest

@@ -41,7 +41,7 @@ qpl equivalent:
 ```q
 thr: 3 * 45
 t: select r: i64$neg mean size, total_market_value: sum size * price by sym, side from << `my_trades.parq where price > thr
-t >> `output.parquet
+`t >> `output.parquet
 ```
 
 ## Install
@@ -154,16 +154,22 @@ select from << `data/quotes.csv
 
 ### sink — write to file
 
+The left of `sink` / `>>` is a **table expression** — `` `tbl ``, a `select …`, an
+`update …`, etc. — never a bare identifier (write `` `t >> … ``, not `t >> …`).
+
 ```q
-t: select total_size: sum size, apx: mean price, total_value: sum price * size by sym, side from trades
-t sink `summary.parquet
+t: select total_size: sum size, apx: mean price by sym, side from trades
 
-/ also with operator >>
-t >> `summary.parquet
+/ sink a table by reference
+`t >> `summary.parquet
+`t sink `summary.parquet
 
-/ the path can come from a string variable — `\`$expr` casts a string to a symbol
+/ ...or sink a query directly, without binding it first
+select sym, price from trades where size > 100 >> `big_trades.parquet
+
+/ the path can come from a string variable — `\`$expr` interns a string to a symbol
 o: "output/summary.parquet"
-t >> `$o
+`t >> `$o
 ```
 
 ### lazy / collect — defer materialisation
@@ -215,7 +221,7 @@ select from tm where side = `buy
 ...or skip the table entirely and stream the plan straight to a file:
 
 ```q
-j >> `summary.parquet
+`j >> `summary.parquet
 ```
 
 This whole implpementation uses one of Polars's most powerful features: being able to process **larger than RAM data** in a single pipeline/sequence of statements.
@@ -260,10 +266,10 @@ names a column, table or path. `` `$expr `` interns a string into a symbol:
 
 ```
 o: "out/summary.parquet"
-t >> `$o                 / sink to the path held in the string variable `o`
+`t >> `$o                / sink to the path held in the string variable `o`
 ```
 
-(a plain string path still works too: `t >> "out/summary.parquet"`).
+(a plain string path still works too: `` `t >> "out/summary.parquet" ``).
 
 ### Categoricals
 

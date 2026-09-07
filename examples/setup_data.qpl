@@ -5,5 +5,5 @@
 / Run from the repo root:
 /   cargo run -- --load-demo examples/setup_data.qpl
 
-trades >> `examples/data/trades.parquet
-quotes >> `examples/data/quotes.parquet
+`trades >> `examples/data/trades.parquet
+`quotes >> `examples/data/quotes.parquet
