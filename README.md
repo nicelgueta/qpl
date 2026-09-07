@@ -58,17 +58,16 @@ select tot: sum price * size, avg_spread: avg ask - bid, n: count price
     >> `summary.parquet
 ```
 
-Because each step is its own statement, you can also build the pipeline up line
-by line in the REPL and inspect it as you go — no rewriting the query or
-commenting out blocks the way you would while iterating in SQL:
+But the same pipeline is more naturally built up **one statement at a time** in
+the REPL — see [Working incrementally](#working-incrementally):
 
 ```q
 j: select sym, side, price, size, bid, ask from << `trades.parquet `sym lj << `quotes.parquet `sym where price > 0
 `j  / check the table so far
 j: update spread: ask - bid, notional: price * size from j
-/ check this works before actually updating the table by not assigning it to anything
+/ try the next step without committing — don't assign, just look
 update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from j
-/ now assign to persist
+/ happy with it — now assign to persist
 j: update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from j
 cols `j                                    / check the schema so far
 select tot: sum notional, avg_spread: avg spread, n: count price by csym: `$sym, side, band from j order tot desc
@@ -103,6 +102,46 @@ Runnable scripts are in [`examples/`](examples/) — e.g.
 
 Editor support (syntax highlighting + a Ctrl+Enter REPL) is in
 [`tools/vscode/`](tools/vscode/).
+
+## Working incrementally
+
+This is the part qpl really leans on: **a transformation is a sequence of
+statements, and you build it one statement at a time.**
+
+Every step binds a name; the binding persists, so the next step starts from it.
+There's no re-running a growing query, no stacking CTEs, no scrolling up to edit
+and resubmit a 30-line block — the loop is *type a line, look, type the next*.
+
+```q
+qpl) t: << `trades.parquet          / bind a table
+qpl) `t                             / look at it
+qpl) cols `t                        / ...or just its schema
+
+qpl) t: select sym, side, price, size from t where price > 0
+qpl) t: update notional: price * size from t
+
+qpl) / not sure about the next step? run it WITHOUT assigning — the source is untouched
+qpl) update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from t
+qpl) t: update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from t   / keep it
+
+qpl) select traded: sum notional by sym, side, band from t order traded desc
+qpl) `t >> `out.parquet
+```
+
+Things that make the loop tight:
+
+- **`` `t `` / `cols `t``** — peek at a table or its schema between steps.
+- **Run a statement without assigning it** — you see the result, nothing changes.
+  Assign only once you're happy.
+- **`\d <stmt>`** — show the compiled plan without executing anything.
+- **`lazy`** binds a *plan* rather than a table: nothing touches disk until a
+  `collect` or `>>`, so building a large pipeline is instant and you pay for it
+  once, at the end.
+- In the [VSCode extension](tools/vscode/), **Ctrl+Enter** sends the current line
+  or selection to this same session.
+
+The SQL equivalent is: edit the query, re-run the whole thing, eyeball the
+result, comment a block out to isolate a step, uncomment it, repeat.
 
 ## Language
 
@@ -226,12 +265,15 @@ re-keys it). Values absent from an enum become null.
 
 ### Reading & writing files
 
-`load` (or the `<<` operator) reads a parquet or CSV file:
+`load` (or the `<<` operator) reads a parquet or CSV file. On its own it is
+**eager** — `t: load ...` materialises a table straight away. Prefix it with
+[`lazy`](#lazy--collect) to keep it as a deferred scan instead.
 
 ```q
 select avg price by sym from load `data/trades.parquet
-t: load `data/trades.parquet     / materialise a table
+t: load `data/trades.parquet     / eager — reads the file now, binds a table
 t: << `data/trades.parquet       / same, operator form
+t: lazy load `data/trades.parquet   / deferred — binds a plan, no IO yet
 select from << `data/quotes.csv
 ```
 
