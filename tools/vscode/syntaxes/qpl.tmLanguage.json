@@ -1,0 +1,117 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "qpl",
+  "scopeName": "source.qpl",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#repl" },
+    { "include": "#string" },
+    { "include": "#symbol" },
+    { "include": "#number" },
+    { "include": "#assignment" },
+    { "include": "#keyword" },
+    { "include": "#cast" },
+    { "include": "#aggregate" },
+    { "include": "#join" },
+    { "include": "#index" },
+    { "include": "#operator" },
+    { "include": "#identifier" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.slash.qpl",
+      "match": "/.*$"
+    },
+    "repl": {
+      "match": "^\\s*(\\\\[d1]|log)\\b",
+      "captures": {
+        "1": { "name": "keyword.other.repl.qpl" }
+      }
+    },
+    "string": {
+      "name": "string.quoted.double.qpl",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.qpl",
+          "match": "\\\\[ntr\"\\\\]"
+        }
+      ]
+    },
+    "symbol": {
+      "name": "entity.name.type.symbol.qpl",
+      "match": "(`[A-Za-z0-9_.\\/-]*)+"
+    },
+    "number": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.qpl",
+          "match": "\\b\\d+\\.\\d*"
+        },
+        {
+          "name": "constant.numeric.bool.qpl",
+          "match": "\\b[01]+b\\b"
+        },
+        {
+          "name": "constant.numeric.integer.qpl",
+          "match": "\\b\\d+\\b"
+        }
+      ]
+    },
+    "assignment": {
+      "match": "^\\s*([A-Za-z_]\\w*)\\s*(:)(?!=)",
+      "captures": {
+        "1": { "name": "variable.other.qpl" },
+        "2": { "name": "keyword.operator.assignment.qpl" }
+      }
+    },
+    "keyword": {
+      "patterns": [
+        {
+          "name": "keyword.control.qpl",
+          "match": "\\b(select|by|from|where|order|asc|desc|distinct|limit|drop|update|delete)\\b"
+        },
+        {
+          "name": "keyword.other.qpl",
+          "match": "\\b(load|sink|cols|show|lazy|collect)\\b"
+        }
+      ]
+    },
+    "cast": {
+      "match": "\\b(f64|float|f32|i64|int|i32|i16|i8|u64|u32|u16|u8|bool|str|string)(\\$)",
+      "captures": {
+        "1": { "name": "support.type.cast.qpl" },
+        "2": { "name": "keyword.operator.cast.qpl" }
+      }
+    },
+    "aggregate": {
+      "name": "support.function.aggregate.qpl",
+      "match": "\\b(sum|avg|mean|min|max|count|first|last|std|dev|var|med|median|abs|neg|not|string|n_unique)\\b"
+    },
+    "join": {
+      "name": "keyword.operator.join.qpl",
+      "match": "\\b(lj|ij|rj)\\b"
+    },
+    "index": {
+      "name": "variable.language.index.qpl",
+      "match": "\\bi\\b"
+    },
+    "identifier": {
+      "name": "variable.other.qpl",
+      "match": "\\b[A-Za-z_]\\w*\\b"
+    },
+    "operator": {
+      "patterns": [
+        {
+          "name": "keyword.other.qpl",
+          "match": "<<|>>"
+        },
+        {
+          "name": "keyword.operator.qpl",
+          "match": "<>|!=|<=|>=|[-+*%=<>&|$!#]"
+        }
+      ]
+    }
+  }
+}

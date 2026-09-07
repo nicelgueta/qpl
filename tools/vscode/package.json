@@ -1,0 +1,40 @@
+{
+  "name": "qpl",
+  "displayName": "qpl — Quick Polars Query Language",
+  "description": "Syntax highlighting (and, later, autocomplete) for the qpl query language.",
+  "version": "0.1.0",
+  "publisher": "nicelgueta",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nicelgueta/qpl"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "qpl",
+        "aliases": [
+          "qpl",
+          "QPL"
+        ],
+        "extensions": [
+          ".qpl"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "qpl",
+        "scopeName": "source.qpl",
+        "path": "./syntaxes/qpl.tmLanguage.json"
+      }
+    ]
+  }
+}
