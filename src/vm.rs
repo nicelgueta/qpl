@@ -376,6 +376,16 @@ impl Vm {
                         proj = expressions;
                     } else {
                         let predicate = predicates.into_iter().reduce(|left, right| left.and(right));
+                        // `update col: … where p` keeps the old value where `p` is
+                        // false — but a brand-new column has no old value, so it
+                        // gets null there instead of `col(name)` (which would fail
+                        // to resolve).
+                        let schema = match (&predicate, frame.as_mut()) {
+                            (Some(_), Some(lf)) => Some(
+                                lf.collect_schema().map_err(|e| QplError::Runtime(e.to_string()))?,
+                            ),
+                            _ => None,
+                        };
                         proj = expressions.into_iter().zip(exclude.iter()).map(|(expr, name)| {
                             let expr = if keys.is_empty() {
                                 expr
@@ -383,7 +393,14 @@ impl Vm {
                                 expr.over(keys.clone()).map_err(|e| QplError::Runtime(e.to_string()))?
                             };
                             Ok(match &predicate {
-                                Some(predicate) => when(predicate.clone()).then(expr).otherwise(col(name.as_str())).alias(name),
+                                Some(predicate) => {
+                                    let old = if schema.as_ref().is_none_or(|s| s.contains(name.as_str())) {
+                                        col(name.as_str())
+                                    } else {
+                                        lit(NULL)
+                                    };
+                                    when(predicate.clone()).then(expr).otherwise(old).alias(name)
+                                }
                                 None => expr,
                             })
                         }).collect::<Result<Vec<_>, QplError>>()?;
@@ -908,6 +925,14 @@ mod tests {
     fn update_where_preserves_nonmatching_rows() {
         let df = run(make_vm(), "update c2: c2 * 2 from t where c1 = `a");
         assert_eq!(i64s(&df, "c2"), vec![20, 20, 60, 15]);
+    }
+
+    #[test]
+    fn update_new_column_with_where_is_null_on_nonmatching_rows() {
+        // c1 = [a, b, a, c]; the b/c rows get null, not an error
+        let df = run(make_vm(), "update flag: c2 * 10 from t where c1 = `a");
+        let flag: Vec<Option<i64>> = df.column("flag").unwrap().i64().unwrap().iter().collect();
+        assert_eq!(flag, vec![Some(100), None, Some(300), None]);
     }
 
     #[test]

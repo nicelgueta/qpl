@@ -4,11 +4,11 @@ An agent-friendly qsql/kdb+-inspired query language that compiles to Polars lazy
 Write concise q-style select statements; Polars executes them efficiently. Great for use without having python or polars installed.
 
 ## Why?
-I often need to quickly query large data in parquet format on cloud storage under high time-pressure as well as write quick transformation jobs. DuckDB is brilliant for that kind of thing but I always forget the syntax and can't really knock something up more quickly than typing a prompt into Claude, which sometimes takes longer than I want to get the result I need or goes off on a tangent and provdies fluff I wasn't looking for.
+I often need to quickly query large data in parquet format on cloud storage under high time-pressure as well as write quick transformation jobs. DuckDB is brilliant for that kind of thing but I always forget the syntax and can't really knock something up more quickly than typing a prompt into Claude, which sometimes takes longer than I want to get the result I need or goes off on a tangent and provides fluff I wasn't looking for.
 
 So I wanted to see if I could create a language/interface that is faster to write than writing a prompt into Claude, but just as efficient as something like DuckDB.
 
-Of course the added benefit is that, inevitably using AI agents a lot to query data and debug issues, we can have a language that can actualyl be easily used by LLM agents too (that can't do that much damage whether in a sandbox, webUI or running free on your machine) but is efficient as polars or DuckDB - especially as it's zero dependency without even needing a python runtime.
+Of course the added benefit is that, inevitably using AI agents a lot to query data and debug issues, we can have a language that can actually be easily used by LLM agents too (that can't do that much damage whether in a sandbox, webUI or running free on your machine) but is efficient as polars or DuckDB - especially as it's zero dependency without even needing a python runtime.
 
 ### Polars
 I'm also actually kinda cheating here.
@@ -20,28 +20,59 @@ Given I have been lightly introduced to kdb+/q at work - and I don't know that m
 
 Thus: `qpl`.
 
+### Example
 
-### Example:
-DuckDB - loading table from parquet, transforming into another table and then saving to another parquet
+Read two parquet files, left-join them, derive a couple of columns, tag every
+row with a conditional, dictionary-encode a key, aggregate, sort, and write the
+result back out.
+
+DuckDB:
+
 ```sql
-SET VARIABLE thr = 2 * 45;
-CREATE TEMP TABLE t AS
-SELECT
-    sym,
-    side,
-    CAST(-AVG(size) AS BIGINT) AS r,
-    SUM(size * price) AS total_market_value
-FROM read_parquet('my_trades.parq')
-WHERE price < thr
-GROUP BY sym, side;
-
-COPY t TO 'output.parquet' (FORMAT PARQUET);
+CREATE TYPE sym_t AS ENUM (SELECT DISTINCT sym FROM read_parquet('trades.parquet'));
+COPY (
+    SELECT
+        CAST(t.sym AS sym_t)        AS csym,
+        t.side,
+        CASE WHEN t.size >= 1000 THEN 'large'
+             WHEN t.size >= 250  THEN 'mid'
+             ELSE 'small' END       AS band,
+        SUM(t.price * t.size)       AS tot,
+        AVG(q.ask - q.bid)          AS avg_spread,
+        COUNT(*)                    AS n
+    FROM read_parquet('trades.parquet') t
+    LEFT JOIN read_parquet('quotes.parquet') q USING (sym)
+    WHERE t.price > 0
+    GROUP BY csym, t.side, band
+    ORDER BY tot DESC
+) TO 'summary.parquet' (FORMAT PARQUET);
 ```
-qpl equivalent:
+
+qpl — the whole thing is one statement:
+
 ```q
-thr: 3 * 45
-t: select r: i64$neg mean size, total_market_value: sum size * price by sym, side from << `my_trades.parq where price > thr
-`t >> `output.parquet
+select tot: sum price * size, avg_spread: avg ask - bid, n: count price
+    by csym: `$sym, side, band: ?[size >= 1000; `large; size >= 250; `mid; `small]
+    from << `trades.parquet `sym lj << `quotes.parquet `sym where price > 0
+    order tot desc
+    >> `summary.parquet
+```
+
+Because each step is its own statement, you can also build the pipeline up line
+by line in the REPL and inspect it as you go — no rewriting the query or
+commenting out blocks the way you would while iterating in SQL:
+
+```q
+j: select sym, side, price, size, bid, ask from << `trades.parquet `sym lj << `quotes.parquet `sym where price > 0
+`j  / check the table so far
+j: update spread: ask - bid, notional: price * size from j
+/ check this works before actually updating the table by not assigning it to anything
+update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from j
+/ now assign to persist
+j: update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from j
+cols `j                                    / check the schema so far
+select tot: sum notional, avg_spread: avg spread, n: count price by csym: `$sym, side, band from j order tot desc
+`j >> `summary.parquet
 ```
 
 ## Install
@@ -52,141 +83,200 @@ cargo install --path .
 
 Or grab a pre-built binary from [Releases](../../releases).
 
-## Usage
+## Quickstart
 
-```
-# Interactive REPL (loads demo tables: trades, quotes)
-qpl
-
-# Run a script
-qpl script.qpl
-
-# Run a script then drop into the REPL
-qpl -i script.qpl
+```bash
+qpl                 # REPL, with demo tables `trades` and `quotes` preloaded
+qpl script.qpl      # run a script
+qpl -i script.qpl   # run a script, then drop into the REPL
 ```
 
-Runnable scripts live in [`examples/`](examples/) — `qpl examples/lazy_join_pipeline.qpl`.
+```q
+qpl) select sym, price from trades where price > 200
+qpl) select avg price by sym from trades
+qpl) t: select from trades where size > 100     / bind a table
+qpl) `t >> `big.parquet                          / write it out
+```
+
+Runnable scripts are in [`examples/`](examples/) — e.g.
+`qpl examples/lazy_join_pipeline.qpl`.
+
+Editor support (syntax highlighting + a Ctrl+Enter REPL) is in
+[`tools/vscode/`](tools/vscode/).
 
 ## Language
 
-### Select
+### Assignment
+
+`:` binds a name. The right-hand side decides what kind of binding it is:
+
+```q
+threshold: 150                                 / scalar
+t: select from trades where size > threshold   / table
+lvl: `low`mid`high                             / symbol vector
+```
+
+Scalar variables are evaluated in Rust and substituted into later queries as
+Polars literals, so they compose transparently with column expressions.
+
+### select / update / delete
 
 ```
-select <cols> from <table> [by <keys>] [where <preds>] [order <column> <asc|desc>, ...]
+select <cols> from <table> [by <keys>] [where <preds>] [order <col> <asc|desc>, ...]
 ```
 
-(the interactive REPL comes with some demo tables `quotes` and `trades` for you to play around with)
 ```q
 select from trades
 select sym, price from trades
-select px: price, qty: size from trades
-select avg price by sym from trades
-select from trades where size > 100
+select px: price, qty: size from trades          / aliasing
+select avg price by sym from trades              / group-by aggregation
 select total: sum size by sym from trades where side = "buy"
+select from trades where size > 100
+select from trades where 10100000b               / boolean-vector mask
 select from trades order sym asc, price desc
-select price_bin: ?[price>400;`high;price>200;`mid;`low] from trades
 ```
 
-### Update
+`update` returns the whole table with the named columns replaced or added:
 
 ```q
 update price: price * 2 from trades
 update price: price * 2 by sym from trades where size > 100
+update notional: price * size from trades where price > 0   / new column; null where the filter misses
 ```
 
-Updates return the complete table, retaining columns that are not updated.
+With a `where`, rows that don't match keep the column's old value — or `null` if
+it's a brand-new column.
 
-### Delete
+`delete` removes rows (with `where`) or columns (with a symbol list):
 
 ```q
 delete from trades where size < 100
 delete `price`size from trades
 ```
 
-### Column dropping
+### Expressions
+
+| Kind | |
+|---|---|
+| arithmetic | `+` `-` `*` `%` (`%` is division, q convention) |
+| comparison | `=` `<>` `!=` `<` `<=` `>` `>=` |
+| logical | `&` `\|` |
+| conditional | `?[cond; then; cond2; then2; ...; else]` — vectorised, nests for else-if |
+| cast | `type$expr` — see [Casts](#casts) |
 
 ```q
-`price`size drop select from trades
-`price`size _ `trades
+select price_bin: ?[price>400;`high;price>200;`mid;`low] from trades
+```
+
+**Aggregates:** `sum`, `avg`/`mean`, `min`, `max`, `count`, `first`, `last`,
+`std`/`dev`, `var`, `med`/`median`, `abs`, `neg`, `not`, `string`,
+`distinct`/`n_unique`.
+
+**Virtual column `i`** is the row index (aliased to `x` in output, per q):
+
+```q
+select i, sym from trades
+select from trades where i < 5
+```
+
+### Casts
+
+`type$expr` casts a column or scalar:
+
+```q
+select f: f64$size from trades
+select f64$size, str$sym from trades
+```
+
+Types: `f64`/`float`, `f32`, `i64`/`int`, `i32`, `i16`, `i8`, `u64`, `u32`,
+`u16`, `u8`, `bool`, `str`/`string`.
+
+### Symbols, categoricals & enums
+
+Outside a table expression, `` `foo `` is a **symbol** — a distinct value kind
+that names a column, table or path. `` `$expr `` interns a string into a symbol:
+
+```q
+o: "out/summary.parquet"
+`t >> `$o                      / use a string variable as a path
+```
+
+Inside a table expression, `` `$col `` casts a column to a Polars **Categorical**
+(an interned string pool — fast joins, group-bys and filters), `u32` codes by
+default. `u8!` / `u16!` / `u32!` before `` `$ `` picks the physical width:
+
+```q
+select country: `$country from t
+select country: u8!`$country from t   / u8 codes (<=255 distinct values)
+```
+
+An **enum** is an *ordered* symbol vector — the order fixes sort order and each
+value's code. Define it, then cast with `` name::`$col ``:
+
+```q
+lvl: `low`mid`high
+select level: lvl::`$band from t
+```
+
+The cast input may be a string column or an existing categorical/enum (Polars
+re-keys it). Values absent from an enum become null.
+
+### Reading & writing files
+
+`load` (or the `<<` operator) reads a parquet or CSV file:
+
+```q
+select avg price by sym from load `data/trades.parquet
+t: load `data/trades.parquet     / materialise a table
+t: << `data/trades.parquet       / same, operator form
+select from << `data/quotes.csv
+```
+
+`sink` (or `>>`) streams a **table expression** to a file — `` `tbl ``, a
+`select ...`, an `update ...`; never a bare identifier:
+
+```q
+`t >> `summary.parquet
+`t sink `summary.parquet
+select sym, price from trades where size > 100 >> `big_trades.parquet
+```
+
+`cols` shows a table's schema (works on lazy bindings too):
+
+```q
+cols `trades
 ```
 
 ### Table operators
 
 ```q
-/ distinct
 distinct select sym from trades
 
-/ limit
-10 limit select from trades
-10#select from trades
+10 limit select from trades      / first N rows
+10#select from trades            / `#` is the same
 10#`trades
 
-/ also use str vars a symbols (maybe change this but easy to write for now)
-select total: sum size by sym from trades where side = `buy
+`price`size drop select from trades   / drop columns
+`price`size _ `trades                 / `_` is the same
 
-/ using bool vecs
-select from trades where 10100000b
+`sym`price!01b `trades           / sort by a `col!bool` map (0 asc, 1 desc)
+sorted: `sym`price!01b select from trades where size > 100
 ```
 
-### Assignments
-
-```q
-/ table variable
-t: select from trades where size > 100
-
-/ scalar variable (usable in subsequent queries)
-threshold: 150
-select from trades where size > threshold
-```
-
-### load — load files lazily
-
-```q
-/ parquet
-select avg price by sym from load `data/trades.parquet
-t: load `data/trades.parquet
-/ also use special operator <<
-t: << `data/trades.parquet
-
-/ csv
-select from << `data/quotes.csv
-```
-
-### sink — write to file
-
-The left of `sink` / `>>` is a **table expression** — `` `tbl ``, a `select …`, an
-`update …`, etc. — never a bare identifier (write `` `t >> … ``, not `t >> …`).
-
-```q
-t: select total_size: sum size, apx: mean price by sym, side from trades
-
-/ sink a table by reference
-`t >> `summary.parquet
-`t sink `summary.parquet
-
-/ ...or sink a query directly, without binding it first
-select sym, price from trades where size > 100 >> `big_trades.parquet
-
-/ the path can come from a string variable — `\`$expr` interns a string to a symbol
-o: "output/summary.parquet"
-`t >> `$o
-```
-
-### lazy / collect — defer materialisation
+### lazy / collect
 
 `lazy` as the first token of a table expression stores the **query plan** under a
-name instead of a materialised table. Nothing runs until you `collect` it
-(materialise to a DataFrame) or `sink` it to a file.
+name instead of running it. Nothing touches disk until you `collect` (materialise
+to a DataFrame) or `sink` (stream to a file) — so a whole pipeline can process
+**larger-than-RAM** data in a single pass.
 
 ```q
-/ build a plan, don't run it — no IO happens here
 t: lazy load `trades.parquet
-/ `lazy` works on any table expression, not just load
 q: lazy select sym, bid, ask from load `quotes.parquet
 ```
 
-Extend a plan by **re-assigning the binding**. Each step is still just plan
-nodes; the file is never touched:
+Extend a plan by **re-assigning the binding** — each step just adds plan nodes,
+the file is never touched:
 
 ```q
 t: select sym, side, price, size from t where size > 100
@@ -194,8 +284,8 @@ t: update notional: price * size from t
 t: update band: ?[notional > 50000; `big; `small] from t
 ```
 
-Reading a lazy binding without collecting is contagious — the result is another
-lazy plan, and the REPL prints it rather than a table:
+Reading a lazy binding is contagious — you get another plan, and the REPL prints
+it instead of a table:
 
 ```q
 select from t
@@ -204,144 +294,38 @@ select from t
 /   SELECTION: col("size") > 100
 ```
 
-Joins, `by` aggregation, `order`, `distinct` and `limit` all compose lazily too:
+Joins, `by` aggregation, `order`, `distinct` and `limit` all compose lazily:
 
 ```q
 j: select sym, side, price, size, bid, ask from t `sym lj q `sym
 j: select traded: sum notional, n: count price by sym, side from j
 ```
 
-`collect` runs the plan once and binds the result as a normal table:
+`collect` runs the plan once and binds a normal table; or skip the table and
+`sink` the plan straight to disk:
 
 ```q
 tm: collect j
-select from tm where side = `buy
-```
-
-...or skip the table entirely and stream the plan straight to a file:
-
-```q
 `j >> `summary.parquet
 ```
 
-This whole implpementation uses one of Polars's most powerful features: being able to process **larger than RAM data** in a single pipeline/sequence of statements.
-
-`cols` always resolves to a table, even on a lazy binding. Assignment uses `:`
-(`tm: collect t`), same as everywhere else in qpl.
-
-See [`examples/`](examples/) for runnable scripts, including
-[`lazy_join_pipeline.qpl`](examples/lazy_join_pipeline.qpl) — a two-input,
-join + aggregate pipeline that is sunk to parquet without ever being collected.
-
-### cols — inspect schema
-
-```q
-cols `trades
-cols `t
-```
-
-### sorting — pass a map of column names to bools (false = ascending, true = descending) to sort by
-
-```q
-`sym`price!01b `trades
-sorted: `sym`price!01b select from trades where size > 100
-```
-
-### Type casts
-
-Uses the `$` operator: `type$expr`
-
-```
-select f: f64$size from trades
-select f64$size, str$sym from trades
-```
-
-Supported types: `f64`/`float`, `f32`, `i64`/`int`, `i32`, `i16`, `i8`,
-`u64`, `u32`, `u16`, `u8`, `bool`, `str`/`string`.
-
-### Symbols
-
-Outside a table expression `` `foo `` is a **symbol** — a distinct value kind that
-names a column, table or path. `` `$expr `` interns a string into a symbol:
-
-```
-o: "out/summary.parquet"
-`t >> `$o                / sink to the path held in the string variable `o`
-```
-
-(a plain string path still works too: `` `t >> "out/summary.parquet" ``).
-
-### Categoricals
-
-Inside a table expression `` `$col `` casts a column to a Polars **Categorical**
-(an interned string pool — fast joins, group-bys and filters), default `u32`
-physical codes. `u8!` / `u16!` / `u32!` before `` `$ `` picks the physical width:
-
-```
-select country: `$country from t          / u32-backed categorical
-select country: u8!`$country from t        / u8-backed (≤255 distinct values)
-```
-
-The input may be a string column or an existing categorical/enum — Polars re-keys
-it automatically.
-
-### Enums
-
-An **enum** is an ordered set of symbols (order matters — it defines sort order and
-the physical code of each value). Define it as a symbol vector, then cast with
-`name::`$col`:
-
-```
-lvl: `low`mid`high                         / the enum definition, a symbol vector
-select level: lvl::`$band from t           / cast the `band` column to that enum
-```
-
-Values not in the enum become null.
-
-### Operators
-
-| Operator | Meaning |
-|----------|---------|
-| `+` `-` `*` | arithmetic |
-| `%` | division (q convention) |
-| `=` `<>` `!=` | equality |
-| `<` `<=` `>` `>=` | comparison |
-| `&` `\|` | logical and / or |
-| `?[c;t;e]` | vectorised conditional (q-style; nests for else-if) |
-| `$` | cast (`f64$x`); `` `$x `` → categorical |
-| `!` | dict / sort key map; `u8!`$x` → categorical physical width |
-| `::` | enum cast (`lvl::`$x`) |
-
-### Aggregates
-
-`sum`, `avg`/`mean`, `min`, `max`, `count`, `first`, `last`,
-`std`/`dev`, `var`, `med`/`median`, `abs`, `neg`, `not`,
-`string`, `distinct`/`n_unique`
-
-### Virtual column `i`
-
-`i` is the row index. It is aliased to `x` in the result (q convention).
-
-```q
-select i, sym from trades
-select from trades where i < 5
-```
+[`examples/lazy_join_pipeline.qpl`](examples/lazy_join_pipeline.qpl) is a
+two-input join + aggregate pipeline sunk to parquet without ever being collected.
 
 ### Comments
 
-Lines beginning with `/` are comments (in scripts and in subexpressions).
+`/` starts a comment that runs to end of line:
 
 ```q
-/ this is a comment
+/ full-line comment
 select from trades  / inline comment
 ```
 
 ### Multi-line statements
 
-In a script file a statement may span several lines. Any line indented by a tab
-or four (or more) spaces continues the statement above it; a statement ends at
-the next line that starts in column 0 (or a blank line). No trailing token or
-line-continuation character is needed.
+In a script, a statement may span several lines: any line indented by a tab or
+4+ spaces continues the one above it; a line starting in column 0 (or a blank
+line) ends it. No continuation character needed.
 
 ```q
 t: select
@@ -350,60 +334,63 @@ t: select
     by sym
     from trades
     where size > 50
-
-select from t order sym asc
 ```
 
-### Logging to stdout
+In the REPL the prompt keeps reading while brackets are open, after a trailing
+`,`, or when input was cut off mid-statement; a blank line submits.
 
-`log <expr>` — or just `1 <expr>`, kdb-style — evaluates a scalar expression and
-prints it (raw, with no type prefix). Bare `log` / `1` prints a blank line.
+### Logging
+
+`log <expr>` (or `1 <expr>`, kdb-style) evaluates a scalar and prints it raw;
+bare `log` / `1` prints a blank line. Space-separated expressions are rendered
+and concatenated:
 
 ```q
 log "starting run"
-1 "rows above threshold:"
-thr: 150
-log thr * 2
+log "test" str$2*3 " that"       / test6 that
+log "rows > " thr ": " n         / rows > 150: 42
 ```
 
-Several space-separated expressions are rendered and **concatenated**, so you can
-build a message inline:
+Top-level juxtaposition separates items rather than forming a call — wrap a call
+in parens: `log (f x) " done"`.
 
-```q
-log "test" "me"                 / testme
-log "test" str$2*3 " that"      / test6 that
-log "rows > " thr ": " n        / rows > 150: 42
-```
-
-Top-level juxtaposition separates items rather than forming a function call;
-wrap a call in parens if you need one (`log (f x) " done"`).
-
-`\1 <path>` redirects stdout to a log file: every line that would be printed —
-`log` output *and* query results — is appended to `<path>` **and** still shown
-on the terminal. Bare `\1` detaches the log. Works in the REPL and in scripts.
+`\1 <path>` tees all stdout (log lines *and* query output) to a file as well as
+the terminal; bare `\1` detaches it. Works in scripts and the REPL.
 
 ```q
 \1 run.log
-log "this is teed to run.log"
 select from trades where size > 100
 \1
 ```
 
-## REPL commands
+### Operator reference
+
+| Operator | Meaning |
+|---|---|
+| `+` `-` `*` | arithmetic |
+| `%` | division (q convention) |
+| `=` `<>` `!=` | equality |
+| `<` `<=` `>` `>=` | comparison |
+| `&` `\|` | logical and / or |
+| `?[...]` | vectorised conditional |
+| `$` | cast (`f64$x`); `` `$x `` -> categorical |
+| `!` | `col!bool` sort map; `` u8!`$x `` -> categorical physical width |
+| `::` | enum cast (`` lvl::`$x ``) |
+| `<<` `>>` | load / sink |
+| `#` | limit (`10#t`) |
+| `_` | drop columns (`` `a`b _ `t ``) |
+
+## REPL
 
 | Command | Action |
-|---------|--------|
+|---|---|
 | `\d <stmt>` | disassemble — show bytecode without executing |
 | `\l <path>` | run a `.qpl` script in the current session |
-| `\1 <path>` | mirror all stdout to `<path>` (bare `\1` detaches) |
-| `log <expr>` / `1 <expr>` | print a scalar to stdout (and the log) |
-| `cols <name>` | show column names and types for a table |
+| `\1 <path>` | tee all stdout to `<path>` (bare `\1` detaches) |
+| `log <expr>` / `1 <expr>` | print a scalar |
+| `cols <name>` | show a table's schema |
 | Ctrl-C | abandon a partial statement (or exit at an empty prompt) |
 | Ctrl-D | exit |
-
-Statements can span several lines: the prompt keeps reading while brackets are
-open, after a trailing `,`, or when input was cut off before the statement was
-complete. A blank line submits whatever has been entered.
 
 ```
 qpl) \d select avg price by sym from trades where size > 100
@@ -426,28 +413,24 @@ qpl) \d select avg price by sym from trades where size > 100
 ## Architecture
 
 ```
-source → Lexer → Tokens → Parser → AST → Compiler → Instructions → VM (Polars LazyFrame) → DataFrame
+source -> lexer -> tokens -> parser -> AST -> compiler -> instructions -> VM (Polars LazyFrame) -> DataFrame
 ```
 
 | Module | Role |
-|--------|------|
+|---|---|
 | `lexer` | tokenise source text |
-| `parser` | build typed AST |
-| `compiler` | emit stack-based instructions |
-| `vm` | execute instructions, build and collect a `LazyFrame` |
+| `parser` | build the typed AST |
+| `compiler` | emit stack-machine instructions |
+| `vm` | execute instructions, build & collect a `LazyFrame` |
 | `repl` | interactive loop + script runner |
-
-Scalar variables (`x: 1+2`) are evaluated in Rust; their values are
-substituted as Polars `lit(...)` literals at query time so they compose
-transparently with column expressions.
 
 ## Releases
 
-Binaries are built automatically on every version bump via GitHub Actions
-for Linux (gnu + musl), Linux ARM64, macOS (x86 + ARM).
+Binaries build automatically on every version bump (GitHub Actions) for Linux
+(gnu + musl), Linux ARM64, and macOS (x86 + ARM).
 
+## Roadmap
 
-## TODO
->aside from obviously expanding the language further...
-- WASM (so this can be used directly in a web browser)
-- binary size is non-trivial (100MB). Likely because it has the whole polars lib + other deps bundled in. should find a way to reduce this.
+- WASM build, so qpl can run in the browser.
+- Shrink the binary — it bundles all of Polars (~100 MB).
+- More of the language.
