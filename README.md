@@ -211,7 +211,8 @@ select country: u8!`$country from t   / u8 codes (<=255 distinct values)
 ```
 
 An **enum** is an *ordered* symbol vector — the order fixes sort order and each
-value's code. Define it, then cast with `` name::`$col ``:
+value's code. More performant than categorical and more efficient sorting using the physical representation.
+Define it, then cast with `` name::`$col ``:
 
 ```q
 lvl: `low`mid`high
@@ -220,6 +221,8 @@ select level: lvl::`$band from t
 
 The cast input may be a string column or an existing categorical/enum (Polars
 re-keys it). Values absent from an enum become null.
+
+>See https://docs.pola.rs/user-guide/expressions/categorical-data-and-enums for more on this subject.
 
 ### Reading & writing files
 
