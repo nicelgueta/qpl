@@ -255,7 +255,10 @@ Define it, then cast with `` name::`$col ``:
 
 ```q
 lvl: `low`mid`high
-select level: lvl::`$band from t
+t: update level: lvl::`$?[price>400;`high;price>100;`mid;`low] from trades
+
+/ as it's a polars enum under the hood, you can sort/compare them too
+select from t where level >= `mid
 ```
 
 The cast input may be a string column or an existing categorical/enum (Polars
