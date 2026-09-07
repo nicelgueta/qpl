@@ -1,0 +1,39 @@
+/ ─────────────────────────────────────────────────────────────────────────────
+/ Symbols, categoricals and enums.
+/
+/   `foo              a symbol — names a column, table or path
+/   `$strvar          intern a string into a symbol
+/   `$col             cast a column to a Polars Categorical (u32 physical)
+/   u8!`$col          ... with an explicit physical width (u8 / u16 / u32)
+/   name::`$col       cast a column to a Polars Enum defined by the symbol
+/                     vector `name` (order matters; unknown values -> null)
+/
+/ Run from the repo root:
+/   cargo run -- examples/symbols_and_enums.qpl
+/ ─────────────────────────────────────────────────────────────────────────────
+
+trades: load `examples/data/trades.parquet
+
+/ an enum definition: an ordered symbol vector stored in a global
+band_levels: `low`mid`high
+
+/ tag each row, then turn the tags into an enum and the sym into a categorical
+tagged: select
+    sym,
+    price,
+    band: ?[price > 300; `high; price > 150; `mid; `low]
+    from trades
+
+out: select
+    csym:  u8!`$sym,                 / u8-backed categorical
+    blevel: band_levels::`$band,     / enum, ordered low < mid < high
+    price
+    from tagged
+
+cols `out
+select from out
+
+/ sink to a path held in a string variable — `$ interns it to a symbol
+dest: "examples/data/symbols_and_enums.parquet"
+out >> `$dest
+log "wrote " dest

@@ -176,6 +176,8 @@ fn system_command(line: &str, vm: &mut Vm) -> Option<Result<(), QplError>> {
 fn fmt_log_val(v: &ast::Value) -> String {
     match v {
         ast::Value::Str(s)   => s.clone(),
+        ast::Value::Sym(s)   => s.clone(),
+        ast::Value::SymVec(v)=> v.iter().map(|s| format!("`{s}")).collect(),
         ast::Value::Int(n)   => n.to_string(),
         ast::Value::Float(f) => f.to_string(),
         ast::Value::Bool(b)  => b.to_string(),
@@ -188,6 +190,8 @@ fn fmt_val(v: &ast::Value) -> String {
         ast::Value::Int(n)   => format!("i64: {n}"),
         ast::Value::Float(f) => format!("f64: {f}"),
         ast::Value::Str(s)   => format!("str: \"{s}\""),
+        ast::Value::Sym(s)   => format!("sym: `{s}"),
+        ast::Value::SymVec(v)=> format!("sym[{}]: {}", v.len(), v.iter().map(|s| format!("`{s}")).collect::<String>()),
         ast::Value::Bool(b)  => format!("bool: {b}"),
         other                => format!("{other:?}"),
     }

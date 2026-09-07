@@ -149,11 +149,13 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 continue;
             }
             ':' => {
-                tokens.push(Token {
-                    kind: TokenKind::Colon,
-                    pos: start,
-                });
-                i += 1;
+                if chars.get(i + 1) == Some(&':') {
+                    tokens.push(Token { kind: TokenKind::ColonColon, pos: start });
+                    i += 2;
+                } else {
+                    tokens.push(Token { kind: TokenKind::Colon, pos: start });
+                    i += 1;
+                }
             }
             ',' => {
                 tokens.push(Token {
@@ -171,6 +173,11 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     kind: TokenKind::Hash,
                     pos: start,
                 });
+                i += 1;
+            }
+            '?' => {
+                // vectorised conditional: `?[cond;then;else]`
+                tokens.push(Token { kind: TokenKind::Op("?".to_string()), pos: start });
                 i += 1;
             }
             '(' => {
@@ -460,8 +467,8 @@ mod tests {
 
     #[test]
     fn case_punctuation() {
-        assert_eq!(kinds("$[a>1;`large;a>0;`small;`none]"), vec![
-            TokenKind::Op("$".into()),
+        assert_eq!(kinds("?[a>1;`large;a>0;`small;`none]"), vec![
+            TokenKind::Op("?".into()),
             TokenKind::LBracket,
             TokenKind::Name("a".into()),
             TokenKind::Op(">".into()),
@@ -533,6 +540,21 @@ mod tests {
     #[test]
     fn punct_colon() {
         assert_eq!(kinds(":"), vec![TokenKind::Colon]);
+    }
+
+    #[test]
+    fn punct_colon_colon() {
+        assert_eq!(kinds("::"), vec![TokenKind::ColonColon]);
+        assert_eq!(kinds("a: b"), vec![
+            TokenKind::Name("a".into()), TokenKind::Colon, TokenKind::Name("b".into()),
+        ]);
+        assert_eq!(kinds("lvl::`$b"), vec![
+            TokenKind::Name("lvl".into()),
+            TokenKind::ColonColon,
+            TokenKind::Symbol("".into()),
+            TokenKind::Op("$".into()),
+            TokenKind::Name("b".into()),
+        ]);
     }
 
     #[test]

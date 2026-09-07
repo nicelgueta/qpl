@@ -1,7 +1,8 @@
 /target
 
-# output written by examples/lazy_join_pipeline.qpl
+# output written by the example scripts
 /examples/data/market_summary.parquet
+/examples/data/symbols_and_enums.parquet
 
 # stdout logs written by examples/logging.qpl (and \1 in general)
 *.log

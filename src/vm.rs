@@ -114,16 +114,64 @@ impl Vm {
     pub fn eval_scalar(&self, expr: &ast::Expr) -> Result<ast::Value, QplError> {
         match expr {
             ast::Expr::Lit(v) => Ok(v.clone()),
+            // outside a table expression `` `foo `` is a symbol (a distinct value kind)
+            ast::Expr::Sym(s) => Ok(ast::Value::Sym(s.clone())),
             ast::Expr::ColRef(name) => self.globals.get(name)
                 .cloned()
                 .ok_or_else(|| QplError::Runtime(format!("undefined variable '{name}'"))),
             ast::Expr::BinOp { left, op, right } => {
                 scalar_binop(self.eval_scalar(left)?, self.eval_scalar(right)?, op)
             }
-            ast::Expr::Cast { dtype, expr } => {
-                scalar_cast(self.eval_scalar(expr)?, dtype)
-            }
+            ast::Expr::Cast { target, expr } => match target {
+                ast::CastTarget::Prim(dtype) => scalar_cast(self.eval_scalar(expr)?, dtype),
+                // `` `$expr `` — intern a string into a symbol
+                ast::CastTarget::Sym => match self.eval_scalar(expr)? {
+                    ast::Value::Str(s) | ast::Value::Sym(s) => Ok(ast::Value::Sym(s)),
+                    v => Err(QplError::Runtime(format!("cannot make a symbol from {v:?}"))),
+                },
+                ast::CastTarget::SymPhysical(_) | ast::CastTarget::Enum(_) => Err(QplError::Runtime(
+                    "categorical / enum casts apply to columns, not scalars".into(),
+                )),
+            },
             other => Err(QplError::Runtime(format!("not supported in scalar context: {other:?}"))),
+        }
+    }
+
+    /// Resolves a column-context cast target to a concrete Polars `DataType`.
+    fn resolve_cast_target(&self, target: &ast::CastTarget) -> Result<DataType, QplError> {
+        match target {
+            ast::CastTarget::Prim(name) => polars_dtype(name),
+            // `` `$col `` — a Polars Categorical (interned string pool), default u32 physical
+            ast::CastTarget::Sym => Ok(DataType::from_categories(Categories::global())),
+            // `` u8!`$col `` — Categorical with an explicit physical width; one
+            // process-global pool per width, keyed by (name, namespace, physical)
+            ast::CastTarget::SymPhysical(width) => {
+                let phys = match width.as_str() {
+                    "u8"  => CategoricalPhysical::U8,
+                    "u16" => CategoricalPhysical::U16,
+                    "u32" => CategoricalPhysical::U32,
+                    other => return Err(QplError::Runtime(format!(
+                        "categorical physical width must be u8/u16/u32, got '{other}'"
+                    ))),
+                };
+                Ok(DataType::from_categories(Categories::new(
+                    "qpl".into(), "".into(), phys,
+                )))
+            }
+            // `` name::`$col `` — a Polars Enum whose categories come, in order,
+            // from the global symbol vector `name`
+            ast::CastTarget::Enum(name) => {
+                let cats = match self.globals.get(name) {
+                    Some(Value::SymVec(v)) => v,
+                    Some(other) => return Err(QplError::Runtime(format!(
+                        "'{name}' is not an enum (expected a symbol vector, got {other:?})"
+                    ))),
+                    None => return Err(QplError::Runtime(format!("undefined enum '{name}'"))),
+                };
+                let fcats = FrozenCategories::new(cats.iter().map(String::as_str))
+                    .map_err(|e| QplError::Runtime(format!("invalid enum '{name}': {e}")))?;
+                Ok(DataType::from_frozen_categories(fcats))
+            }
         }
     }
 
@@ -170,8 +218,8 @@ impl Vm {
                 Instruction::Sink => {
                     let path = pop1(&mut stack)?.unwrap_scalar()?;
                     let path_str = match path {
-                        Value::Str(s) => s,
-                        _ => return Err(QplError::Runtime(format!("expected string path for sink, got {path:?}"))),
+                        Value::Sym(s) | Value::Str(s) => s,
+                        _ => return Err(QplError::Runtime(format!("expected a symbol or string path for sink, got {path:?}"))),
                     };
                     let lf = require_frame(&mut frame)?;
                     sink_file(lf, &path_str)?
@@ -181,10 +229,6 @@ impl Vm {
                 }
                 Instruction::Collect => {
                     lazy_mode = false;
-                }
-
-                Instruction::PushScalar(name) => {
-                    stack.push(StackObj::Scalar(name))
                 }
 
                 Instruction::PushPolarsArg(arg) => {
@@ -366,9 +410,9 @@ impl Vm {
                     );
                 }
 
-                Instruction::Cast(dtype) => {
+                Instruction::Cast(target) => {
                     let expr = pop1(&mut stack)?.unwrap_expr()?;
-                    stack.push(StackObj::Expr(expr.cast(polars_dtype(&dtype)?)));
+                    stack.push(StackObj::Expr(expr.cast(self.resolve_cast_target(&target)?)));
                 }
 
                 Instruction::Eval(expr) => {
@@ -468,6 +512,7 @@ fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
         ast::Value::Int(n)     => lit(n),
         ast::Value::Float(n)   => lit(n),
         ast::Value::Str(s)     => lit(s),
+        ast::Value::Sym(s)     => lit(s),
         ast::Value::Bool(b)    => lit(b),
         ast::Value::IntVec(v)  => Series::new("".into(), v.as_slice()).lit(),
         ast::Value::FloatVec(v)=> Series::new("".into(), v.as_slice()).lit(),
@@ -691,6 +736,27 @@ mod tests {
         assert_eq!(val, ast::Value::Int(42));
     }
 
+    #[test]
+    fn eval_bare_symbol_is_a_symbol_value() {
+        let vm = make_vm();
+        assert_eq!(
+            vm.eval_scalar(&ast::Expr::Sym("trades".into())).expect("eval"),
+            ast::Value::Sym("trades".into()),
+        );
+    }
+
+    #[test]
+    fn eval_cast_string_var_to_symbol() {
+        // `\`$o` resolves the string global `o` and interns it into a symbol
+        let mut vm = make_vm();
+        vm.globals.insert("o".into(), ast::Value::Str("out.parquet".into()));
+        let expr = ast::Expr::Cast {
+            target: ast::CastTarget::Sym,
+            expr: Box::new(ast::Expr::ColRef("o".into())),
+        };
+        assert_eq!(vm.eval_scalar(&expr).expect("eval"), ast::Value::Sym("out.parquet".into()));
+    }
+
     // scalar eval and assignment via instructions
     #[test]
     fn eval_assign_scalar() {
@@ -702,6 +768,69 @@ mod tests {
         vm.eval(prog).expect("eval");
         let val = vm.globals.get("x").expect("x exists");
         assert_eq!(val, &ast::Value::Int(42));
+    }
+
+    // --- categorical casts ---
+
+    #[test]
+    fn sym_cast_makes_a_categorical_column() {
+        let df = run(make_vm(), "select cat: `$c1 from t");
+        assert!(df.column("cat").unwrap().dtype().is_categorical());
+    }
+
+    #[test]
+    fn sym_physical_cast_sets_the_categorical_physical_width() {
+        let df = run(make_vm(), "select cat: u8!`$c1 from t");
+        let dt = df.column("cat").unwrap().dtype();
+        assert!(dt.is_categorical());
+        assert_eq!(dt.cat_physical().unwrap(), CategoricalPhysical::U8);
+    }
+
+    #[test]
+    fn unsupported_categorical_physical_width_is_an_error() {
+        let tokens = tokenise("select cat: u64!`$c1 from t").expect("lex");
+        let stmt   = parse(tokens).expect("parse");
+        let prog   = compile(&stmt).expect("compile");
+        assert!(make_vm().eval(prog).is_err());
+    }
+
+    #[test]
+    fn enum_cast_builds_an_enum_column_from_a_global() {
+        let mut vm = make_vm();
+        vm.globals.insert("e".into(), ast::Value::SymVec(vec!["a".into(), "b".into(), "c".into()]));
+        let df = run(vm, "select lvl: e::`$c1 from t");
+        assert!(df.column("lvl").unwrap().dtype().is_enum());
+    }
+
+    #[test]
+    fn enum_cast_maps_unknown_labels_to_null() {
+        let mut vm = make_vm();
+        vm.globals.insert("e".into(), ast::Value::SymVec(vec!["a".into(), "b".into()]));
+        let df = run(vm, "select lvl: e::`$c1 from t");
+        // c1 = [a, b, a, c] — the "c" row is not in the enum
+        assert_eq!(df.column("lvl").unwrap().null_count(), 1);
+    }
+
+    #[test]
+    fn enum_cast_with_undefined_global_is_an_error() {
+        let tokens = tokenise("select lvl: nope::`$c1 from t").expect("lex");
+        let stmt   = parse(tokens).expect("parse");
+        let prog   = compile(&stmt).expect("compile");
+        assert!(make_vm().eval(prog).is_err());
+    }
+
+    #[test]
+    fn symbol_vector_assignment_is_stored_as_a_global() {
+        let mut vm = make_vm();
+        let prog = {
+            let tokens = tokenise("e: `low`mid`high").expect("lex");
+            compile(&parse(tokens).expect("parse")).expect("compile")
+        };
+        vm.eval(prog).expect("eval");
+        assert_eq!(
+            vm.globals.get("e"),
+            Some(&ast::Value::SymVec(vec!["low".into(), "mid".into(), "high".into()])),
+        );
     }
 
     // --- basic projections ---
@@ -770,7 +899,7 @@ mod tests {
 
     #[test]
     fn update_can_add_new_case_column() {
-        let df = run(make_vm(), "update band: $[c2>20;`high;c2>10;`mid;`low] from t");
+        let df = run(make_vm(), "update band: ?[c2>20;`high;c2>10;`mid;`low] from t");
         assert_eq!(strs(&df, "band"), vec!["low", "mid", "high", "mid"]);
         assert_eq!(df.width(), 4);
     }
@@ -802,7 +931,7 @@ mod tests {
 
     #[test]
     fn case_expression_returns_first_matching_value() {
-        let df = run(make_vm(), "select bin: $[c2>20;`high;c2>10;`mid;`low] from t");
+        let df = run(make_vm(), "select bin: ?[c2>20;`high;c2>10;`mid;`low] from t");
         assert_eq!(strs(&df, "bin"), vec!["low", "mid", "high", "mid"]);
     }
 

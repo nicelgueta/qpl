@@ -25,7 +25,7 @@ can be added later without reworking phase 1.
 | Aggregates (lexed as `Name`) | `sum avg mean min max count first last std dev var med median abs neg not string distinct n_unique` |
 | Cast types (after `$`) | `f64 float f32 i64 int i32 i16 i8 u64 u32 u16 u8 bool str string` |
 | Join operators (infix `Name`) | `lj ij rj` |
-| Operators | `+ - * % = <> != < <= >= > & \| $ : ! #`; special `<<` (load), `>>` (sink) |
+| Operators | `+ - * % = <> != < <= >= > & \| $ ? :: : ! #`; special `<<` (load), `>>` (sink); `?[c;t;e]` conditional |
 | Literals | int `42`, float `3.14`, bool `1b`/`0b`, bool-vec `1010b`, string `"..."` (escapes `\n \t \r \" \\`), symbol `` `AAPL ``, symbol-vec `` `a`b`c `` |
 | Comments | `/` to end of line — **single slash only**, full-line and inline |
 | Virtual column | `i` (row index, aliased `x` in output) |
@@ -103,7 +103,7 @@ One `CompletionItemProvider` for language id `qpl`:
 
 ## Snippets
 
-`sel`, `selby`, `upd`, `del`, `join`, `lazyp` (README lazy pipeline), `case` (`$[...]`).
+`sel`, `selby`, `upd`, `del`, `join`, `lazyp` (README lazy pipeline), `cond` (`?[...]`).
 
 ## package.json contributions
 

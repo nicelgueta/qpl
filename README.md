@@ -84,7 +84,7 @@ select avg price by sym from trades
 select from trades where size > 100
 select total: sum size by sym from trades where side = "buy"
 select from trades order sym asc, price desc
-select price_bin: $[price>400;`high;price>200;`mid;`low] from trades
+select price_bin: ?[price>400;`high;price>200;`mid;`low] from trades
 ```
 
 ### Update
@@ -160,6 +160,10 @@ t sink `summary.parquet
 
 / also with operator >>
 t >> `summary.parquet
+
+/ the path can come from a string variable — `\`$expr` casts a string to a symbol
+o: "output/summary.parquet"
+t >> `$o
 ```
 
 ### lazy / collect — defer materialisation
@@ -181,7 +185,7 @@ nodes; the file is never touched:
 ```q
 t: select sym, side, price, size from t where size > 100
 t: update notional: price * size from t
-t: update band: $[notional > 50000; `big; `small] from t
+t: update band: ?[notional > 50000; `big; `small] from t
 ```
 
 Reading a lazy binding without collecting is contagious — the result is another
@@ -249,6 +253,45 @@ select f64$size, str$sym from trades
 Supported types: `f64`/`float`, `f32`, `i64`/`int`, `i32`, `i16`, `i8`,
 `u64`, `u32`, `u16`, `u8`, `bool`, `str`/`string`.
 
+### Symbols
+
+Outside a table expression `` `foo `` is a **symbol** — a distinct value kind that
+names a column, table or path. `` `$expr `` interns a string into a symbol:
+
+```
+o: "out/summary.parquet"
+t >> `$o                 / sink to the path held in the string variable `o`
+```
+
+(a plain string path still works too: `t >> "out/summary.parquet"`).
+
+### Categoricals
+
+Inside a table expression `` `$col `` casts a column to a Polars **Categorical**
+(an interned string pool — fast joins, group-bys and filters), default `u32`
+physical codes. `u8!` / `u16!` / `u32!` before `` `$ `` picks the physical width:
+
+```
+select country: `$country from t          / u32-backed categorical
+select country: u8!`$country from t        / u8-backed (≤255 distinct values)
+```
+
+The input may be a string column or an existing categorical/enum — Polars re-keys
+it automatically.
+
+### Enums
+
+An **enum** is an ordered set of symbols (order matters — it defines sort order and
+the physical code of each value). Define it as a symbol vector, then cast with
+`name::`$col`:
+
+```
+lvl: `low`mid`high                         / the enum definition, a symbol vector
+select level: lvl::`$band from t           / cast the `band` column to that enum
+```
+
+Values not in the enum become null.
+
 ### Operators
 
 | Operator | Meaning |
@@ -258,7 +301,10 @@ Supported types: `f64`/`float`, `f32`, `i64`/`int`, `i32`, `i16`, `i8`,
 | `=` `<>` `!=` | equality |
 | `<` `<=` `>` `>=` | comparison |
 | `&` `\|` | logical and / or |
-| `$` | cast (`f64$x`) |
+| `?[c;t;e]` | vectorised conditional (q-style; nests for else-if) |
+| `$` | cast (`f64$x`); `` `$x `` → categorical |
+| `!` | dict / sort key map; `u8!`$x` → categorical physical width |
+| `::` | enum cast (`lvl::`$x`) |
 
 ### Aggregates
 

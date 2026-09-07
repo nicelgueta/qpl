@@ -1,5 +1,5 @@
 use std::fmt;
-use crate::ast::{self, TableSource, Value};
+use crate::ast::{self, CastTarget, TableSource, Value};
 use crate::enums::{PolarsFrameExpr, PolarsStackArg};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -9,7 +9,6 @@ pub enum Instruction {
     PushColRef(String),
     PushPolarsArg(PolarsStackArg),
     PushIColRef,
-    PushScalar(Value),
     BinOp(String),
     Assign(String),
     Call { func: String, args_count: usize },
@@ -29,7 +28,7 @@ pub enum Instruction {
     BuildProj { count: usize, exclude: Vec<String>, predicates: usize }, // pop expressions into a projection list
     Select,
     SelectBy,
-    Cast(String),
+    Cast(CastTarget),
     Result,
 
 }
@@ -40,7 +39,6 @@ impl fmt::Display for Instruction {
             Instruction::FromSrc(tbl_src)             => write!(f, "FROM_SRC {tbl_src:?}"),
             Instruction::PushConst(val)                     => write!(f, "PUSH_CONST {val:?}"),
             Instruction::PushColRef(name)                  => write!(f, "PUSH_COL_REF {name}"),
-            Instruction::PushScalar(name)                   => write!(f, "PUSH_SCALAR {name:?}"),
             Instruction::PushIColRef                                => write!(f, "PUSH_I_COL_REF"),
             Instruction::PushPolarsArg(arg)        => write!(f, "PUSH_POLARS_ARG {arg:?}"),
             Instruction::BinOp(op)                         => write!(f, "BIN_OP {op}"),
@@ -52,7 +50,12 @@ impl fmt::Display for Instruction {
             Instruction::BuildProj { count, .. }            => write!(f, "BUILD_PROJ {count}"),
             Instruction::Select                                     => write!(f, "SELECT"),
             Instruction::SelectBy                                   => write!(f, "SELECT_BY"),
-            Instruction::Cast(dtype)                       => write!(f, "CAST {dtype}"),
+            Instruction::Cast(target)                      => match target {
+                CastTarget::Prim(d)         => write!(f, "CAST {d}"),
+                CastTarget::Sym             => write!(f, "CAST sym"),
+                CastTarget::SymPhysical(w)  => write!(f, "CAST sym!{w}"),
+                CastTarget::Enum(name)      => write!(f, "CAST enum({name})"),
+            },
             Instruction::Result                                     => write!(f, "RESULT"),
             Instruction::Assign(name )                     => write!(f, "ASSIGN {name}"),
             Instruction::Eval(expr)                          => write!(f, "EVAL {expr:?}"),

@@ -37,6 +37,7 @@ pub enum TokenKind {
 
     // punc
     Colon,
+    ColonColon,
     Comma,
     Semicolon,
     LParen,

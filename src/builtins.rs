@@ -1,10 +1,13 @@
-use crate::ast::{TableExpr, TableSource, Value};
+use crate::ast::{Expr, TableExpr, TableSource};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BuiltIn {
     Cols(Box<TableExpr>),
     Show(Box<TableExpr>),
-    Sink {name: TableSource, path: Value},
+    /// `<table> >> <path>` / `<table> sink <path>` — stream the frame to a file.
+    /// `path` is any scalar expression: a `` `literal ``, a string global, or
+    /// `` `$expr `` to cast a string to a symbol path.
+    Sink {name: TableSource, path: Expr},
     Sort(Box<TableExpr>, Vec<(String, bool)>),
     Distinct(Box<TableExpr>),
     Limit(Box<TableExpr>, usize),

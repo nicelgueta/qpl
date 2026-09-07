@@ -4,7 +4,7 @@ Runnable `.qpl` scripts. All paths assume you run them from the repo root.
 
 | Script | What it shows |
 |--------|---------------|
-| [`basics.qpl`](basics.qpl) | Core language: projection, aliases, scalar vars, `where`, `by` aggregation, `$[...]` case, `order`, casts |
+| [`basics.qpl`](basics.qpl) | Core language: projection, aliases, scalar vars, `where`, `by` aggregation, `?[...]` conditional, `order`, casts |
 | [`multiline.qpl`](multiline.qpl) | Statements spanning multiple lines via tab / 4-space indentation |
 | [`logging.qpl`](logging.qpl) | `log` / `1` stdout writes and `\1 <path>` stdout mirroring |
 | [`lazy_and_collect.qpl`](lazy_and_collect.qpl) | `lazy` to keep a query plan, extend it by re-assignment, print the plan, `collect` to a table |

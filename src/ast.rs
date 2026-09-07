@@ -10,11 +10,27 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Str(String),
+    /// an interned symbol — `` `foo `` outside a table expression; names a
+    /// column, table or path. Distinct from `Str` even though it wraps a `String`.
+    Sym(String),
     Bool(bool),
     IntVec(Vec<i64>),
     FloatVec(Vec<f64>),
     SymVec(Vec<String>),
     BoolVec(Vec<bool>),
+}
+
+/// Target of a `$` / `` `$ `` cast.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CastTarget {
+    /// primitive dtype: `f64`, `i32`, `u8`, `bool`, `str`, ...
+    Prim(String),
+    /// `` `$expr `` — to a Polars `Categorical`, default (u32) physical width
+    Sym,
+    /// `` u8!`$expr `` — to `Categorical` with an explicit physical width (`u8`/`u16`/`u32`)
+    SymPhysical(String),
+    /// `` name::`$expr `` — to a Polars `Enum` built from the global symbol vector `name`
+    Enum(String),
 }
 
 
@@ -27,7 +43,7 @@ pub enum Expr {
     IColRef, // virtual i col (for indexing like: select i, col1, col2 from df)
     BinOp { left: Box<Expr>, op: String, right: Box<Expr>,},
     Call { func: String, args: Vec<Expr>,}, //  used for agg funcs like sum etc
-    Cast { dtype: String, expr: Box<Expr> },
+    Cast { target: CastTarget, expr: Box<Expr> },
     Case { branches: Vec<(Expr, Expr)>, default: Box<Expr> },
 }
 

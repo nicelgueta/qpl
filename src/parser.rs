@@ -63,8 +63,16 @@ impl Parser {
                 | TokenKind::Show
                 | TokenKind::Lazy
                 | TokenKind::Collect
-                | TokenKind::Symbol(_)
-                | TokenKind::SymbolVec(_)=> {
+                | TokenKind::Symbol(_) => {
+                    let stmt = self.parse_body()?;
+                    Ok(Stmt::Assign { name, body: Box::new(stmt) })
+                }
+                // `\`a\`b!01b …` (sort) / `\`a\`b drop …` (drop) are table ops;
+                // a bare `\`a\`b\`c` is a symbol-vector value (e.g. an enum definition)
+                TokenKind::SymbolVec(_)
+                    if matches!(self.peek2(), TokenKind::Bang | TokenKind::Drop)
+                        || matches!(self.peek2(), TokenKind::Name(n) if n == "_") =>
+                {
                     let stmt = self.parse_body()?;
                     Ok(Stmt::Assign { name, body: Box::new(stmt) })
                 }
@@ -103,23 +111,13 @@ impl Parser {
                 if matches!(self.peek2(), TokenKind::Sink) {
                     if let TokenKind::Name(name) = self.next() { // consume name
                         self.next(); //consume sink
-                        let res = match self.peek() {
-                            TokenKind::Symbol(path) => {
-                                Ok(
-                                    Stmt::RetTable(
-                                        TableExpr::BuiltIn(
-                                            BuiltIn::Sink {
-                                                name: TableSource::InMem(name),
-                                                path: Value::Str(path.clone())
-                                            }
-                                        )
-                                    )
-                                )
-                            }
-                            _ => Err(QplError::Parse(format!("Unexpected token: {:?}", self.peek())))
-                        };
-                        self.next(); // consume the path
-                        res
+                        // path is any scalar expr: `\`literal`, a string global,
+                        // or `\`$expr` (cast a string to a symbol path)
+                        let path = self.parse_expr()?;
+                        Ok(Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink {
+                            name: TableSource::InMem(name),
+                            path,
+                        })))
                     } else {
                         unreachable!()
                     }
@@ -361,17 +359,20 @@ impl Parser {
     fn parse_expr(&mut self) -> Result<Expr, QplError> {
         let left = self.parse_primary()?;
 
+        // `u8!`$expr` (physical-width categorical) / `name::`$expr` (enum) —
+        // a modifier token between the type and the `` `$ `` cast operator
+        if let Some(cast) = self.parse_modified_cast(&left, false)? {
+            return Ok(cast);
+        }
+
         // bin op: left op right where right is the entire expr cos q is right to left eval
         if let TokenKind::Op(op) = self.peek().clone() {
-            // cast: type$expr  e.g. f64$qty
+            // cast: type$expr  e.g. f64$qty ;  `$expr  casts to a symbol / categorical
             if op == "$" {
-                let dtype = match &left {
-                    Expr::ColRef(name) => name.clone(),
-                    _ => return Err(QplError::Parse(format!("expected type name before '$', got {left:?}"))),
-                };
+                let target = cast_target(&left)?;
                 self.next();
                 let expr = self.parse_expr()?;
-                return Ok(Expr::Cast { dtype, expr: Box::new(expr) });
+                return Ok(Expr::Cast { target, expr: Box::new(expr) });
             }
             self.next();
             let right = self.parse_expr()?;
@@ -400,14 +401,14 @@ impl Parser {
     /// casts still compose; wrap an actual function call in parens.
     fn parse_expr_no_call(&mut self) -> Result<Expr, QplError> {
         let left = self.parse_primary()?;
+        if let Some(cast) = self.parse_modified_cast(&left, true)? {
+            return Ok(cast);
+        }
         if let TokenKind::Op(op) = self.peek().clone() {
             if op == "$" {
-                let dtype = match &left {
-                    Expr::ColRef(name) => name.clone(),
-                    _ => return Err(QplError::Parse(format!("expected type name before '$', got {left:?}"))),
-                };
+                let target = cast_target(&left)?;
                 self.next();
-                return Ok(Expr::Cast { dtype, expr: Box::new(self.parse_expr_no_call()?) });
+                return Ok(Expr::Cast { target, expr: Box::new(self.parse_expr_no_call()?) });
             }
             self.next();
             return Ok(Expr::BinOp {
@@ -417,6 +418,35 @@ impl Parser {
             });
         }
         Ok(left)
+    }
+
+    /// `u8!`$expr`  → `CastTarget::SymPhysical("u8")`
+    /// `name::`$expr` → `CastTarget::Enum("name")`
+    /// `left` is whatever `parse_primary` produced before the modifier token.
+    /// Returns `Ok(None)` when there is no `!` / `::` modifier to consume.
+    fn parse_modified_cast(&mut self, left: &Expr, no_call: bool) -> Result<Option<Expr>, QplError> {
+        let target = match (self.peek(), left) {
+            (TokenKind::Bang, Expr::ColRef(w)) => {
+                self.next();
+                CastTarget::SymPhysical(w.clone())
+            }
+            (TokenKind::ColonColon, Expr::ColRef(name)) => {
+                self.next();
+                CastTarget::Enum(name.clone())
+            }
+            _ => return Ok(None),
+        };
+        // the modifier must be followed by the `` `$ `` cast operator
+        match self.next() {
+            TokenKind::Symbol(s) if s.is_empty() => {}
+            other => return Err(QplError::Parse(format!("expected `$ after a cast modifier, got {other:?}"))),
+        }
+        match self.next() {
+            TokenKind::Op(op) if op == "$" => {}
+            other => return Err(QplError::Parse(format!("expected `$ after a cast modifier, got {other:?}"))),
+        }
+        let expr = if no_call { self.parse_expr_no_call()? } else { self.parse_expr()? };
+        Ok(Some(Expr::Cast { target, expr: Box::new(expr) }))
     }
 
     fn parse_case(&mut self) -> Result<Expr, QplError> {
@@ -541,10 +571,11 @@ impl Parser {
             TokenKind::Str(s)      => Ok(Expr::Lit(Value::Str(s))),
             TokenKind::Bool(b)     => Ok(Expr::Lit(Value::Bool(b))),
             TokenKind::BoolVec(v)  => Ok(Expr::Lit(Value::BoolVec(v))),
+            TokenKind::SymbolVec(v)=> Ok(Expr::Lit(Value::SymVec(v))),
             TokenKind::Symbol(s)   => Ok(Expr::Sym(s)),
             TokenKind::Name(n) if n == "i" => Ok(Expr::IColRef),
             TokenKind::Name(n)     => Ok(Expr::ColRef(n)),
-            TokenKind::Op(op) if op == "$" => self.parse_case(),
+            TokenKind::Op(op) if op == "?" => self.parse_case(),
             TokenKind::LParen      => {
                 let expr = self.parse_expr()?;
                 self.eat(&TokenKind::RParen)?;
@@ -573,6 +604,18 @@ pub fn parse_expr_seq(tokens: Vec<Token>) -> Result<Vec<Expr>, QplError> {
         exprs.push(parser.parse_expr_no_call()?);
     }
     Ok(exprs)
+}
+
+/// The token(s) just before a `$` in a cast expression, already parsed into
+/// `left`, decide the cast target: `f64$x` → `Prim("f64")`, `` `$x `` → `Sym`.
+/// `u8!`$x` and `name::`$x` are handled in `parse_expr` before this is reached.
+fn cast_target(left: &Expr) -> Result<CastTarget, QplError> {
+    match left {
+        Expr::ColRef(name) => Ok(CastTarget::Prim(name.clone())),
+        // bare backtick before `$` — `` `$expr `` casts to a symbol / categorical
+        Expr::Sym(s) if s.is_empty() => Ok(CastTarget::Sym),
+        _ => Err(QplError::Parse(format!("expected type name before '$', got {left:?}"))),
+    }
 }
 
 fn is_noun_start(token: &TokenKind) -> bool {
@@ -638,7 +681,7 @@ mod tests {
         let got = seq("\"test\" str$2*3 \" that\"");
         assert_eq!(got.len(), 3);
         assert_eq!(got[0], Expr::Lit(Value::Str("test".into())));
-        assert!(matches!(&got[1], Expr::Cast { dtype, .. } if dtype == "str"));
+        assert!(matches!(&got[1], Expr::Cast { target, .. } if *target == CastTarget::Prim("str".into())));
         assert_eq!(got[2], Expr::Lit(Value::Str(" that".into())));
     }
 
@@ -901,8 +944,84 @@ mod tests {
     }
 
     #[test]
+    fn sink_path_is_a_symbol_literal() {
+        match p("t >> `out.parquet") {
+            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink { path, .. })) => {
+                assert_eq!(path, Expr::Sym("out.parquet".into()));
+            }
+            other => panic!("expected sink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sink_path_can_cast_a_string_var_to_a_symbol() {
+        // `\`$o` — cast the string held in `o` to a symbol path
+        match p("t >> `$o") {
+            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink { path, .. })) => {
+                assert!(matches!(
+                    &path,
+                    Expr::Cast { target: CastTarget::Sym, expr }
+                        if **expr == Expr::ColRef("o".into())
+                ));
+            }
+            other => panic!("expected sink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sym_cast_parses_to_cast_target_sym() {
+        let s = sel("select c: `$name from t");
+        assert!(matches!(
+            &s.cols[0].expr,
+            Expr::Cast { target: CastTarget::Sym, expr } if **expr == Expr::ColRef("name".into())
+        ));
+    }
+
+    #[test]
+    fn physical_width_sym_cast_parses() {
+        let s = sel("select c: u8!`$name from t");
+        assert!(matches!(
+            &s.cols[0].expr,
+            Expr::Cast { target: CastTarget::SymPhysical(w), expr }
+                if w == "u8" && **expr == Expr::ColRef("name".into())
+        ));
+    }
+
+    #[test]
+    fn enum_cast_parses() {
+        let s = sel("select c: lvl::`$band from t");
+        assert!(matches!(
+            &s.cols[0].expr,
+            Expr::Cast { target: CastTarget::Enum(n), expr }
+                if n == "lvl" && **expr == Expr::ColRef("band".into())
+        ));
+    }
+
+    #[test]
+    fn bare_symbol_vector_is_a_scalar_value_assignment() {
+        match p("lvl: `low`mid`high") {
+            Stmt::ScalarAssign { name, expr } => {
+                assert_eq!(name, "lvl");
+                assert_eq!(expr, Expr::Lit(Value::SymVec(vec![
+                    "low".into(), "mid".into(), "high".into(),
+                ])));
+            }
+            other => panic!("expected scalar assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_symbol_dict_sort_is_unaffected_by_cast_modifiers() {
+        // `\`a\`b!01b \`t` must still parse as a sort, not a cast
+        assert!(matches!(
+            p("`c1`c2!01b `t"),
+            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sort(..)))
+        ));
+    }
+
+    #[test]
     fn case_expression_parses() {
-        let s = sel("select price_bin: $[price>100;`large;price>50;`med;`small] from data");
+        let s = sel("select price_bin: ?[price>100;`large;price>50;`med;`small] from data");
         assert_eq!(s.cols[0].name, Some("price_bin".into()));
         assert!(matches!(&s.cols[0].expr, Expr::Case { branches, .. } if branches.len() == 2));
     }

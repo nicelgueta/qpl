@@ -51,7 +51,7 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), 
         }
         BuiltIn::Sink { name, path } => {
             out.push(Instruction::FromSrc(name.clone()));
-            out.push(Instruction::PushScalar(path.clone()));
+            out.push(Instruction::Eval(path.clone()));
             out.push(Instruction::Sink);
             Ok(())
         }
@@ -230,9 +230,9 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
             }
             out.push(Instruction::Call { func: func.clone(), args_count: args.len() });
         }
-        Expr::Cast { dtype, expr } => {
+        Expr::Cast { target, expr } => {
             compile_expr(expr, out)?;
-            out.push(Instruction::Cast(dtype.clone()));
+            out.push(Instruction::Cast(target.clone()));
         }
         Expr::Case { branches, default } => {
             for (condition, value) in branches {
@@ -470,13 +470,13 @@ mod tests {
     fn sink_is_terminal_without_trailing_result() {
         let prog = compile_src("t >> `out.parquet");
         assert_eq!(prog, vec![
-            from_table("t"), PushScalar(Value::Str("out.parquet".into())), Sink,
+            from_table("t"), Eval(Expr::Sym("out.parquet".into())), Sink,
         ]);
     }
 
     #[test]
     fn case_expression_compiles() {
-        let program = compile_src("select bin: $[c2>20;`high;c2>10;`mid;`low] from t");
+        let program = compile_src("select bin: ?[c2>20;`high;c2>10;`mid;`low] from t");
         assert!(program.iter().any(|instruction| matches!(instruction, Case { branches: 2 })));
     }
 

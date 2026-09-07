@@ -5,5 +5,5 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
-polars = { version = "0.55.2", features = ["lazy", "parquet", "csv", "strings", "is_in", "abs"] }
+polars = { version = "0.55.2", features = ["lazy", "parquet", "csv", "strings", "is_in", "abs", "dtype-categorical"] }
 rustyline = "18.0.1"

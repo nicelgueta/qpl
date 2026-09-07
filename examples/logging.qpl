@@ -10,7 +10,7 @@
 /   cargo run -- examples/logging.qpl
 / ─────────────────────────────────────────────────────────────────────────────
 
-trades: collect load `examples/data/trades.parquet
+trades: << `examples/data/trades.parquet
 
 log "run started"
 thr: 150
