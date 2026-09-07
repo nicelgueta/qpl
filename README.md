@@ -308,7 +308,7 @@ j: select traded: sum notional, n: count price by sym, side from j
 `sink` the plan straight to disk:
 
 ```q
-tm: collect j
+tm: collect `j
 `j >> `summary.parquet
 ```
 
