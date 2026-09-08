@@ -98,7 +98,10 @@ fn wants_more(src: &str) -> bool {
 pub fn start(vm: &mut Vm) {
     let mut rl = DefaultEditor::new().expect("failed to create line editor");
 
-    println!("qpl (Quick Polars Query Language) REPL - \\d disassemble, \\l <path> run a script, \\1 <path> log stdout");
+    println!(
+        "qpl v{} (Quick Polars Query Language) REPL - \\d disassemble, \\l <path> run a script, \\1 <path> log stdout",
+        env!("CARGO_PKG_VERSION")
+    );
 
     let mut buf: Vec<String> = Vec::new();
     loop {
