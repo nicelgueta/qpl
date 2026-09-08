@@ -2,7 +2,7 @@ use polars::io::utils::sync_on_close::SyncOnCloseType;
 use polars::prelude::*;
 use polars_ops::prelude::RoundMode;
 use crate::ast::{self, TableSource, Value};
-use crate::enums::{PolarsFrameExpr, PolarsStackArg};
+use crate::enums::{PolarsFrameExpr, PolarsStackArg, WindowFn};
 use crate::lexer::tokenise;
 use crate::parser::parse;
 use crate::compiler::compile;
@@ -345,6 +345,14 @@ impl Vm {
                 Instruction::Round { decimals } => {
                     let expr = pop1(&mut stack)?.unwrap_expr()?;
                     stack.push(StackObj::Expr(expr.round(decimals, self.config.round_type)));
+                }
+
+                Instruction::Window { func, partition, order } => {
+                    let target = match func {
+                        WindowFn::Over => Some(pop1(&mut stack)?.unwrap_expr()?),
+                        _ => None,
+                    };
+                    stack.push(StackObj::Expr(build_window(func, target, &partition, &order)?));
                 }
 
                 Instruction::Case { branches } => {
@@ -728,6 +736,66 @@ fn sink_file(lf: LazyFrame, path: &str) -> Result<(), QplError> {
     .collect_with_engine(Engine::Streaming)
     .map_err(|e| QplError::Runtime(e.to_string()))?;
     Ok(())
+}
+
+/// Build a window expression. `WindowFn::Over` broadcasts `target` (an aggregate
+/// or column expression) across each partition.
+///
+/// The ranking verbs need a single per-partition ordering key. For one `order`
+/// column that key is the column itself. For several — with independent asc/desc
+/// directions — each column is replaced by its dense per-partition rank (which
+/// preserves order and value-equality) and the ranks are packed positionally
+/// into one number, so ascending order matches the requested lexicographic
+/// order and equal keys stay equal. That composite is then ranked with the
+/// method for the verb (`Ordinal` = `rn`, `Min` = `rank`, `Dense` = `drank`).
+fn build_window(
+    func: WindowFn,
+    target: Option<Expr>,
+    partition: &[String],
+    order: &[(String, bool)],
+) -> Result<Expr, QplError> {
+    let part: Vec<Expr> = partition.iter().map(|c| col(c.as_str())).collect();
+    let over = |e: Expr, keys: &[Expr]| {
+        e.over(keys).map_err(|err| QplError::Runtime(err.to_string()))
+    };
+
+    if let WindowFn::Over = func {
+        return over(target.expect("Over target"), &part);
+    }
+
+    // (rank_key, descending) — the single key the final rank is computed over.
+    let (rank_key, descending) = if let [(name, desc)] = order {
+        (col(name.as_str()), *desc)
+    } else {
+        // pack per-column dense ranks: composite = ((r1)*B2 + r2)*B3 + r3 ...
+        // where Bi = (max r_i in partition) + 1 keeps digits from colliding.
+        let mut composite: Option<Expr> = None;
+        for (name, desc) in order {
+            let ri = over(
+                col(name.as_str())
+                    .rank(RankOptions { method: RankMethod::Dense, descending: *desc }, None)
+                    .cast(DataType::Int64),
+                &part,
+            )?;
+            composite = Some(match composite {
+                None => ri,
+                Some(acc) => {
+                    let base = over(ri.clone().max(), &part)? + lit(1i64);
+                    acc * base + ri
+                }
+            });
+        }
+        (composite.expect("non-empty order"), false)
+    };
+
+    let method = match func {
+        WindowFn::RowNumber => RankMethod::Ordinal,
+        WindowFn::Rank => RankMethod::Min,
+        WindowFn::DenseRank => RankMethod::Dense,
+        WindowFn::Over => unreachable!(),
+    };
+    let ranked = over(rank_key.rank(RankOptions { method, descending }, None), &part)?;
+    Ok(ranked.cast(DataType::Int64))
 }
 
 fn apply_binop(left: Expr, right: Expr, op: &str) -> Result<Expr, QplError> {
@@ -1314,6 +1382,58 @@ mod tests {
         assert_eq!(cfg.maxrow, 42);
         assert_eq!(cfg.maxcol, 7);
         assert_eq!(cfg.round_type, RoundMode::HalfAwayFromZero);
+    }
+
+    // --- window functions ---
+
+    fn win_vm() -> Vm {
+        // grp:  x x x | y y
+        // v:    10 10 20 | 5 7      (a tie at v=10 within x)
+        // k:    p q p | p q        (for the mixed-direction multi-key test)
+        let df = df![
+            "grp" => ["x", "x", "x", "y", "y"],
+            "v"   => [10i64, 10, 20, 5, 7],
+            "k"   => ["p", "q", "p", "p", "q"],
+        ].unwrap();
+        let mut vm = Vm::new();
+        vm.tables.insert("t".into(), df);
+        vm
+    }
+
+    #[test]
+    fn window_over_broadcasts_a_partition_aggregate() {
+        let df = run(win_vm(), "select m: max v over `grp from t");
+        assert_eq!(i64s(&df, "m"), vec![20, 20, 20, 7, 7]);
+    }
+
+    #[test]
+    fn window_rn_is_a_strict_ordinal_per_partition() {
+        let df = run(win_vm(), "select r: rn over `grp order `v asc from t");
+        // x: v=[10,10,20] -> 1,2,3 (ties keep row order); y: [5,7] -> 1,2
+        assert_eq!(i64s(&df, "r"), vec![1, 2, 3, 1, 2]);
+    }
+
+    #[test]
+    fn window_rank_and_drank_share_a_rank_on_ties() {
+        let df = run(win_vm(),
+            "select rk: rank over `grp order `v asc, dr: drank over `grp order `v asc from t");
+        // x: v=[10,10,20] -> rank 1,1,3 / dense 1,1,2 ; y: [5,7] -> 1,2 / 1,2
+        assert_eq!(i64s(&df, "rk"), vec![1, 1, 3, 1, 2]);
+        assert_eq!(i64s(&df, "dr"), vec![1, 1, 2, 1, 2]);
+    }
+
+    #[test]
+    fn window_rn_with_mixed_direction_multi_key_order() {
+        let df = run(win_vm(), "select r: rn over `grp order `k asc `v desc from t");
+        // x rows (k,v): (p,10)@0 (q,10)@1 (p,20)@2 -> order p:20,p:10,q:10 = [2,0,1]
+        //   => row0=2, row1=3, row2=1 ; y: (p,5)@3 (q,7)@4 -> row3=1, row4=2
+        assert_eq!(i64s(&df, "r"), vec![2, 3, 1, 1, 2]);
+    }
+
+    #[test]
+    fn window_over_composes_inside_arithmetic() {
+        let df = run(win_vm(), "select g: (max v over `grp) - v from t");
+        assert_eq!(i64s(&df, "g"), vec![10, 10, 0, 2, 0]);
     }
 
     // --- error cases ---

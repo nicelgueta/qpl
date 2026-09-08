@@ -205,6 +205,7 @@ delete `price`size from trades
 | conditional | `?[cond; then; cond2; then2; ...; else]` — vectorised, nests for else-if |
 | cast | `type$expr` — see [Casts](#casts) |
 | round | `<precision> round <col>` — round a float column to N places |
+| window | `<expr> over `p1`p2 [order `k1 asc `k2 desc]` — see [Window functions](#window-functions) |
 
 ```q
 select price_bin: ?[price>400;`high;price>200;`mid;`low] from trades
@@ -218,6 +219,37 @@ config `round_type` (`HALF_TO_EVEN` by default; see [Config](#config)).
 **Aggregates:** `sum`, `avg`/`mean`, `min`, `max`, `count`, `first`, `last`,
 `std`/`dev`, `var`, `med`/`median`, `abs`, `neg`, `not`, `string`,
 `distinct`/`n_unique`.
+
+### Window functions
+
+`<expr> over `key` computes `<expr>` per partition and broadcasts the result
+back to every row (SQL `<expr> OVER (PARTITION BY key)`). Any column expression
+or aggregate works:
+
+```q
+select sym, price, top: max price over `sym from trades
+select sym, gap: (max price over `sym) - price from trades   / `over` binds tighter than `-`
+```
+
+Partition keys are backtick symbols — one (`` `sym ``) or several (`` `sym`day ``).
+
+An `order` sub-clause (space-separated `` `col asc|desc `` pairs, per-column
+direction) enables the ranking verbs, which stand alone in place of `<expr>`:
+
+| Verb | SQL | Ties |
+|---|---|---|
+| `rn`    | `row_number()` | broken by row order — strict `1..n` |
+| `rank`  | `rank()`       | share the lowest rank, then a gap (`1,1,3`) |
+| `drank` | `dense_rank()` | share a rank, no gap (`1,1,2`) |
+
+```q
+select emp, country, role,
+    seat: rank over `country`role order `desk asc `date desc,
+    seniority: rn over `country order `hired asc
+    from staff
+```
+
+`order` is only valid with `rn` / `rank` / `drank`; the ranking verbs require it.
 
 **Virtual column `i`** is the row index (aliased to `x` in output, per q):
 
@@ -447,6 +479,7 @@ select mv: 2 round market_value from trades
 | `&` `\|` | logical and / or |
 | `?[...]` | vectorised conditional |
 | `round` | `<precision> round <col>` — round a float column (mode: `.qpl.cfg round_type`) |
+| `over` | window: `<expr> over `p [order `k asc]`; verbs `rn` / `rank` / `drank` |
 | `$` | cast (`f64$x`); `` `$x `` -> categorical |
 | `!` | `col!bool` sort map; `` u8!`$x `` -> categorical physical width |
 | `::` | enum cast (`` lvl::`$x ``) |

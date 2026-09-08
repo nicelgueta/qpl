@@ -1,6 +1,6 @@
 
 use crate::ast::{Expr, TableExpr, SelectStmt, Stmt, Value};
-use crate::enums::PolarsStackArg;
+use crate::enums::{PolarsStackArg, WindowFn};
 use crate::builtins::BuiltIn;
 use crate::enums::PolarsFrameExpr;
 use crate::errors::QplError;
@@ -253,6 +253,43 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
             compile_expr(default, out)?;
             out.push(Instruction::Case { branches: branches.len() });
         }
+        Expr::Window { func, partition, order } => {
+            if partition.is_empty() {
+                return Err(QplError::Compile("`over` needs at least one partition symbol".into()));
+            }
+            // bare ranking verbs (`rn` / `rank` / `drank`) synthesise their own
+            // expression from the window order; everything else is a column
+            // expression applied per partition.
+            let ranking = match func.as_ref() {
+                Expr::ColRef(name) => match name.as_str() {
+                    "rn"    => Some(WindowFn::RowNumber),
+                    "rank"  => Some(WindowFn::Rank),
+                    "drank" => Some(WindowFn::DenseRank),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match ranking {
+                Some(_) => {
+                    if order.is_empty() {
+                        return Err(QplError::Compile(
+                            "`rn` / `rank` / `drank` need an `order` sub-clause".into()));
+                    }
+                }
+                None => {
+                    if !order.is_empty() {
+                        return Err(QplError::Compile(
+                            "window `order` applies only to `rn` / `rank` / `drank`".into()));
+                    }
+                    compile_expr(func, out)?;
+                }
+            }
+            out.push(Instruction::Window {
+                func: ranking.unwrap_or(WindowFn::Over),
+                partition: partition.clone(),
+                order: order.clone(),
+            });
+        }
         Expr::Dict(_) => return Err(QplError::Runtime("Dict expressions are not supported in select statements (yet)".into())),
     }
     Ok(())
@@ -273,6 +310,7 @@ fn leftmost_leaf(node: &Expr) -> &Expr {
         match n {
             Expr::BinOp { left, .. } => n = left,
             Expr::Call { args, .. } if !args.is_empty() => n = &args[0],
+            Expr::Window { func, .. } => n = func,
             _ => break,
         }
     }
@@ -512,6 +550,43 @@ mod tests {
     #[test]
     fn round_with_non_literal_precision_is_compile_error() {
         let stmt = parse(tokenise("select r: sz round px from t").unwrap()).unwrap();
+        assert!(matches!(compile(&stmt), Err(QplError::Compile(_))));
+    }
+
+    // --- window functions ---
+
+    #[test]
+    fn window_over_compiles_the_target_then_a_window_instruction() {
+        use crate::enums::WindowFn;
+        assert_eq!(compile_src("select m: max px over `s from t"), vec![
+            from_table("t"),
+            col("px"), call("max", 1),
+            Window { func: WindowFn::Over, partition: vec!["s".into()], order: vec![] },
+            alias("m"),
+            BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
+        ]);
+    }
+
+    #[test]
+    fn window_ranking_verb_emits_only_the_window_instruction() {
+        use crate::enums::WindowFn;
+        assert_eq!(compile_src("select r: rn over `s order `px desc from t"), vec![
+            from_table("t"),
+            Window { func: WindowFn::RowNumber, partition: vec!["s".into()], order: vec![("px".into(), true)] },
+            alias("r"),
+            BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
+        ]);
+    }
+
+    #[test]
+    fn window_ranking_verb_without_order_is_compile_error() {
+        let stmt = parse(tokenise("select r: rank over `s from t").unwrap()).unwrap();
+        assert!(matches!(compile(&stmt), Err(QplError::Compile(_))));
+    }
+
+    #[test]
+    fn window_order_on_a_plain_aggregate_is_compile_error() {
+        let stmt = parse(tokenise("select m: max px over `s order `px asc from t").unwrap()).unwrap();
         assert!(matches!(compile(&stmt), Err(QplError::Compile(_))));
     }
 

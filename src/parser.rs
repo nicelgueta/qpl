@@ -349,20 +349,34 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, QplError> {
+        self.parse_expr_inner(true)
+    }
+
+    /// Like [`Parser::parse_expr`] but stops at a trailing `over`: the window
+    /// binds to the whole aggregate (`(sum x) over p`), and an aggregate's own
+    /// argument (`sum price * size`) must not swallow a following `over`.
+    fn parse_value(&mut self) -> Result<Expr, QplError> {
+        self.parse_expr_inner(false)
+    }
+
+    /// The core expression parser. `windows` enables the trailing `over` postfix.
+    fn parse_expr_inner(&mut self, windows: bool) -> Result<Expr, QplError> {
         let left = self.parse_primary()?;
 
         // `u8!`$expr` (physical-width categorical) / `name::`$expr` (enum) —
         // a modifier token between the type and the `` `$ `` cast operator
         if let Some(cast) = self.parse_modified_cast(&left, false)? {
-            return Ok(cast);
+            return self.finish_window(cast, windows);
         }
 
         // infix `round`: `<precision> round <expr>` (q-style dyadic verb). The
-        // precision is `left`; the value is the rest of the expression.
+        // precision is `left`; the value is the rest of the expression. `round`
+        // binds tighter than `over`, so its value never swallows a window.
         if matches!(self.peek(), TokenKind::Name(n) if n == "round") {
             self.next();
-            let value = self.parse_expr()?;
-            return Ok(Expr::Call { func: "round".into(), args: vec![value, left] });
+            let value = self.parse_value()?;
+            let call = Expr::Call { func: "round".into(), args: vec![value, left] };
+            return self.finish_window(call, windows);
         }
 
         // bin op: left op right where right is the entire expr cos q is right to left eval
@@ -371,11 +385,11 @@ impl Parser {
             if op == "$" {
                 let target = cast_target(&left)?;
                 self.next();
-                let expr = self.parse_expr()?;
+                let expr = self.parse_expr_inner(windows)?;
                 return Ok(Expr::Cast { target, expr: Box::new(expr) });
             }
             self.next();
-            let right = self.parse_expr()?;
+            let right = self.parse_expr_inner(windows)?;
             return Ok(Expr::BinOp {
                 left: Box::new(left),
                 op,
@@ -386,14 +400,76 @@ impl Parser {
         if let Expr::ColRef(name) = &left {
             if is_noun_start(self.peek()) {
                 let name = name.clone();
-                let arg = self.parse_expr()?;
-                return Ok(Expr::Call {
-                    func: name,
-                    args: vec![arg],
-                });
+                let arg = self.parse_value()?;
+                let call = Expr::Call { func: name, args: vec![arg] };
+                return self.finish_window(call, windows);
             }
         }
-        Ok(left)
+        self.finish_window(left, windows)
+    }
+
+    /// If `windows` and the next token is `over`, wrap `left` in an
+    /// `Expr::Window` and let any arithmetic *after* the window continue
+    /// (`... over `p - salary`). Otherwise return `left` unchanged.
+    fn finish_window(&mut self, left: Expr, windows: bool) -> Result<Expr, QplError> {
+        if !windows || !matches!(self.peek(), TokenKind::Over) {
+            return Ok(left);
+        }
+        self.next(); // consume `over`
+        let partition = self.parse_partition_syms()?;
+        let order = if matches!(self.peek(), TokenKind::Order) {
+            self.next();
+            self.parse_window_order()?
+        } else {
+            Vec::new()
+        };
+        let win = Expr::Window { func: Box::new(left), partition, order };
+        // `over` binds tighter than arithmetic: fold trailing binary operators.
+        if let TokenKind::Op(op) = self.peek().clone()
+            && op != "$"
+        {
+            self.next();
+            let right = self.parse_expr_inner(true)?;
+            return Ok(Expr::BinOp { left: Box::new(win), op, right: Box::new(right) });
+        }
+        Ok(win)
+    }
+
+    /// Partition keys after `over`: one `` `sym `` or a `` `a`b `` vector.
+    fn parse_partition_syms(&mut self) -> Result<Vec<String>, QplError> {
+        match self.next() {
+            TokenKind::Symbol(s) => Ok(vec![s]),
+            TokenKind::SymbolVec(v) => Ok(v),
+            other => Err(QplError::Parse(format!(
+                "expected a `partition symbol after 'over', got {other:?}"
+            ))),
+        }
+    }
+
+    /// Window `order` sub-clause: space-separated `` `col asc|desc `` pairs
+    /// (no commas — a comma ends the clause and returns to the projection list).
+    fn parse_window_order(&mut self) -> Result<Vec<(String, bool)>, QplError> {
+        let mut order = Vec::new();
+        loop {
+            let column = match self.next() {
+                TokenKind::Symbol(name) => name,
+                other => return Err(QplError::Parse(format!(
+                    "expected a `column after window 'order', got {other:?}"
+                ))),
+            };
+            let descending = match self.next() {
+                TokenKind::Asc => false,
+                TokenKind::Desc => true,
+                other => return Err(QplError::Parse(format!(
+                    "expected 'asc' or 'desc' after window order column, got {other:?}"
+                ))),
+            };
+            order.push((column, descending));
+            if !matches!(self.peek(), TokenKind::Symbol(_)) {
+                break;
+            }
+        }
+        Ok(order)
     }
 
     /// Like [`Parser::parse_expr`] but without trailing juxtaposition-as-call:
@@ -1050,6 +1126,61 @@ mod tests {
             func: "round".into(),
             args: vec![cref("market_value"), Expr::Lit(Value::Int(2))],
         });
+    }
+
+    // --- window functions ---
+
+    fn window(func: Expr, partition: &[&str], order: &[(&str, bool)]) -> Expr {
+        Expr::Window {
+            func: Box::new(func),
+            partition: partition.iter().map(|s| s.to_string()).collect(),
+            order: order.iter().map(|(c, d)| (c.to_string(), *d)).collect(),
+        }
+    }
+
+    #[test]
+    fn window_over_binds_to_the_whole_aggregate() {
+        let s = sel("select m: max salary over `country from t");
+        assert_eq!(
+            s.cols[0].expr,
+            window(Expr::Call { func: "max".into(), args: vec![cref("salary")] }, &["country"], &[]),
+        );
+    }
+
+    #[test]
+    fn window_aggregate_argument_does_not_swallow_over() {
+        // `sum price * size over `c` == `(sum(price*size)) over c`
+        let s = sel("select v: sum price * size over `c from t");
+        assert_eq!(
+            s.cols[0].expr,
+            window(
+                Expr::Call { func: "sum".into(), args: vec![binop(cref("price"), "*", cref("size"))] },
+                &["c"], &[],
+            ),
+        );
+    }
+
+    #[test]
+    fn window_ranking_verb_with_partition_vector_and_order() {
+        let s = sel("select r: rank over `country`role order `desk asc `date desc from t");
+        assert_eq!(
+            s.cols[0].expr,
+            window(cref("rank"), &["country", "role"], &[("desk", false), ("date", true)]),
+        );
+    }
+
+    #[test]
+    fn window_binds_tighter_than_arithmetic() {
+        // both forms mean `(max salary over `c) - salary`
+        let bare   = sel("select g: max salary over `c - salary from t");
+        let parens = sel("select g: (max salary over `c) - salary from t");
+        let want = binop(
+            window(Expr::Call { func: "max".into(), args: vec![cref("salary")] }, &["c"], &[]),
+            "-",
+            cref("salary"),
+        );
+        assert_eq!(bare.cols[0].expr, want);
+        assert_eq!(parens.cols[0].expr, want);
     }
 
     // --- by clause ---

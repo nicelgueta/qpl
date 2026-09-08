@@ -1,0 +1,27 @@
+/ ─────────────────────────────────────────────────────────────────────────────
+/ Window functions: `<expr> over `key [order `k asc `k2 desc]`.
+/
+/ Run from the repo root:
+/   cargo run -- examples/window_functions.qpl
+/ ─────────────────────────────────────────────────────────────────────────────
+
+trades: load `examples/data/trades.parquet
+
+/ partition aggregate broadcast back to every row (SQL: max(price) OVER (PARTITION BY sym))
+select sym, price, top: max price over `sym from trades
+
+/ `over` binds tighter than arithmetic, so no parens needed here
+select sym, price, off_top: max price over `sym - price from trades
+
+/ ranking verbs need an `order` sub-clause (space-separated `col asc|desc pairs)
+/   rn    = row_number()  — strict 1..n
+/   rank  = rank()        — ties share the low rank, then a gap
+/   drank = dense_rank()  — ties share a rank, no gap
+select sym, side, price,
+    rn:    rn    over `sym order `price asc,
+    rnk:   rank  over `sym order `side  asc,
+    drnk:  drank over `sym order `side  asc
+    from trades
+
+/ multi-key order with independent directions: side ascending, then price descending
+select sym, side, price, seat: rn over `sym order `side asc `price desc from trades

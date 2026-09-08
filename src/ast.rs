@@ -45,6 +45,15 @@ pub enum Expr {
     Call { func: String, args: Vec<Expr>,}, //  used for agg funcs like sum etc
     Cast { target: CastTarget, expr: Box<Expr> },
     Case { branches: Vec<(Expr, Expr)>, default: Box<Expr> },
+    /// `<func> over `p1`p2 [order `k1 asc `k2 desc]` — a window function.
+    /// `func` is either a column expression (`max salary`) applied per partition,
+    /// or the bare ranking verb `rn` / `rank` / `drank`. `order` is empty unless
+    /// an `order` sub-clause was given (only meaningful for the ranking verbs).
+    Window {
+        func: Box<Expr>,
+        partition: Vec<String>,
+        order: Vec<(String, bool)>, // (column, descending)
+    },
 }
 
 

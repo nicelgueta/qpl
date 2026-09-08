@@ -273,6 +273,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         "by"     => TokenKind::By,
                         "from"   => TokenKind::From,
                         "where"  => TokenKind::Where,
+                        "over"   => TokenKind::Over,
                         "order"  => TokenKind::Order,
                         "asc"    => TokenKind::Asc,
                         "desc"   => TokenKind::Desc,
@@ -442,6 +443,11 @@ mod tests {
     #[test]
     fn keyword_from() {
         assert_eq!(kinds("from"), vec![TokenKind::From]);
+    }
+
+    #[test]
+    fn keyword_over() {
+        assert_eq!(kinds("over"), vec![TokenKind::Over]);
     }
 
     #[test]

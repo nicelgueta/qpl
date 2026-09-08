@@ -9,7 +9,7 @@ Editor support for [`qpl`](../../README.md) — the Quick Polars Query Language.
 `.qpl` files get highlighting for comments (`/`), double-quoted strings with
 escapes, symbols and symbol vectors (`` `a`b`c ``), integer / float / bool /
 bool-vector literals, statement keywords (`select`, `by`, `from`, `where`,
-`order`, `asc`, `desc`, `distinct`, `limit`, `drop`, `update`, `delete`),
+`over`, `order`, `asc`, `desc`, `distinct`, `limit`, `drop`, `update`, `delete`),
 builtin keywords (`load`, `sink`, `cols`, `lazy`, `collect`) and `.qpl.*`
 builtin functions (`.qpl.cfg`), aggregates (`sum`, `avg`, `count`, `round`, ...),
 cast types (`f64$x`), the operator functions `?` `$` `::` `!` `#`, join

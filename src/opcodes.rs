@@ -1,6 +1,6 @@
 use std::fmt;
 use crate::ast::{self, CastTarget, TableSource, Value};
-use crate::enums::{PolarsFrameExpr, PolarsStackArg};
+use crate::enums::{PolarsFrameExpr, PolarsStackArg, WindowFn};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Instruction {
@@ -15,6 +15,10 @@ pub enum Instruction {
     /// `<precision> round <col>` — round a float column to `decimals` places.
     /// The rounding mode is read from `VmConfig::round_type` at execution time.
     Round { decimals: u32 },
+    /// `<func> over <partition> [order <keys>]` — a window function. For
+    /// `WindowFn::Over` the target expression is popped from the stack; the
+    /// ranking verbs synthesise their own expression.
+    Window { func: WindowFn, partition: Vec<String>, order: Vec<(String, bool)> },
     Case { branches: usize },
     Alias { name: Option<String> },
     Eval(ast::Expr),
@@ -47,6 +51,16 @@ impl fmt::Display for Instruction {
             Instruction::BinOp(op)                         => write!(f, "BIN_OP {op}"),
             Instruction::Call { func, args_count } => write!(f, "CALL {func} {args_count}"),
             Instruction::Round { decimals } => write!(f, "ROUND {decimals}"),
+            Instruction::Window { func, partition, order } => {
+                write!(f, "WINDOW {func:?} [{}]", partition.join(","))?;
+                if !order.is_empty() {
+                    let keys: Vec<String> = order.iter()
+                        .map(|(c, d)| format!("{c} {}", if *d { "desc" } else { "asc" }))
+                        .collect();
+                    write!(f, " order [{}]", keys.join(","))?;
+                }
+                Ok(())
+            }
             Instruction::Case { branches } => write!(f, "CASE {branches}"),
             Instruction::Alias { name }            => write!(f, "ALIAS {:?}", name),
             Instruction::FrameExpr(expr)          => write!(f, "FRAME_EXPR {expr:?}"),
@@ -137,6 +151,23 @@ mod tests {
     #[test]
     fn display_round() {
         assert_eq!(disp(Instruction::Round { decimals: 2 }), "ROUND 2");
+    }
+
+    #[test]
+    fn display_window() {
+        use crate::enums::WindowFn;
+        assert_eq!(
+            disp(Instruction::Window { func: WindowFn::Over, partition: vec!["country".into()], order: vec![] }),
+            "WINDOW Over [country]",
+        );
+        assert_eq!(
+            disp(Instruction::Window {
+                func: WindowFn::Rank,
+                partition: vec!["country".into(), "role".into()],
+                order: vec![("desk".into(), false), ("date".into(), true)],
+            }),
+            "WINDOW Rank [country,role] order [desk asc,date desc]",
+        );
     }
 
     #[test]

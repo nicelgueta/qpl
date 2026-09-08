@@ -6,6 +6,7 @@ pub enum TokenKind {
     By,
     From,
     Where,
+    Over,
     Order,
     Asc,
     Desc,

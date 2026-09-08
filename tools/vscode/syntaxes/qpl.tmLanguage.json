@@ -76,7 +76,7 @@
       "patterns": [
         {
           "name": "keyword.control.qpl",
-          "match": "\\b(select|by|from|where|order|asc|desc|distinct|limit|drop|update|delete)\\b"
+          "match": "\\b(select|by|from|where|over|order|asc|desc|distinct|limit|drop|update|delete)\\b"
         },
         {
           "name": "keyword.other.qpl",
@@ -93,7 +93,7 @@
     },
     "aggregate": {
       "name": "support.function.aggregate.qpl",
-      "match": "\\b(sum|avg|mean|min|max|count|first|last|std|dev|var|med|median|abs|neg|not|string|n_unique|round)\\b"
+      "match": "\\b(sum|avg|mean|min|max|count|first|last|std|dev|var|med|median|abs|neg|not|string|n_unique|round|rn|rank|drank)\\b"
     },
     "join": {
       "name": "keyword.operator.join.qpl",
