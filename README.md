@@ -539,5 +539,4 @@ Binaries build automatically on every version bump (GitHub Actions) for Linux
 ## Roadmap
 
 - WASM build, so qpl can run in the browser.
-- Shrink the binary — it bundles all of Polars (~100 MB).
 - More of the language.
