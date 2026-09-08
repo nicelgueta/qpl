@@ -21,8 +21,8 @@ can be added later without reworking phase 1.
 | Category | Tokens |
 |---|---|
 | Statement keywords | `select by from where order asc desc distinct limit drop update delete` |
-| Builtin keywords | `load sink cols show lazy collect` |
-| Aggregates (lexed as `Name`) | `sum avg mean min max count first last std dev var med median abs neg not string distinct n_unique` |
+| Builtin keywords | `load sink cols lazy collect` |
+| Aggregates (lexed as `Name`) | `sum avg mean min max count first last std dev var med median abs neg not string distinct n_unique round` |
 | Cast types (after `$`) | `f64 float f32 i64 int i32 i16 i8 u64 u32 u16 u8 bool str string` |
 | Join operators (infix `Name`) | `lj ij rj` |
 | Operators | `+ - * % = <> != < <= >= > & \| $ ? :: : ! #`; special `<<` (load), `>>` (sink); `?[c;t;e]` conditional |
@@ -63,7 +63,7 @@ tools/vscode/
 - `constant.numeric.float.qpl` — `\b\d+\.\d*`
 - `constant.numeric.integer.qpl` — `\b\d+\b`
 - `keyword.control.qpl` — statement keywords
-- `keyword.other.qpl` — `load sink cols show lazy collect`
+- `keyword.other.qpl` — `load sink cols lazy collect` and `.qpl.*` builtin functions (`.qpl.cfg`)
 - `support.function.aggregate.qpl` — aggregate names
 - `support.function.operator.qpl` — q-style operator functions `? $ :: ! #` (same colour as aggregates)
 - `support.type.cast.qpl` — cast type name in `type$expr`

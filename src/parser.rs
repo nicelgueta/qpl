@@ -60,7 +60,6 @@ impl Parser {
                 | TokenKind::Distinct
                 | TokenKind::Cols
                 | TokenKind::Load
-                | TokenKind::Show
                 | TokenKind::Lazy
                 | TokenKind::Collect
                 | TokenKind::Symbol(_) => {
@@ -168,11 +167,6 @@ impl Parser {
                 let tbl_expr = self.parse_table_expr()?;
                 Ok(TableExpr::BuiltIn(BuiltIn::Cols(Box::new(tbl_expr))))
             }
-            TokenKind::Show => {
-                self.next(); // consume 'show'
-                let tbl_expr = self.parse_table_expr()?;
-                Ok(TableExpr::BuiltIn(BuiltIn::Show(Box::new(tbl_expr))))
-            }
             TokenKind::Lazy => {
                 self.next(); // consume 'lazy'
                 Ok(TableExpr::BuiltIn(BuiltIn::Lazy(Box::new(self.parse_lazy_operand()?))))
@@ -184,10 +178,10 @@ impl Parser {
             TokenKind::Symbol(s) => {
                 self.next(); // consume the symbol
                 match self.peek() {
-                    // bare `\`tbl` → show it; `\`tbl >> path` → the postfix sink
-                    // in `parse_body` handles the rest, so hand back the plain frame
+                    // bare `\`tbl` selects the whole table; `\`tbl >> path` → the
+                    // postfix sink in `parse_body` handles the rest
                     TokenKind::Eof | TokenKind::Sink => {
-                        let tbl_expr = TableExpr::Select(SelectStmt {
+                        Ok(TableExpr::Select(SelectStmt {
                             cols: vec![],
                             from: TableSource::InMem(s),
                             by: None,
@@ -196,12 +190,7 @@ impl Parser {
                             join: None,
                             update: false,
                             delete: false,
-                        });
-                        if matches!(self.peek(), TokenKind::Sink) {
-                            Ok(tbl_expr)
-                        } else {
-                            Ok(TableExpr::BuiltIn(BuiltIn::Show(Box::new(tbl_expr))))
-                        }
+                        }))
                     }
                     TokenKind::Bang => {
                         // single symbol with a bang should actually 
@@ -366,6 +355,14 @@ impl Parser {
         // a modifier token between the type and the `` `$ `` cast operator
         if let Some(cast) = self.parse_modified_cast(&left, false)? {
             return Ok(cast);
+        }
+
+        // infix `round`: `<precision> round <expr>` (q-style dyadic verb). The
+        // precision is `left`; the value is the rest of the expression.
+        if matches!(self.peek(), TokenKind::Name(n) if n == "round") {
+            self.next();
+            let value = self.parse_expr()?;
+            return Ok(Expr::Call { func: "round".into(), args: vec![value, left] });
         }
 
         // bin op: left op right where right is the entire expr cos q is right to left eval
@@ -643,7 +640,6 @@ fn is_table_expr_start(token: &TokenKind) -> bool {
         | TokenKind::Int(_)
         | TokenKind::Load
         | TokenKind::Cols
-        | TokenKind::Show
         | TokenKind::Lazy
         | TokenKind::Collect
         | TokenKind::SymbolVec(_)
@@ -1045,6 +1041,15 @@ mod tests {
         let s = sel("select price_bin: ?[price>100;`large;price>50;`med;`small] from data");
         assert_eq!(s.cols[0].name, Some("price_bin".into()));
         assert!(matches!(&s.cols[0].expr, Expr::Case { branches, .. } if branches.len() == 2));
+    }
+
+    #[test]
+    fn infix_round_parses_to_a_call_value_then_precision() {
+        let s = sel("select mv: 2 round market_value from t");
+        assert_eq!(s.cols[0].expr, Expr::Call {
+            func: "round".into(),
+            args: vec![cref("market_value"), Expr::Lit(Value::Int(2))],
+        });
     }
 
     // --- by clause ---

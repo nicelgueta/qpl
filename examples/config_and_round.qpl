@@ -1,0 +1,23 @@
+/ ─────────────────────────────────────────────────────────────────────────────
+/ Session config via `.qpl.cfg` and the `round` column function.
+/
+/ Run from the repo root:
+/   cargo run -- examples/config_and_round.qpl
+/ ─────────────────────────────────────────────────────────────────────────────
+
+trades: load `examples/data/trades.parquet
+
+/ `.qpl.cfg key=value ...` sets session-wide knobs; a bare `.qpl.cfg` prints them
+.qpl.cfg maxrow=4 maxcol=6
+.qpl.cfg
+
+/ maxrow / maxcol only affect how much is *printed* — the query is unchanged
+select from trades
+
+/ `round` is dyadic, q-style: `<precision> round <column>`.
+/ precision is an integer literal; the mode comes from `round_type`.
+select sym, spread: 2 round price % size from trades
+
+/ HALF_TO_EVEN (banker's rounding) is the default; switch to HALF_UP
+.qpl.cfg round_type=HALF_UP
+select sym, spread: 2 round price % size from trades

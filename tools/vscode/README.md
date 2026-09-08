@@ -10,11 +10,12 @@ Editor support for [`qpl`](../../README.md) — the Quick Polars Query Language.
 escapes, symbols and symbol vectors (`` `a`b`c ``), integer / float / bool /
 bool-vector literals, statement keywords (`select`, `by`, `from`, `where`,
 `order`, `asc`, `desc`, `distinct`, `limit`, `drop`, `update`, `delete`),
-builtin keywords (`load`, `sink`, `cols`, `show`, `lazy`, `collect`),
-aggregates (`sum`, `avg`, `count`, ...), cast types (`f64$x`), the operator
-functions `?` `$` `::` `!` `#`, join operators (`lj`, `ij`, `rj`), the
-`<<` / `>>` channels, assignments, `\d` / `\l` / `\1` REPL lines, and the
-virtual `i` column. Plus line comments, bracket matching and auto-closing pairs.
+builtin keywords (`load`, `sink`, `cols`, `lazy`, `collect`) and `.qpl.*`
+builtin functions (`.qpl.cfg`), aggregates (`sum`, `avg`, `count`, `round`, ...),
+cast types (`f64$x`), the operator functions `?` `$` `::` `!` `#`, join
+operators (`lj`, `ij`, `rj`), the `<<` / `>>` channels, assignments,
+`\d` / `\l` / `\1` REPL lines, and the virtual `i` column. Plus line comments,
+bracket matching and auto-closing pairs.
 
 ### Interactive REPL
 

@@ -5,5 +5,8 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
-polars = { version = "0.55.2", features = ["lazy", "parquet", "csv", "strings", "is_in", "abs", "dtype-categorical"] }
+polars = { version = "0.55.2", features = ["lazy", "parquet", "csv", "strings", "is_in", "abs", "dtype-categorical", "round_series"] }
+# pulled in only to name `RoundMode` (the `polars` facade re-exports it crate-privately);
+# already compiled as a transitive dep, same version.
+polars-ops = { version = "0.55.2", features = ["round_series"] }
 rustyline = "18.0.1"

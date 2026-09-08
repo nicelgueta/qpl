@@ -171,6 +171,8 @@ select px: price, qty: size from trades          / aliasing
 select avg price by sym from trades              / group-by aggregation
 select total: sum size by sym from trades where side = "buy"
 select from trades where size > 100
+select from trades where size > 100, price < 400  / comma-separated preds = AND
+select from trades where (size > 400) | (side = "buy")   / & / | for and / or
 select from trades where 10100000b               / boolean-vector mask
 select from trades order sym asc, price desc
 ```
@@ -202,10 +204,16 @@ delete `price`size from trades
 | logical | `&` `\|` |
 | conditional | `?[cond; then; cond2; then2; ...; else]` — vectorised, nests for else-if |
 | cast | `type$expr` — see [Casts](#casts) |
+| round | `<precision> round <col>` — round a float column to N places |
 
 ```q
 select price_bin: ?[price>400;`high;price>200;`mid;`low] from trades
+select mv: 2 round market_value from trades          / round to 2 dp
 ```
+
+`round` is dyadic, q-style: the left operand is the decimal precision (an
+integer literal), the right is the column. The rounding mode is the session
+config `round_type` (`HALF_TO_EVEN` by default; see [Config](#config)).
 
 **Aggregates:** `sum`, `avg`/`mean`, `min`, `max`, `count`, `first`, `last`,
 `std`/`dev`, `var`, `med`/`median`, `abs`, `neg`, `not`, `string`,
@@ -411,6 +419,23 @@ select from trades where size > 100
 \1
 ```
 
+### Config
+
+`.qpl.cfg key=value ...` sets session-wide knobs. A bare `.qpl.cfg` prints the
+current settings. Works in scripts and the REPL.
+
+| Key | Meaning | Default |
+|---|---|---|
+| `maxcol` | max columns physically printed when rendering a table | `8` |
+| `maxrow` | max rows physically printed when rendering a table | `10` |
+| `round_type` | rounding mode for `round`: `HALF_UP` or `HALF_TO_EVEN` | `HALF_TO_EVEN` |
+
+```q
+.qpl.cfg maxrow=50 maxcol=20
+.qpl.cfg round_type=HALF_UP
+select mv: 2 round market_value from trades
+```
+
 ### Operator reference
 
 | Operator | Meaning |
@@ -421,6 +446,7 @@ select from trades where size > 100
 | `<` `<=` `>` `>=` | comparison |
 | `&` `\|` | logical and / or |
 | `?[...]` | vectorised conditional |
+| `round` | `<precision> round <col>` — round a float column (mode: `.qpl.cfg round_type`) |
 | `$` | cast (`f64$x`); `` `$x `` -> categorical |
 | `!` | `col!bool` sort map; `` u8!`$x `` -> categorical physical width |
 | `::` | enum cast (`` lvl::`$x ``) |

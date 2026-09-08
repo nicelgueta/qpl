@@ -1,5 +1,6 @@
 use polars::io::utils::sync_on_close::SyncOnCloseType;
 use polars::prelude::*;
+use polars_ops::prelude::RoundMode;
 use crate::ast::{self, TableSource, Value};
 use crate::enums::{PolarsFrameExpr, PolarsStackArg};
 use crate::lexer::tokenise;
@@ -16,6 +17,80 @@ pub struct Vm {
     /// When set (via the `\1 <path>` command), every line printed through
     /// [`Vm::emit`] is also appended here — kdb-style stdout redirection.
     pub stdout_log: Option<std::fs::File>,
+    /// Session-wide knobs set from `.qpl.cfg key=value ...`.
+    pub config: VmConfig,
+}
+
+/// Interpreter configuration set at run time via `.qpl.cfg`. To add a knob:
+/// give it a field + default here and a match arm in [`VmConfig::set`] — nothing
+/// else in the pipeline needs to change.
+#[derive(Debug, Clone)]
+pub struct VmConfig {
+    /// max columns physically printed when rendering a table (`maxcol`)
+    pub maxcol: usize,
+    /// max rows physically printed when rendering a table (`maxrow`)
+    pub maxrow: usize,
+    /// rounding mode used by the `round` column function (`round_type`)
+    pub round_type: RoundMode,
+}
+
+impl Default for VmConfig {
+    fn default() -> Self {
+        // mirror Polars' own display defaults
+        Self { maxcol: 8, maxrow: 10, round_type: RoundMode::HalfToEven }
+    }
+}
+
+impl VmConfig {
+    /// Apply one `key=value` assignment. Unknown keys / bad values are errors.
+    pub fn set(&mut self, key: &str, value: &str) -> Result<(), QplError> {
+        match key {
+            "maxcol" => self.maxcol = parse_cfg_usize(key, value)?,
+            "maxrow" => self.maxrow = parse_cfg_usize(key, value)?,
+            "round_type" => self.round_type = parse_round_type(value)?,
+            _ => return Err(QplError::Runtime(format!(
+                "unknown config '{key}' (known: maxcol, maxrow, round_type)"
+            ))),
+        }
+        // the row/col limits are read by Polars from the environment at render time
+        match key {
+            "maxcol" => unsafe { std::env::set_var("POLARS_FMT_MAX_COLS", self.maxcol.to_string()) },
+            "maxrow" => unsafe { std::env::set_var("POLARS_FMT_MAX_ROWS", self.maxrow.to_string()) },
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// One `key=value` line per knob — printed by a bare `.qpl.cfg`.
+    pub fn describe(&self) -> String {
+        format!(
+            "maxcol={}\nmaxrow={}\nround_type={}",
+            self.maxcol, self.maxrow, round_type_name(self.round_type),
+        )
+    }
+}
+
+fn parse_cfg_usize(key: &str, value: &str) -> Result<usize, QplError> {
+    value.parse().map_err(|_| {
+        QplError::Runtime(format!("config '{key}' expects a non-negative integer, got '{value}'"))
+    })
+}
+
+fn parse_round_type(value: &str) -> Result<RoundMode, QplError> {
+    match value.to_ascii_uppercase().as_str() {
+        "HALF_UP" => Ok(RoundMode::HalfAwayFromZero),
+        "HALF_TO_EVEN" => Ok(RoundMode::HalfToEven),
+        _ => Err(QplError::Runtime(format!(
+            "round_type must be HALF_UP or HALF_TO_EVEN, got '{value}'"
+        ))),
+    }
+}
+
+fn round_type_name(mode: RoundMode) -> &'static str {
+    match mode {
+        RoundMode::HalfAwayFromZero => "HALF_UP",
+        _ => "HALF_TO_EVEN",
+    }
 }
 
 enum StackObj {
@@ -68,6 +143,7 @@ impl Vm {
             lazy_frames: HashMap::new(),
             globals: HashMap::new(),
             stdout_log: None,
+            config: VmConfig::default(),
         }
     }
 
@@ -264,6 +340,11 @@ impl Vm {
                         .map(|o| o.unwrap_expr())
                         .collect::<Result<Vec<_>, _>>()?;
                     stack.push(StackObj::Expr(apply_call(&func, args)?));
+                }
+
+                Instruction::Round { decimals } => {
+                    let expr = pop1(&mut stack)?.unwrap_expr()?;
+                    stack.push(StackObj::Expr(expr.round(decimals, self.config.round_type)));
                 }
 
                 Instruction::Case { branches } => {
@@ -1187,6 +1268,52 @@ mod tests {
     fn collect_over_eager_table_is_noop_passthrough() {
         let df = run(make_vm(), "collect select c2 from t");
         assert_eq!(i64s(&df, "c2"), vec![10, 20, 30, 15]);
+    }
+
+    // --- round column function + config ---
+
+    fn round_vm() -> Vm {
+        // c3 = [0.5, 1.5, 2.5, 0.125]
+        let df = df![
+            "c3" => [0.5f64, 1.5, 2.5, 0.125],
+        ].unwrap();
+        let mut vm = Vm::new();
+        vm.tables.insert("t".into(), df);
+        vm
+    }
+
+    #[test]
+    fn round_defaults_to_half_to_even() {
+        let df = run(round_vm(), "select r: 0 round c3 from t");
+        assert_eq!(f64s(&df, "r"), vec![0.0, 2.0, 2.0, 0.0]);
+    }
+
+    #[test]
+    fn round_type_half_up_rounds_half_away_from_zero() {
+        let mut vm = round_vm();
+        vm.config.set("round_type", "HALF_UP").unwrap();
+        let df = run(vm, "select r: 0 round c3 from t");
+        assert_eq!(f64s(&df, "r"), vec![1.0, 2.0, 3.0, 0.0]);
+    }
+
+    #[test]
+    fn round_honours_precision() {
+        let df = run(round_vm(), "select r: 2 round c3 from t");
+        assert_eq!(f64s(&df, "r"), vec![0.5, 1.5, 2.5, 0.12]);
+    }
+
+    #[test]
+    fn config_set_rejects_unknown_key_and_bad_value() {
+        let mut cfg = VmConfig::default();
+        assert!(cfg.set("nope", "1").is_err());
+        assert!(cfg.set("maxrow", "abc").is_err());
+        assert!(cfg.set("round_type", "sideways").is_err());
+        cfg.set("maxrow", "42").unwrap();
+        cfg.set("maxcol", "7").unwrap();
+        cfg.set("round_type", "half_up").unwrap(); // case-insensitive
+        assert_eq!(cfg.maxrow, 42);
+        assert_eq!(cfg.maxcol, 7);
+        assert_eq!(cfg.round_type, RoundMode::HalfAwayFromZero);
     }
 
     // --- error cases ---

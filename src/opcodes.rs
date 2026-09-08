@@ -12,6 +12,9 @@ pub enum Instruction {
     BinOp(String),
     Assign(String),
     Call { func: String, args_count: usize },
+    /// `<precision> round <col>` — round a float column to `decimals` places.
+    /// The rounding mode is read from `VmConfig::round_type` at execution time.
+    Round { decimals: u32 },
     Case { branches: usize },
     Alias { name: Option<String> },
     Eval(ast::Expr),
@@ -43,6 +46,7 @@ impl fmt::Display for Instruction {
             Instruction::PushPolarsArg(arg)        => write!(f, "PUSH_POLARS_ARG {arg:?}"),
             Instruction::BinOp(op)                         => write!(f, "BIN_OP {op}"),
             Instruction::Call { func, args_count } => write!(f, "CALL {func} {args_count}"),
+            Instruction::Round { decimals } => write!(f, "ROUND {decimals}"),
             Instruction::Case { branches } => write!(f, "CASE {branches}"),
             Instruction::Alias { name }            => write!(f, "ALIAS {:?}", name),
             Instruction::FrameExpr(expr)          => write!(f, "FRAME_EXPR {expr:?}"),
@@ -128,6 +132,11 @@ mod tests {
             disp(Instruction::Call { func: "avg".into(), args_count: 2 }),
             "CALL avg 2"
         );
+    }
+
+    #[test]
+    fn display_round() {
+        assert_eq!(disp(Instruction::Round { decimals: 2 }), "ROUND 2");
     }
 
     #[test]

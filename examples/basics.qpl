@@ -15,8 +15,11 @@ select sym, px: price, qty: size from trades
 thr: 150
 select from trades where size > thr
 
-/ where with multiple successive filters
+/ where with multiple successive filters (comma = AND)
 select sym, price from trades where size > 100, price < 400
+
+/ combine predicates with & (and) / | (or); parenthesise, q has no precedence
+select from trades where (size > 400) | (price < 141)
 
 / group-by aggregation
 select traded: sum size, apx: avg price by sym, side from trades

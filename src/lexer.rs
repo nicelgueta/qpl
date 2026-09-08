@@ -180,6 +180,11 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 tokens.push(Token { kind: TokenKind::Op("?".to_string()), pos: start });
                 i += 1;
             }
+            '&' | '|' => {
+                // logical and / or; single-char, no run-glomming
+                tokens.push(Token { kind: TokenKind::Op(chars[i].to_string()), pos: start });
+                i += 1;
+            }
             '(' => {
                 tokens.push(Token {
                     kind: TokenKind::LParen,
@@ -279,7 +284,6 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         "cols"   => TokenKind::Cols,
                         "load"   => TokenKind::Load,
                         "sink"   => TokenKind::Sink,
-                        "show"   => TokenKind::Show,
                         "lazy"    => TokenKind::Lazy,
                         "collect" => TokenKind::Collect,
                         _ => TokenKind::Name(name),
@@ -461,6 +465,11 @@ mod tests {
     }
 
     #[test]
+    fn show_is_no_longer_a_keyword() {
+        assert_eq!(kinds("show"), vec![TokenKind::Name("show".into())]);
+    }
+
+    #[test]
     fn keyword_lazy_and_collect() {
         assert_eq!(kinds("lazy collect"), vec![TokenKind::Lazy, TokenKind::Collect]);
     }
@@ -533,6 +542,19 @@ mod tests {
         for (src, expected) in [("<", "<"), (">", ">"), ("<=", "<="), (">=", ">=")] {
             assert_eq!(kinds(src), vec![TokenKind::Op(expected.into())], "op: {src}");
         }
+    }
+
+    #[test]
+    fn op_logical_and_or() {
+        for op in ["&", "|"] {
+            assert_eq!(kinds(op), vec![TokenKind::Op(op.into())], "op: {op}");
+        }
+        // no run-glomming with adjacent operators
+        assert_eq!(kinds("a|b"), vec![
+            TokenKind::Name("a".into()),
+            TokenKind::Op("|".into()),
+            TokenKind::Name("b".into()),
+        ]);
     }
 
     // --- punctuation ---

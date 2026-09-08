@@ -66,12 +66,16 @@ fn logical_statements(src: &str) -> Vec<(usize, String)> {
 /// out (so a genuine syntax error still surfaces immediately). `\` commands are
 /// always single-line.
 fn wants_more(src: &str) -> bool {
-    if src.trim_start().starts_with('\\') {
+    let trimmed = src.trim_start();
+    if trimmed.starts_with('\\') || trimmed.starts_with(".qpl.cfg") {
         return false;
     }
     let toks = match tokenise(src) {
         Ok(toks) => toks,
-        Err(_) => return true,
+        // an unterminated string may be finished on the next line; every other
+        // lex error is terminal, so stop reading and let it surface.
+        Err(QplError::Lex(msg)) => return msg.contains("Unterminated"),
+        Err(_) => return false,
     };
     let mut depth: i32 = 0;
     for t in &toks {
@@ -186,6 +190,9 @@ fn match_run_vm(line: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<()
 /// Evaluate one statement and print its result. All output goes through
 /// [`Vm::emit`] so it is mirrored to the stdout log when one is configured.
 fn eval_line(line: &str, vm: &mut Vm) -> Result<(), QplError> {
+    if let Some(args) = cfg_directive(line) {
+        return apply_cfg(args, vm);
+    }
     if let Some(arg) = log_target(line) {
         // a `log` argument is a list of expressions; render and concatenate each
         let mut text = String::new();
@@ -223,6 +230,35 @@ fn log_target(line: &str) -> Option<&str> {
         return Some(rest);
     }
     None
+}
+
+/// Recognise the `.qpl.cfg` config function: `.qpl.cfg key=value key=value ...`.
+/// Returns the argument text (possibly empty, for a bare `.qpl.cfg` which just
+/// prints the current settings). Not a config line → `None`.
+fn cfg_directive(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix(".qpl.cfg")?;
+    match rest.chars().next() {
+        None => Some(""),
+        Some(c) if c.is_whitespace() => Some(rest.trim()),
+        Some(_) => None, // e.g. `.qpl.cfgx` is not this directive
+    }
+}
+
+/// Apply `.qpl.cfg` arguments: whitespace-separated `key=value` pairs. A bare
+/// `.qpl.cfg` prints the current configuration.
+fn apply_cfg(args: &str, vm: &mut Vm) -> Result<(), QplError> {
+    if args.is_empty() {
+        let current = vm.config.describe();
+        vm.emit(&current);
+        return Ok(());
+    }
+    for pair in args.split_whitespace() {
+        let (key, value) = pair.split_once('=').ok_or_else(|| {
+            QplError::Runtime(format!("expected key=value in `.qpl.cfg`, got '{pair}'"))
+        })?;
+        vm.config.set(key.trim(), value.trim())?;
+    }
+    Ok(())
 }
 
 /// Handle a `\` system command. Returns `Some(result)` if `line` is one.
@@ -275,7 +311,7 @@ fn disassemble(source: &str) -> Result<String, QplError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{logical_statements, log_target, wants_more};
+    use super::{cfg_directive, logical_statements, log_target, wants_more};
 
     #[test]
     fn wants_more_detects_unfinished_input() {
@@ -294,9 +330,22 @@ mod tests {
         assert!(wants_more("log \"oops"));
         // a real syntax error is NOT "more" — surface it now
         assert!(!wants_more("selct from trades"));
+        // a terminal lex error must not hang the prompt waiting for input
+        assert!(!wants_more("select from t where a = 1 @"));
         // `\` commands are always single-line
         assert!(!wants_more("\\d select a: ?[c>1;`x"));
         assert!(!wants_more("\\l some/script.qpl"));
+        // `.qpl.cfg` is a single-line directive, never "more"
+        assert!(!wants_more(".qpl.cfg maxrow=5 maxcol=3"));
+    }
+
+    #[test]
+    fn cfg_directive_recognises_the_config_function() {
+        assert_eq!(cfg_directive(".qpl.cfg maxcol=8 maxrow=20"), Some("maxcol=8 maxrow=20"));
+        assert_eq!(cfg_directive("  .qpl.cfg  round_type=HALF_UP "), Some("round_type=HALF_UP"));
+        assert_eq!(cfg_directive(".qpl.cfg"), Some(""));
+        assert_eq!(cfg_directive(".qpl.cfgx maxcol=1"), None);
+        assert_eq!(cfg_directive("select from t"), None);
     }
 
     #[test]

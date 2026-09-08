@@ -3,7 +3,6 @@ use crate::ast::{Expr, TableExpr};
 #[derive(Debug, Clone, PartialEq)]
 pub enum BuiltIn {
     Cols(Box<TableExpr>),
-    Show(Box<TableExpr>),
     /// `<table-expr> >> <path>` / `<table-expr> sink <path>` — stream a frame to
     /// a file. The left side is any table expression (`` `tbl ``, `select …`,
     /// `update …`, …), never a bare identifier. `path` is any scalar expression:

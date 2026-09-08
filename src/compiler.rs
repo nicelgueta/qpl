@@ -45,10 +45,6 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), 
             out.push(Instruction::FrameExpr(PolarsFrameExpr::Cols));
             Ok(())
         }
-        BuiltIn::Show(tbl_expr) => {
-            compile_tbl_expr(tbl_expr.as_ref(), out)?;
-            Ok(())
-        }
         BuiltIn::Sink { src, path } => {
             compile_tbl_expr(src.as_ref(), out)?;
             out.push(Instruction::Eval(path.clone()));
@@ -223,6 +219,21 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
             compile_expr(left, out)?;
             compile_expr(right, out)?;
             out.push(Instruction::BinOp(op.clone()));
+        }
+        // `<precision> round <col>` — parser hands us args = [value, precision].
+        // Precision must be a literal (it becomes part of the instruction); the
+        // rounding mode is resolved from VM config at run time.
+        Expr::Call { func, args } if func == "round" => {
+            let [value, precision] = args.as_slice() else {
+                return Err(QplError::Compile("round expects `<precision> round <column>`".into()));
+            };
+            let decimals = match precision {
+                Expr::Lit(Value::Int(n)) if *n >= 0 => *n as u32,
+                _ => return Err(QplError::Compile(
+                    "round precision must be a non-negative integer literal".into())),
+            };
+            compile_expr(value, out)?;
+            out.push(Instruction::Round { decimals });
         }
         Expr::Call { func, args } => {
             for arg in args {
@@ -487,6 +498,21 @@ mod tests {
     fn case_expression_compiles() {
         let program = compile_src("select bin: ?[c2>20;`high;c2>10;`mid;`low] from t");
         assert!(program.iter().any(|instruction| matches!(instruction, Case { branches: 2 })));
+    }
+
+    #[test]
+    fn round_compiles_to_round_instruction_with_precision() {
+        assert_eq!(compile_src("select r: 2 round px from t"), vec![
+            from_table("t"),
+            col("px"), Round { decimals: 2 }, alias("r"),
+            BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
+        ]);
+    }
+
+    #[test]
+    fn round_with_non_literal_precision_is_compile_error() {
+        let stmt = parse(tokenise("select r: sz round px from t").unwrap()).unwrap();
+        assert!(matches!(compile(&stmt), Err(QplError::Compile(_))));
     }
 
     // --- by clause ---

@@ -14,6 +14,9 @@
 
 ## Unreleased
 
+- `.qpl.*` namespaced builtin functions (e.g. `.qpl.cfg`) share the
+  `keyword.other.qpl` scope, so they colour the same as `load` / `sink` / `cols`.
+- Dropped the removed `show` keyword; added `round` to the aggregate/function group.
 - All bare identifiers share one scope (`variable.other.qpl`) so a declared
   variable, its later references, and column names/references all render in the
   same colour.

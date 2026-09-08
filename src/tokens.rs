@@ -18,7 +18,6 @@ pub enum TokenKind {
     Load,
     Sink,
     Cols,
-    Show,
     Lazy,
     Collect,
 
