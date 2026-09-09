@@ -7,6 +7,7 @@ mod opcodes;
 mod parser;
 mod enums;
 mod resolve;
+mod helpers;
 pub mod repl;
 mod tokens;
 mod vm;
@@ -31,7 +32,7 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
     let mut vm = vm::Vm::new();
-    
+
     if cli.load_demo {
         println!("Loading demo tables `trades` and `quotes`");
         repl::load_demo_tables(&mut vm)

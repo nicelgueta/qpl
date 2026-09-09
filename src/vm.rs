@@ -9,6 +9,7 @@ use crate::compiler::compile;
 use crate::errors::QplError;
 use crate::opcodes::Instruction;
 use crate::resolve;
+use crate::helpers::rename_columns_snake_case;
 use std::collections::HashMap;
 
 pub struct Vm {
@@ -319,7 +320,7 @@ impl Vm {
                             frame = Some(if needs_i { lf.with_row_index("i", None) } else { lf });
                         }
                         TableSource::Load(path) => {
-                            let lf = load_file(&path)?;
+                            let lf = rename_columns_snake_case(load_file(&path)?)?;
                             frame = Some(if needs_i { lf.with_row_index("i", None) } else { lf });
                         }
 
@@ -446,7 +447,7 @@ impl Vm {
                                 PolarsStackArg::Join(join_type) => {
                                     frame = Some(
                                         left.join(
-                                            right, 
+                                            right,
                                             left_on,
                                             right_on,
                                             JoinArgs::new(join_type)
