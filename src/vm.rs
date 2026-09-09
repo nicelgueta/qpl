@@ -347,12 +347,18 @@ impl Vm {
                     stack.push(StackObj::Expr(expr.round(decimals, self.config.round_type)));
                 }
 
-                Instruction::Window { func, partition, order } => {
-                    let target = match func {
-                        WindowFn::Over => Some(pop1(&mut stack)?.unwrap_expr()?),
-                        _ => None,
-                    };
-                    stack.push(StackObj::Expr(build_window(func, target, &partition, &order)?));
+                Instruction::Window { func, partition, order, rolling } => {
+                    if let Some((agg, window)) = rolling {
+                        let column = pop1(&mut stack)?.unwrap_expr()?;
+                        stack.push(StackObj::Expr(
+                            build_rolling_window(&agg, window, column, &partition, &order)?));
+                    } else {
+                        let target = match func {
+                            WindowFn::Over => Some(pop1(&mut stack)?.unwrap_expr()?),
+                            _ => None,
+                        };
+                        stack.push(StackObj::Expr(build_window(func, target, &partition, &order)?));
+                    }
                 }
 
                 Instruction::Case { branches } => {
@@ -738,6 +744,53 @@ fn sink_file(lf: LazyFrame, path: &str) -> Result<(), QplError> {
     Ok(())
 }
 
+/// Apply `.over(partition)` to `e`, honouring an optional window `order`
+/// sub-clause. With no `order` this is a plain partition broadcast; with one it
+/// sorts each partition by the order keys first (a single direction is applied
+/// to every key — mixed asc/desc is only supported by the ranking verbs). The
+/// result is mapped back onto the original row positions.
+fn apply_over(e: Expr, part: &[Expr], order: &[(String, bool)]) -> Result<Expr, QplError> {
+    if order.is_empty() {
+        return e.over(part).map_err(|err| QplError::Runtime(err.to_string()));
+    }
+    let order_by: Vec<Expr> = order.iter().map(|(c, _)| col(c.as_str())).collect();
+    let sort = SortOptions::default().with_order_descending(order[0].1);
+    e.over_with_options(Some(part.to_vec()), Some((order_by, sort)), WindowMapping::GroupsToRows)
+        .map_err(|err| QplError::Runtime(err.to_string()))
+}
+
+/// Build a fixed-size rolling-window aggregate (`<agg> <col> <n>!rolling over
+/// `key [order `k asc]`). Unlike the plain window path the aggregate is *not*
+/// pre-applied: `col` is the raw column and `agg` names the rolling reduction.
+fn build_rolling_window(
+    agg: &str,
+    window: usize,
+    column: Expr,
+    partition: &[String],
+    order: &[(String, bool)],
+) -> Result<Expr, QplError> {
+    let opts = RollingOptionsFixedWindow {
+        window_size: window,
+        min_periods: window,
+        weights: None,
+        center: false,
+        fn_params: None,
+    };
+    let rolled = match agg {
+        "sum"            => column.rolling_sum(opts),
+        "avg" | "mean"   => column.rolling_mean(opts),
+        "min"            => column.rolling_min(opts),
+        "max"            => column.rolling_max(opts),
+        "std" | "dev"    => column.rolling_std(opts),
+        "var"            => column.rolling_var(opts),
+        "median" | "med" => column.rolling_median(opts),
+        other => return Err(QplError::Runtime(format!(
+            "`rolling` supports sum/avg/min/max/std/var/median, not '{other}'"))),
+    };
+    let part: Vec<Expr> = partition.iter().map(|c| col(c.as_str())).collect();
+    apply_over(rolled, &part, order)
+}
+
 /// Build a window expression. `WindowFn::Over` broadcasts `target` (an aggregate
 /// or column expression) across each partition.
 ///
@@ -760,7 +813,7 @@ fn build_window(
     };
 
     if let WindowFn::Over = func {
-        return over(target.expect("Over target"), &part);
+        return apply_over(target.expect("Over target"), &part, order);
     }
 
     // (rank_key, descending) — the single key the final rank is computed over.
@@ -822,7 +875,14 @@ fn apply_call(func: &str, mut args: Vec<Expr>) -> Result<Expr, QplError> {
     if args.is_empty() {
         return Err(QplError::Runtime(format!("'{func}' called with no args")));
     }
-    let arg = args.remove(0); // all current builtins are unary
+    // dyadic verbs (`<param> verb <col>`): the parser hands us `[value, param]`,
+    // mirroring `round`. They never reach here with any other arity.
+    if args.len() == 2 {
+        let param = args.pop().unwrap();
+        let value = args.pop().unwrap();
+        return apply_dyadic(func, value, param);
+    }
+    let arg = args.remove(0);
     Ok(match func {
         "sum"                   => arg.sum(),
         "avg" | "mean"          => arg.mean(),
@@ -834,11 +894,39 @@ fn apply_call(func: &str, mut args: Vec<Expr>) -> Result<Expr, QplError> {
         "std"  | "dev"          => arg.std(1),
         "var"                   => arg.var(1),
         "median" | "med"        => arg.median(),
+        "mode" | "modal"        => arg.mode(false).sort(SortOptions::default()).first(),
+        "skew"                  => arg.skew(false),
+        "kurt" | "kurtosis"     => arg.kurtosis(true, false),
+        "any"                   => arg.any(true),
+        "all"                   => arg.all(true),
+        "prod" | "product"      => arg.product(),
+        "argmin"                => arg.arg_min(),
+        "argmax"                => arg.arg_max(),
+        "nnull" | "null_count"  => arg.null_count(),
+        "cumsum"                => arg.cum_sum(false),
+        "cummax"                => arg.cum_max(false),
+        "cummin"                => arg.cum_min(false),
+        "cumprod"               => arg.cum_prod(false),
+        "cumcount"              => arg.cum_count(false),
+        "ffill"                 => arg.fill_null_with_strategy(FillNullStrategy::Forward(None)),
+        "bfill"                 => arg.fill_null_with_strategy(FillNullStrategy::Backward(None)),
         "abs"                   => arg.abs(),
         "neg"                   => -arg,
         "not"                   => arg.not(),
         "distinct" | "n_unique" => arg.n_unique(),
         _ => return Err(QplError::Runtime(format!("unknown function '{func}'"))),
+    })
+}
+
+/// Dyadic column verbs, parsed q-style as `<param> verb <col>` (like `round`).
+fn apply_dyadic(func: &str, value: Expr, param: Expr) -> Result<Expr, QplError> {
+    Ok(match func {
+        "quantile" | "pctl" => value.quantile(param, QuantileMethod::Linear),
+        "shift" | "lag"     => value.shift(param),
+        "lead"              => value.shift(-param),
+        "diff"              => value.diff(param, polars::series::ops::NullBehavior::Ignore),
+        "pctchange"         => value.pct_change(param),
+        _ => return Err(QplError::Runtime(format!("unknown dyadic verb '{func}'"))),
     })
 }
 
@@ -882,6 +970,18 @@ mod tests {
 
     fn f64s(df: &DataFrame, name: &str) -> Vec<f64> {
         df.column(name).unwrap().f64().unwrap().into_no_null_iter().collect()
+    }
+
+    fn opt_i64s(df: &DataFrame, name: &str) -> Vec<Option<i64>> {
+        df.column(name).unwrap().i64().unwrap().iter().collect()
+    }
+
+    fn opt_f64s(df: &DataFrame, name: &str) -> Vec<Option<f64>> {
+        df.column(name).unwrap().f64().unwrap().iter().collect()
+    }
+
+    fn bools(df: &DataFrame, name: &str) -> Vec<bool> {
+        df.column(name).unwrap().bool().unwrap().iter().flatten().collect()
     }
 
     fn strs(df: &DataFrame, name: &str) -> Vec<String> {
@@ -1227,6 +1327,69 @@ mod tests {
     fn agg_mean() {
         let df = run(make_vm(), "select n: avg c2 from t");
         assert_eq!(f64s(&df, "n"), vec![18.75]);
+    }
+
+    #[test]
+    fn agg_mode() {
+        let df = run(make_vm(), "select n: mode c1 from t");
+        assert_eq!(strs(&df, "n"), vec!["a"]);
+    }
+
+    #[test]
+    fn agg_modal_alias() {
+        // ties resolve to the smallest value (mode list is sorted)
+        let df = run(make_vm(), "select n: modal c2 from t");
+        assert_eq!(i64s(&df, "n"), vec![10]);
+    }
+
+    #[test]
+    fn agg_any_all_prod_argmax() {
+        let df = run(make_vm(),
+            "select a: any c2 > 25, b: all c2 > 5, p: prod c3 from t");
+        assert_eq!(bools(&df, "a"), vec![true]);
+        assert_eq!(bools(&df, "b"), vec![true]);
+        assert_eq!(f64s(&df, "p"), vec![24.0]); // 1*2*3*4
+        let m = run(make_vm(), "select m: argmax c2 from t"); // 30 is at row 2
+        assert_eq!(m.column("m").unwrap().u32().unwrap().get(0), Some(2));
+    }
+
+    #[test]
+    fn dyadic_quantile() {
+        // c2 = [10, 20, 30, 15]; linear p50 over the whole column = 17.5
+        let df = run(make_vm(), "select q: 0.5 quantile c2 from t");
+        assert_eq!(f64s(&df, "q"), vec![17.5]);
+    }
+
+    #[test]
+    fn dyadic_shift_and_diff() {
+        let df = run(make_vm(), "select s: 1 shift c2, d: 1 diff c2 from t");
+        assert_eq!(opt_i64s(&df, "s"), vec![None, Some(10), Some(20), Some(30)]);
+        assert_eq!(opt_i64s(&df, "d"), vec![None, Some(10), Some(10), Some(-15)]);
+    }
+
+    #[test]
+    fn cumsum_over_partition_in_order() {
+        // c1 partitions: a{c2:10,30}, b{20}, c{15}; cumsum in ascending c2 order,
+        // mapped back to the original row positions [a10, b20, a30, c15].
+        let df = run(make_vm(), "select r: cumsum c2 over `c1 order `c2 asc from t");
+        assert_eq!(i64s(&df, "r"), vec![10, 20, 40, 15]);
+    }
+
+    #[test]
+    fn rolling_window_sum_over_partition() {
+        // partition a has c3 {1.0, 3.0} in order -> [null, 4.0]; singletons -> null
+        let df = run(make_vm(), "select r: sum c3 over `c1 order `c3 asc rolling 2 from t");
+        assert_eq!(opt_f64s(&df, "r"), vec![None, None, Some(4.0), None]);
+    }
+
+    #[test]
+    fn rolling_rejects_unsupported_aggregate() {
+        let mut vm = make_vm();
+        let src = "select r: first c3 over `c1 order `c3 asc rolling 2 from t";
+        let tokens = tokenise(src).unwrap();
+        let stmt = parse(tokens).unwrap();
+        let prog = compile(&stmt).unwrap();
+        assert!(vm.eval(prog).is_err());
     }
 
     #[test]

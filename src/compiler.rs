@@ -253,9 +253,27 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
             compile_expr(default, out)?;
             out.push(Instruction::Case { branches: branches.len() });
         }
-        Expr::Window { func, partition, order } => {
+        Expr::Window { func, partition, order, rolling } => {
             if partition.is_empty() {
                 return Err(QplError::Compile("`over` needs at least one partition symbol".into()));
+            }
+            // `<agg> <col> <n>!rolling over ...` — push the *raw* column and carry
+            // the aggregate name in the instruction; the VM applies the rolling
+            // reduction instead of the plain aggregate.
+            if let Some(window) = rolling {
+                let (agg, column) = match func.as_ref() {
+                    Expr::Call { func: agg, args } if args.len() == 1 => (agg.clone(), &args[0]),
+                    _ => return Err(QplError::Compile(
+                        "`rolling` must wrap a plain aggregate, e.g. `sum px 5!rolling over `k`".into())),
+                };
+                compile_expr(column, out)?;
+                out.push(Instruction::Window {
+                    func: WindowFn::Over,
+                    partition: partition.clone(),
+                    order: order.clone(),
+                    rolling: Some((agg, *window)),
+                });
+                return Ok(());
             }
             // bare ranking verbs (`rn` / `rank` / `drank`) synthesise their own
             // expression from the window order; everything else is a column
@@ -276,18 +294,13 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
                             "`rn` / `rank` / `drank` need an `order` sub-clause".into()));
                     }
                 }
-                None => {
-                    if !order.is_empty() {
-                        return Err(QplError::Compile(
-                            "window `order` applies only to `rn` / `rank` / `drank`".into()));
-                    }
-                    compile_expr(func, out)?;
-                }
+                None => compile_expr(func, out)?,
             }
             out.push(Instruction::Window {
                 func: ranking.unwrap_or(WindowFn::Over),
                 partition: partition.clone(),
                 order: order.clone(),
+                rolling: None,
             });
         }
         Expr::Dict(_) => return Err(QplError::Runtime("Dict expressions are not supported in select statements (yet)".into())),
@@ -561,7 +574,7 @@ mod tests {
         assert_eq!(compile_src("select m: max px over `s from t"), vec![
             from_table("t"),
             col("px"), call("max", 1),
-            Window { func: WindowFn::Over, partition: vec!["s".into()], order: vec![] },
+            Window { func: WindowFn::Over, partition: vec!["s".into()], order: vec![], rolling: None },
             alias("m"),
             BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
         ]);
@@ -572,7 +585,7 @@ mod tests {
         use crate::enums::WindowFn;
         assert_eq!(compile_src("select r: rn over `s order `px desc from t"), vec![
             from_table("t"),
-            Window { func: WindowFn::RowNumber, partition: vec!["s".into()], order: vec![("px".into(), true)] },
+            Window { func: WindowFn::RowNumber, partition: vec!["s".into()], order: vec![("px".into(), true)], rolling: None },
             alias("r"),
             BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
         ]);
@@ -585,9 +598,32 @@ mod tests {
     }
 
     #[test]
-    fn window_order_on_a_plain_aggregate_is_compile_error() {
-        let stmt = parse(tokenise("select m: max px over `s order `px asc from t").unwrap()).unwrap();
-        assert!(matches!(compile(&stmt), Err(QplError::Compile(_))));
+    fn window_order_on_a_plain_aggregate_is_allowed() {
+        use crate::enums::WindowFn;
+        assert_eq!(compile_src("select c: cumsum px over `s order `px asc from t"), vec![
+            from_table("t"),
+            col("px"), call("cumsum", 1),
+            Window { func: WindowFn::Over, partition: vec!["s".into()], order: vec![("px".into(), false)], rolling: None },
+            alias("c"),
+            BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
+        ]);
+    }
+
+    #[test]
+    fn rolling_window_pushes_raw_column_and_carries_agg_name() {
+        use crate::enums::WindowFn;
+        assert_eq!(compile_src("select r: sum px over `s order `ts asc rolling 3 from t"), vec![
+            from_table("t"),
+            col("px"),
+            Window {
+                func: WindowFn::Over,
+                partition: vec!["s".into()],
+                order: vec![("ts".into(), false)],
+                rolling: Some(("sum".into(), 3)),
+            },
+            alias("r"),
+            BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
+        ]);
     }
 
     // --- by clause ---

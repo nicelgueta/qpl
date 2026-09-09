@@ -369,13 +369,20 @@ impl Parser {
             return self.finish_window(cast, windows);
         }
 
-        // infix `round`: `<precision> round <expr>` (q-style dyadic verb). The
-        // precision is `left`; the value is the rest of the expression. `round`
-        // binds tighter than `over`, so its value never swallows a window.
-        if matches!(self.peek(), TokenKind::Name(n) if n == "round") {
+        // infix dyadic verbs: `<param> verb <expr>` (q-style). `param` is `left`;
+        // the value is the rest of the expression. They bind tighter than `over`,
+        // so the value never swallows a window. The parser only records
+        // `Call { func, args: [value, param] }`; `round` is lowered in the
+        // compiler, the rest dispatch through `apply_dyadic` in the VM.
+        if let TokenKind::Name(n) = self.peek()
+            && matches!(n.as_str(),
+                "round" | "quantile" | "pctl" | "shift" | "lag" | "lead"
+                | "diff" | "pctchange")
+        {
+            let name = n.clone();
             self.next();
             let value = self.parse_value()?;
-            let call = Expr::Call { func: "round".into(), args: vec![value, left] };
+            let call = Expr::Call { func: name, args: vec![value, left] };
             return self.finish_window(call, windows);
         }
 
@@ -423,7 +430,10 @@ impl Parser {
         } else {
             Vec::new()
         };
-        let win = Expr::Window { func: Box::new(left), partition, order };
+        // trailing `rolling <n>` sub-clause turns the aggregate into a fixed-size
+        // rolling window (`sum px over `sym order `ts asc rolling 3`).
+        let rolling = self.parse_rolling_modifier()?;
+        let win = Expr::Window { func: Box::new(left), partition, order, rolling };
         // `over` binds tighter than arithmetic: fold trailing binary operators.
         if let TokenKind::Op(op) = self.peek().clone()
             && op != "$"
@@ -433,6 +443,21 @@ impl Parser {
             return Ok(Expr::BinOp { left: Box::new(win), op, right: Box::new(right) });
         }
         Ok(win)
+    }
+
+    /// Trailing `rolling <n>` window sub-clause (after the `over` partition and
+    /// any `order`). Returns `None` when there is no `rolling` keyword.
+    fn parse_rolling_modifier(&mut self) -> Result<Option<usize>, QplError> {
+        if !matches!(self.peek(), TokenKind::Name(n) if n == "rolling") {
+            return Ok(None);
+        }
+        self.next(); // `rolling`
+        match self.next() {
+            TokenKind::Int(n) if n > 0 => Ok(Some(n as usize)),
+            other => Err(QplError::Parse(format!(
+                "`rolling` needs a positive integer window size, got {other:?}"
+            ))),
+        }
     }
 
     /// Partition keys after `over`: one `` `sym `` or a `` `a`b `` vector.
@@ -1135,6 +1160,7 @@ mod tests {
             func: Box::new(func),
             partition: partition.iter().map(|s| s.to_string()).collect(),
             order: order.iter().map(|(c, d)| (c.to_string(), *d)).collect(),
+            rolling: None,
         }
     }
 

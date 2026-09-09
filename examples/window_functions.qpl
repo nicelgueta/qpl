@@ -25,3 +25,28 @@ select sym, side, price,
 
 / multi-key order with independent directions: side ascending, then price descending
 select sym, side, price, seat: rn over `sym order `side asc `price desc from trades
+
+/ ── ordered aggregates ───────────────────────────────────────────────────────
+/ any aggregate may take an `order` sub-clause: the partition is sorted before
+/ the aggregate runs (one direction for all keys). Handy for cumulatives and the
+/ row-relative dyadic verbs. (ordering by `price` here just for a stable
+/ sequence — real data would order by a timestamp.)
+
+/ running total, plus previous row and the change from it
+/   cumsum <col>        — running total
+/   <n> shift <col>     — value n rows earlier   (alias: `lag`)
+/   <n> diff  <col>     — difference from n rows back
+select sym, price,
+    run:  cumsum price over `sym order `price asc,
+    prev: 1 shift price over `sym order `price asc,
+    chg:  1 diff  price over `sym order `price asc
+    from trades
+
+/ ── rolling windows ─────────────────────────────────────────────────────────
+/ a trailing `rolling <n>` turns the aggregate into a fixed n-row moving window
+/ (sum / avg / min / max / std / var / median). The first n-1 rows of each
+/ partition are null — the window isn't full yet.
+select sym, price,
+    ma3: avg price over `sym order `price asc rolling 2,
+    mx3: max price over `sym order `price asc rolling 2
+    from trades

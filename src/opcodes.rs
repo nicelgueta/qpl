@@ -17,8 +17,16 @@ pub enum Instruction {
     Round { decimals: u32 },
     /// `<func> over <partition> [order <keys>]` — a window function. For
     /// `WindowFn::Over` the target expression is popped from the stack; the
-    /// ranking verbs synthesise their own expression.
-    Window { func: WindowFn, partition: Vec<String>, order: Vec<(String, bool)> },
+    /// ranking verbs synthesise their own expression. `rolling` is
+    /// `Some((agg, window))` for `<agg> <col> <n>!rolling over ...`, where the
+    /// popped stack value is the raw column and `agg` names the rolling
+    /// reduction instead of it being pre-applied.
+    Window {
+        func: WindowFn,
+        partition: Vec<String>,
+        order: Vec<(String, bool)>,
+        rolling: Option<(String, usize)>,
+    },
     Case { branches: usize },
     Alias { name: Option<String> },
     Eval(ast::Expr),
@@ -51,13 +59,16 @@ impl fmt::Display for Instruction {
             Instruction::BinOp(op)                         => write!(f, "BIN_OP {op}"),
             Instruction::Call { func, args_count } => write!(f, "CALL {func} {args_count}"),
             Instruction::Round { decimals } => write!(f, "ROUND {decimals}"),
-            Instruction::Window { func, partition, order } => {
+            Instruction::Window { func, partition, order, rolling } => {
                 write!(f, "WINDOW {func:?} [{}]", partition.join(","))?;
                 if !order.is_empty() {
                     let keys: Vec<String> = order.iter()
                         .map(|(c, d)| format!("{c} {}", if *d { "desc" } else { "asc" }))
                         .collect();
                     write!(f, " order [{}]", keys.join(","))?;
+                }
+                if let Some((agg, window)) = rolling {
+                    write!(f, " rolling {agg}/{window}")?;
                 }
                 Ok(())
             }
@@ -157,7 +168,12 @@ mod tests {
     fn display_window() {
         use crate::enums::WindowFn;
         assert_eq!(
-            disp(Instruction::Window { func: WindowFn::Over, partition: vec!["country".into()], order: vec![] }),
+            disp(Instruction::Window {
+                func: WindowFn::Over,
+                partition: vec!["country".into()],
+                order: vec![],
+                rolling: None,
+            }),
             "WINDOW Over [country]",
         );
         assert_eq!(
@@ -165,8 +181,18 @@ mod tests {
                 func: WindowFn::Rank,
                 partition: vec!["country".into(), "role".into()],
                 order: vec![("desk".into(), false), ("date".into(), true)],
+                rolling: None,
             }),
             "WINDOW Rank [country,role] order [desk asc,date desc]",
+        );
+        assert_eq!(
+            disp(Instruction::Window {
+                func: WindowFn::Over,
+                partition: vec!["sym".into()],
+                order: vec![("date".into(), false)],
+                rolling: Some(("sum".into(), 3)),
+            }),
+            "WINDOW Over [sym] order [date asc] rolling sum/3",
         );
     }
 

@@ -93,7 +93,7 @@
     },
     "aggregate": {
       "name": "support.function.aggregate.qpl",
-      "match": "\\b(sum|avg|mean|min|max|count|first|last|std|dev|var|med|median|abs|neg|not|string|n_unique|round|rn|rank|drank)\\b"
+      "match": "\\b(sum|avg|mean|min|max|count|first|last|std|dev|var|med|median|mode|modal|skew|kurt|kurtosis|any|all|prod|product|argmin|argmax|nnull|null_count|cumsum|cummax|cummin|cumprod|cumcount|ffill|bfill|abs|neg|not|string|n_unique|round|quantile|pctl|shift|lag|lead|diff|pctchange|rolling|rn|rank|drank)\\b"
     },
     "join": {
       "name": "keyword.operator.join.qpl",

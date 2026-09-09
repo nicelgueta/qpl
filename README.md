@@ -205,20 +205,32 @@ delete `price`size from trades
 | conditional | `?[cond; then; cond2; then2; ...; else]` — vectorised, nests for else-if |
 | cast | `type$expr` — see [Casts](#casts) |
 | round | `<precision> round <col>` — round a float column to N places |
-| window | `<expr> over `p1`p2 [order `k1 asc `k2 desc]` — see [Window functions](#window-functions) |
+| dyadic verbs | `<param> verb <col>` — `quantile`/`pctl`, `shift`/`lag`, `lead`, `diff`, `pctchange` (and `round`) |
+| window | `<expr> over `p1`p2 [order `k1 asc `k2 desc] [rolling n]` — see [Window functions](#window-functions) |
 
 ```q
 select price_bin: ?[price>400;`high;price>200;`mid;`low] from trades
 select mv: 2 round market_value from trades          / round to 2 dp
+select p95: 0.95 quantile price by sym from trades   / 95th percentile
+select sym, price, ret: 1 diff price by sym from trades   / row-over-row change
 ```
 
-`round` is dyadic, q-style: the left operand is the decimal precision (an
-integer literal), the right is the column. The rounding mode is the session
-config `round_type` (`HALF_TO_EVEN` by default; see [Config](#config)).
+`round` and the other **dyadic verbs** are q-style: the left operand is a
+parameter (a literal), the right is the column. `<p> quantile <col>` takes a
+fraction in `[0,1]`; `<n> shift <col>` (alias `lag`) moves values `n` rows later,
+`lead` `n` rows earlier; `<n> diff <col>` is the difference from `n` rows back;
+`<n> pctchange <col>` the fractional change. `round`'s rounding mode is the
+session config `round_type` (`HALF_TO_EVEN` by default; see [Config](#config)).
 
 **Aggregates:** `sum`, `avg`/`mean`, `min`, `max`, `count`, `first`, `last`,
-`std`/`dev`, `var`, `med`/`median`, `abs`, `neg`, `not`, `string`,
-`distinct`/`n_unique`.
+`std`/`dev`, `var`, `med`/`median`, `mode`/`modal` (modal average — most
+frequent value; ties resolve to the smallest), `skew`, `kurt`/`kurtosis`,
+`any`, `all`, `prod`/`product`, `argmin`, `argmax`, `nnull`/`null_count`,
+`abs`, `neg`, `not`, `string`, `distinct`/`n_unique`.
+
+**Ordered / cumulative** (most useful with `over` + an `order` sub-clause, which
+sorts each partition before applying): `cumsum`, `cummax`, `cummin`, `cumprod`,
+`cumcount`, `ffill` (forward-fill nulls), `bfill` (backward-fill).
 
 ### Window functions
 
@@ -249,7 +261,27 @@ select emp, country, role,
     from staff
 ```
 
-`order` is only valid with `rn` / `rank` / `drank`; the ranking verbs require it.
+The ranking verbs **require** `order`. Any other aggregate **may** take it: with
+an `order` sub-clause the partition is sorted before the aggregate runs, so
+`cumsum` / `diff` / `ffill` and friends compose in a defined order (a single
+direction applies to every key — mixed asc/desc is ranking-verb only):
+
+```q
+select sym, ts, px,
+    run:  cumsum px over `sym order `ts asc,       / running total in time order
+    prev: lag px    over `sym order `ts asc         / previous row's price
+    from trades
+```
+
+**Rolling windows** — a trailing `rolling <n>` sub-clause turns the aggregate
+into a fixed `n`-row rolling reduction over the ordered partition
+(`sum`/`avg`/`min`/`max`/`std`/`var`/`median`):
+
+```q
+select sym, ts, px, ma5: avg px over `sym order `ts asc rolling 5 from trades
+```
+
+The first `n-1` rows of each partition are `null` (the window isn't full yet).
 
 **Virtual column `i`** is the row index (aliased to `x` in output, per q):
 

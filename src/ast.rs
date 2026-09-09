@@ -48,11 +48,14 @@ pub enum Expr {
     /// `<func> over `p1`p2 [order `k1 asc `k2 desc]` — a window function.
     /// `func` is either a column expression (`max salary`) applied per partition,
     /// or the bare ranking verb `rn` / `rank` / `drank`. `order` is empty unless
-    /// an `order` sub-clause was given (only meaningful for the ranking verbs).
+    /// an `order` sub-clause was given. `rolling` is `Some(n)` for the
+    /// `<agg> <col> <n>!rolling over ...` form (a fixed `n`-row rolling
+    /// aggregate); `func` must then be a plain aggregate call.
     Window {
         func: Box<Expr>,
         partition: Vec<String>,
         order: Vec<(String, bool)>, // (column, descending)
+        rolling: Option<usize>,
     },
 }
 
