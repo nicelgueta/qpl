@@ -15,6 +15,10 @@ select sym, px: price, qty: size from trades
 thr: 150
 select from trades where size > thr
 
+/ casts fold in a scalar context too - `int$` truncates, strings are parsed
+thr: int$149.5 + 1
+select from trades where size > thr
+
 / where with multiple successive filters (comma = AND)
 select sym, price from trades where size > 100, price < 400
 

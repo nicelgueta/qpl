@@ -698,15 +698,55 @@ fn scalar_binop(l: ast::Value, r: ast::Value, op: &str) -> Result<ast::Value, Qp
     })
 }
 
+/// Casts a scalar [`Value`] to the family named by `dtype` — the same type
+/// names [`polars_dtype`] accepts. qpl scalars carry a single integer and a
+/// single float type, so every `iN`/`uN` name folds to `Int` and `f32`/`f64`
+/// to `Float`; the width only matters once the value reaches a column.
 fn scalar_cast(val: ast::Value, dtype: &str) -> Result<ast::Value, QplError> {
     use ast::Value::*;
-    Ok(match (val, dtype) {
-        (Int(n),   "f64" | "float" | "f32") => Float(n as f64),
-        (Float(f), "i64" | "int"  | "i32" | "i16" | "i8") => Int(f as i64),
-        (Int(n),   "str" | "string") => Str(n.to_string()),
-        (Float(f), "str" | "string") => Str(f.to_string()),
-        (Bool(b),  "str" | "string") => Str(b.to_string()),
-        (v, t) => return Err(QplError::Runtime(format!("cannot cast {v:?} to '{t}'"))),
+    // shared string parse for `Str` / `Sym` sources; accepts an int- or
+    // float-looking literal
+    let as_int = |s: &str| {
+        let s = s.trim();
+        s.parse::<i64>().ok().or_else(|| s.parse::<f64>().ok().map(|f| f as i64))
+    };
+    let bad = |v: &ast::Value| QplError::Runtime(format!("cannot cast {v:?} to '{dtype}'"));
+    Ok(match dtype {
+        "i64" | "int" | "i32" | "i16" | "i8" | "u64" | "u32" | "u16" | "u8" => match val {
+            Int(n)          => Int(n),
+            Float(f)        => Int(f as i64),
+            Bool(b)         => Int(b as i64),
+            Str(ref s) | Sym(ref s) => Int(as_int(s)
+                .ok_or_else(|| QplError::Runtime(format!("cannot parse '{s}' as '{dtype}'")))?),
+            ref v           => return Err(bad(v)),
+        },
+        "f64" | "float" | "f32" => match val {
+            Int(n)          => Float(n as f64),
+            Float(f)        => Float(f),
+            Bool(b)         => Float(b as i64 as f64),
+            Str(ref s) | Sym(ref s) => Float(s.trim().parse::<f64>()
+                .map_err(|_| QplError::Runtime(format!("cannot parse '{s}' as '{dtype}'")))?),
+            ref v           => return Err(bad(v)),
+        },
+        "bool" => match val {
+            Int(n)          => Bool(n != 0),
+            Float(f)        => Bool(f != 0.0),
+            Bool(b)         => Bool(b),
+            Str(ref s) | Sym(ref s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true"  | "1" => Bool(true),
+                "false" | "0" => Bool(false),
+                _ => return Err(QplError::Runtime(format!("cannot parse '{s}' as 'bool'"))),
+            },
+            ref v           => return Err(bad(v)),
+        },
+        "str" | "string" => match val {
+            Int(n)          => Str(n.to_string()),
+            Float(f)        => Str(f.to_string()),
+            Bool(b)         => Str(b.to_string()),
+            Str(s) | Sym(s) => Str(s),
+            ref v           => return Err(bad(v)),
+        },
+        _ => return Err(QplError::Runtime(format!("unknown cast type '{dtype}'"))),
     })
 }
 
@@ -1049,6 +1089,48 @@ mod tests {
             expr: Box::new(ast::Expr::ColRef("o".into())),
         };
         assert_eq!(vm.eval_scalar(&expr).expect("eval"), ast::Value::Sym("out.parquet".into()));
+    }
+
+    #[test]
+    fn scalar_cast_covers_every_family() {
+        use ast::Value::*;
+        // float -> int truncates; the width name is accepted but folds to i64
+        assert_eq!(scalar_cast(Float(45.3), "int").unwrap(), Int(45));
+        assert_eq!(scalar_cast(Float(45.9), "u32").unwrap(), Int(45));
+        assert_eq!(scalar_cast(Int(300), "i8").unwrap(), Int(300));
+        // int/bool -> float
+        assert_eq!(scalar_cast(Int(45), "f64").unwrap(), Float(45.0));
+        assert_eq!(scalar_cast(Bool(true), "f32").unwrap(), Float(1.0));
+        // -> bool
+        assert_eq!(scalar_cast(Int(0), "bool").unwrap(), Bool(false));
+        assert_eq!(scalar_cast(Float(3.0), "bool").unwrap(), Bool(true));
+        assert_eq!(scalar_cast(Str("true".into()), "bool").unwrap(), Bool(true));
+        // string parses into a number
+        assert_eq!(scalar_cast(Str("45".into()), "int").unwrap(), Int(45));
+        assert_eq!(scalar_cast(Str("3.9".into()), "int").unwrap(), Int(3));
+        assert_eq!(scalar_cast(Str(" 3.5 ".into()), "f64").unwrap(), Float(3.5));
+        // -> string
+        assert_eq!(scalar_cast(Int(45), "str").unwrap(), Str("45".into()));
+        assert_eq!(scalar_cast(Bool(true), "string").unwrap(), Str("true".into()));
+    }
+
+    #[test]
+    fn scalar_cast_rejects_junk() {
+        use ast::Value::*;
+        assert!(scalar_cast(Str("nope".into()), "bool").is_err());
+        assert!(scalar_cast(Str("abc".into()), "int").is_err());
+        assert!(scalar_cast(Int(1), "widget").is_err());
+    }
+
+    #[test]
+    fn eval_scalar_cast_end_to_end() {
+        // the `l: int$45.3` case from the docs: a cast folds during scalar eval
+        let vm = make_vm();
+        let expr = ast::Expr::Cast {
+            target: ast::CastTarget::Prim("int".into()),
+            expr: Box::new(ast::Expr::Lit(ast::Value::Float(45.3))),
+        };
+        assert_eq!(vm.eval_scalar(&expr).unwrap(), ast::Value::Int(45));
     }
 
     // scalar eval and assignment via instructions
