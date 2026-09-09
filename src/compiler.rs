@@ -31,7 +31,7 @@ fn compile_stmt(stmt: &Stmt, out: &mut Vec<Instruction>) -> Result<(), QplError>
     }
 }
 
-fn compile_tbl_expr(tbl_expr: &TableExpr, out: &mut Vec<Instruction>) -> Result<(), QplError> {
+pub(crate) fn compile_tbl_expr(tbl_expr: &TableExpr, out: &mut Vec<Instruction>) -> Result<(), QplError> {
     match tbl_expr {
         TableExpr::Select(sel) => compile_select(sel, out),
         TableExpr::BuiltIn(func) => compile_builtin(func, out)
@@ -304,6 +304,14 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
             });
         }
         Expr::Dict(_) => return Err(QplError::Runtime("Dict expressions are not supported in select statements (yet)".into())),
+        // column expressions / slices / indexing are value-context only — they are
+        // tree-walked by `resolve::eval_value`, never lowered into a projection.
+        Expr::Table(_) => return Err(QplError::Compile(
+            "a `table`col` / `select` column expression cannot appear inside a select projection".into())),
+        Expr::Take { .. } => return Err(QplError::Compile(
+            "`n#…` slicing is only valid outside a select projection".into())),
+        Expr::Index { .. } => return Err(QplError::Compile(
+            "positional indexing is only valid outside a select projection".into())),
     }
     Ok(())
 }
@@ -483,10 +491,12 @@ mod tests {
             from_table("trades"), BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
             FrameExpr(PolarsFrameExpr::Distinct), Result,
         ]);
-        assert_eq!(compile_src("10#select from trades"), vec![
+        assert_eq!(compile_src("10 limit select from trades"), vec![
             from_table("trades"), BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
             FrameExpr(PolarsFrameExpr::Limit(10)), Result,
         ]);
+        // `n#…` is a value expression, tree-walked from a single Eval
+        assert!(matches!(compile_src("10#select from trades").as_slice(), [Eval(_)]));
     }
 
     #[test]
@@ -530,7 +540,7 @@ mod tests {
 
     #[test]
     fn sink_is_terminal_without_trailing_result() {
-        let prog = compile_src("`t >> `out.parquet");
+        let prog = compile_src("t >> `out.parquet");
         assert_eq!(prog, vec![
             from_table("t"),
             BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,

@@ -6,6 +6,7 @@ mod lexer;
 mod opcodes;
 mod parser;
 mod enums;
+mod resolve;
 pub mod repl;
 mod tokens;
 mod vm;

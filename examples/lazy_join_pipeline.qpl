@@ -25,13 +25,13 @@ enriched: update band: ?[spread > 0.4; `wide; `tight] from enriched
 
 / 5. aggregate per sym/side/band, then sort — all lazy
 summary: select traded: sum notional, avg_spread: avg spread, n: count price by sym, side, band from enriched
-summary: `traded`sym!10b `summary
+summary: `traded`sym!10b summary
 
 / show the plan
-`summary
+summary
 
 o: "examples/data/market_summary.parquet"
 / 6. the ONLY execution: stream the final plan to parquet without collecting
-`summary >> `$o
+summary >> `$o
 
 log "created parquet file: '" o "'"

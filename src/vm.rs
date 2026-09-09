@@ -8,6 +8,7 @@ use crate::parser::parse;
 use crate::compiler::compile;
 use crate::errors::QplError;
 use crate::opcodes::Instruction;
+use crate::resolve;
 use std::collections::HashMap;
 
 pub struct Vm {
@@ -251,9 +252,42 @@ impl Vm {
         }
     }
 
-    /// Executes a compiled program. Builds a LazyFrame plan for every
-    /// instruction and materialises it only at `Result`.
+    /// Executes a compiled program and reduces the final stack to an
+    /// [`EvalResult`]. The instruction loop itself lives in [`Vm::run_program`]
+    /// so it can be reused by [`Vm::eval_frame`].
     pub fn eval(&mut self, program: Vec<Instruction>) -> Result<EvalResult, QplError> {
+        let (mut stack, lazy_mode) = self.run_program(program)?;
+        if let Some(last_item) = stack.pop() {
+            match last_item {
+                StackObj::Frame(lf) => {
+                    if lazy_mode {
+                        return Ok(EvalResult::Lazy(explain_plan(&lf)));
+                    }
+                    Ok(EvalResult::Table(lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?))
+                }
+                StackObj::Scalar(s) => Ok(EvalResult::Scalar(s)),
+                typ => Err(QplError::Runtime(format!("Unexpected type on stack: {}", typ.type_name()))),
+            }
+        } else {
+            Ok(EvalResult::Stored)
+        }
+    }
+
+    /// Run a compiled table expression and hand back the still-lazy frame plus
+    /// whether it should stay lazy. Used by `resolve::eval_value` to compose a
+    /// column expression with reductions / slices without collecting early.
+    pub(crate) fn eval_frame(&mut self, mut program: Vec<Instruction>) -> Result<(LazyFrame, bool), QplError> {
+        program.push(Instruction::Result);
+        let (mut stack, lazy_mode) = self.run_program(program)?;
+        match stack.pop() {
+            Some(StackObj::Frame(lf)) => Ok((lf, lazy_mode)),
+            _ => Err(QplError::Runtime("expected a table expression".into())),
+        }
+    }
+
+    /// The instruction loop. Builds a LazyFrame plan for every instruction and
+    /// returns the final operand stack and the `lazy` flag.
+    fn run_program(&mut self, program: Vec<Instruction>) -> Result<(Vec<StackObj>, bool), QplError> {
         let needs_i = program.iter().any(|i| matches!(i, Instruction::PushIColRef));
 
         let mut stack: Vec<StackObj> = Vec::new();
@@ -528,8 +562,15 @@ impl Vm {
                 }
 
                 Instruction::Eval(expr) => {
-                    let val = self.eval_scalar(&expr)?;
-                    stack.push(StackObj::Scalar(val));
+                    match resolve::eval_value(self, &expr)? {
+                        resolve::EvalValue::Scalar(val) => stack.push(StackObj::Scalar(val)),
+                        resolve::EvalValue::Frame { lf, lazy } => {
+                            if lazy {
+                                lazy_mode = true;
+                            }
+                            stack.push(StackObj::Frame(lf));
+                        }
+                    }
                 }
 
                 Instruction::Result => {
@@ -559,21 +600,7 @@ impl Vm {
                 }
             }
         }
-        if !stack.is_empty() {
-            let last_item = stack.pop().unwrap();
-            match last_item {
-                StackObj::Frame(lf) => {
-                    if lazy_mode {
-                        return Ok(EvalResult::Lazy(explain_plan(&lf)));
-                    }
-                    Ok(EvalResult::Table(lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?))
-                }
-                StackObj::Scalar(s) => Ok(EvalResult::Scalar(s)),
-                typ => Err(QplError::Runtime(format!("Unexpected type on stack: {}", typ.type_name()))),
-            }
-        } else {
-            Ok(EvalResult::Stored)
-        }
+        Ok((stack, lazy_mode))
     }
 }
 
@@ -619,7 +646,7 @@ fn popn(stack: &mut Vec<StackObj>, n: usize) -> Result<Vec<StackObj>, QplError> 
     Ok(stack.drain(at..).collect()) // drain preserves push order
 }
 
-fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
+pub(crate) fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
     Ok(match val {
         ast::Value::Int(n)     => lit(n),
         ast::Value::Float(n)   => lit(n),
@@ -629,7 +656,7 @@ fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
         ast::Value::IntVec(v)  => Series::new("".into(), v.as_slice()).lit(),
         ast::Value::FloatVec(v)=> Series::new("".into(), v.as_slice()).lit(),
         ast::Value::BoolVec(v) => Series::new("".into(), v.as_slice()).lit(),
-        ast::Value::SymVec(v)  => {
+        ast::Value::SymVec(v) | ast::Value::StrVec(v) => {
             let strs: Vec<&str> = v.iter().map(String::as_str).collect();
             Series::new("".into(), strs.as_slice()).lit()
         }
@@ -871,7 +898,7 @@ fn apply_binop(left: Expr, right: Expr, op: &str) -> Result<Expr, QplError> {
 
 // fn ap
 
-fn apply_call(func: &str, mut args: Vec<Expr>) -> Result<Expr, QplError> {
+pub(crate) fn apply_call(func: &str, mut args: Vec<Expr>) -> Result<Expr, QplError> {
     if args.is_empty() {
         return Err(QplError::Runtime(format!("'{func}' called with no args")));
     }
@@ -919,7 +946,7 @@ fn apply_call(func: &str, mut args: Vec<Expr>) -> Result<Expr, QplError> {
 }
 
 /// Dyadic column verbs, parsed q-style as `<param> verb <col>` (like `round`).
-fn apply_dyadic(func: &str, value: Expr, param: Expr) -> Result<Expr, QplError> {
+pub(crate) fn apply_dyadic(func: &str, value: Expr, param: Expr) -> Result<Expr, QplError> {
     Ok(match func {
         "quantile" | "pctl" => value.quantile(param, QuantileMethod::Linear),
         "shift" | "lag"     => value.shift(param),
@@ -1137,17 +1164,27 @@ mod tests {
     }
 
     #[test]
-    fn limit_keyword_and_hash() {
-        for source in ["2 limit select c1 from t", "2#select c1 from t", "2#`t"] {
+    fn limit_keyword_and_hash_on_tables() {
+        // `2 limit …` and `n#` on a whole table stay table results
+        for source in ["2 limit select c1 from t", "2#t", "2#select c1, c2 from t"] {
             let df = run(make_vm(), source);
-            assert_eq!(df.height(), 2);
+            assert_eq!(df.height(), 2, "{source}");
             assert_eq!(strs(&df, "c1"), vec!["a", "b"]);
         }
     }
 
     #[test]
+    fn hash_take_on_a_column_expression_is_a_list() {
+        match run_instructions(make_vm(), "2#select c1 from t") {
+            EvalResult::Scalar(ast::Value::StrVec(v)) => assert_eq!(v, vec!["a", "b"]),
+            EvalResult::Scalar(other) => panic!("expected a str list, got scalar {other:?}"),
+            _ => panic!("expected a scalar str list"),
+        }
+    }
+
+    #[test]
     fn drop_single_symbol_keyword_and_shorthand() {
-        for source in ["`c2 drop select from t", "`c2 _ `t"] {
+        for source in ["`c2 drop select from t", "`c2 _ t"] {
             let df = run(make_vm(), source);
             let names: Vec<&str> = df.get_column_names().iter().map(|name| name.as_str()).collect();
             assert_eq!(names, vec!["c1", "c3"]);
@@ -1212,7 +1249,7 @@ mod tests {
     #[test]
     fn dictionary_sort_order_survives_assignment() {
         let mut vm = make_vm();
-        assert!(matches!(run_vm("t2: `c1`c2!01b `t", &mut vm), Ok(EvalResult::Stored)));
+        assert!(matches!(run_vm("t2: `c1`c2!01b t", &mut vm), Ok(EvalResult::Stored)));
         let df = run(vm, "select from t2");
         assert_eq!(strs(&df, "c1"), vec!["a", "a", "b", "c"]);
         assert_eq!(i64s(&df, "c2"), vec![30, 10, 20, 15]);

@@ -21,4 +21,4 @@ tm: collect t
 select sym, notional from tm where side = `buy
 
 / `cols` always resolves to a table, even on a lazy binding.
-cols `t
+cols t

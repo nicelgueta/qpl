@@ -25,6 +25,13 @@ impl Parser {
             &TokenKind::Eof
         }
     }
+    fn peek3(&self) -> &TokenKind {
+        if self.i + 2 < self.tokens.len() {
+            &self.tokens[self.i + 2].kind
+        } else {
+            &TokenKind::Eof
+        }
+    }
     fn next(&mut self) -> TokenKind {
         if self.i < self.tokens.len() {
             let kind = self.tokens[self.i].kind.clone();
@@ -52,7 +59,10 @@ impl Parser {
                 unreachable!()
             };
             self.eat(&TokenKind::Colon)?;
-            // query keywords produce a table result; anything else is a scalar expression
+            // query keywords produce a table result; anything else is a scalar
+            // expression. `parse_body` decides between a table statement and a
+            // column expression (a one-column select → `Stmt::SingleVar`), so we
+            // just rewrap whatever it returns.
             match self.peek() {
                 TokenKind::Select
                 | TokenKind::Update
@@ -61,23 +71,21 @@ impl Parser {
                 | TokenKind::Cols
                 | TokenKind::Load
                 | TokenKind::Lazy
-                | TokenKind::Collect
-                | TokenKind::Symbol(_) => {
-                    let stmt = self.parse_body()?;
-                    Ok(Stmt::Assign { name, body: Box::new(stmt) })
-                }
-                // `\`a\`b!01b …` (sort) / `\`a\`b drop …` (drop) are table ops;
-                // a bare `\`a\`b\`c` is a symbol-vector value (e.g. an enum definition)
-                TokenKind::SymbolVec(_)
+                | TokenKind::Collect => self.assign_from_body(name),
+                // `\`c!01b <tbl>` (sort) / `\`a\`b drop <tbl>` (drop) are table ops
+                // keyed off the leading symbol; a bare `\`a\`b\`c` is a symbol
+                // vector value (e.g. an enum definition), and a bare `\`x` is a
+                // plain symbol — tables are referenced by name, never by symbol.
+                TokenKind::Symbol(_) | TokenKind::SymbolVec(_)
                     if matches!(self.peek2(), TokenKind::Bang | TokenKind::Drop)
                         || matches!(self.peek2(), TokenKind::Name(n) if n == "_") =>
                 {
-                    let stmt = self.parse_body()?;
-                    Ok(Stmt::Assign { name, body: Box::new(stmt) })
+                    self.assign_from_body(name)
                 }
-                TokenKind::Int(_) if matches!(self.peek2(), TokenKind::Limit | TokenKind::Hash) => {
-                    let stmt = self.parse_body()?;
-                    Ok(Stmt::Assign { name, body: Box::new(stmt) })
+                // `n limit <table-expr>` is a table operation; `n#…` is always a
+                // take/slice value expression (the VM decides frame vs list).
+                TokenKind::Int(_) if self.peek2() == &TokenKind::Limit => {
+                    self.assign_from_body(name)
                 }
                 _ => {
                     let expr = self.parse_expr()?;
@@ -89,11 +97,45 @@ impl Parser {
         }
     }
 
+    /// Parse `name: <body>` where `<body>` went through [`Parser::parse_body`].
+    /// In assignment position a one-column `select` is a *column expression*:
+    /// it materialises to a list global rather than a named table. A bare
+    /// one-column select (no `name:`) still prints as a table.
+    fn assign_from_body(&mut self, name: String) -> Result<Stmt, QplError> {
+        match self.parse_body()? {
+            Stmt::SingleVar(expr) => Ok(Stmt::ScalarAssign { name, expr }),
+            Stmt::RetTable(te) if is_column_expr(&te) => {
+                Ok(Stmt::ScalarAssign { name, expr: Expr::Table(Box::new(te)) })
+            }
+            other => Ok(Stmt::Assign { name, body: Box::new(other) }),
+        }
+    }
+
     fn parse_body(&mut self) -> Result<Stmt, QplError> {
-        if is_table_expr_start(self.peek())
-            || (matches!(self.peek(), TokenKind::Int(_))
-                && matches!(self.peek2(), TokenKind::Limit | TokenKind::Hash))
-        {
+        // `<name> >> <path>` — sink a table referenced by name.
+        if matches!(self.peek(), TokenKind::Name(_)) && self.peek2() == &TokenKind::Sink {
+            let name = match self.next() {
+                TokenKind::Name(n) => n,
+                _ => unreachable!(),
+            };
+            self.next(); // `>>` / `sink`
+            let path = self.parse_expr()?;
+            return Ok(Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink {
+                src: Box::new(table_ref(name)),
+                path,
+            })));
+        }
+
+        // A leading `Int` only starts a *table* statement for `n limit …`;
+        // `n#…` is a take/slice value expression handled by `parse_scalar_stmt`.
+        let leading_int = matches!(self.peek(), TokenKind::Int(_));
+        let int_table = leading_int && self.peek2() == &TokenKind::Limit;
+        // `\`c!01b <tbl>` / `\`a\`b drop <tbl>` — a table op keyed off a leading
+        // symbol. A bare `\`x` (or `\`x >> …`) is a symbol value, not a table.
+        let sym_table_op = matches!(self.peek(), TokenKind::Symbol(_) | TokenKind::SymbolVec(_))
+            && (matches!(self.peek2(), TokenKind::Bang | TokenKind::Drop)
+                || matches!(self.peek2(), TokenKind::Name(n) if n == "_"));
+        if (is_table_expr_start(self.peek()) && !leading_int) || int_table || sym_table_op {
             let tbl_expr = self.parse_table_expr()?;
             // postfix sink: `<table-expr> >> <path>` / `<table-expr> sink <path>`
             if matches!(self.peek(), TokenKind::Sink) {
@@ -111,18 +153,7 @@ impl Parser {
     }
 
     fn parse_scalar_stmt(&mut self) -> Result<Stmt, QplError> {
-        match self.peek() {
-            TokenKind::Name(_name) => {
-                if matches!(self.peek2(), TokenKind::Sink) {
-                    return Err(QplError::Parse(
-                        "sink expects a table expression on the left (e.g. `\
-                         `tbl >> `path` or `select … from tbl >> `path`), not a bare name".into(),
-                    ));
-                }
-                Ok(Stmt::SingleVar(self.parse_expr()?))
-            }
-            _ => Err(QplError::Parse(format!("Unexpected token: {:?}", self.peek()))),
-        }
+        Ok(Stmt::SingleVar(self.parse_expr()?))
     }
 
     fn parse_table_expr(&mut self) -> Result<TableExpr, QplError> {
@@ -131,6 +162,11 @@ impl Parser {
             TokenKind::Select => Ok(TableExpr::Select(self.parse_query(false, false)?)),
             TokenKind::Update => Ok(TableExpr::Select(self.parse_query(true, false)?)),
             TokenKind::Delete => Ok(TableExpr::Select(self.parse_query(false, true)?)),
+            // a bare table name, e.g. `cols t`, `distinct t`, `\`c drop t`
+            TokenKind::Name(n) => {
+                self.next();
+                Ok(table_ref(n))
+            }
             TokenKind::Distinct => {
                 self.next();
                 Ok(TableExpr::BuiltIn(BuiltIn::Distinct(Box::new(self.parse_table_expr()?))))
@@ -178,20 +214,11 @@ impl Parser {
             TokenKind::Symbol(s) => {
                 self.next(); // consume the symbol
                 match self.peek() {
-                    // bare `\`tbl` selects the whole table; `\`tbl >> path` → the
-                    // postfix sink in `parse_body` handles the rest
-                    TokenKind::Eof | TokenKind::Sink => {
-                        Ok(TableExpr::Select(SelectStmt {
-                            cols: vec![],
-                            from: TableSource::InMem(s),
-                            by: None,
-                            where_: None,
-                            order: None,
-                            join: None,
-                            update: false,
-                            delete: false,
-                        }))
-                    }
+                    // `\`tbl` / `\`tbl >> path` used to name a table — tables are
+                    // referenced by name now, so this is a plain symbol value.
+                    TokenKind::Eof | TokenKind::Sink => Err(QplError::Parse(format!(
+                        "reference tables by name, not by symbol: write '{s}', not '`{s}'"
+                    ))),
                     TokenKind::Bang => {
                         // single symbol with a bang should actually 
                         // be a symvec with a single element
@@ -361,7 +388,7 @@ impl Parser {
 
     /// The core expression parser. `windows` enables the trailing `over` postfix.
     fn parse_expr_inner(&mut self, windows: bool) -> Result<Expr, QplError> {
-        let left = self.parse_primary()?;
+        let left = self.parse_noun()?;
 
         // `u8!`$expr` (physical-width categorical) / `name::`$expr` (enum) —
         // a modifier token between the type and the `` `$ `` cast operator
@@ -408,6 +435,14 @@ impl Parser {
             if is_noun_start(self.peek()) {
                 let name = name.clone();
                 let arg = self.parse_value()?;
+                let call = Expr::Call { func: name, args: vec![arg] };
+                return self.finish_window(call, windows);
+            }
+            // `<verb> select … from …` / `<verb> distinct …` — a reduction over a
+            // column expression, e.g. `first select price from trades`.
+            if is_table_expr_start(self.peek()) {
+                let name = name.clone();
+                let arg = Expr::Table(Box::new(self.parse_table_expr()?));
                 let call = Expr::Call { func: name, args: vec![arg] };
                 return self.finish_window(call, windows);
             }
@@ -665,7 +700,143 @@ impl Parser {
     }
 
 
+    /// A "noun": a primary plus the value-context postfixes that bind tightest —
+    /// `` name`col `` / `` name`c1`c2 `` table references and positional indexing
+    /// (`(expr) 2 3`). Everything downstream (`parse_expr_inner`) sees the result
+    /// as an opaque operand.
+    fn parse_noun(&mut self) -> Result<Expr, QplError> {
+        // `<n>#<operand>` — take / slice. Caught before `parse_primary` so the
+        // leading int is not read as a literal.
+        if let Some(take) = self.try_parse_take()? {
+            return Ok(take);
+        }
+        let mut e = self.parse_primary()?;
+        // did `parse_primary` just close a parenthesised group? `(x) 2 3` indexes
+        // even when `x` is a bare name (`x 2 3` on its own is a call).
+        let parenthesised = self.i > 0 && self.tokens[self.i - 1].kind == TokenKind::RParen;
+
+        // `` name`col `` / `` name`c1`c2 `` — a column / table expression.
+        if let Expr::ColRef(name) = &e {
+            match self.peek().clone() {
+                TokenKind::Symbol(s) => {
+                    let name = name.clone();
+                    self.next();
+                    e = self.finish_table_ref(name, vec![Alias { name: None, expr: Expr::ColRef(s) }])?;
+                }
+                TokenKind::SymbolVec(v) => {
+                    let name = name.clone();
+                    self.next();
+                    let cols = v.into_iter().map(|s| Alias { name: None, expr: Expr::ColRef(s) }).collect();
+                    e = self.finish_table_ref(name, cols)?;
+                }
+                _ => {}
+            }
+        }
+
+        // positional index. Two forms, both chainable:
+        //   `<list>[<i>]` / `<list>[<i j k>]`  — bracket index, works on a bare name
+        //   `(<expr>) 2 3`                     — juxtaposed int run, not after a
+        //                                        bare name (that stays a call site)
+        loop {
+            if matches!(self.peek(), TokenKind::LBracket) {
+                self.next(); // `[`
+                let idx = self.parse_expr()?;
+                self.eat(&TokenKind::RBracket)?;
+                e = Expr::Index { expr: Box::new(e), idx: Box::new(idx) };
+                continue;
+            }
+            if parenthesised || !matches!(e, Expr::ColRef(_)) {
+                if let Some(idx) = self.try_parse_int_run() {
+                    e = Expr::Index { expr: Box::new(e), idx: Box::new(idx) };
+                    continue;
+                }
+            }
+            break;
+        }
+        Ok(e)
+    }
+
+    /// `` name`col … `` — build the one/many-column select and fold a trailing
+    /// `where` (only valid in this sugar) into it.
+    fn finish_table_ref(&mut self, table: String, cols: Vec<Alias>) -> Result<Expr, QplError> {
+        let where_ = if self.peek() == &TokenKind::Where {
+            self.next();
+            self.parse_where()?
+        } else {
+            None
+        };
+        Ok(Expr::Table(Box::new(TableExpr::Select(SelectStmt {
+            cols,
+            from: TableSource::InMem(table),
+            by: None,
+            where_,
+            order: None,
+            join: None,
+            update: false,
+            delete: false,
+        }))))
+    }
+
+    /// `[-]<int>#<operand>` — returns `None` when the next tokens are not that shape.
+    fn try_parse_take(&mut self) -> Result<Option<Expr>, QplError> {
+        let n = match (self.peek(), self.peek2()) {
+            (TokenKind::Int(n), TokenKind::Hash) => {
+                let n = *n;
+                self.next();
+                self.next();
+                n
+            }
+            (TokenKind::Op(m), TokenKind::Int(_))
+                if m == "-" && self.peek3() == &TokenKind::Hash =>
+            {
+                self.next(); // `-`
+                let n = match self.next() {
+                    TokenKind::Int(n) => -n,
+                    _ => unreachable!(),
+                };
+                self.next(); // `#`
+                n
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Expr::Take { n, expr: Box::new(self.parse_take_operand()?) }))
+    }
+
+    /// Operand of `<n>#…`: a table expression (`select …`, `` `tbl ``) or a noun
+    /// (`` name`col ``, `(expr)`, a bare name / list global).
+    fn parse_take_operand(&mut self) -> Result<Expr, QplError> {
+        if matches!(self.peek(),
+            TokenKind::Select | TokenKind::Update | TokenKind::Delete
+            | TokenKind::Distinct | TokenKind::Cols | TokenKind::Load
+            | TokenKind::Symbol(_) | TokenKind::SymbolVec(_))
+        {
+            return Ok(Expr::Table(Box::new(self.parse_table_expr()?)));
+        }
+        self.parse_noun()
+    }
+
+    /// A run of one or more consecutive `Int` tokens → `Int` / `IntVec` literal.
+    fn try_parse_int_run(&mut self) -> Option<Expr> {
+        if !matches!(self.peek(), TokenKind::Int(_)) {
+            return None;
+        }
+        let mut ns = Vec::new();
+        while let TokenKind::Int(n) = self.peek() {
+            ns.push(*n);
+            self.next();
+        }
+        Some(if ns.len() == 1 {
+            Expr::Lit(Value::Int(ns[0]))
+        } else {
+            Expr::Lit(Value::IntVec(ns))
+        })
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, QplError> {
+        // a run of ints juxtaposed with no operator is an int-vector literal
+        if matches!(self.peek(), TokenKind::Int(_)) && matches!(self.peek2(), TokenKind::Int(_)) {
+            return Ok(self.try_parse_int_run().unwrap());
+        }
         match self.next() {
             TokenKind::Int(n)      => Ok(Expr::Lit(Value::Int(n))),
             TokenKind::Float(n)    => Ok(Expr::Lit(Value::Float(n))),
@@ -685,6 +856,13 @@ impl Parser {
             other => Err(QplError::Parse(format!("Unexpected token in primary: {:?}", other))),
         }
     }
+}
+
+/// A table expression that, used in a value context, is a *column expression*:
+/// a single-column `select` with no `by` (it materialises to a list, not a table).
+fn is_column_expr(te: &TableExpr) -> bool {
+    matches!(te, TableExpr::Select(sel)
+        if sel.cols.len() == 1 && sel.by.is_none() && !sel.update && !sel.delete)
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Stmt, QplError> {
@@ -743,9 +921,21 @@ fn is_table_expr_start(token: &TokenKind) -> bool {
         | TokenKind::Cols
         | TokenKind::Lazy
         | TokenKind::Collect
-        | TokenKind::SymbolVec(_)
-        | TokenKind::Symbol(_)
     )
+}
+
+/// A `SelectStmt` that reads a whole in-memory table by name.
+fn table_ref(name: String) -> TableExpr {
+    TableExpr::Select(SelectStmt {
+        cols: vec![],
+        from: TableSource::InMem(name),
+        by: None,
+        where_: None,
+        order: None,
+        join: None,
+        update: false,
+        delete: false,
+    })
 }
 
 #[cfg(test)]
@@ -966,18 +1156,43 @@ mod tests {
     }
 
     #[test]
-    fn limit_keyword_and_hash() {
-        for source in ["10 limit select from trades", "10#`trades", "10#select from trades"] {
-            assert!(matches!(
-                p(source),
-                Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Limit(_, 10)))
-            ));
+    fn limit_keyword_is_a_table_op() {
+        assert!(matches!(
+            p("10 limit select from trades"),
+            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Limit(_, 10)))
+        ));
+    }
+
+    #[test]
+    fn hash_take_is_a_value_expression() {
+        // `n#…` is always a take/slice; the VM decides frame vs list at run time
+        for source in ["10#trades", "10#select from trades", "10#trades`price", "-3#trades`price"] {
+            assert!(matches!(p(source), Stmt::SingleVar(Expr::Take { .. })), "{source}");
+        }
+    }
+
+    #[test]
+    fn index_forms_parse_to_expr_index() {
+        for source in ["l[0]", "l[2 3 4]", "(l) 2 3", "trades`price[1]", "l[0][1]"] {
+            assert!(matches!(p(source), Stmt::SingleVar(Expr::Index { .. })), "{source}");
+        }
+    }
+
+    #[test]
+    fn reference_a_table_by_symbol_is_rejected() {
+        // `\`name` is a plain symbol value or an outright parse error — never a table
+        for source in ["`trades", "`trades >> `out.parquet", "distinct `t", "3#`trades"] {
+            let parsed = parse(tokenise(source).expect("lex"));
+            assert!(
+                !matches!(parsed, Ok(Stmt::RetTable(_))),
+                "`{source}` should not resolve to a table, got {parsed:?}",
+            );
         }
     }
 
     #[test]
     fn drop_single_symbol_keyword_and_shorthand() {
-        for source in ["`price drop select from trades", "`price _ `trades"] {
+        for source in ["`price drop select from trades", "`price _ trades"] {
             assert!(matches!(
                 p(source),
                 Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Drop(columns, _))) if columns == vec!["price"]
@@ -1044,8 +1259,8 @@ mod tests {
     }
 
     #[test]
-    fn sink_takes_a_table_ref_on_the_left_and_a_symbol_path() {
-        match p("`t >> `out.parquet") {
+    fn sink_takes_a_table_name_on_the_left_and_a_symbol_path() {
+        match p("t >> `out.parquet") {
             Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink { src, path })) => {
                 assert!(matches!(
                     src.as_ref(),
@@ -1067,14 +1282,15 @@ mod tests {
     }
 
     #[test]
-    fn sink_rejects_a_bare_identifier_on_the_left() {
-        assert!(parse(tokenise("t >> `out.parquet").unwrap()).is_err());
+    fn sink_rejects_a_symbol_on_the_left() {
+        // tables are named, not symboled — `\`t >> …` no longer parses
+        assert!(parse(tokenise("`t >> `out.parquet").unwrap()).is_err());
     }
 
     #[test]
     fn sink_path_can_cast_a_string_var_to_a_symbol() {
         // `\`$o` — intern the string held in `o` into a symbol path
-        match p("`t >> `$o") {
+        match p("t >> `$o") {
             Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink { path, .. })) => {
                 assert!(matches!(
                     &path,
@@ -1130,9 +1346,9 @@ mod tests {
 
     #[test]
     fn bare_symbol_dict_sort_is_unaffected_by_cast_modifiers() {
-        // `\`a\`b!01b \`t` must still parse as a sort, not a cast
+        // `\`a\`b!01b t` must still parse as a sort, not a cast
         assert!(matches!(
-            p("`c1`c2!01b `t"),
+            p("`c1`c2!01b t"),
             Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sort(..)))
         ));
     }
@@ -1226,13 +1442,25 @@ mod tests {
     // --- assignment ---
 
     #[test]
-    fn assign_select() {
-        match p("t: select px from trades") {
+    fn assign_multi_col_select_is_a_table_binding() {
+        match p("t: select px, qty from trades") {
             Stmt::Assign { name, body } => {
                 assert_eq!(name, "t");
                 assert!(matches!(*body, Stmt::RetTable(_)));
             }
             other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_one_col_select_is_a_column_expression() {
+        // in assignment position a single-column select materialises to a list
+        match p("t: select px from trades") {
+            Stmt::ScalarAssign { name, expr } => {
+                assert_eq!(name, "t");
+                assert!(matches!(expr, Expr::Table(_)));
+            }
+            other => panic!("expected ScalarAssign, got {other:?}"),
         }
     }
 

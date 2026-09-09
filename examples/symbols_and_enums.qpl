@@ -30,10 +30,10 @@ out: select
     price
     from tagged
 
-cols `out
+cols out
 select from out
 
-/ sink a table by reference; the path comes from a string variable (`$ interns it)
+/ sink a table by name; the path comes from a string variable (`$ interns it)
 dest: "examples/data/symbols_and_enums.parquet"
-`out >> `$dest
+out >> `$dest
 log "wrote " dest

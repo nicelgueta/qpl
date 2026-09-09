@@ -17,6 +17,7 @@ pub enum Value {
     IntVec(Vec<i64>),
     FloatVec(Vec<f64>),
     SymVec(Vec<String>),
+    StrVec(Vec<String>),
     BoolVec(Vec<bool>),
 }
 
@@ -57,6 +58,19 @@ pub enum Expr {
         order: Vec<(String, bool)>, // (column, descending)
         rolling: Option<usize>,
     },
+    /// A table expression used in a scalar / value context: `` name`col ``,
+    /// `` name`c1`c2 ``, or a `select … from …` whose result feeds a reduction,
+    /// slice, index or assignment rather than being printed as a table. A
+    /// one-column `Select` is a *column expression* (materialises to a list
+    /// `Value`); anything else stays a frame. Tree-walked by `resolve::eval_value`,
+    /// never lowered to stack instructions.
+    Table(Box<TableExpr>),
+    /// `<n>#<expr>` — take the first `n` rows (`n >= 0`) or the last `-n`
+    /// (`n < 0`) of a frame or list.
+    Take { n: i64, expr: Box<Expr> },
+    /// `(<expr>) <i>` / `(<expr>) <i j k>` — positional index into a list with a
+    /// single int or an int run.
+    Index { expr: Box<Expr>, idx: Box<Expr> },
 }
 
 

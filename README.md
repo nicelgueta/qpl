@@ -63,15 +63,15 @@ the REPL — see [Working incrementally](#working-incrementally):
 
 ```q
 j: select sym, side, price, size, bid, ask from << `trades.parquet `sym lj << `quotes.parquet `sym where price > 0
-`j  / check the table so far
+j  / check the table so far
 j: update spread: ask - bid, notional: price * size from j
 / try the next step without committing — don't assign, just look
 update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from j
 / happy with it — now assign to persist
 j: update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from j
-cols `j                                    / check the schema so far
+cols j                                     / check the schema so far
 select tot: sum notional, avg_spread: avg spread, n: count price by csym: `$sym, side, band from j order tot desc
-`j >> `summary.parquet
+j >> `summary.parquet
 ```
 
 ## Install
@@ -94,7 +94,7 @@ qpl -i script.qpl   # run a script, then drop into the REPL
 qpl) select sym, price from trades where price > 200
 qpl) select avg price by sym from trades
 qpl) t: select from trades where size > 100     / bind a table
-qpl) `t >> `big.parquet                          / write it out
+qpl) t >> `big.parquet                           / write it out
 ```
 
 Runnable scripts are in [`examples/`](examples/) — e.g.
@@ -114,8 +114,8 @@ and resubmit a 30-line block — the loop is *type a line, look, type the next*.
 
 ```q
 qpl) t: << `trades.parquet          / bind a table
-qpl) `t                             / look at it
-qpl) cols `t                        / ...or just its schema
+qpl) t                              / look at it
+qpl) cols t                         / ...or just its schema
 
 qpl) t: select sym, side, price, size from t where price > 0
 qpl) t: update notional: price * size from t
@@ -125,12 +125,12 @@ qpl) update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from t
 qpl) t: update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from t   / keep it
 
 qpl) select traded: sum notional by sym, side, band from t order traded desc
-qpl) `t >> `out.parquet
+qpl) t >> `out.parquet
 ```
 
 Things that make the loop tight:
 
-- **`` `t `` / `cols `t``** — peek at a table or its schema between steps.
+- **`t` / `cols t`** — peek at a table or its schema between steps.
 - **Run a statement without assigning it** — you see the result, nothing changes.
   Assign only once you're happy.
 - **`\d <stmt>`** — show the compiled plan without executing anything.
@@ -153,10 +153,14 @@ result, comment a block out to isolate a step, uncomment it, repeat.
 threshold: 150                                 / scalar
 t: select from trades where size > threshold   / table
 lvl: `low`mid`high                             / symbol vector
+px: trades`price                               / column expression → a list
+top: max trades`price                          / reduction → a scalar
 ```
 
 Scalar variables are evaluated in Rust and substituted into later queries as
-Polars literals, so they compose transparently with column expressions.
+Polars literals, so they compose transparently with column expressions. See
+[Column expressions & lists](#column-expressions--lists) for `` table`col ``,
+reductions, slicing (`n#`) and indexing.
 
 ### select / update / delete
 
@@ -194,6 +198,74 @@ it's a brand-new column.
 delete from trades where size < 100
 delete `price`size from trades
 ```
+
+### Column expressions & lists
+
+A **column expression** pulls one column out of a table *without* a surrounding
+`select` statement. It takes one of two forms:
+
+```q
+trades`price                 / backtick a column off a table name
+select price from trades     / a one-column select
+trades`price where size > 100   / a `where` may be attached (column expressions only)
+```
+
+Used as a value — assigned to a name, reduced, sliced or indexed — a column
+expression **materialises to a list** (`IntVec` / `FloatVec` / `StrVec` /
+`SymVec` / `BoolVec`; other column dtypes, and columns containing nulls, are an
+error). A bare one-column `select` typed on its own still prints as a table; it
+becomes a list only in a value position.
+
+```q
+px: trades`price             / a FloatVec global
+px: select price from trades  / same
+```
+
+**Reductions** (`sum` `avg`/`mean` `min` `max` `first` `last` `count`
+`std`/`dev` `var` `med`/`median` `mode`/`modal` `skew` `kurt` `any` `all`
+`prod` `argmin` `argmax` `nnull` `distinct`/`n_unique`) collapse a column
+expression to a scalar you can bind:
+
+```q
+top:  max trades`price
+n:    count select price from trades where size > 100
+select sym, price from trades where price >= top   / the scalar composes into later queries
+```
+
+Any non-reducing column verb (`cumsum`, `abs`, `2 shift`, `2 round`, …) yields
+another list.
+
+**Slicing** — `n#<expr>` takes the first `n` rows, `-n#<expr>` the last `n`:
+
+```q
+3#trades`price
+-3#trades`price
+3#select price from trades
+```
+
+`n#<whole table>` (`3#trades`, `3#select sym, price from t`) stays a table — use
+`n limit …` or `n#…` interchangeably there.
+
+**Indexing** — `list[i]` picks one element (an atom); `list[i j k]` gathers a
+sub-list. Works on a list global, a column expression, or a parenthesised
+expression, and chains:
+
+```q
+l: 10 20 30 40 50
+l[0]                         / i64: 10   (an atom)
+l[1 3 4]                     / i64[3]: 20 40 50
+sub: trades`price[2 3]       / a 2-element FloatVec: rows 2 and 3
+one: (trades`sym)[0]
+```
+
+A parenthesised expression may also be followed by a bare int run, q-style:
+`(trades`price) 2 3`.
+
+Once a column expression has been persisted as a list, `where` no longer applies
+to it — filter before materialising.
+
+Bare names in a value position resolve at run time: first a scalar global, then
+a lazy binding, then a table. `t2: trades` copies the table under a new name.
 
 ### Expressions
 
@@ -305,11 +377,12 @@ Types: `f64`/`float`, `f32`, `i64`/`int`, `i32`, `i16`, `i8`, `u64`, `u32`,
 ### Symbols, categoricals & enums
 
 Outside a table expression, `` `foo `` is a **symbol** — a distinct value kind
-that names a column, table or path. `` `$expr `` interns a string into a symbol:
+that names a column or a path. (Tables are named, not symboled: write `trades`,
+not `` `trades ``.) `` `$expr `` interns a string into a symbol:
 
 ```q
 o: "out/summary.parquet"
-`t >> `$o                      / use a string variable as a path
+t >> `$o                       / use a string variable as a path
 ```
 
 Inside a table expression, `` `$col `` casts a column to a Polars **Categorical**
@@ -352,19 +425,19 @@ t: lazy load `data/trades.parquet   / deferred — binds a plan, no IO yet
 select from << `data/quotes.csv
 ```
 
-`sink` (or `>>`) streams a **table expression** to a file — `` `tbl ``, a
-`select ...`, an `update ...`; never a bare identifier:
+`sink` (or `>>`) streams a **table expression** to a file — a table name, a
+`select ...`, an `update ...`:
 
 ```q
-`t >> `summary.parquet
-`t sink `summary.parquet
+trades >> `summary.parquet
+trades sink `summary.parquet
 select sym, price from trades where size > 100 >> `big_trades.parquet
 ```
 
 `cols` shows a table's schema (works on lazy bindings too):
 
 ```q
-cols `trades
+cols trades
 ```
 
 ### Table operators
@@ -374,12 +447,12 @@ distinct select sym from trades
 
 10 limit select from trades      / first N rows
 10#select from trades            / `#` is the same
-10#`trades
+10#trades
 
 `price`size drop select from trades   / drop columns
-`price`size _ `trades                 / `_` is the same
+`price`size _ trades                  / `_` is the same
 
-`sym`price!01b `trades           / sort by a `col!bool` map (0 asc, 1 desc)
+`sym`price!01b trades            / sort by a `col!bool` map (0 asc, 1 desc)
 sorted: `sym`price!01b select from trades where size > 100
 ```
 
@@ -425,8 +498,8 @@ j: select traded: sum notional, n: count price by sym, side from j
 `sink` the plan straight to disk:
 
 ```q
-tm: collect `j
-`j >> `summary.parquet
+tm: collect j
+j >> `summary.parquet
 ```
 
 [`examples/lazy_join_pipeline.qpl`](examples/lazy_join_pipeline.qpl) is a
@@ -516,8 +589,9 @@ select mv: 2 round market_value from trades
 | `!` | `col!bool` sort map; `` u8!`$x `` -> categorical physical width |
 | `::` | enum cast (`` lvl::`$x ``) |
 | `<<` `>>` | load / sink |
-| `#` | limit (`10#t`) |
-| `_` | drop columns (`` `a`b _ `t ``) |
+| `#` | limit (`10#t`); take / slice a list (`3#l`, `-3#l`) |
+| `[...]` | positional index into a list (`l[0]`, `l[1 2 3]`) |
+| `_` | drop columns (`` `a`b _ t ``) |
 
 ## REPL
 

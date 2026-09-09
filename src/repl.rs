@@ -277,6 +277,7 @@ fn fmt_log_val(v: &ast::Value) -> String {
         ast::Value::Str(s)   => s.clone(),
         ast::Value::Sym(s)   => s.clone(),
         ast::Value::SymVec(v)=> v.iter().map(|s| format!("`{s}")).collect(),
+        ast::Value::StrVec(v)=> v.join(" "),
         ast::Value::Int(n)   => n.to_string(),
         ast::Value::Float(f) => f.to_string(),
         ast::Value::Bool(b)  => b.to_string(),
@@ -291,8 +292,11 @@ fn fmt_val(v: &ast::Value) -> String {
         ast::Value::Str(s)   => format!("str: \"{s}\""),
         ast::Value::Sym(s)   => format!("sym: `{s}"),
         ast::Value::SymVec(v)=> format!("sym[{}]: {}", v.len(), v.iter().map(|s| format!("`{s}")).collect::<String>()),
+        ast::Value::StrVec(v)=> format!("str[{}]: {}", v.len(), v.iter().map(|s| format!("\"{s}\" ")).collect::<String>().trim_end()),
+        ast::Value::IntVec(v)=> format!("i64[{}]: {}", v.len(), v.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" ")),
+        ast::Value::FloatVec(v)=> format!("f64[{}]: {}", v.len(), v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(" ")),
+        ast::Value::BoolVec(v)=> format!("bool[{}]: {}", v.len(), v.iter().map(|b| if *b {"1"} else {"0"}).collect::<String>()),
         ast::Value::Bool(b)  => format!("bool: {b}"),
-        other                => format!("{other:?}"),
     }
 }
 
