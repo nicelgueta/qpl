@@ -280,8 +280,13 @@ a lazy binding, then a table. `t2: trades` copies the table under a new name.
 | dyadic verbs | `<param> verb <col>` — `quantile`/`pctl`, `shift`/`lag`, `lead`, `diff`, `pctchange` (and `round`) |
 | window | `<expr> over `p1`p2 [order `k1 asc `k2 desc] [rolling n]` — see [Window functions](#window-functions) |
 
+A leading `-` negates: `-45.3` is a negative literal, `-col` / `-x` folds to
+`0 - …` (works in scalars, column expressions and filters).
+
 ```q
+l: int$-45.3                                         / scalar: -45
 select price_bin: ?[price>400;`high;price>200;`mid;`low] from trades
+select neg_mv: -market_value from trades
 select mv: 2 round market_value from trades          / round to 2 dp
 select p95: 0.95 quantile price by sym from trades   / 95th percentile
 select sym, price, ret: 1 diff price by sym from trades   / row-over-row change

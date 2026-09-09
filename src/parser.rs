@@ -848,6 +848,12 @@ impl Parser {
             TokenKind::Name(n) if n == "i" => Ok(Expr::IColRef),
             TokenKind::Name(n)     => Ok(Expr::ColRef(n)),
             TokenKind::Op(op) if op == "?" => self.parse_case(),
+            // leading `-`: a negative literal (`-45.3`) or unary negation of the
+            // next primary, lowered to `0 - x` so it composes like any `-`
+            TokenKind::Op(op) if op == "-" => {
+                let rhs = self.parse_primary()?;
+                Ok(negate(rhs))
+            }
             TokenKind::LParen      => {
                 let expr = self.parse_expr()?;
                 self.eat(&TokenKind::RParen)?;
@@ -855,6 +861,21 @@ impl Parser {
             },
             other => Err(QplError::Parse(format!("Unexpected token in primary: {:?}", other))),
         }
+    }
+}
+
+/// Applies a leading unary minus: folds a numeric literal in place, otherwise
+/// lowers to `0 - expr` so it reuses the existing subtraction path everywhere
+/// (scalar fold, column expr, filter).
+fn negate(e: Expr) -> Expr {
+    match e {
+        Expr::Lit(Value::Int(n))   => Expr::Lit(Value::Int(-n)),
+        Expr::Lit(Value::Float(f)) => Expr::Lit(Value::Float(-f)),
+        other => Expr::BinOp {
+            left: Box::new(Expr::Lit(Value::Int(0))),
+            op: "-".into(),
+            right: Box::new(other),
+        },
     }
 }
 
@@ -1329,6 +1350,42 @@ mod tests {
             Expr::Cast { target: CastTarget::Enum(n), expr }
                 if n == "lvl" && **expr == Expr::ColRef("band".into())
         ));
+    }
+
+    #[test]
+    fn leading_minus_is_a_negative_literal() {
+        match p("l: -45.3") {
+            Stmt::ScalarAssign { expr, .. } => {
+                assert_eq!(expr, Expr::Lit(Value::Float(-45.3)));
+            }
+            other => panic!("expected scalar assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn minus_on_a_name_lowers_to_zero_minus_expr() {
+        match p("l: -y") {
+            Stmt::ScalarAssign { expr, .. } => assert!(matches!(
+                expr,
+                Expr::BinOp { left, op, right }
+                    if *left == Expr::Lit(Value::Int(0)) && op == "-"
+                        && *right == Expr::ColRef("y".into())
+            )),
+            other => panic!("expected scalar assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_of_a_negative_literal_parses() {
+        // the lexer must not glom `$-` into one operator
+        match p("l: int$-45.3") {
+            Stmt::ScalarAssign { expr, .. } => assert!(matches!(
+                expr,
+                Expr::Cast { target: CastTarget::Prim(t), expr }
+                    if t == "int" && *expr == Expr::Lit(Value::Float(-45.3))
+            )),
+            other => panic!("expected scalar assign, got {other:?}"),
+        }
     }
 
     #[test]

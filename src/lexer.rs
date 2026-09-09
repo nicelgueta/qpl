@@ -250,7 +250,9 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     continue;
 
                 };
-                while j < n && "+-*/=<>!".contains(chars[j]) {
+                // only `<= >= <>` are real multi-char operators; never glom a
+                // following `+ - * $` etc. onto an operator (`int$-1`, `a%-b`)
+                while j < n && "=<>".contains(chars[j]) {
                     j += 1;
                 }
                 let op: String = chars[i..j].iter().collect();
@@ -548,6 +550,17 @@ mod tests {
         for (src, expected) in [("<", "<"), (">", ">"), ("<=", "<="), (">=", ">=")] {
             assert_eq!(kinds(src), vec![TokenKind::Op(expected.into())], "op: {src}");
         }
+    }
+
+    #[test]
+    fn dollar_never_gloms_a_following_operator() {
+        // `int$-45.3` must tokenise as a cast of a negative literal
+        assert_eq!(kinds("int$-45.3"), vec![
+            TokenKind::Name("int".into()),
+            TokenKind::Op("$".into()),
+            TokenKind::Op("-".into()),
+            TokenKind::Float(45.3),
+        ]);
     }
 
     #[test]

@@ -1133,6 +1133,15 @@ mod tests {
         assert_eq!(vm.eval_scalar(&expr).unwrap(), ast::Value::Int(45));
     }
 
+    #[test]
+    fn scalar_cast_of_a_negative_literal() {
+        // `l: int$-45.3` — lexes, parses (negative literal) and folds to -45
+        let mut vm = make_vm();
+        let prog = compile(&parse(tokenise("l: int$-45.3").unwrap()).unwrap()).unwrap();
+        vm.eval(prog).unwrap();
+        assert_eq!(vm.globals.get("l"), Some(&ast::Value::Int(-45)));
+    }
+
     // scalar eval and assignment via instructions
     #[test]
     fn eval_assign_scalar() {
