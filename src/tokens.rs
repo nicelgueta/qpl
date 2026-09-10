@@ -33,6 +33,13 @@ pub enum TokenKind {
     Bool(bool),
     BoolVec(Vec<bool>),
     Str(String),
+    /// a kdb temporal literal (`2024.03.15`, `12:30:00.000`, `0D12:30:00.0`, …),
+    /// already parsed to the matching `ast::Value` variant by the lexer.
+    Temporal(crate::ast::Value),
+    /// a `.qpl.<name>` now-function reference (`.qpl.d`, `.qpl.p`, …). Carries
+    /// the full name. A noun, not an operator — kept distinct so it never binds
+    /// like one.
+    QplNow(String),
     // StrVec(Vec<String>),
 
     // punc

@@ -14,6 +14,16 @@ pub enum Value {
     /// column, table or path. Distinct from `Str` even though it wraps a `String`.
     Sym(String),
     Bool(bool),
+    /// kdb+ temporal scalars. Each carries the integer offset kdb uses; the
+    /// conversion to the Polars (1970) epoch happens in `vm::ast_val_to_expr`.
+    /// See [`crate::temporal`].
+    Date(i32),      // days since 2000.01.01
+    Month(i32),     // months since 2000.01
+    Time(i64),      // ns since midnight
+    Minute(i32),    // minutes since midnight
+    Second(i32),    // seconds since midnight
+    Timestamp(i64), // ns since 2000.01.01
+    Timespan(i64),  // ns duration
     IntVec(Vec<i64>),
     FloatVec(Vec<f64>),
     SymVec(Vec<String>),

@@ -1,0 +1,50 @@
+/ ─────────────────────────────────────────────────────────────────────────────
+/ Temporal types (kdb+/q convention). Phase 1: literals, scalars, arithmetic,
+/ casts, and the `.qpl.*` now-functions. Column bucketing (`xbar`) and `within`
+/ land in Phase 2.
+/
+/   date       2024.03.15
+/   month      2024.03m
+/   time       12:30:00.000                      (ms)
+/   minute     12:30
+/   second     12:30:00
+/   timestamp  2024.03.15D12:30:00.000000000     (ns)
+/   timespan   0D12:30:00.000000000              (ns duration)
+/
+/   .qpl.d  today's date         .qpl.p  now (timestamp, ns)
+/   .qpl.t  now (time)           .qpl.n  now (timespan since midnight)   -- UTC
+/
+/ Run from the repo root:
+/   cargo run -- examples/temporal.qpl
+/ ─────────────────────────────────────────────────────────────────────────────
+
+/ literals bind like any scalar
+d:  2024.03.15
+p:  2024.03.15D09:30:00.000000000
+n:  0D00:05:00.000000000
+
+log "date       " d
+log "timestamp  " p
+log "timespan   " n
+
+/ arithmetic — days on a date, a nanosecond offset on a timestamp
+log "d + 10     " d + 10                     / 2024.03.25
+log "p - 5 min  " p - n                      / 2024.03.15D09:25:00.000000000
+log "span days  " 2024.03.20 - 2024.03.15    / 5
+
+/ comparison (temporals order by their underlying offset)
+log "before?    " p < 2024.03.15D16:00:00.0  / 1b
+
+/ casts: `` `date$ ``, `` `month$ ``, `` `timestamp$ ``, and the kdb type codes
+log "ts->date   " `date$p                    / 2024.03.15
+log "date->mon  " `month$d                    / 2024.03m
+log "date->ts   " `timestamp$d                / 2024.03.15D00:00:00.000000000
+log "raw days   " `int$d                      / 8840   (days since 2000.01.01)
+log "parsed     " "p"$"2024.06.01D12:00:00"   / 2024.06.01D12:00:00.000000000
+
+/ now-functions work in queries too (here just as scalars)
+log "today      " .qpl.d
+
+/ temporal literals project as Polars-native typed columns
+trades: load `examples/data/trades.parquet
+select sym, asof: 2024.03.15D09:30:00.000000000 from trades

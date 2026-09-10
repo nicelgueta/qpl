@@ -9,6 +9,7 @@ use crate::compiler::compile;
 use crate::errors::QplError;
 use crate::opcodes::Instruction;
 use crate::resolve;
+use crate::temporal;
 use crate::helpers::rename_columns_snake_case;
 use std::collections::HashMap;
 
@@ -199,6 +200,10 @@ impl Vm {
                 .ok_or_else(|| QplError::Runtime(format!("undefined variable '{name}'"))),
             ast::Expr::BinOp { left, op, right } => {
                 scalar_binop(self.eval_scalar(left)?, self.eval_scalar(right)?, op)
+            }
+            // `.qpl.d` / `.qpl.t` / `.qpl.p` / `.qpl.n` — nullary now-functions
+            ast::Expr::Call { func, args } if func.starts_with(".qpl.") && args.is_empty() => {
+                temporal::now_value(func)
             }
             ast::Expr::Cast { target, expr } => match target {
                 ast::CastTarget::Prim(dtype) => scalar_cast(self.eval_scalar(expr)?, dtype),
@@ -661,11 +666,161 @@ pub(crate) fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
             let strs: Vec<&str> = v.iter().map(String::as_str).collect();
             Series::new("".into(), strs.as_slice()).lit()
         }
+        // temporal scalars carry a kdb offset; re-base to the Polars 1970 epoch
+        // and give the literal its Polars dtype so it composes with columns.
+        ast::Value::Date(d) => {
+            lit(d + temporal::DAYS_2000_TO_1970).cast(DataType::Date)
+        }
+        ast::Value::Month(mo) => {
+            let days = temporal::days_from_civil(2000 + mo.div_euclid(12), (mo.rem_euclid(12) + 1) as u32, 1);
+            lit(days).cast(DataType::Date)
+        }
+        ast::Value::Time(ns)    => lit(ns).cast(DataType::Time),
+        ast::Value::Minute(m)   => lit(m as i64 * 60_000_000_000).cast(DataType::Time),
+        ast::Value::Second(s)   => lit(s as i64 * 1_000_000_000).cast(DataType::Time),
+        ast::Value::Timestamp(ns) => {
+            lit(ns + temporal::NS_2000_TO_1970).cast(DataType::Datetime(TimeUnit::Nanoseconds, None))
+        }
+        ast::Value::Timespan(ns) => lit(ns).cast(DataType::Duration(TimeUnit::Nanoseconds)),
+    })
+}
+
+const NS_PER_DAY: i64 = 86_400_000_000_000;
+const NS_PER_MIN: i64 = 60_000_000_000;
+const NS_PER_SEC: i64 = 1_000_000_000;
+const NS_PER_MS:  i64 = 1_000_000;
+
+/// A temporal scalar as `(kind class, nanoseconds)` for comparison. Classes:
+/// 0 = absolute instant (`date` / `timestamp` interchange), 1 = time of day
+/// (`time` / `minute` / `second`), 2 = duration (`timespan`), 3 = month.
+/// Comparison only crosses variants within the same class.
+fn temporal_ns(v: &ast::Value) -> Option<(u8, i64)> {
+    use ast::Value::*;
+    Some(match *v {
+        Timestamp(ns) => (0, ns),
+        Date(d)       => (0, d as i64 * NS_PER_DAY),
+        Time(ns)      => (1, ns),
+        Minute(m)     => (1, m as i64 * NS_PER_MIN),
+        Second(s)     => (1, s as i64 * NS_PER_SEC),
+        Timespan(ns)  => (2, ns),
+        Month(m)      => (3, m as i64),
+        _ => return None,
+    })
+}
+
+/// Nanosecond magnitude of a "duration-like" temporal scalar (`time`, `minute`,
+/// `second`, `timespan`) added to / taken from a timestamp, date or time.
+fn as_ns_delta(v: &ast::Value) -> Option<i64> {
+    use ast::Value::*;
+    Some(match *v {
+        Time(ns) | Timespan(ns) => ns,
+        Minute(m)               => m as i64 * NS_PER_MIN,
+        Second(s)               => s as i64 * NS_PER_SEC,
+        _ => return None,
+    })
+}
+
+/// `<temporal> ± <int>` — kdb adds the integer in the operand's own resolution
+/// (`date`+n days, `month`+n months, `time`+n ms, `minute`+n min, `second`+n s,
+/// `timestamp`/`timespan`+n ns). `None` on a non-temporal `v` or on overflow.
+fn shift_temporal_by_int(v: &ast::Value, n: i64) -> Option<ast::Value> {
+    use ast::Value::*;
+    let i32c = |x: i64| i32::try_from(x).ok();
+    Some(match *v {
+        Date(d)       => Date(i32c(d as i64 + n)?),
+        Month(m)      => Month(i32c(m as i64 + n)?),
+        Minute(x)     => Minute(i32c(x as i64 + n)?),
+        Second(x)     => Second(i32c(x as i64 + n)?),
+        Time(ns)      => Time(ns.checked_add(n.checked_mul(NS_PER_MS)?)?),
+        Timestamp(ns) => Timestamp(ns.checked_add(n)?),
+        Timespan(ns)  => Timespan(ns.checked_add(n)?),
+        _ => return None,
+    })
+}
+
+/// All binops where at least one side is a temporal scalar. `None` lets
+/// `scalar_binop` fall through to the numeric path.
+fn temporal_binop(l: &ast::Value, r: &ast::Value, op: &str) -> Option<Result<ast::Value, QplError>> {
+    use ast::Value::*;
+    let overflow = || QplError::Runtime("temporal arithmetic overflowed".into());
+
+    // comparison — only within the same kind class
+    if matches!(op, "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=") {
+        let ((lc, a), (rc, b)) = (temporal_ns(l)?, temporal_ns(r)?);
+        if lc != rc {
+            return Some(Err(QplError::Runtime(format!("cannot compare {l:?} and {r:?}"))));
+        }
+        return Some(Ok(Bool(match op {
+            "="        => a == b,
+            "<>" | "!="=> a != b,
+            "<"        => a < b,
+            ">"        => a > b,
+            "<="       => a <= b,
+            _          => a >= b,
+        })));
+    }
+
+    if !matches!(op, "+" | "-" | "*") {
+        return if temporal_ns(l).is_some() || temporal_ns(r).is_some() {
+            Some(Err(QplError::Runtime(format!("cannot apply '{op}' to {l:?} and {r:?}"))))
+        } else {
+            None
+        };
+    }
+
+    // temporal ± integer (each in the operand's own unit)
+    if matches!(op, "+" | "-") {
+        if let Int(n) = r
+            && temporal_ns(l).is_some()
+        {
+            let n = if op == "-" { n.checked_neg()? } else { *n };
+            return Some(shift_temporal_by_int(l, n).ok_or_else(overflow));
+        }
+        if let Int(n) = l
+            && op == "+"
+            && temporal_ns(r).is_some()
+        {
+            return Some(shift_temporal_by_int(r, *n).ok_or_else(overflow));
+        }
+        // timestamp / date / time / timespan ± a duration-like temporal
+        if let Some(d0) = as_ns_delta(r) {
+            let d = if op == "-" { d0.checked_neg()? } else { d0 };
+            return Some(match *l {
+                Timestamp(a) => a.checked_add(d).map(Timestamp).ok_or_else(overflow),
+                Time(a)      => a.checked_add(d).map(Time).ok_or_else(overflow),
+                Timespan(a)  => a.checked_add(d).map(Timespan).ok_or_else(overflow),
+                Date(a)      => (a as i64).checked_mul(NS_PER_DAY)
+                                    .and_then(|x| x.checked_add(d))
+                                    .map(Timestamp).ok_or_else(overflow),
+                _ => return Some(Err(QplError::Runtime(
+                    format!("cannot apply '{op}' to {l:?} and {r:?}")))),
+            });
+        }
+        if op == "+" && as_ns_delta(l).is_some() && matches!(r, Timestamp(_) | Date(_)) {
+            return temporal_binop(r, l, op); // commute
+        }
+    }
+
+    let checked = |o: Option<ast::Value>| o.ok_or_else(overflow);
+    Some(match (l, r, op) {
+        (Date(a),      Date(b),      "-") => Ok(Int((*a - *b) as i64)),
+        (Timestamp(a), Timestamp(b), "-") => checked(a.checked_sub(*b).map(Timespan)),
+        (Month(a),     Month(b),     "-") => Ok(Int((*a - *b) as i64)),
+        (Timespan(a),  Int(b),       "*") => checked(a.checked_mul(*b).map(Timespan)),
+        (Int(a),       Timespan(b),  "*") => checked(b.checked_mul(*a).map(Timespan)),
+        _ => Err(QplError::Runtime(format!("cannot apply '{op}' to {l:?} and {r:?}"))),
     })
 }
 
 fn scalar_binop(l: ast::Value, r: ast::Value, op: &str) -> Result<ast::Value, QplError> {
     use ast::Value::*;
+
+    if (temporal_ns(&l).is_some() || temporal_ns(&r).is_some())
+        && let Some(res) = temporal_binop(&l, &r, op)
+    {
+        return res;
+    }
+
     // promote int to float when mixed
     let (l, r) = match (l, r) {
         (Int(a),   Float(b)) => (Float(a as f64), Float(b)),
@@ -711,11 +866,18 @@ fn scalar_cast(val: ast::Value, dtype: &str) -> Result<ast::Value, QplError> {
         s.parse::<i64>().ok().or_else(|| s.parse::<f64>().ok().map(|f| f as i64))
     };
     let bad = |v: &ast::Value| QplError::Runtime(format!("cannot cast {v:?} to '{dtype}'"));
+    // temporal targets (`` `date$x ``, `"p"$"…"`, …) have their own path
+    if matches!(dtype, "date" | "month" | "time" | "minute" | "second" | "timestamp" | "timespan") {
+        return scalar_temporal_cast(val, dtype);
+    }
     Ok(match dtype {
-        "i64" | "int" | "i32" | "i16" | "i8" | "u64" | "u32" | "u16" | "u8" => match val {
+        "i64" | "int" | "long" | "i32" | "i16" | "i8" | "u64" | "u32" | "u16" | "u8" => match val {
             Int(n)          => Int(n),
             Float(f)        => Int(f as i64),
             Bool(b)         => Int(b as i64),
+            // a temporal scalar unwraps to its kdb integer offset
+            Date(n) | Month(n) | Minute(n) | Second(n) => Int(n as i64),
+            Time(n) | Timestamp(n) | Timespan(n)       => Int(n),
             Str(ref s) | Sym(ref s) => Int(as_int(s)
                 .ok_or_else(|| QplError::Runtime(format!("cannot parse '{s}' as '{dtype}'")))?),
             ref v           => return Err(bad(v)),
@@ -744,9 +906,93 @@ fn scalar_cast(val: ast::Value, dtype: &str) -> Result<ast::Value, QplError> {
             Float(f)        => Str(f.to_string()),
             Bool(b)         => Str(b.to_string()),
             Str(s) | Sym(s) => Str(s),
-            ref v           => return Err(bad(v)),
+            ref v => match temporal::format_temporal(v) {
+                Some(text) => Str(text),
+                None => return Err(bad(v)),
+            },
         },
         _ => return Err(QplError::Runtime(format!("unknown cast type '{dtype}'"))),
+    })
+}
+
+/// `` `date$ ``, `` `month$ ``, `"p"$"…"` … — cast to a temporal scalar. A
+/// string / symbol source is parsed with [`temporal::parse_temporal`]; a
+/// temporal source is converted through its day- or nanosecond-offset; a plain
+/// `Int` is reinterpreted directly as the offset (kdb `` `date$8000 ``).
+fn scalar_temporal_cast(val: ast::Value, target: &str) -> Result<ast::Value, QplError> {
+    use ast::Value::*;
+
+    // string / symbol → parse, then fall through to the converters below
+    let val = match val {
+        Str(s) | Sym(s) => temporal::parse_temporal(&s)
+            .ok_or_else(|| QplError::Runtime(format!("cannot parse {s:?} as a temporal value")))?,
+        other => other,
+    };
+
+    // days since 2000.01.01 for any date-ish source
+    let to_days = |v: &ast::Value| -> Option<i32> {
+        Some(match *v {
+            Date(d)       => d,
+            Timestamp(ns) => ns.div_euclid(NS_PER_DAY) as i32,
+            Month(m)      => temporal::days_from_civil(
+                                 2000 + m.div_euclid(12), (m.rem_euclid(12) + 1) as u32, 1)
+                             - temporal::DAYS_2000_TO_1970,
+            _ => return None,
+        })
+    };
+    let bad = || QplError::Runtime(format!("cannot cast {val:?} to '{target}'"));
+
+    Ok(match target {
+        "date" => match val {
+            Date(_)  => val,
+            Int(n)   => Date(n as i32),
+            ref v    => Date(to_days(v).ok_or_else(bad)?),
+        },
+        "month" => match val {
+            Month(_) => val,
+            Int(n)   => Month(n as i32),
+            ref v => {
+                let d = to_days(v).ok_or_else(bad)?;
+                let (y, m, _) = temporal::civil_from_days(d + temporal::DAYS_2000_TO_1970);
+                Month((y - 2000) * 12 + (m as i32 - 1))
+            }
+        },
+        "timestamp" => match val {
+            Timestamp(_) => val,
+            Int(n)       => Timestamp(n),
+            ref v        => Timestamp(to_days(v).ok_or_else(bad)? as i64 * NS_PER_DAY),
+        },
+        "time" => match val {
+            Time(_)       => val,
+            Int(n)        => Time(n),
+            Timestamp(ns) => Time(ns.rem_euclid(NS_PER_DAY)),
+            Minute(m)     => Time(m as i64 * 60_000_000_000),
+            Second(s)     => Time(s as i64 * 1_000_000_000),
+            _             => return Err(bad()),
+        },
+        "minute" => match val {
+            Minute(_)     => val,
+            Int(n)        => Minute(n as i32),
+            Time(ns)      => Minute((ns / 60_000_000_000) as i32),
+            Timestamp(ns) => Minute((ns.rem_euclid(NS_PER_DAY) / 60_000_000_000) as i32),
+            Second(s)     => Minute(s / 60),
+            _             => return Err(bad()),
+        },
+        "second" => match val {
+            Second(_)     => val,
+            Int(n)        => Second(n as i32),
+            Time(ns)      => Second((ns / 1_000_000_000) as i32),
+            Timestamp(ns) => Second((ns.rem_euclid(NS_PER_DAY) / 1_000_000_000) as i32),
+            Minute(m)     => Second(m * 60),
+            _             => return Err(bad()),
+        },
+        "timespan" => match val {
+            Timespan(_) => val,
+            Int(n)      => Timespan(n),
+            Time(ns)    => Timespan(ns),
+            _           => return Err(bad()),
+        },
+        _ => return Err(QplError::Runtime(format!("unknown cast type '{target}'"))),
     })
 }
 
@@ -764,6 +1010,15 @@ fn polars_dtype(name: &str) -> Result<DataType, QplError> {
         "u8"             => DataType::UInt8,
         "bool"           => DataType::Boolean,
         "str" | "string" => DataType::String,
+        "long"           => DataType::Int64,
+        // temporal targets in column context. `month` has no Polars dtype so it
+        // maps to `Date`; `minute` / `second` map to `Time` (truncation to the
+        // unit is a Phase-2 concern).
+        "date"           => DataType::Date,
+        "month"          => DataType::Date,
+        "time" | "minute" | "second" => DataType::Time,
+        "timestamp"      => DataType::Datetime(TimeUnit::Nanoseconds, None),
+        "timespan"       => DataType::Duration(TimeUnit::Nanoseconds),
         _ => return Err(QplError::Runtime(format!("unknown cast type '{name}'"))),
     })
 }
@@ -1140,6 +1395,126 @@ mod tests {
         let prog = compile(&parse(tokenise("l: int$-45.3").unwrap()).unwrap()).unwrap();
         vm.eval(prog).unwrap();
         assert_eq!(vm.globals.get("l"), Some(&ast::Value::Int(-45)));
+    }
+
+    // --- temporal scalars ---
+
+    fn scalar_of(src: &str) -> ast::Value {
+        let mut vm = make_vm();
+        let prog = compile(&parse(tokenise(src).unwrap()).unwrap()).unwrap();
+        vm.eval(prog).unwrap();
+        vm.globals.get("l").cloned().expect("l bound")
+    }
+
+    /// Compile + run `src`, expecting a lex/parse/compile/runtime error; returns its message.
+    fn run_err(src: &str) -> String {
+        let mut vm = make_vm();
+        let res = tokenise(src)
+            .and_then(parse)
+            .and_then(|s| compile(&s))
+            .and_then(|p| vm.eval(p));
+        match res {
+            Ok(_) => panic!("expected an error from {src:?}"),
+            Err(e) => format!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn temporal_scalar_arithmetic() {
+        use ast::Value::*;
+        assert_eq!(scalar_of("l: 2024.03.15 + 10"), Date(8850));
+        assert_eq!(scalar_of("l: 2024.03.20 - 2024.03.15"), Int(5));
+        // timestamp + a time-of-day offset
+        assert_eq!(
+            scalar_of("l: 2000.01.01D00:00:00.0 + 00:30:00.0"),
+            Timestamp(1_800_000_000_000),
+        );
+        // timestamp - timespan
+        assert_eq!(
+            scalar_of("l: 2000.01.01D01:00:00.0 - 0D01:00:00.0"),
+            Timestamp(0),
+        );
+        // date + a bare timespan promotes to timestamp
+        assert_eq!(scalar_of("l: 2000.01.02 + 0D00:00:00.000000001"), Timestamp(NS_PER_DAY + 1));
+    }
+
+    #[test]
+    fn temporal_scalar_comparison() {
+        use ast::Value::*;
+        assert_eq!(scalar_of("l: 2024.03.15 < 2024.03.16"), Bool(true));
+        assert_eq!(scalar_of("l: 2024.03.15 = 2024.03.15"), Bool(true));
+        assert_eq!(scalar_of("l: 09:30 > 09:00"), Bool(true));
+        // cross-variant, same kind class (date <-> timestamp, minute <-> second)
+        assert_eq!(scalar_of("l: 2024.03.15 = 2024.03.15D00:00:00.0"), Bool(true));
+        assert_eq!(scalar_of("l: 09:30 < 09:31:00"), Bool(true));
+    }
+
+    #[test]
+    fn temporal_scalar_plus_integer_uses_the_operand_unit() {
+        use ast::Value::*;
+        assert_eq!(scalar_of("l: 09:30 + 5"), Minute(575));               // minutes
+        assert_eq!(scalar_of("l: 12:00:00 + 5"), Second(43205));          // seconds
+        assert_eq!(scalar_of("l: 12:30:00.000 + 5"), Time(45_000_005_000_000)); // ms
+        assert_eq!(scalar_of("l: 2024.03m + 1"), Month(291));             // months
+        assert_eq!(
+            scalar_of("l: 2000.01.01D00:00:00.0 + 1"),
+            Timestamp(1),                                                 // ns
+        );
+    }
+
+    #[test]
+    fn temporal_negative_literal_and_overflow() {
+        use ast::Value::*;
+        assert_eq!(scalar_of("l: -0D01:00:00.000000000"), Timespan(-3_600_000_000_000));
+        // i32 offset overflow is an error, not a silent wrap
+        assert!(run_err("l: 2024.03.15 + 3000000000").contains("overflow"));
+        // i64 overflow on a scaled timespan is an error, not a debug panic
+        assert!(run_err("l: 0D01:00:00.000000000 * 1000000000").contains("overflow"));
+        // comparing across kind classes is rejected
+        assert!(run_err("l: 0D01:00:00.0 = 2024.03.15").contains("cannot compare"));
+    }
+
+    #[test]
+    fn temporal_casts() {
+        use ast::Value::*;
+        // timestamp -> date
+        assert_eq!(scalar_of("l: `date$2024.03.15D12:30:00.0"), Date(8840));
+        // date -> month
+        assert_eq!(scalar_of("l: `month$2024.03.15"), Month(290));
+        // date -> timestamp (midnight)
+        assert_eq!(scalar_of("l: `timestamp$2000.01.02"), Timestamp(NS_PER_DAY));
+        // temporal -> underlying kdb integer
+        assert_eq!(scalar_of("l: `int$2024.03.15"), Int(8840));
+        assert_eq!(scalar_of("l: `long$2000.01.01D00:00:00.000000001"), Int(1));
+        // string parse via a kdb type code
+        assert_eq!(
+            scalar_of(r#"l: "p"$"2000.01.01D00:00:00.000000000""#),
+            Timestamp(0),
+        );
+        assert_eq!(scalar_of(r#"l: "d"$"2024.03.15""#), Date(8840));
+    }
+
+    #[test]
+    fn qpl_now_functions_evaluate_in_scalar_context() {
+        assert!(matches!(scalar_of("l: .qpl.d"), ast::Value::Date(_)));
+        assert!(matches!(scalar_of("l: .qpl.p"), ast::Value::Timestamp(_)));
+    }
+
+    #[test]
+    fn temporal_literal_projects_as_a_typed_column() {
+        let df = run(make_vm(), "select d: 2024.03.15, ts: 2024.03.15D09:30:00.0 from t");
+        assert_eq!(df.column("d").unwrap().dtype(), &DataType::Date);
+        assert!(matches!(
+            df.column("ts").unwrap().dtype(),
+            DataType::Datetime(TimeUnit::Nanoseconds, None)
+        ));
+    }
+
+    #[test]
+    fn temporal_column_filters_against_a_literal() {
+        // `c2` = 10 20 30 15 → dates 1970-01-11 .. ; keep those strictly after 1970-01-21 (day 20)
+        let df = run(make_vm(), "select v: `date$c2 from t where (`date$c2) > 1970.01.21");
+        assert_eq!(df.height(), 1); // day 20 cutoff -> only c2 = 30
     }
 
     // scalar eval and assignment via instructions

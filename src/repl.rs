@@ -4,6 +4,7 @@ use crate::errors::QplError;
 use crate::lexer::tokenise;
 use crate::parser::{parse, parse_expr_seq};
 use crate::tokens::TokenKind;
+use crate::temporal;
 use crate::opcodes::disassemble_instructions;
 use crate::vm::{Vm, run_vm, EvalResult};
 use polars::prelude::*;
@@ -281,11 +282,23 @@ fn fmt_log_val(v: &ast::Value) -> String {
         ast::Value::Int(n)   => n.to_string(),
         ast::Value::Float(f) => f.to_string(),
         ast::Value::Bool(b)  => b.to_string(),
-        other                => format!("{other:?}"),
+        _ => temporal::format_temporal(v).unwrap_or_else(|| format!("{v:?}")),
     }
 }
 
 fn fmt_val(v: &ast::Value) -> String {
+    if let Some(text) = temporal::format_temporal(v) {
+        let tag = match v {
+            ast::Value::Date(_)      => "date",
+            ast::Value::Month(_)     => "month",
+            ast::Value::Time(_)      => "time",
+            ast::Value::Minute(_)    => "minute",
+            ast::Value::Second(_)    => "second",
+            ast::Value::Timestamp(_) => "timestamp",
+            _                        => "timespan",
+        };
+        return format!("{tag}: {text}");
+    }
     match v {
         ast::Value::Int(n)   => format!("i64: {n}"),
         ast::Value::Float(f) => format!("f64: {f}"),
@@ -297,6 +310,9 @@ fn fmt_val(v: &ast::Value) -> String {
         ast::Value::FloatVec(v)=> format!("f64[{}]: {}", v.len(), v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(" ")),
         ast::Value::BoolVec(v)=> format!("bool[{}]: {}", v.len(), v.iter().map(|b| if *b {"1"} else {"0"}).collect::<String>()),
         ast::Value::Bool(b)  => format!("bool: {b}"),
+        // temporal variants are handled by the early return above; this keeps
+        // the match total without a panic path if a new `Value` is added
+        other => temporal::format_temporal(other).unwrap_or_else(|| format!("{other:?}")),
     }
 }
 

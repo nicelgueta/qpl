@@ -386,6 +386,61 @@ folds to a single 64-bit integer and `f32`/`f64` to a single float — the width
 only takes effect once the value lands in a column. A string (or symbol) scalar
 is parsed: `int$"42"`, `f64$"3.5"`, `bool$"false"`.
 
+### Temporal types
+
+kdb+/q-style date & time literals. Each has an underlying integer offset that
+`` `int$ `` / `` `long$ `` exposes.
+
+| type | literal | offset |
+|---|---|---|
+| date | `2024.03.15` | days since `2000.01.01` |
+| month | `2024.03m` | months since `2000.01` |
+| time | `12:30:00.000` | ms of day (stored as ns) |
+| minute | `12:30` | minutes of day |
+| second | `12:30:00` | seconds of day |
+| timestamp | `2024.03.15D12:30:00.000000000` | ns since `2000.01.01` |
+| timespan | `0D12:30:00.000000000` | ns duration |
+
+```q
+d: 2024.03.15
+d + 10                              / 2024.03.25   (days)
+2024.03.20 - 2024.03.15             / 5
+p: 2024.03.15D09:30:00.000000000
+p - 0D00:05:00.000000000            / 2024.03.15D09:25:00.000000000
+p < 2024.03.15D16:00:00.0           / 1b
+```
+
+Adding an integer shifts by one unit of the operand's own resolution — `date`+n
+days, `month`+n months, `time`+n ms, `minute`+n minutes, `second`+n seconds,
+`timestamp`/`timespan`+n ns. Comparison works across variants of the same
+family (`date`↔`timestamp`, `time`↔`minute`↔`second`).
+
+Casts use the backtick form `` `date$x ``, `` `month$x ``, `` `timestamp$x ``,
+or a kdb single-char type code on a string — `"p"$` timestamp, `"d"$` date,
+`"t"$` time, `"m"$` month, `"u"$` minute, `"v"$` second, `"n"$` timespan:
+
+```q
+`date$2024.03.15D12:30:00.0         / 2024.03.15
+`month$2024.03.15                    / 2024.03m
+`timestamp$2024.03.15               / 2024.03.15D00:00:00.000000000
+"p"$"2024.03.15D12:30:00"           / parse a string
+```
+
+Now-functions (**UTC** — there is no timezone database): `.qpl.d` today's date,
+`.qpl.t` time, `.qpl.p` timestamp (ns), `.qpl.n` timespan since midnight. They
+are ordinary expressions:
+
+```q
+log .qpl.d
+```
+
+Temporal literals project as Polars-native columns (`Date`, `Datetime[ns]`,
+`Time`, `Duration[ns]`); month maps to `Date` at the 1st. Column output is
+Polars' ISO form, not the kdb form. Not yet in the language: `xbar` bucketing,
+the `within` window operator, `.minute` / `.date` unit accessors, and
+temporal arithmetic on a **column** (`date_col + n` — scalar arithmetic is
+fully supported) — those are planned.
+
 ### Symbols, categoricals & enums
 
 Outside a table expression, `` `foo `` is a **symbol** — a distinct value kind
@@ -597,7 +652,8 @@ select mv: 2 round market_value from trades
 | `?[...]` | vectorised conditional |
 | `round` | `<precision> round <col>` — round a float column (mode: `.qpl.cfg round_type`) |
 | `over` | window: `<expr> over `p [order `k asc]`; verbs `rn` / `rank` / `drank` |
-| `$` | cast (`f64$x`); `` `$x `` -> categorical |
+| `$` | cast (`f64$x`, `` `date$x ``, `"p"$s`); `` `$x `` -> categorical |
+| `.qpl.d` `.qpl.t` `.qpl.p` `.qpl.n` | now: date / time / timestamp / timespan (UTC) |
 | `!` | `col!bool` sort map; `` u8!`$x `` -> categorical physical width |
 | `::` | enum cast (`` lvl::`$x ``) |
 | `<<` `>>` | load / sink |

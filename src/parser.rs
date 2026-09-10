@@ -845,9 +845,12 @@ impl Parser {
             TokenKind::BoolVec(v)  => Ok(Expr::Lit(Value::BoolVec(v))),
             TokenKind::SymbolVec(v)=> Ok(Expr::Lit(Value::SymVec(v))),
             TokenKind::Symbol(s)   => Ok(Expr::Sym(s)),
+            TokenKind::Temporal(v) => Ok(Expr::Lit(v)),
             TokenKind::Name(n) if n == "i" => Ok(Expr::IColRef),
             TokenKind::Name(n)     => Ok(Expr::ColRef(n)),
             TokenKind::Op(op) if op == "?" => self.parse_case(),
+            // `.qpl.d` / `.qpl.t` / `.qpl.p` / `.qpl.n` — nullary now-functions
+            TokenKind::QplNow(name) => Ok(Expr::Call { func: name, args: vec![] }),
             // leading `-`: a negative literal (`-45.3`) or unary negation of the
             // next primary, lowered to `0 - x` so it composes like any `-`
             TokenKind::Op(op) if op == "-" => {
@@ -868,9 +871,21 @@ impl Parser {
 /// lowers to `0 - expr` so it reuses the existing subtraction path everywhere
 /// (scalar fold, column expr, filter).
 fn negate(e: Expr) -> Expr {
+    let flip = |v: Value| match v {
+        Value::Int(n)       => Some(Value::Int(-n)),
+        Value::Float(f)     => Some(Value::Float(-f)),
+        // temporal literals negate their integer offset (kdb treats them as ints)
+        Value::Date(n)      => Some(Value::Date(-n)),
+        Value::Month(n)     => Some(Value::Month(-n)),
+        Value::Minute(n)    => Some(Value::Minute(-n)),
+        Value::Second(n)    => Some(Value::Second(-n)),
+        Value::Time(n)      => Some(Value::Time(-n)),
+        Value::Timestamp(n) => Some(Value::Timestamp(-n)),
+        Value::Timespan(n)  => Some(Value::Timespan(-n)),
+        _ => None,
+    };
     match e {
-        Expr::Lit(Value::Int(n))   => Expr::Lit(Value::Int(-n)),
-        Expr::Lit(Value::Float(f)) => Expr::Lit(Value::Float(-f)),
+        Expr::Lit(v) if flip(v.clone()).is_some() => Expr::Lit(flip(v).unwrap()),
         other => Expr::BinOp {
             left: Box::new(Expr::Lit(Value::Int(0))),
             op: "-".into(),
@@ -914,8 +929,29 @@ fn cast_target(left: &Expr) -> Result<CastTarget, QplError> {
         Expr::ColRef(name) => Ok(CastTarget::Prim(name.clone())),
         // bare backtick before `$` — `` `$expr `` casts to a symbol / categorical
         Expr::Sym(s) if s.is_empty() => Ok(CastTarget::Sym),
+        // `` `date$x `` / `` `int$d `` — a named type before `` `$ ``
+        Expr::Sym(s) => Ok(CastTarget::Prim(s.clone())),
+        // `"p"$"…"` — a kdb single-char type code (or full name) before `$`
+        Expr::Lit(Value::Str(s)) => temporal_type_from_code(s)
+            .map(|t| CastTarget::Prim(t.into()))
+            .ok_or_else(|| QplError::Parse(format!("unknown cast type code {s:?}"))),
         _ => Err(QplError::Parse(format!("expected type name before '$', got {left:?}"))),
     }
+}
+
+/// kdb single-char temporal type codes (and their full names) accepted as a
+/// cast target, e.g. `"p"$"2024.03.15D…"`.
+fn temporal_type_from_code(s: &str) -> Option<&'static str> {
+    Some(match s {
+        "d" | "date"      => "date",
+        "m" | "month"     => "month",
+        "t" | "time"      => "time",
+        "u" | "minute"    => "minute",
+        "v" | "second"    => "second",
+        "p" | "timestamp" => "timestamp",
+        "n" | "timespan"  => "timespan",
+        _ => return None,
+    })
 }
 
 fn is_noun_start(token: &TokenKind) -> bool {
@@ -927,6 +963,8 @@ fn is_noun_start(token: &TokenKind) -> bool {
         | TokenKind::Bool(_)
         | TokenKind::Symbol(_)
         | TokenKind::BoolVec(_)
+        | TokenKind::Temporal(_)
+        | TokenKind::QplNow(_)
         | TokenKind::LParen
     )
 }
@@ -1350,6 +1388,43 @@ mod tests {
             Expr::Cast { target: CastTarget::Enum(n), expr }
                 if n == "lvl" && **expr == Expr::ColRef("band".into())
         ));
+    }
+
+    #[test]
+    fn temporal_literal_parses_to_a_lit() {
+        match p("l: 2024.03.15") {
+            Stmt::ScalarAssign { expr, .. } => assert_eq!(expr, Expr::Lit(Value::Date(8840))),
+            other => panic!("expected scalar assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qpl_now_function_parses_to_a_zero_arg_call() {
+        match p("l: .qpl.p") {
+            Stmt::ScalarAssign { expr, .. } => assert!(matches!(
+                expr,
+                Expr::Call { func, args } if func == ".qpl.p" && args.is_empty()
+            )),
+            other => panic!("expected scalar assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backtick_and_string_temporal_cast_targets_parse() {
+        // `` `date$x ``
+        let s = sel("select c: `date$ts from t");
+        assert!(matches!(
+            &s.cols[0].expr,
+            Expr::Cast { target: CastTarget::Prim(n), .. } if n == "date"
+        ));
+        // `"p"$"…"` — single-char kdb type code expands to the full name
+        match p(r#"l: "p"$"2024.03.15D09:00:00""#) {
+            Stmt::ScalarAssign { expr, .. } => assert!(matches!(
+                expr,
+                Expr::Cast { target: CastTarget::Prim(n), .. } if n == "timestamp"
+            )),
+            other => panic!("expected scalar assign, got {other:?}"),
+        }
     }
 
     #[test]

@@ -119,6 +119,31 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     tokens.push(Token { kind, pos: start });
                     continue;
                 }
+                // temporal literal: a run of digits / `.` / `:` / `D` that
+                // `parse_temporal` accepts (`2024.03.15`, `12:30`, `0D12:30:00.0`,
+                // `2024.03.15D09:30:00.000`, `2024.03m`). Falls through to the
+                // float / int paths below when the shape doesn't match.
+                if j < n && matches!(chars[j], '.' | ':' | 'D') {
+                    let mut k = j;
+                    while k < n && (chars[k].is_ascii_digit() || matches!(chars[k], '.' | ':' | 'D')) {
+                        k += 1;
+                    }
+                    if k < n && chars[k] == 'm' {
+                        k += 1; // `2024.03m` month suffix
+                    }
+                    let slice: String = chars[i..k].iter().collect();
+                    if let Some(val) = crate::temporal::parse_temporal(&slice) {
+                        tokens.push(Token { kind: TokenKind::Temporal(val), pos: start });
+                        i = k;
+                        continue;
+                    }
+                    // it looked temporal (`:` / `D` / a second `.`) but didn't
+                    // parse — a clearer error than letting the float path choke
+                    let dots = slice.bytes().filter(|&b| b == b'.').count();
+                    if slice.contains([':', 'D']) || dots >= 2 {
+                        return Err(QplError::Lex(format!("invalid temporal literal '{slice}'")));
+                    }
+                }
                 // float: decimal point after integer digits
                 if j < n && chars[j] == '.' {
                     j += 1;
@@ -163,6 +188,26 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     pos: start,
                 });
                 i += 1;
+            }
+            '.' => {
+                // `.qpl.<ident>` — a nullary "now" function (`.qpl.d`, `.qpl.p`,
+                // …) usable anywhere an expression is. Carried as an `Op` so no
+                // new token / AST node is needed; the parser turns it into a
+                // zero-arg `Expr::Call`. (`.qpl.cfg` is handled at the string
+                // level in repl.rs and never reaches here.)
+                if chars[i..].starts_with(&['.', 'q', 'p', 'l', '.']) {
+                    let mut k = i + 5;
+                    while k < n && is_name_char(chars[k]) {
+                        k += 1;
+                    }
+                    if k > i + 5 {
+                        let name: String = chars[i..k].iter().collect();
+                        tokens.push(Token { kind: TokenKind::QplNow(name), pos: start });
+                        i = k;
+                        continue;
+                    }
+                }
+                return Err(QplError::Lex(format!("Unexpected character: {c}")));
             }
             ';' => {
                 tokens.push(Token { kind: TokenKind::Semicolon, pos: start });
@@ -343,6 +388,60 @@ mod tests {
     #[test]
     fn float_zero() {
         assert_eq!(kinds("0.0"), vec![TokenKind::Float(0.0)]);
+    }
+
+    #[test]
+    fn float_not_confused_with_a_date() {
+        // two dotted groups only — still a float, not a temporal literal
+        assert_eq!(kinds("2024.03"), vec![TokenKind::Float(2024.03)]);
+    }
+
+    // --- temporal literals ---
+
+    #[test]
+    fn temporal_literals_lex_to_values() {
+        use crate::ast::Value;
+        assert_eq!(kinds("2024.03.15"), vec![TokenKind::Temporal(Value::Date(8840))]);
+        assert_eq!(kinds("2000.01.01"), vec![TokenKind::Temporal(Value::Date(0))]);
+        assert_eq!(kinds("2024.03m"), vec![TokenKind::Temporal(Value::Month(290))]);
+        assert_eq!(kinds("09:30"), vec![TokenKind::Temporal(Value::Minute(570))]);
+        assert_eq!(kinds("12:30:00"), vec![TokenKind::Temporal(Value::Second(45000))]);
+        assert_eq!(kinds("12:30:00.000"), vec![TokenKind::Temporal(Value::Time(45_000_000_000_000))]);
+        assert_eq!(kinds("0D00:00:00.000000001"), vec![TokenKind::Temporal(Value::Timespan(1))]);
+        assert_eq!(
+            kinds("2000.01.01D00:00:00.000000000"),
+            vec![TokenKind::Temporal(Value::Timestamp(0))],
+        );
+    }
+
+    #[test]
+    fn temporal_literal_composes_with_an_operator() {
+        use crate::ast::Value;
+        assert_eq!(kinds("2024.03.15 + 10"), vec![
+            TokenKind::Temporal(Value::Date(8840)),
+            TokenKind::Op("+".into()),
+            TokenKind::Int(10),
+        ]);
+    }
+
+    #[test]
+    fn temporal_shaped_but_invalid_literal_is_a_clear_error() {
+        for bad in ["2024.13.01", "2024.02.30", "12:99"] {
+            let err = tokenise(bad).unwrap_err();
+            assert!(
+                matches!(&err, QplError::Lex(m) if m.contains("temporal")),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qpl_now_functions_lex_as_their_own_token() {
+        assert_eq!(kinds(".qpl.d"), vec![TokenKind::QplNow(".qpl.d".into())]);
+        assert_eq!(kinds("log .qpl.p"), vec![
+            TokenKind::Name("log".into()),
+            TokenKind::QplNow(".qpl.p".into()),
+        ]);
     }
 
     // --- booleans ---

@@ -198,6 +198,14 @@ fn list_to_lazy(list: Value) -> Result<LazyFrame, QplError> {
         Value::Float(n) => Series::new("x".into(), [n]),
         Value::Bool(b) => Series::new("x".into(), [b]),
         Value::Str(s) | Value::Sym(s) => Series::new("x".into(), [s]),
+        // temporal scalars: a 1-row frame via the shared literal bridge
+        v @ (Value::Date(_) | Value::Month(_) | Value::Time(_) | Value::Minute(_)
+            | Value::Second(_) | Value::Timestamp(_) | Value::Timespan(_)) => {
+            return Ok(df!("x" => [0i64])
+                .map_err(rt)?
+                .lazy()
+                .select([crate::vm::ast_val_to_expr(v)?.alias("x")]));
+        }
     };
     Ok(s.into_frame().lazy())
 }
@@ -227,6 +235,37 @@ fn column_to_value(col: &Column) -> Result<Value, QplError> {
         DataType::Float32 | DataType::Float64 => {
             let c = col.cast(&DataType::Float64).map_err(rt)?;
             Value::FloatVec(c.f64().map_err(rt)?.into_no_null_iter().collect())
+        }
+        // temporal columns materialise to their kdb integer offsets (there is
+        // no typed temporal-vector `Value` yet — Phase 2).
+        DataType::Date => {
+            let c = col.cast(&DataType::Int32).map_err(rt)?;
+            Value::IntVec(
+                c.i32().map_err(rt)?.into_no_null_iter()
+                    .map(|d| (d - crate::temporal::DAYS_2000_TO_1970) as i64).collect(),
+            )
+        }
+        // normalise to nanoseconds first — a column loaded from a file may be
+        // ms / us resolution, not ns
+        DataType::Datetime(_, _) => {
+            let c = col
+                .cast(&DataType::Datetime(TimeUnit::Nanoseconds, None)).map_err(rt)?
+                .cast(&DataType::Int64).map_err(rt)?;
+            Value::IntVec(
+                c.i64().map_err(rt)?.into_no_null_iter()
+                    .map(|n| n - crate::temporal::NS_2000_TO_1970).collect(),
+            )
+        }
+        DataType::Duration(_) => {
+            let c = col
+                .cast(&DataType::Duration(TimeUnit::Nanoseconds)).map_err(rt)?
+                .cast(&DataType::Int64).map_err(rt)?;
+            Value::IntVec(c.i64().map_err(rt)?.into_no_null_iter().collect())
+        }
+        DataType::Time => {
+            // Polars `Time` is always ns since midnight
+            let c = col.cast(&DataType::Int64).map_err(rt)?;
+            Value::IntVec(c.i64().map_err(rt)?.into_no_null_iter().collect())
         }
         d if d.is_integer() => {
             let c = col.cast(&DataType::Int64).map_err(rt)?;

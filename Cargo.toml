@@ -1,6 +1,6 @@
 [package]
 name = "qpl"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2024"
 
 [dependencies]
@@ -10,7 +10,10 @@ clap = { version = "4.6.6", features = ["derive"] }
 # feature but cannot be dropped -- polars-expr's `strings` dispatch does
 # `use polars_time::prelude::StringMethods`, and polars_time is only linked via
 # `temporal`, so `strings` without `temporal` fails to compile (upstream, 0.55.2).
-polars = { version = "0.55.2", default-features = false, features = ["fmt", "temporal", "lazy", "parquet", "csv", "strings", "is_in", "abs", "dtype-categorical", "round_series", "rank", "mode", "moment", "diff",
+# `temporal` links `polars-time` (needed by `strings`, see above) but does NOT
+# enable the temporal dtypes -- the `dtype-date` / `-datetime` / `-time` /
+# `-duration` features are separate and power qpl's date/time literals & casts.
+polars = { version = "0.55.2", default-features = false, features = ["fmt", "temporal", "lazy", "parquet", "csv", "strings", "is_in", "abs", "dtype-categorical", "dtype-date", "dtype-datetime", "dtype-time", "dtype-duration", "round_series", "rank", "mode", "moment", "diff",
     "pct_change", "cum_agg", "rolling_window", "product"] }
 # pulled in only to name `RoundMode` (the `polars` facade re-exports it crate-privately);
 # already compiled as a transitive dep, same version.
