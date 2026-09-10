@@ -44,7 +44,6 @@ pub enum CastTarget {
     Enum(String),
 }
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Lit(Value),
