@@ -1,22 +1,62 @@
 # qpl — Quick Polars Query Language
 
-An agent-friendly qsql/kdb+-inspired query language that compiles to Polars lazy frames.
-Write concise q-style select statements; Polars executes them efficiently. Great for use without having python or polars installed.
+An agent-friendly, q/kdb+-inspired query language that compiles to Polars lazy
+frames. Write concise select statements; Polars runs them fast. Single binary,
+zero dependencies — no Python, no Polars install needed.
+
+There's also a [VSCode extension](tools/vscode/) — syntax highlighting plus a
+Ctrl+Enter REPL for sending lines straight from the editor.
+
+## Table of Contents
+
+- [Why?](#why)
+  - [Polars](#polars)
+  - [Example](#example)
+- [Install](#install)
+- [Quickstart](#quickstart)
+- [Working incrementally](#working-incrementally)
+- [Language](#language)
+  - [Assignment](#assignment)
+  - [select / update / delete](#select--update--delete)
+  - [Column expressions & lists](#column-expressions--lists)
+  - [Expressions](#expressions)
+  - [Window functions](#window-functions)
+  - [Functions](#functions)
+  - [Casts](#casts)
+  - [Temporal types](#temporal-types)
+  - [Symbols, categoricals & enums](#symbols-categoricals--enums)
+  - [Reading & writing files](#reading--writing-files)
+  - [Table operators](#table-operators)
+  - [lazy / collect](#lazy--collect)
+  - [Comments](#comments)
+  - [Multi-line statements](#multi-line-statements)
+  - [Logging](#logging)
+  - [Config](#config)
+  - [Operator reference](#operator-reference)
+- [REPL](#repl)
+- [Architecture](#architecture)
+- [Releases](#releases)
+- [Roadmap](#roadmap)
 
 ## Why?
-I often need to quickly query large data in parquet format on cloud storage under high time-pressure as well as write quick transformation jobs. DuckDB is brilliant for that kind of thing but I always forget the syntax and can't really knock something up more quickly than typing a prompt into Claude, which sometimes takes longer than I want to get the result I need or goes off on a tangent and provides fluff I wasn't looking for.
 
-So I wanted to see if I could create a language/interface that is faster to write than writing a prompt into Claude, but just as efficient as something like DuckDB.
+I often need to query large parquet files on cloud storage under time
+pressure, or knock out a quick transform job. DuckDB is great for this, but I
+always forget the syntax — and prompting an agent for it is often slower than
+just writing the query myself.
 
-Of course the added benefit is that, inevitably using AI agents a lot to query data and debug issues, we can have a language that can actually be easily used by LLM agents too (that can't do that much damage whether in a sandbox, webUI or running free on your machine) but is efficient as polars or DuckDB - especially as it's zero dependency without even needing a python runtime.
+So: a language fast enough to type without thinking, but with DuckDB-level
+performance. As a bonus, one that LLM agents can drive easily too — and can't
+do much damage with, sandboxed or not.
 
 ### Polars
-I'm also actually kinda cheating here.
+Writing a DuckDB-grade engine from scratch solo isn't realistic, so I cheated:
+Polars (a dataframe library written in Rust) is the backend. Its API is clean
+enough that the "language" is really just a VM translating instructions into
+Polars queries — which left me free to build whatever front-end I wanted.
 
-Although the goal was to write something of similar efficiency to DuckDB (which is obviously not gonna happen by myself from scratch as that is an incredible piece of software crafted over many years), I can cheat if I use something well established as the backend for my language. I had thought about just writing some kind of dialect translator as an abstraction over DuckDB but that didn't excite me. Since I love Rust however, this meant Polars (an also brilliant DataFrame library mostly used in the python world but actually written in Rust) was an option.
-Given it has such a neat API - all my lazy self had to do was write a VM that implements instructions as Polars queries and voilá - I can then go crazy with my front-end in what ever I want.
-
-Given I have been lightly introduced to kdb+/q at work - and I don't know that much about the language, but am very impressed with its syntactic sugar as lack of verbosity. I thought this could be a good way to try to learn some of the language by writing the front-end interpreter for this language in this style, but still get to satisfy my Rust cravings.
+That front-end borrows from kdb+/q, a language I'd been lightly exposed to at
+work and wanted an excuse to actually learn, while still getting to write Rust.
 
 Thus: `qpl`.
 
