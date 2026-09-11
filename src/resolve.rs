@@ -11,7 +11,7 @@ use polars::prelude::*;
 
 use crate::ast::{self, Expr, TableExpr, Value};
 use crate::errors::QplError;
-use crate::vm::Vm;
+use crate::vm::{Lookup, Vm};
 
 /// The outcome of evaluating a value expression: a concrete scalar / list, or a
 /// frame (a bare table name, a multi-column `select`, `n#<table>`).
@@ -25,6 +25,16 @@ fn rt<E: std::fmt::Display>(e: E) -> QplError {
     QplError::Runtime(e.to_string())
 }
 
+/// Require a value-context result to be a concrete scalar / list (not a frame).
+fn expect_scalar(v: EvalValue) -> Result<ast::Value, QplError> {
+    match v {
+        EvalValue::Scalar(s) => Ok(s),
+        EvalValue::Frame { .. } => {
+            Err(QplError::Runtime("expected a scalar here, got a table".into()))
+        }
+    }
+}
+
 /// Evaluate a value expression coming from `Instruction::Eval`.
 pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
     match expr {
@@ -33,6 +43,23 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
 
         // `` name`col `` / `` name`c1`c2 `` / a `select …` used as a value
         Expr::Table(te) => eval_table(vm, te),
+
+        // `f[a;b]` / `f[]` — user-function application.
+        Expr::Apply { func, args } => apply_function(vm, func, args),
+
+        // `f[x]` parsed as an index but `f` names a user function → monadic
+        // application. Otherwise falls through to positional indexing below.
+        Expr::Index { expr, idx }
+            if matches!(expr.as_ref(), Expr::ColRef(n) if vm.lookup_function(n).is_some()) =>
+        {
+            apply_function(vm, expr, std::slice::from_ref(idx))
+        }
+
+        // `f x` — monadic user-function application (juxtaposition).
+        Expr::Call { func, args } if vm.lookup_function(func).is_some() => {
+            let func = Expr::ColRef(func.clone());
+            apply_function(vm, &func, args)
+        }
 
         // `<n>#<expr>` — head (`n >= 0`) / tail (`n < 0`) slice
         Expr::Take { n, expr } => match eval_value(vm, expr)? {
@@ -68,20 +95,57 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
         // `sum trades`price`, `2 shift px`, `2 round px`, `cumsum px`, …
         Expr::Call { func, args } if (1..=2).contains(&args.len()) => eval_call(vm, func, args),
 
+        // a binary op whose operands may themselves be function calls
+        // (`n * fac[n-1]`): reduce both sides to scalars, then reuse the existing
+        // operator logic on the two literals.
+        Expr::BinOp { left, op, right } => {
+            let l = expect_scalar(eval_value(vm, left)?)?;
+            let r = expect_scalar(eval_value(vm, right)?)?;
+            Ok(EvalValue::Scalar(vm.eval_scalar(&Expr::BinOp {
+                left: Box::new(Expr::Lit(l)),
+                op: op.clone(),
+                right: Box::new(Expr::Lit(r)),
+            })?))
+        }
+
+        // `?[c1;v1;c2;v2;default]` in value context — a scalar conditional,
+        // tree-walked so it short-circuits (needed for conditional recursion in
+        // function bodies).
+        Expr::Case { branches, default } => {
+            for (cond, val) in branches {
+                match eval_value(vm, cond)? {
+                    EvalValue::Scalar(Value::Bool(true)) => return eval_value(vm, val),
+                    EvalValue::Scalar(Value::Bool(false)) => {}
+                    _ => {
+                        return Err(QplError::Runtime(
+                            "a `?[..]` condition must be a boolean scalar in value context".into(),
+                        ))
+                    }
+                }
+            }
+            eval_value(vm, default)
+        }
+
         // everything else is a pure scalar fold (literals, symbols, binops, casts)
         other => Ok(EvalValue::Scalar(vm.eval_scalar(other)?)),
     }
 }
 
 fn resolve_name(vm: &Vm, name: &str) -> Result<EvalValue, QplError> {
-    if let Some(v) = vm.globals.get(name) {
-        return Ok(EvalValue::Scalar(v.clone()));
-    }
-    if let Some(lf) = vm.lazy_frames.get(name) {
-        return Ok(EvalValue::Frame { lf: lf.clone(), lazy: true });
-    }
-    if let Some(df) = vm.tables.get(name) {
-        return Ok(EvalValue::Frame { lf: df.clone().lazy(), lazy: false });
+    match vm.lookup(name) {
+        Some(Lookup::Global(v)) => return Ok(EvalValue::Scalar(v.clone())),
+        Some(Lookup::LazyFrame(lf)) => {
+            return Ok(EvalValue::Frame { lf: lf.clone(), lazy: true });
+        }
+        Some(Lookup::Table(df)) => {
+            return Ok(EvalValue::Frame { lf: df.clone().lazy(), lazy: false });
+        }
+        Some(Lookup::Function(_)) => {
+            return Err(QplError::Runtime(format!(
+                "'{name}' is a function — call it with '{name}[..]'"
+            )));
+        }
+        None => {}
     }
     Err(QplError::Runtime(format!(
         "undefined name '{name}' (not a variable, table or lazy frame)"
@@ -161,6 +225,92 @@ fn eval_call(vm: &mut Vm, func: &str, args: &[Expr]) -> Result<EvalValue, QplErr
         Ok(EvalValue::Scalar(scalarise(materialised)?))
     } else {
         Ok(EvalValue::Scalar(materialised))
+    }
+}
+
+/// Apply a user function (`name: {[..] ..}`) to `args`.
+///
+/// Arguments are evaluated in the *caller* scope, then bound to the parameter
+/// names in a child scope that shadows the session: params and any locals the
+/// body assigns are discarded on return, so a function cannot mutate outer
+/// bindings. The body's leading statements run for their side effects; its final
+/// statement (an expression, guaranteed by the compiler) supplies the return.
+fn apply_function(vm: &mut Vm, func: &Expr, args: &[Expr]) -> Result<EvalValue, QplError> {
+    let name = match func {
+        Expr::ColRef(n) => n.clone(),
+        _ => {
+            return Err(QplError::Runtime(
+                "only a named function can be applied (higher-order use is unsupported)".into(),
+            ))
+        }
+    };
+    let def = vm
+        .lookup_function(&name)
+        .cloned()
+        .ok_or_else(|| QplError::Runtime(format!("'{name}' is not a function")))?;
+    if args.len() != def.params.len() {
+        return Err(QplError::Runtime(format!(
+            "function '{name}' takes {} argument(s), got {}",
+            def.params.len(),
+            args.len()
+        )));
+    }
+    if vm.scopes.len() >= crate::vm::MAX_CALL_DEPTH {
+        return Err(QplError::Runtime(format!(
+            "function recursion too deep (limit {})",
+            crate::vm::MAX_CALL_DEPTH
+        )));
+    }
+
+    // arguments are evaluated in the *caller's* frame, before the callee's is pushed
+    let arg_vals = args
+        .iter()
+        .map(|a| eval_value(vm, a))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // push a fresh call frame; pop it unconditionally on the way out. `lookup`
+    // only ever consults the top frame + globals, so the callee cannot see this
+    // caller's own locals — lexical, not dynamic, scoping.
+    vm.push_scope();
+    let result = run_body(vm, &def, arg_vals);
+    vm.pop_scope();
+    result
+}
+
+/// Bind `arg_vals` to `def.params` in the frame [`apply_function`] just pushed,
+/// then run the body. Split out so the caller can pop that frame unconditionally
+/// afterwards, on every exit path.
+fn run_body(
+    vm: &mut Vm,
+    def: &ast::Function,
+    arg_vals: Vec<EvalValue>,
+) -> Result<EvalValue, QplError> {
+    for (p, v) in def.params.iter().zip(arg_vals) {
+        match v {
+            EvalValue::Scalar(s) => vm.bind_global(p.clone(), s),
+            EvalValue::Frame { lf, lazy } if lazy => vm.bind_lazy(p.clone(), lf),
+            EvalValue::Frame { lf, .. } => {
+                let df = lf.collect().map_err(rt)?;
+                vm.bind_table(p.clone(), df);
+            }
+        }
+    }
+    let (last, head) = def.body.split_last().expect("non-empty function body");
+    for st in head {
+        let prog = crate::compiler::compile(st)?;
+        vm.eval(prog)?;
+    }
+    match last {
+        ast::Stmt::SingleVar(e) => eval_value(vm, e),
+        ast::Stmt::RetTable(te) => {
+            let mut instrs = Vec::new();
+            crate::compiler::compile_tbl_expr(te, &mut instrs)?;
+            let (lf, lazy) = vm.eval_frame(instrs)?;
+            Ok(EvalValue::Frame { lf, lazy })
+        }
+        _ => Err(QplError::Runtime(
+            "a function body must end with an expression".into(),
+        )),
     }
 }
 
@@ -387,6 +537,111 @@ mod tests {
     #[test]
     fn table_col_materialises_to_a_list() {
         assert_eq!(scalar(&mut make_vm(), "t`c3"), Value::FloatVec(vec![1.0, 2.0, 3.0, 4.0]));
+    }
+
+    // --- functions ---
+
+    #[test]
+    fn define_and_call_a_scalar_function() {
+        let mut vm = make_vm();
+        run_vm("add: {[x,y] x+y}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "add[2;3]"), Value::Int(5));
+        run_vm("inc: {[x] x+1}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "inc 41"), Value::Int(42)); // `f x`
+        assert_eq!(scalar(&mut vm, "inc[41]"), Value::Int(42)); // `f[x]`
+    }
+
+    #[test]
+    fn function_body_locals_are_scoped_and_do_not_leak() {
+        let mut vm = make_vm();
+        vm.globals.insert("tmp".into(), Value::Int(99));
+        run_vm("sq: {[x] tmp: x*x; tmp}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "sq[9]"), Value::Int(81));
+        assert_eq!(vm.globals.get("tmp"), Some(&Value::Int(99))); // outer `tmp` untouched
+    }
+
+    #[test]
+    fn a_callee_cannot_see_its_caller_s_locals() {
+        // lexical, not dynamic, scoping: `callee` has no param/local named `a`,
+        // so it must resolve `a` against the true global (99), never against
+        // `caller`'s own `a` param — even though `caller` is still on the call
+        // stack when `callee` runs.
+        let mut vm = make_vm();
+        vm.globals.insert("a".into(), Value::Int(99));
+        run_vm("callee: {[] a}", &mut vm).unwrap();
+        run_vm("caller: {[a] callee[]}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "caller[1]"), Value::Int(99));
+    }
+
+    #[test]
+    fn conditional_recursion_terminates() {
+        let mut vm = make_vm();
+        run_vm("fac: {[n] ?[n<2;1;n*fac[n-1]]}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "fac[5]"), Value::Int(120));
+    }
+
+    #[test]
+    fn a_function_can_return_a_table() {
+        let mut vm = make_vm();
+        run_vm("q: {[k] select c2 from t where c1 = k}", &mut vm).unwrap();
+        match run_vm("q[`a]", &mut vm).expect("run") {
+            EvalResult::Table(df) => {
+                let got: Vec<i64> =
+                    df.column("c2").unwrap().i64().unwrap().into_no_null_iter().collect();
+                assert_eq!(got, vec![10, 30]);
+            }
+            other => panic!("expected a table, got {}", kind(&other)),
+        }
+    }
+
+    #[test]
+    fn wrong_arity_is_a_runtime_error() {
+        let mut vm = make_vm();
+        run_vm("add: {[x,y] x+y}", &mut vm).unwrap();
+        assert!(run_vm("add[1]", &mut vm).is_err());
+    }
+
+    #[test]
+    fn unbounded_recursion_hits_the_depth_cap_and_unwinds_cleanly() {
+        // `apply_function` recurses through the native Rust call stack (compile
+        // + eval + eval_value per level), so MAX_CALL_DEPTH levels need more
+        // headroom than the default *test-thread* stack (smaller than the main
+        // thread the REPL actually runs on) reliably provides — run this one on
+        // an explicitly-sized thread rather than weakening the real guard.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut vm = make_vm();
+                run_vm("loop: {[n] loop[n+1]}", &mut vm).unwrap();
+                let err = run_vm("loop[0]", &mut vm);
+                assert!(err.is_err());
+                // every pushed call frame was popped again on the way back out
+                // through the error, even though none of those calls returned
+                // normally
+                assert!(vm.scopes.is_empty());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn call_frame_is_popped_after_an_error_inside_the_body() {
+        let mut vm = make_vm();
+        run_vm("boom: {[x] x + nope}", &mut vm).unwrap(); // `nope` is undefined
+        assert!(run_vm("boom[1]", &mut vm).is_err());
+        assert!(vm.scopes.is_empty());
+    }
+
+    #[test]
+    fn a_bare_function_name_is_a_helpful_error() {
+        let mut vm = make_vm();
+        run_vm("f: {[x] x}", &mut vm).unwrap();
+        let err = match run_vm("f", &mut vm) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(format!("{err:?}").contains("is a function"));
     }
 
     #[test]

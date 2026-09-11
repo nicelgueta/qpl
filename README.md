@@ -367,6 +367,41 @@ select i, sym from trades
 select from trades where i < 5
 ```
 
+### Functions
+
+q-style lambdas, bound to a name:
+
+```q
+add:   {[x,y] x+y}            / parameter list in [ ], body is ;-separated
+add[2;3]                      / 5   — call with bracketed args
+inc:   {[x] x+1}
+inc 41                        / 42  — a one-arg function also takes `f x`
+inc[41]                      / 42
+
+hypot2: {[a,b] s: (a*a)+(b*b); s}   / earlier statements bind call-local vars;
+hypot2[3;4]                          / the last statement is the return value
+
+fac: {[n] ?[n<2; 1; n*fac[n-1]]}   / `?[..]` works in value context, so
+fac[5]                              / recursion terminates → 120
+```
+
+A function can return a table, and its result composes like any value
+expression:
+
+```q
+bysym: {[s] select sym, price from trades where sym = s}
+bysym[`AAPL]                  / a table
+avgpx: {[s] avg select price from trades where sym = s}
+avgpx[`MSFT]                  / a scalar
+```
+
+The final statement in the body must be an expression (a trailing assignment is
+an error). Parameters and any locals the body assigns are scoped to the call —
+a function cannot mutate outer bindings. Niladic functions are written `{[] ..}`
+or `{ ..}` and called `f[]`. Functions are a named binding kind, not first-class
+values: they cannot be passed as arguments, returned, or used inside a `select`
+projection. See [examples/functions.qpl](examples/functions.qpl).
+
 ### Casts
 
 `type$expr` casts a column or scalar:
@@ -425,6 +460,23 @@ or a kdb single-char type code on a string — `"p"$` timestamp, `"d"$` date,
 `timestamp$2024.03.15               / 2024.03.15D00:00:00.000000000
 "p"$"2024.03.15D12:30:00"           / parse a string
 ```
+
+In **column** context, a string→temporal cast parses through Polars' string
+parser (`expr.cast(<temporal>)` on a string is deprecated). The format is
+inferred per value — ISO *and* kdb's dotted `2024.03.15` both work:
+
+| cast | parser | result column |
+|---|---|---|
+| `` `date$s `` / `` `month$s `` | `str.to_datetime` → date | `Date` |
+| `` `timestamp$s `` (`"p"$s`) | `str.to_datetime` | `Datetime` (keeps the time part) |
+| `` `time$s `` (`"t"$s`) | `str.to_time` | `Time` |
+
+```q
+select d: `date$date_str from t        / "2024.03.15"          -> 2024-03-15
+select ts: `timestamp$ts_str from t    / "2024-03-15T09:30:00" -> 2024-03-15 09:30:00
+```
+
+A value the inferred format cannot read aborts the query (strict by default).
 
 Now-functions (**UTC** — there is no timezone database): `.qpl.d` today's date,
 `.qpl.t` time, `.qpl.p` timestamp (ns), `.qpl.n` timespan since midnight. They

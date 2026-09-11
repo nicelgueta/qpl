@@ -80,6 +80,12 @@ pub enum Expr {
     /// `(<expr>) <i>` / `(<expr>) <i j k>` — positional index into a list with a
     /// single int or an int run.
     Index { expr: Box<Expr>, idx: Box<Expr> },
+    /// `f[a;b]` / `f[]` — apply a user function (defined with `name: {[..] ..}`)
+    /// to a semicolon-separated argument list. `f[x]` with a single argument and
+    /// no `;` parses as `Index` instead and is resolved to an application at run
+    /// time when `f` names a function. Value context only; `func` is always an
+    /// `Expr::ColRef` (higher-order use is unsupported).
+    Apply { func: Box<Expr>, args: Vec<Expr> },
 }
 
 
@@ -122,5 +128,18 @@ pub enum Stmt {
     Assign { name: String, body: Box<Stmt> },
     ScalarAssign { name: String, expr: Expr },
     // single var on its own - this just evals and prints in repl
-    SingleVar(Expr)
+    SingleVar(Expr),
+    /// `name: {[p1,p2] stmt; stmt; last-expr}` — bind a user function. The final
+    /// statement in `body` must be an expression (its value is the return);
+    /// earlier statements run for their (locally scoped) side effects.
+    FuncDef { name: String, params: Vec<String>, body: Vec<Stmt> },
+}
+
+/// A user function bound by `Stmt::FuncDef`. Held in `Vm::functions` — a binding
+/// kind alongside tables / lazy frames, not a first-class `Value`. The body is
+/// kept as AST and recompiled per call (qpl recompiles every line anyway).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Function {
+    pub params: Vec<String>,
+    pub body: Vec<Stmt>,
 }

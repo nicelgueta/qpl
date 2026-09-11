@@ -28,6 +28,21 @@ fn compile_stmt(stmt: &Stmt, out: &mut Vec<Instruction>) -> Result<(), QplError>
         // scalar assigns are evaluated by the REPL before reaching the compiler
         Stmt::ScalarAssign { name, expr } => { out.push(Instruction::Eval(expr.clone())); out.push(Instruction::Assign(name.clone())); Ok(()) },
         Stmt::SingleVar(expr) => { out.push(Instruction::Eval(expr.clone())); Ok(())}
+        // `name: {[..] ..}` — register a user function. The body must end in an
+        // expression (its return value); a trailing assignment is rejected here.
+        Stmt::FuncDef { name, params, body } => {
+            if !matches!(body.last(), Some(Stmt::SingleVar(_) | Stmt::RetTable(_))) {
+                return Err(QplError::Compile(
+                    "a function body must end with an expression, not an assignment".into(),
+                ));
+            }
+            out.push(Instruction::DefFunc {
+                name: name.clone(),
+                params: params.clone(),
+                body: body.clone(),
+            });
+            Ok(())
+        }
     }
 }
 
@@ -318,6 +333,8 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
             "`n#…` slicing is only valid outside a select projection".into())),
         Expr::Index { .. } => return Err(QplError::Compile(
             "positional indexing is only valid outside a select projection".into())),
+        Expr::Apply { .. } => return Err(QplError::Compile(
+            "a user function call `f[..]` is only valid outside a select projection".into())),
     }
     Ok(())
 }
@@ -542,6 +559,26 @@ mod tests {
             BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
             Collect, Result, Assign("tm".into()),
         ]);
+    }
+
+    #[test]
+    fn func_def_compiles_to_a_single_def_func() {
+        use crate::ast::{Expr, Stmt};
+        assert_eq!(compile_src("f: {[x,y] x+y}"), vec![DefFunc {
+            name: "f".into(),
+            params: vec!["x".into(), "y".into()],
+            body: vec![Stmt::SingleVar(Expr::BinOp {
+                left: Box::new(Expr::ColRef("x".into())),
+                op: "+".into(),
+                right: Box::new(Expr::ColRef("y".into())),
+            })],
+        }]);
+    }
+
+    #[test]
+    fn func_body_ending_in_an_assignment_is_a_compile_error() {
+        let stmt = parse(tokenise("f: {[x] y: x+1}").unwrap()).unwrap();
+        assert!(matches!(compile(&stmt), Err(QplError::Compile(_))));
     }
 
     #[test]

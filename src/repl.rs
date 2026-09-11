@@ -81,8 +81,8 @@ fn wants_more(src: &str) -> bool {
     let mut depth: i32 = 0;
     for t in &toks {
         match t.kind {
-            TokenKind::LBracket | TokenKind::LParen => depth += 1,
-            TokenKind::RBracket | TokenKind::RParen => depth -= 1,
+            TokenKind::LBracket | TokenKind::LParen | TokenKind::LBrace => depth += 1,
+            TokenKind::RBracket | TokenKind::RParen | TokenKind::RBrace => depth -= 1,
             _ => {}
         }
     }
@@ -163,13 +163,40 @@ pub fn start(vm: &mut Vm) {
     }
 }
 
+/// Rebase a kdb-style timestamp literal (as accepted by [`temporal::parse_temporal`])
+/// to ns-since-Unix-epoch, for building a Polars `Datetime` demo column in Rust —
+/// the same rebasing [`crate::vm::ast_val_to_expr`] applies to a `Timestamp` literal
+/// at query time.
+fn demo_ts(literal: &str) -> i64 {
+    match temporal::parse_temporal(literal) {
+        Some(ast::Value::Timestamp(ns)) => ns + temporal::NS_2000_TO_1970,
+        _ => panic!("bad demo timestamp literal: {literal}"),
+    }
+}
+
 pub fn load_demo_tables(vm: &mut Vm) {
     let trades = df![
         "sym"   => ["AAPL","AAPL","MSFT","MSFT","GOOG","GOOG","AAPL","MSFT"],
         "price" => [182.3f64, 183.1, 415.2, 416.0, 140.5, 141.2, 184.0, 414.8],
         "size"  => [100i64, 250, 80, 300, 150, 90, 500, 200],
         "side"  => ["buy","sell","buy","buy","sell","buy","sell","sell"],
+        // one trading morning, 2024.03.15 — used by the temporal examples
+        "ts"    => [
+            demo_ts("2024.03.15D09:30:00.000000000"),
+            demo_ts("2024.03.15D09:31:15.000000000"),
+            demo_ts("2024.03.15D09:32:40.000000000"),
+            demo_ts("2024.03.15D09:45:05.000000000"),
+            demo_ts("2024.03.15D10:01:30.000000000"),
+            demo_ts("2024.03.15D10:02:50.000000000"),
+            demo_ts("2024.03.15D10:15:00.000000000"),
+            demo_ts("2024.03.15D10:20:35.000000000"),
+        ],
     ].expect("trades");
+    let trades = trades
+        .lazy()
+        .with_column(col("ts").cast(DataType::Datetime(TimeUnit::Nanoseconds, None)))
+        .collect()
+        .expect("cast trades.ts");
 
     let quotes = df![
         "sym"   => ["AAPL","MSFT","GOOG","AAPL","MSFT"],
@@ -177,7 +204,19 @@ pub fn load_demo_tables(vm: &mut Vm) {
         "ask"   => [182.5f64, 415.5, 140.8, 184.2, 415.0],
         "bsize" => [500i64, 300, 200, 400, 600],
         "asize" => [400i64, 250, 150, 350, 500],
+        "ts"    => [
+            demo_ts("2024.03.15D09:29:55.000000000"),
+            demo_ts("2024.03.15D09:32:35.000000000"),
+            demo_ts("2024.03.15D10:01:25.000000000"),
+            demo_ts("2024.03.15D10:14:55.000000000"),
+            demo_ts("2024.03.15D10:20:30.000000000"),
+        ],
     ].expect("quotes");
+    let quotes = quotes
+        .lazy()
+        .with_column(col("ts").cast(DataType::Datetime(TimeUnit::Nanoseconds, None)))
+        .collect()
+        .expect("cast quotes.ts");
 
     vm.tables.insert("trades".into(), trades);
     vm.tables.insert("quotes".into(), quotes);

@@ -59,6 +59,10 @@ impl Parser {
                 unreachable!()
             };
             self.eat(&TokenKind::Colon)?;
+            // `name: {[..] ..}` — a function definition.
+            if self.peek() == &TokenKind::LBrace {
+                return self.parse_func_def(name);
+            }
             // query keywords produce a table result; anything else is a scalar
             // expression. `parse_body` decides between a table statement and a
             // column expression (a one-column select → `Stmt::SingleVar`), so we
@@ -109,6 +113,51 @@ impl Parser {
             }
             other => Ok(Stmt::Assign { name, body: Box::new(other) }),
         }
+    }
+
+    /// `name: {[p1,p2] stmt; stmt; last-expr}` — a function definition. The
+    /// param list is optional (`{[] ..}` / `{ .. }` are niladic). Statements are
+    /// `;`-separated, each a full `parse_stmt` (so locals may be assigned); the
+    /// body must be non-empty, its last statement an expression (checked at
+    /// compile time).
+    fn parse_func_def(&mut self, name: String) -> Result<Stmt, QplError> {
+        self.eat(&TokenKind::LBrace)?;
+        let mut params = Vec::new();
+        if self.peek() == &TokenKind::LBracket {
+            self.next();
+            while let TokenKind::Name(p) = self.peek().clone() {
+                self.next();
+                params.push(p);
+                if self.peek() != &TokenKind::Comma {
+                    break;
+                }
+                self.next();
+            }
+            self.eat(&TokenKind::RBracket)?;
+        }
+        let mut body = Vec::new();
+        while self.peek() != &TokenKind::RBrace {
+            if matches!(self.peek(), TokenKind::Eof) {
+                return Err(QplError::Parse("unterminated function: missing '}'".into()));
+            }
+            body.push(self.parse_stmt()?);
+            match self.peek() {
+                TokenKind::Semicolon => {
+                    self.next();
+                }
+                TokenKind::RBrace => break,
+                other => {
+                    return Err(QplError::Parse(format!(
+                        "expected ';' or '}}' in function body, got {other:?}"
+                    )));
+                }
+            }
+        }
+        self.eat(&TokenKind::RBrace)?;
+        if body.is_empty() {
+            return Err(QplError::Parse("function body cannot be empty".into()));
+        }
+        Ok(Stmt::FuncDef { name, params, body })
     }
 
     fn parse_body(&mut self) -> Result<Stmt, QplError> {
@@ -740,9 +789,27 @@ impl Parser {
         loop {
             if matches!(self.peek(), TokenKind::LBracket) {
                 self.next(); // `[`
-                let idx = self.parse_expr()?;
+                // `f[]` / `f[a;b]` → `Expr::Apply`; a single expression with no
+                // `;` stays `Expr::Index` (list index, or a monadic function
+                // call resolved at run time).
+                if self.peek() == &TokenKind::RBracket {
+                    self.next();
+                    e = Expr::Apply { func: Box::new(e), args: vec![] };
+                    continue;
+                }
+                let mut args = vec![self.parse_expr()?];
+                let mut multi = false;
+                while self.peek() == &TokenKind::Semicolon {
+                    multi = true;
+                    self.next();
+                    args.push(self.parse_expr()?);
+                }
                 self.eat(&TokenKind::RBracket)?;
-                e = Expr::Index { expr: Box::new(e), idx: Box::new(idx) };
+                e = if multi {
+                    Expr::Apply { func: Box::new(e), args }
+                } else {
+                    Expr::Index { expr: Box::new(e), idx: Box::new(args.pop().unwrap()) }
+                };
                 continue;
             }
             if parenthesised || !matches!(e, Expr::ColRef(_)) {
@@ -862,6 +929,11 @@ impl Parser {
                 self.eat(&TokenKind::RParen)?;
                 Ok(expr)
             },
+            // a bare `{ .. }` — anonymous functions are unsupported; a function
+            // must be named (`f: {[..] ..}`).
+            TokenKind::LBrace => Err(QplError::Parse(
+                "anonymous functions are not supported — bind it to a name: `f: {[..] ..}`".into(),
+            )),
             other => Err(QplError::Parse(format!("Unexpected token in primary: {:?}", other))),
         }
     }
@@ -1235,6 +1307,58 @@ mod tests {
         for source in ["l[0]", "l[2 3 4]", "(l) 2 3", "trades`price[1]", "l[0][1]"] {
             assert!(matches!(p(source), Stmt::SingleVar(Expr::Index { .. })), "{source}");
         }
+    }
+
+    // --- functions ---
+
+    #[test]
+    fn func_def_parses_params_and_body() {
+        match p("f: {[x,y] t: x*y; t+1}") {
+            Stmt::FuncDef { name, params, body } => {
+                assert_eq!(name, "f");
+                assert_eq!(params, vec!["x".to_string(), "y".to_string()]);
+                assert_eq!(body.len(), 2);
+                assert!(matches!(body[0], Stmt::ScalarAssign { .. }));
+                assert!(matches!(body[1], Stmt::SingleVar(_)));
+            }
+            other => panic!("expected FuncDef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn niladic_func_def_needs_no_param_list() {
+        for source in ["f: {[] 42}", "f: {42}"] {
+            assert!(
+                matches!(p(source), Stmt::FuncDef { ref params, .. } if params.is_empty()),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_arg_bracket_call_parses_to_apply() {
+        match p("f[1;2;3]") {
+            Stmt::SingleVar(Expr::Apply { func, args }) => {
+                assert!(matches!(*func, Expr::ColRef(ref n) if n == "f"));
+                assert_eq!(args.len(), 3);
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+        assert!(matches!(
+            p("f[]"),
+            Stmt::SingleVar(Expr::Apply { args, .. }) if args.is_empty()
+        ));
+    }
+
+    #[test]
+    fn single_arg_bracket_call_stays_index_for_runtime_dispatch() {
+        assert!(matches!(p("f[`AAPL]"), Stmt::SingleVar(Expr::Index { .. })));
+    }
+
+    #[test]
+    fn empty_function_body_and_anonymous_function_are_parse_errors() {
+        assert!(parse(tokenise("f: {[x] }").unwrap()).is_err());
+        assert!(parse(tokenise("{[x] x+1}").unwrap()).is_err());
     }
 
     #[test]

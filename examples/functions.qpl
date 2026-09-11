@@ -35,4 +35,38 @@ bysym[`AAPL]
 
 log "... and one that reduces its result to a scalar"
 avgpx: {[s] avg select price from trades where sym = s}
-avgpx[`MSFT]
+2 round avgpx[`MSFT]
+
+log "a multi-line function: the README/DuckDB pipeline, parameterised and reusable"
+log "join quotes onto trades, filter, size-band, aggregate by sym/side/band, sort"
+summarise: {[min_price]
+    joined: select sym, side, price, size, bid, ask from trades `sym lj quotes `sym;
+    priced: select from joined where price > min_price;
+    banded: update band: `$?[size >= 300; `large; size >= 150; `mid; `small] from priced;
+    select tot: sum price * size, avg_spread: avg ask - bid, n: count price
+        by sym, side, band
+        from banded
+        order tot desc
+    }
+
+summarise[0]                / every trade
+summarise[150]               / only trades priced above 150
+
+log "temporal parameters: the demo `trades`/`quotes` carry a `ts` timestamp column"
+log "(one morning, 2024.03.15 - see `load_demo_tables` / examples/temporal.qpl)"
+
+log "a function taking a timestamp literal, filtering with it"
+after: {[t] select sym, price, ts from trades where ts > t}
+after[2024.03.15D10:00:00.000]
+
+log "two timestamp parameters define a time window"
+between: {[lo,hi] select sym, price, ts from trades where ts >= lo, ts <= hi}
+between[2024.03.15D09:30:00.000; 2024.03.15D09:45:05.000000000]
+
+log "temporal arithmetic + a now-function composed inside a function body"
+elapsed: {[t] .qpl.p - t}      / a `timespan` — however long ago `t` was
+elapsed[2024.03.15D09:30:00.000000000]
+
+log "a per-symbol lookup returning its latest trade"
+latest: {[s] select lts: max ts from trades where sym = s}
+latest[`AAPL]

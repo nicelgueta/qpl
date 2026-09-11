@@ -51,6 +51,8 @@ pub enum TokenKind {
     RParen,
     LBracket,
     RBracket,
+    LBrace,
+    RBrace,
     Bang,
     Hash,
     Op(String),

@@ -17,12 +17,48 @@ pub struct Vm {
     pub tables: HashMap<String, DataFrame>,
     pub lazy_frames: HashMap<String, LazyFrame>,
     pub globals: HashMap<String, ast::Value>,
+    /// User functions bound by `name: {[..] ..}`. A binding kind alongside
+    /// `tables` / `lazy_frames`, not a first-class value; applied in value
+    /// context only (see [`crate::resolve`]).
+    pub functions: HashMap<String, ast::Function>,
+    /// The active user-function call stack. Empty at the top level. Only the
+    /// *innermost* frame is ever searched (see [`Vm::lookup`]) — a call sees its
+    /// own params/locals and the session globals, never an enclosing caller's
+    /// frame, so this is lexical (not dynamic) scoping despite being a stack.
+    pub scopes: Vec<Scope>,
     /// When set (via the `\1 <path>` command), every line printed through
     /// [`Vm::emit`] is also appended here — kdb-style stdout redirection.
     pub stdout_log: Option<std::fs::File>,
     /// Session-wide knobs set from `.qpl.cfg key=value ...`.
     pub config: VmConfig,
 }
+
+/// One user-function call frame: params and any names the body binds, isolated
+/// from every other frame. Mirrors the four top-level namespaces on [`Vm`] —
+/// the session globals are, in effect, frame zero at the bottom of the search.
+#[derive(Default)]
+pub struct Scope {
+    pub globals: HashMap<String, ast::Value>,
+    pub tables: HashMap<String, DataFrame>,
+    pub lazy_frames: HashMap<String, LazyFrame>,
+    pub functions: HashMap<String, ast::Function>,
+}
+
+/// The kind of binding [`Vm::lookup`] found for a name.
+pub(crate) enum Lookup<'a> {
+    Global(&'a ast::Value),
+    LazyFrame(&'a LazyFrame),
+    Table(&'a DataFrame),
+    Function(&'a ast::Function),
+}
+
+/// Hard cap on user-function call nesting (a clearer error than a stack
+/// overflow); checked against `Vm::scopes.len()`. A function call recurses
+/// through the native Rust call stack (`apply_function` -> `eval` ->
+/// `eval_value` -> ...), so this is calibrated against the ~8 MiB default main
+/// thread stack the REPL runs on — a much smaller stack (a worker thread, or a
+/// future WASM build) could still overflow before reaching this many levels.
+pub(crate) const MAX_CALL_DEPTH: usize = 128;
 
 /// Interpreter configuration set at run time via `.qpl.cfg`. To add a knob:
 /// give it a field + default here and a match arm in [`VmConfig::set`] — nothing
@@ -145,8 +181,132 @@ impl Vm {
             tables: HashMap::new(),
             lazy_frames: HashMap::new(),
             globals: HashMap::new(),
+            functions: HashMap::new(),
+            scopes: Vec::new(),
             stdout_log: None,
             config: VmConfig::default(),
+        }
+    }
+
+    /// Push a fresh call frame (a user-function call). The caller is
+    /// responsible for popping it (`pop_scope`) on every exit path.
+    pub(crate) fn push_scope(&mut self) {
+        self.scopes.push(Scope::default());
+    }
+
+    /// Pop the innermost call frame, discarding whatever it bound.
+    pub(crate) fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    /// Resolve `name`: the active call frame (if any) first, then the session
+    /// globals. Deliberately **not** a walk of the whole `scopes` stack — a
+    /// function call only ever sees its own frame and the globals, never an
+    /// enclosing caller's frame, which is what makes this lexical scoping
+    /// rather than "whatever the dynamic call chain happens to have bound".
+    pub(crate) fn lookup(&self, name: &str) -> Option<Lookup<'_>> {
+        if let Some(scope) = self.scopes.last() {
+            if let Some(v) = scope.globals.get(name) {
+                return Some(Lookup::Global(v));
+            }
+            if let Some(lf) = scope.lazy_frames.get(name) {
+                return Some(Lookup::LazyFrame(lf));
+            }
+            if let Some(df) = scope.tables.get(name) {
+                return Some(Lookup::Table(df));
+            }
+            if let Some(f) = scope.functions.get(name) {
+                return Some(Lookup::Function(f));
+            }
+        }
+        if let Some(v) = self.globals.get(name) {
+            return Some(Lookup::Global(v));
+        }
+        if let Some(lf) = self.lazy_frames.get(name) {
+            return Some(Lookup::LazyFrame(lf));
+        }
+        if let Some(df) = self.tables.get(name) {
+            return Some(Lookup::Table(df));
+        }
+        if let Some(f) = self.functions.get(name) {
+            return Some(Lookup::Function(f));
+        }
+        None
+    }
+
+    /// `lookup`, narrowed to the scalar-global kind.
+    pub(crate) fn lookup_global(&self, name: &str) -> Option<&ast::Value> {
+        match self.lookup(name) {
+            Some(Lookup::Global(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// `lookup`, narrowed to the user-function kind.
+    pub(crate) fn lookup_function(&self, name: &str) -> Option<&ast::Function> {
+        match self.lookup(name) {
+            Some(Lookup::Function(f)) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// Bind a scalar to `name` in the active call frame, or the session
+    /// globals when there is none.
+    pub(crate) fn bind_global(&mut self, name: String, val: ast::Value) {
+        match self.scopes.last_mut() {
+            Some(scope) => {
+                scope.globals.insert(name, val);
+            }
+            None => {
+                self.globals.insert(name, val);
+            }
+        }
+    }
+
+    /// Bind an eager table to `name`, scope-aware like `bind_global`.
+    pub(crate) fn bind_table(&mut self, name: String, df: DataFrame) {
+        match self.scopes.last_mut() {
+            Some(scope) => {
+                scope.lazy_frames.remove(&name);
+                scope.tables.insert(name, df);
+            }
+            None => {
+                self.lazy_frames.remove(&name);
+                self.tables.insert(name, df);
+            }
+        }
+    }
+
+    /// Bind a lazy plan to `name`, scope-aware like `bind_global`.
+    pub(crate) fn bind_lazy(&mut self, name: String, lf: LazyFrame) {
+        match self.scopes.last_mut() {
+            Some(scope) => {
+                scope.tables.remove(&name);
+                scope.lazy_frames.insert(name, lf);
+            }
+            None => {
+                self.tables.remove(&name);
+                self.lazy_frames.insert(name, lf);
+            }
+        }
+    }
+
+    /// Bind a function to `name`, scope-aware like `bind_global` — a function
+    /// defined inside a call is local to that call, same as any other name.
+    pub(crate) fn bind_function(&mut self, name: String, f: ast::Function) {
+        match self.scopes.last_mut() {
+            Some(scope) => {
+                scope.globals.remove(&name);
+                scope.tables.remove(&name);
+                scope.lazy_frames.remove(&name);
+                scope.functions.insert(name, f);
+            }
+            None => {
+                self.globals.remove(&name);
+                self.tables.remove(&name);
+                self.lazy_frames.remove(&name);
+                self.functions.insert(name, f);
+            }
         }
     }
 
@@ -195,7 +355,7 @@ impl Vm {
             ast::Expr::Lit(v) => Ok(v.clone()),
             // outside a table expression `` `foo `` is a symbol (a distinct value kind)
             ast::Expr::Sym(s) => Ok(ast::Value::Sym(s.clone())),
-            ast::Expr::ColRef(name) => self.globals.get(name)
+            ast::Expr::ColRef(name) => self.lookup_global(name)
                 .cloned()
                 .ok_or_else(|| QplError::Runtime(format!("undefined variable '{name}'"))),
             ast::Expr::BinOp { left, op, right } => {
@@ -244,7 +404,7 @@ impl Vm {
             // `` name::`$col `` — a Polars Enum whose categories come, in order,
             // from the global symbol vector `name`
             ast::CastTarget::Enum(name) => {
-                let cats = match self.globals.get(name) {
+                let cats = match self.lookup_global(name) {
                     Some(Value::SymVec(v)) => v,
                     Some(other) => return Err(QplError::Runtime(format!(
                         "'{name}' is not an enum (expected a symbol vector, got {other:?})"
@@ -310,17 +470,15 @@ impl Vm {
                 Instruction::FromSrc(tbl_source) => {
                     match tbl_source {
                         TableSource::InMem(name) => {
-                            let lf = if let Some(lf) = self.lazy_frames.get(&name) {
+                            let lf = match self.lookup(&name) {
                                 // reading from a lazy binding is contagious: the
                                 // result stays lazy unless explicitly collected.
-                                lazy_mode = true;
-                                lf.clone()
-                            } else {
-                                self.tables
-                                    .get(&name)
-                                    .ok_or_else(|| QplError::Runtime(format!("unknown table '{name}'")))?
-                                    .clone()
-                                    .lazy()
+                                Some(Lookup::LazyFrame(lf)) => {
+                                    lazy_mode = true;
+                                    lf.clone()
+                                }
+                                Some(Lookup::Table(df)) => df.clone().lazy(),
+                                _ => return Err(QplError::Runtime(format!("unknown table '{name}'"))),
                             };
                             frame = Some(if needs_i { lf.with_row_index("i", None) } else { lf });
                         }
@@ -357,7 +515,7 @@ impl Vm {
 
                 Instruction::PushColRef(name) => {
                     // globals shadow column names, substituting a literal into the lazy plan
-                    if let Some(val) = self.globals.get(&name) {
+                    if let Some(val) = self.lookup_global(&name) {
                         stack.push(StackObj::Expr(ast_val_to_expr(val.clone())?));
                     } else {
                         stack.push(StackObj::Expr(col(name.as_str())));
@@ -564,7 +722,41 @@ impl Vm {
 
                 Instruction::Cast(target) => {
                     let expr = pop1(&mut stack)?.unwrap_expr()?;
-                    stack.push(StackObj::Expr(expr.cast(self.resolve_cast_target(&target)?)));
+                    // String → temporal casts route through Polars' string
+                    // datetime/time parser: `expr.cast(Date/Datetime/Time)` on a
+                    // String is deprecated (gone in Polars 2.0). `to_datetime`
+                    // infers the format per value (ISO *and* kdb's dotted
+                    // `2024.03.15`), so `` `date$ `` / `` `month$ `` parse there
+                    // and then truncate to a real `Date`; `` `timestamp$ `` keeps
+                    // the time part; `` `time$ `` uses the time parser.
+                    //
+                    // Every *other* source dtype — a column already `Date` /
+                    // `Datetime` / `Time`, or a raw integer offset (kdb
+                    // `` `date$8000 ``-style) — takes a plain `.cast()`; probe the
+                    // expression's actual resolved dtype against the active frame
+                    // to decide (the target alone doesn't say what `expr` is).
+                    let dtype = self.resolve_cast_target(&target)?;
+                    let temporal_target =
+                        matches!(dtype, DataType::Date | DataType::Datetime(_, _) | DataType::Time);
+                    let casted = if temporal_target && expr_dtype_is_string(frame.as_ref(), &expr)? {
+                        let to_datetime = |e: Expr| {
+                            e.str().to_datetime(
+                                None,
+                                None,
+                                StrptimeOptions::default(),
+                                lit("raise"),
+                            )
+                        };
+                        match &dtype {
+                            DataType::Date => to_datetime(expr).dt().date(),
+                            DataType::Datetime(_, _) => to_datetime(expr),
+                            DataType::Time => expr.str().to_time(StrptimeOptions::default()),
+                            _ => unreachable!("temporal_target guards this to Date/Datetime/Time"),
+                        }
+                    } else {
+                        expr.cast(dtype)
+                    };
+                    stack.push(StackObj::Expr(casted));
                 }
 
                 Instruction::Eval(expr) => {
@@ -579,6 +771,10 @@ impl Vm {
                     }
                 }
 
+                Instruction::DefFunc { name, params, body } => {
+                    self.bind_function(name, ast::Function { params, body });
+                }
+
                 Instruction::Result => {
                     let lf = require_frame(&mut frame)?;
                     stack.push(StackObj::Frame(lf));
@@ -588,17 +784,15 @@ impl Vm {
                 Instruction::Assign(name) => {
                     match pop1(&mut stack)? {
                         StackObj::Scalar(s) => {
-                            self.globals.insert(name.clone(), s.clone());
+                            self.bind_global(name, s);
                         }
                         StackObj::Frame(lf) => {
                             if lazy_mode {
                                 // keep the plan lazy under this name
-                                self.tables.remove(&name);
-                                self.lazy_frames.insert(name, lf);
+                                self.bind_lazy(name, lf);
                             } else {
-                                self.lazy_frames.remove(&name);
-                                self.tables.insert(name, lf.collect()
-                                    .map_err(|e| QplError::Runtime(e.to_string()))?);
+                                let df = lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?;
+                                self.bind_table(name, df);
                             }
                         }
                         typ => return Err(QplError::Runtime(format!("Cannot assign '{}' to type {}: expected a table or scalar on stack", name, typ.type_name()))),
@@ -635,6 +829,26 @@ pub fn run_vm(source: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
 
 fn require_frame(f: &mut Option<LazyFrame>) -> Result<LazyFrame, QplError> {
     f.take().ok_or_else(|| QplError::Runtime("no active frame".into()))
+}
+
+/// Does `expr`, resolved against the active `frame`'s schema, have dtype
+/// `String`? Used to decide whether a `` `date$ `` / `` `timestamp$ `` /
+/// `` `time$ `` cast should parse a string or plain-`.cast()` an already
+/// temporal (or raw integer offset) source. `expr` is a moved-through
+/// `PushColRef`/`PushConst`/… expression, not necessarily a bare column, so
+/// this resolves it the same way Polars would: select it (schema-only, no
+/// data touched) off a clone of the current plan.
+fn expr_dtype_is_string(frame: Option<&LazyFrame>, expr: &Expr) -> Result<bool, QplError> {
+    let Some(lf) = frame else { return Ok(false) };
+    let schema = lf
+        .clone()
+        .select([expr.clone().alias("__qpl_cast_probe")])
+        .collect_schema()
+        .map_err(|e| QplError::Runtime(e.to_string()))?;
+    Ok(schema
+        .iter_names_and_dtypes()
+        .next()
+        .is_some_and(|(_, dtype)| matches!(dtype, DataType::String)))
 }
 
 fn pop1(stack: &mut Vec<StackObj>) -> Result<StackObj, QplError> {
@@ -1511,10 +1725,80 @@ mod tests {
     }
 
     #[test]
-    fn temporal_column_filters_against_a_literal() {
-        // `c2` = 10 20 30 15 → dates 1970-01-11 .. ; keep those strictly after 1970-01-21 (day 20)
-        let df = run(make_vm(), "select v: `date$c2 from t where (`date$c2) > 1970.01.21");
-        assert_eq!(df.height(), 1); // day 20 cutoff -> only c2 = 30
+    fn string_temporal_casts_use_the_dedicated_parsers() {
+        // String → temporal casts route through Polars' string parsers, not a
+        // deprecated `expr.cast(<temporal>)`. `` `date$ `` / `` `month$ `` yield
+        // a real `Date`; `` `timestamp$ `` a `Datetime` that keeps the time
+        // part; `` `time$ `` a `Time`. `to_datetime`'s inference handles both
+        // ISO and kdb's dotted `2024.03.15`, so nothing comes back null.
+        let mut vm = make_vm();
+        let src = df![
+            "ds"  => ["2024.03.15", "2024-06-01", "2024-01-02"],
+            "ts"  => ["2024-03-15T09:30:00", "2024-06-01T16:00:00", "2024-01-02T00:00:01"],
+            "tm"  => ["09:30:00", "16:00:00", "00:00:01"],
+        ]
+        .unwrap();
+        vm.tables.insert("d".into(), src);
+        let df = run(
+            vm,
+            "select a: `date$ds, b: `timestamp$ts, c: `time$tm, e: `month$ds from d",
+        );
+
+        assert_eq!(df.column("a").unwrap().dtype(), &DataType::Date);
+        assert_eq!(df.column("e").unwrap().dtype(), &DataType::Date);
+        assert!(matches!(
+            df.column("b").unwrap().dtype(),
+            DataType::Datetime(_, _)
+        ));
+        assert_eq!(df.column("c").unwrap().dtype(), &DataType::Time);
+
+        for name in ["a", "b", "c", "e"] {
+            assert_eq!(
+                df.column(name).unwrap().null_count(),
+                0,
+                "column {name} has nulls — parse failed"
+            );
+        }
+    }
+
+    #[test]
+    fn string_date_cast_rejects_an_unparseable_value() {
+        // strict by default: a value the inferred format cannot read aborts the
+        // query rather than silently nulling.
+        let mut vm = make_vm();
+        let src = df!["ds" => ["2024-03-15", "not a date", "2024-01-02"]].unwrap();
+        vm.tables.insert("d".into(), src);
+        let prog = compile(&parse(tokenise("select a: `date$ds from d").unwrap()).unwrap()).unwrap();
+        match vm.eval(prog) {
+            Err(e) => assert!(e.to_string().contains("not a date"), "unexpected error: {e}"),
+            Ok(_) => panic!("expected a parse failure on an unreadable date string"),
+        }
+    }
+
+    #[test]
+    fn temporal_casts_on_an_already_temporal_column_use_a_plain_cast() {
+        // a column that's already `Date`/`Datetime`/`Time` (not `String`) must
+        // NOT go through the string parser — it should plain-`.cast()`, same as
+        // any other non-string source.
+        let mut vm = make_vm();
+        let src = df!["ts" => ["2024-03-15T09:30:00", "2024-06-01T16:00:00"]]
+            .unwrap()
+            .lazy()
+            .select([col("ts").str().to_datetime(
+                None,
+                None,
+                StrptimeOptions::default(),
+                lit("raise"),
+            )])
+            .collect()
+            .unwrap();
+        vm.tables.insert("d".into(), src);
+        let df = run(vm, "select a: `date$ts, b: `time$ts from d");
+        assert_eq!(df.column("a").unwrap().dtype(), &DataType::Date);
+        assert_eq!(df.column("b").unwrap().dtype(), &DataType::Time);
+        for name in ["a", "b"] {
+            assert_eq!(df.column(name).unwrap().null_count(), 0, "column {name} has nulls");
+        }
     }
 
     // scalar eval and assignment via instructions

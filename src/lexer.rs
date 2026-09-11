@@ -252,6 +252,14 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 tokens.push(Token { kind: TokenKind::RBracket, pos: start });
                 i += 1;
             }
+            '{' => {
+                tokens.push(Token { kind: TokenKind::LBrace, pos: start });
+                i += 1;
+            }
+            '}' => {
+                tokens.push(Token { kind: TokenKind::RBrace, pos: start });
+                i += 1;
+            }
             '!' => {
                 i += 1;
                 if chars.get(i) == Some(&'=') {
@@ -790,5 +798,20 @@ mod tests {
         assert!(tokenise(r#""hello"#).is_err());
     }
 
+    #[test]
+    fn braces_lex_to_brace_tokens() {
+        assert_eq!(kinds("{[x,y] x+y }"), vec![
+            TokenKind::LBrace,
+            TokenKind::LBracket,
+            TokenKind::Name("x".into()),
+            TokenKind::Comma,
+            TokenKind::Name("y".into()),
+            TokenKind::RBracket,
+            TokenKind::Name("x".into()),
+            TokenKind::Op("+".into()),
+            TokenKind::Name("y".into()),
+            TokenKind::RBrace,
+        ]);
+    }
 }
 
