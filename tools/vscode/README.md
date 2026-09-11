@@ -17,6 +17,19 @@ operators (`lj`, `ij`, `rj`), the `<<` / `>>` channels, assignments,
 `\d` / `\l` / `\1` REPL lines, and the virtual `i` column. Plus line comments,
 bracket matching and auto-closing pairs.
 
+### Completion & snippets
+
+- Statement/builtin keywords and REPL commands (`\d`, `\1`, `\l`, `log`) at the
+  start of a line; aggregates (`sum`, `avg`, `round`, `rn`, `rank`, ...)
+  everywhere.
+- Cast type names (`f64`, `int`, `str`, ...) right after `$`.
+- Table names after `from` / `by` / `drop` / `collect` / `sink` / `load`:
+  tables assigned or referenced in the open document, plus the configurable
+  `qpl.demoTables` (default `trades`, `quotes`).
+- Variables assigned in the open document (`name: ...`).
+- Snippets: `sel`, `selby`, `upd`, `del`, `delcols`, `join`, `lazyp`, `cond`,
+  `over`.
+
 ### Interactive REPL
 
 - **Ctrl+Enter** (Cmd+Enter on macOS) in a `.qpl` file runs the **selection**,
@@ -38,6 +51,8 @@ The extension resolves, in order:
    `Cargo.toml` is present (handy while hacking on qpl itself).
 
 Set `qpl.loadDemo` to start the REPL with the demo `trades` / `quotes` tables.
+Set `qpl.demoTables` to change which table names completion offers by default
+(alongside whatever it finds in the open document).
 
 ## Developing
 

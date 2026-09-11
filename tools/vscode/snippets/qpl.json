@@ -1,0 +1,47 @@
+{
+  "select": {
+    "prefix": "sel",
+    "body": "select ${1:cols} from ${2:table} where ${3:pred}",
+    "description": "select <cols> from <table> where <pred>"
+  },
+  "select by": {
+    "prefix": "selby",
+    "body": "select ${1:total}: ${2:sum} ${3:col} by ${4:keys} from ${5:table}",
+    "description": "select ... by <keys> from <table> (group-by aggregation)"
+  },
+  "update": {
+    "prefix": "upd",
+    "body": "update ${1:col}: ${2:expr} from ${3:table} where ${4:pred}",
+    "description": "update <col>: <expr> from <table> where <pred>"
+  },
+  "delete rows": {
+    "prefix": "del",
+    "body": "delete from ${1:table} where ${2:pred}",
+    "description": "delete rows matching a predicate"
+  },
+  "delete columns": {
+    "prefix": "delcols",
+    "body": "delete `${1:col1}`${2:col2} from ${3:table}",
+    "description": "delete named columns from a table"
+  },
+  "join": {
+    "prefix": "join",
+    "body": "select ${1:cols} from ${2:left} ${3|lj,ij,rj|} ${4:right} where ${5:pred}",
+    "description": "left/inner/right join two tables on matching symbol columns"
+  },
+  "lazy pipeline": {
+    "prefix": "lazyp",
+    "body": "${1:plan}: lazy select ${2:cols} from << `${3:path.parquet} where ${4:pred}\n${1:plan} >> `${5:out.parquet}",
+    "description": "bind a lazy plan and sink it to disk without materialising early"
+  },
+  "conditional": {
+    "prefix": "cond",
+    "body": "?[${1:pred1}; ${2:val1}; ${3:pred2}; ${4:val2}; ${5:default}]",
+    "description": "?[cond; then; cond; then; ...; else] conditional expression"
+  },
+  "window over": {
+    "prefix": "over",
+    "body": "select ${1:col}, ${2:rn}: rn over ${3:keys} from ${4:table}",
+    "description": "window function (rn/rank/drank/shift/lag/lead) partitioned by `over`"
+  }
+}

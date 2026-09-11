@@ -3,6 +3,11 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
+import {
+  AGGREGATES, AGGREGATE_DETAIL, BUILTIN_KEYWORDS, CAST_TYPES,
+  JOIN_OPERATORS, KEYWORD_DETAIL, STATEMENT_KEYWORDS,
+} from './vocabulary';
+import { demoTables, scanDocument } from './docScan';
 
 const TERMINAL_NAME = 'qpl REPL';
 let terminal: vscode.Terminal | undefined;
@@ -22,6 +27,7 @@ export function activate(context: vscode.ExtensionContext) {
         terminal = undefined;
       }
     }),
+    vscode.languages.registerCompletionItemProvider('qpl', new QplCompletionProvider(), ' ', '$', '`', ':'),
   );
 }
 
@@ -152,4 +158,79 @@ async function runFileOrSelection() {
   scratchFile ??= path.join(os.tmpdir(), `qpl-vscode-${process.pid}.qpl`);
   fs.writeFileSync(scratchFile, code.endsWith('\n') ? code : code + '\n');
   term.sendText(`\\l ${scratchFile}`, true);
+}
+
+const TABLE_CONTEXT_RE = /\b(from|by|drop|collect|sink|load)\s+(?:<<\s*)?[A-Za-z_`.\w/-]*$/;
+
+/** Static + document-derived completion for qpl: keywords, aggregates, cast
+ * types, join operators, snippets-adjacent identifiers, and names seen in
+ * the open document (assignment targets and table references). */
+class QplCompletionProvider implements vscode.CompletionItemProvider {
+  provideCompletionItems(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+  ): vscode.CompletionItem[] {
+    const linePrefix = document.lineAt(position).text.slice(0, position.character);
+    const trimmedPrefix = linePrefix.trimStart();
+
+    // `type$expr` cast — only cast type names right after a bare `$` (or a
+    // partial type name being typed before it).
+    if (/\$[A-Za-z0-9_]*$/.test(linePrefix) && !/\$\s/.test(linePrefix)) {
+      return CAST_TYPES.map((t) => this.item(t, vscode.CompletionItemKind.TypeParameter, 'cast target type'));
+    }
+
+    // after from / by / drop / collect / sink / load -> table names
+    if (TABLE_CONTEXT_RE.test(linePrefix)) {
+      const { assigned, tableRefs } = scanDocument(document);
+      const names = new Set([...demoTables(), ...tableRefs, ...assigned]);
+      return [...names].map((n) => this.item(n, vscode.CompletionItemKind.Struct, 'table'));
+    }
+
+    const items: vscode.CompletionItem[] = [];
+
+    // start of line (or start of statement) -> statement/builtin keywords + REPL commands
+    if (trimmedPrefix === '') {
+      for (const kw of [...STATEMENT_KEYWORDS, ...BUILTIN_KEYWORDS]) {
+        items.push(this.item(kw, vscode.CompletionItemKind.Keyword, KEYWORD_DETAIL[kw]));
+      }
+      items.push(
+        this.item('\\d', vscode.CompletionItemKind.Keyword, 'disassemble a statement'),
+        this.item('\\1', vscode.CompletionItemKind.Keyword, 'toggle stdout logging to a file'),
+        this.item('\\l', vscode.CompletionItemKind.Keyword, 'run a script file'),
+        this.item('log', vscode.CompletionItemKind.Keyword, 'print an expression to stdout'),
+      );
+    } else {
+      for (const kw of STATEMENT_KEYWORDS) {
+        items.push(this.item(kw, vscode.CompletionItemKind.Keyword, KEYWORD_DETAIL[kw]));
+      }
+      for (const kw of BUILTIN_KEYWORDS) {
+        items.push(this.item(kw, vscode.CompletionItemKind.Keyword, KEYWORD_DETAIL[kw]));
+      }
+      for (const op of JOIN_OPERATORS) {
+        items.push(this.item(op, vscode.CompletionItemKind.Operator, KEYWORD_DETAIL[op]));
+      }
+    }
+
+    for (const agg of AGGREGATES) {
+      items.push(this.item(agg, vscode.CompletionItemKind.Function, AGGREGATE_DETAIL[agg] ?? `${agg}(expr) — aggregate`));
+    }
+
+    const { assigned } = scanDocument(document);
+    for (const name of assigned) {
+      items.push(this.item(name, vscode.CompletionItemKind.Variable, 'defined in this document'));
+    }
+    for (const t of demoTables()) {
+      items.push(this.item(t, vscode.CompletionItemKind.Struct, 'demo table'));
+    }
+
+    return items;
+  }
+
+  private item(label: string, kind: vscode.CompletionItemKind, detail?: string): vscode.CompletionItem {
+    const it = new vscode.CompletionItem(label, kind);
+    if (detail) {
+      it.detail = detail;
+    }
+    return it;
+  }
 }

@@ -122,10 +122,11 @@ One `CompletionItemProvider` for language id `qpl`:
    runs the file/selection in a persistent `qpl REPL` terminal; multi-line input
    goes through the interpreter's `\l` run-script command. Binary discovery:
    `qpl.path` → `PATH` → `target/release|debug/qpl` → `cargo run`.
-3. **M2 — Static completion + snippets:** `vocabulary.ts`, snippets, `$`-gated cast
-   completion, start-of-line keyword completion. `0.3.0`.
-4. **M3 — Document-aware completion:** `docScan.ts`, table-name extraction, context
-   gating. `0.4.0`.
+3. **M2 — Static completion + snippets: shipped `0.3.0`.** `vocabulary.ts`, `snippets/qpl.json`,
+   `$`-gated cast completion, start-of-line keyword completion.
+4. **M3 — Document-aware completion: shipped `0.3.0`.** `docScan.ts`, table-name extraction
+   (assignments, `from`/`load`/`sink`/`<<` operands, configurable `qpl.demoTables`), context
+   gating (`from`/`by`/`drop`/`collect`/`sink`/`load` → tables).
 5. **M4 — Tests + packaging:** `vscode-tmgrammar-test` snapshots, `@vscode/test-electron`
    tests, README screenshots. `1.0.0`.
 6. **M5 (optional) — Semantic layer:** compile real `lexer`/`parser` to WASM for a

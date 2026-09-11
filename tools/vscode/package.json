@@ -2,7 +2,7 @@
   "name": "qpl",
   "displayName": "qpl — Quick Polars Query Language",
   "description": "Syntax highlighting and an interactive REPL for the qpl query language.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "nicelgueta",
   "license": "MIT",
   "repository": {
@@ -38,6 +38,12 @@
         "language": "qpl",
         "scopeName": "source.qpl",
         "path": "./syntaxes/qpl.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "qpl",
+        "path": "./snippets/qpl.json"
       }
     ],
     "commands": [
@@ -86,6 +92,17 @@
           "type": "boolean",
           "default": false,
           "description": "Start the REPL with --load-demo (preloads the demo `trades` / `quotes` tables)."
+        },
+        "qpl.demoTables": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "trades",
+            "quotes"
+          ],
+          "description": "Table names offered by completion in addition to those found in the open document (matches --load-demo's tables by default)."
         }
       }
     }
