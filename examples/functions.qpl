@@ -1,0 +1,38 @@
+/ ─────────────────────────────────────────────────────────────────────────────
+/ Functions: `name: {[a,b] stmt; stmt; last-expr}` (q-style lambdas).
+/
+/ - the parameter list `[a,b]` is optional (`{[] ..}` / `{ ..}` are niladic)
+/ - statements are `;`-separated; the final one is an expression — its value
+/   is the return. Earlier statements may bind locals (scoped to the call).
+/ - call with brackets: `f[1;2]`, `f[]`, `f[`AAPL]`; or monadically `f 41`.
+/ - functions are a named binding kind — they are not first-class values and
+/   cannot appear inside a `select` projection.
+/
+/ Run from the repo root:
+/   cargo run -- --load-demo examples/functions.qpl
+/ ─────────────────────────────────────────────────────────────────────────────
+
+log "a plain scalar function"
+add: {[x,y] x+y}
+add[2;3]
+
+log "monadic call, two spellings"
+inc: {[x] x+1}
+inc 41
+inc[41]
+
+log "a local variable, scoped to the call (qpl evaluates right-to-left, so the parens matter)"
+hypot2: {[a,b] s: (a*a) + (b*b); s}
+hypot2[3;4]
+
+log "conditional recursion - ?[cond;then;else] works in value context"
+fac: {[n] ?[n<2; 1; n*fac[n-1]]}
+fac[5]
+
+log "a function that parameterises a query and returns a table"
+bysym: {[s] select sym, price, size from trades where sym = s}
+bysym[`AAPL]
+
+log "... and one that reduces its result to a scalar"
+avgpx: {[s] avg select price from trades where sym = s}
+avgpx[`MSFT]

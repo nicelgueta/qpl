@@ -7,23 +7,24 @@
 
 trades: load `examples/data/trades.parquet
 
-/ partition aggregate broadcast back to every row (SQL: max(price) OVER (PARTITION BY sym))
+log "partition aggregate broadcast back to every row (SQL: max(price) OVER (PARTITION BY sym))"
 select sym, price, top: max price over `sym from trades
 
-/ `over` binds tighter than arithmetic, so no parens needed here
+log "`over` binds tighter than arithmetic, so no parens needed here"
 select sym, price, off_top: max price over `sym - price from trades
 
 / ranking verbs need an `order` sub-clause (space-separated `col asc|desc pairs)
 /   rn    = row_number()  — strict 1..n
 /   rank  = rank()        — ties share the low rank, then a gap
 /   drank = dense_rank()  — ties share a rank, no gap
+log "ranking verbs: rn (row_number), rank (ties share low rank + gap), drank (dense_rank, no gap)"
 select sym, side, price,
     rn:    rn    over `sym order `price asc,
     rnk:   rank  over `sym order `side  asc,
     drnk:  drank over `sym order `side  asc
     from trades
 
-/ multi-key order with independent directions: side ascending, then price descending
+log "multi-key order with independent directions: side ascending, then price descending"
 select sym, side, price, seat: rn over `sym order `side asc `price desc from trades
 
 / ── ordered aggregates ───────────────────────────────────────────────────────
@@ -36,6 +37,7 @@ select sym, side, price, seat: rn over `sym order `side asc `price desc from tra
 /   cumsum <col>        — running total
 /   <n> shift <col>     — value n rows earlier   (alias: `lag`)
 /   <n> diff  <col>     — difference from n rows back
+log "running total (cumsum), previous row (shift/lag), and the change from it (diff)"
 select sym, price,
     run:  cumsum price over `sym order `price asc,
     prev: 1 shift price over `sym order `price asc,
@@ -46,6 +48,7 @@ select sym, price,
 / a trailing `rolling <n>` turns the aggregate into a fixed n-row moving window
 / (sum / avg / min / max / std / var / median). The first n-1 rows of each
 / partition are null — the window isn't full yet.
+log "a trailing `rolling <n>` turns the aggregate into a fixed n-row moving window"
 select sym, price,
     ma3: avg price over `sym order `price asc rolling 2,
     mx3: max price over `sym order `price asc rolling 2

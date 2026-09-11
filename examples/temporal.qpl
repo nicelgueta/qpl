@@ -48,3 +48,21 @@ log "today      " .qpl.d
 / temporal literals project as Polars-native typed columns
 trades: load `examples/data/trades.parquet
 select sym, asof: 2024.03.15D09:30:00.000000000 from trades
+
+/ column-context string->temporal casts parse via Polars' string parser
+/ (format inferred): `` `date$ `` -> a Date, `` `timestamp$ `` -> a Datetime
+/ keeping the time part
+withtemporal: update 
+    dsq: "2024.03.15", 
+    dsiso: "2024-03-15",
+    dsd: "15/3/2024",
+    / tsq: "2024.03.15D09:30:00"
+    tsiso: "2024-03-15T09:30:00" 
+    from trades
+select sym, 
+    dsq: `date$dsq,
+    dsiso: `date$dsiso,
+    dsd: `date$dsd,
+    / tsq: `timestamp$tsq
+    tsiso: `timestamp$tsiso 
+    from withtemporal

@@ -14,10 +14,10 @@
 
 trades: load `examples/data/trades.parquet
 
-/ an enum definition: an ordered symbol vector stored in a global
+log "an enum definition: an ordered symbol vector stored in a global"
 band_levels: `low`mid`high
 
-/ tag each row, then turn the tags into an enum and the sym into a categorical
+log "tag each row, then turn the tags into an enum and the sym into a categorical"
 tagged: select
     sym,
     price,
@@ -33,7 +33,7 @@ out: select
 cols out
 select from out
 
-/ sink a table by name; the path comes from a string variable (`$ interns it)
+log "sink a table by name; the path comes from a string variable (`$ interns it)"
 dest: "examples/data/symbols_and_enums.parquet"
 out >> `$dest
 log "wrote " dest

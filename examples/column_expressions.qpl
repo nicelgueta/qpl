@@ -12,34 +12,33 @@
 trades: load `examples/data/trades.parquet
 
 / ── a column as a list ──────────────────────────────────────────────────────
-/ `table`col` and a one-column `select` are equivalent
+log "`table`col` and a one-column `select` are equivalent"
 prices:  trades`price
 prices2: select price from trades
 prices
 
-/ a `where` may be attached to a column expression (but not to a persisted list)
+log "a `where` may be attached to a column expression (but not to a persisted list)"
 big: trades`price where size > 200
 big
 
 / ── reductions land in a scalar global ──────────────────────────────────────
-/ any aggregate verb (max/min/sum/avg/first/last/count/std/…) collapses a
-/ column expression to a single value
+log "any aggregate verb (max/min/sum/avg/first/last/count/std/...) collapses a column expression to a single value"
 top:   max trades`price
 mean:  avg select price from trades
 first_sym: first trades`sym
 top
 
-/ scalars compose with later queries just like any other global
+log "scalars compose with later queries just like any other global"
 select sym, price from trades where price >= mean
 
 / ── slicing with `n#` ───────────────────────────────────────────────────────
+log "slicing with n# - first three rows, last three rows"
 3#trades`price          / first three rows
 -3#trades`price          / last three rows
 3#select price from trades
 
 / ── positional indexing ────────────────────────────────────────────────────
-/ `list[i]` picks one element (an atom); `list[i j k]` gathers a sub-list.
-/ works on a list global, a column expression, or a parenthesised expression.
+log "positional indexing: list[i] picks one element, list[i j k] gathers a sub-list"
 nums: 10 20 30 40 50
 nums[0]                   / an atom: i64: 10
 nums[1 3 4]               / a sub-list: i64[3]: 20 40 50
@@ -48,6 +47,6 @@ trades`price[2 3]         / the 3rd and 4th prices
 (trades`price) 2 3        / q-style juxtaposition still works after `(…)`
 
 / ── bare names resolve at run time ─────────────────────────────────────────
-/ a name is looked up as a global, then a lazy frame, then a table
+log "a name is looked up as a global, then a lazy frame, then a table"
 t2: trades                / copies the table
 2#t2                       / `n#` on a whole table stays a table
