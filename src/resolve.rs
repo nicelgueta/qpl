@@ -95,6 +95,32 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
         // `sum trades`price`, `2 shift px`, `2 round px`, `cumsum px`, …
         Expr::Call { func, args } if (1..=2).contains(&args.len()) => eval_call(vm, func, args),
 
+        // `f64$trades`price` — a cast applied to a column expression, not a
+        // literal scalar. `eval_scalar` can only fold true scalars (and its
+        // `scalar_cast` only handles atoms), so a cast whose operand resolves
+        // to a frame — or, since a one-column expression collapses eagerly
+        // (`is_column_select`), to an already-materialised list — is applied
+        // here instead, through Polars (the same cast logic the VM uses for
+        // `select f64$price from trades`).
+        Expr::Cast { target, expr } => match eval_value(vm, expr)? {
+            EvalValue::Frame { lf, .. } => {
+                let name = first_col_name(&lf)?;
+                let casted = vm.build_cast_expr(target, col(name.as_str()), Some(&lf))?;
+                let df = lf.select([casted.alias("r")]).collect().map_err(rt)?;
+                Ok(EvalValue::Scalar(column_to_value(df.column("r").map_err(rt)?)?))
+            }
+            EvalValue::Scalar(v) if is_list_value(&v) => {
+                let lf = list_to_lazy(v)?;
+                let casted = vm.build_cast_expr(target, col("x"), Some(&lf))?;
+                let df = lf.select([casted.alias("r")]).collect().map_err(rt)?;
+                Ok(EvalValue::Scalar(column_to_value(df.column("r").map_err(rt)?)?))
+            }
+            EvalValue::Scalar(v) => Ok(EvalValue::Scalar(vm.eval_scalar(&Expr::Cast {
+                target: target.clone(),
+                expr: Box::new(Expr::Lit(v)),
+            })?)),
+        },
+
         // a binary op whose operands may themselves be function calls
         // (`n * fac[n-1]`): reduce both sides to scalars, then reuse the existing
         // operator logic on the two literals.
@@ -322,6 +348,15 @@ fn is_reducer(f: &str) -> bool {
             | "std" | "dev" | "var" | "median" | "med" | "mode" | "modal"
             | "skew" | "kurt" | "kurtosis" | "any" | "all" | "prod" | "product"
             | "argmin" | "argmax" | "nnull" | "null_count" | "distinct" | "n_unique"
+    )
+}
+
+/// Is this a list-shaped `Value` (as opposed to an atomic scalar)?
+fn is_list_value(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::IntVec(_) | Value::FloatVec(_) | Value::StrVec(_)
+            | Value::SymVec(_) | Value::BoolVec(_)
     )
 }
 
@@ -671,6 +706,23 @@ mod tests {
     #[test]
     fn reduction_over_a_one_column_select() {
         assert_eq!(scalar(&mut make_vm(), "first select c1 from t"), Value::Str("a".into()));
+    }
+
+    #[test]
+    fn cast_then_reduce_a_column_expression() {
+        // regression: `max f64$t`c2` used to error ("not supported in scalar
+        // context") because a cast on a column expression fell into the plain
+        // scalar folder, which can't resolve a table/column expr underneath it.
+        assert_eq!(scalar(&mut make_vm(), "max f64$t`c2"), Value::Float(30.0));
+        assert_eq!(scalar(&mut make_vm(), "avg f64$t`c2"), Value::Float(18.75));
+    }
+
+    #[test]
+    fn cast_a_column_expression_without_reducing() {
+        assert_eq!(
+            scalar(&mut make_vm(), "f64$t`c2"),
+            Value::FloatVec(vec![10.0, 20.0, 30.0, 15.0])
+        );
     }
 
     #[test]

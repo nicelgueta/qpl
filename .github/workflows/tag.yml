@@ -19,6 +19,19 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: "Set up Rust"
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: "Bump patch version"
+        shell: "bash"
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          make bump patch
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: bump patch version"
+          git push
+
       - name: "Get tag"
         id: "get-tag"
         shell: "bash"

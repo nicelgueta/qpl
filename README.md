@@ -452,7 +452,8 @@ select f64$size, str$sym from trades
 
 l: int$45.3                    / scalar: 45
 ok: bool$"true"                / scalar: 1b
-n: int$"42" + 1               / string parses, then composes: 43
+n: 1 + int$"42"                / string parses, then composes: 43
+n:  (int$"42") - 1             / remember right to left evaluation, so parens for subtraction
 ```
 
 Types: `f64`/`float`, `f32`, `i64`/`int`, `i32`, `i16`, `i8`, `u64`, `u32`,
@@ -537,11 +538,15 @@ fully supported) — those are planned.
 
 Outside a table expression, `` `foo `` is a **symbol** — a distinct value kind
 that names a column or a path. (Tables are named, not symboled: write `trades`,
-not `` `trades ``.) `` `$expr `` interns a string into a symbol:
+not `` `trades ``.) A symbol literal is a bareword (letters, digits, `_` `-`
+`.` `/`) — it can't contain a space. `` `$expr `` interns a *string* into a
+symbol, so a value with spaces or other punctuation goes through a string
+literal instead:
 
 ```q
 o: "out/summary.parquet"
 t >> `$o                       / use a string variable as a path
+role: `$"Analytics Engineer"   / a symbol with a space — quote it, then intern it
 ```
 
 Inside a table expression, `` `$col `` casts a column to a Polars **Categorical**

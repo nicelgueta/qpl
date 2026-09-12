@@ -7,6 +7,7 @@ use crate::tokens::TokenKind;
 use crate::temporal;
 use crate::opcodes::disassemble_instructions;
 use crate::vm::{Vm, run_vm, EvalResult};
+use crate::resolve;
 use polars::prelude::*;
 use rustyline::{DefaultEditor, error::ReadlineError};
 
@@ -237,10 +238,21 @@ fn eval_line(line: &str, vm: &mut Vm) -> Result<(), QplError> {
         return apply_cfg(args, vm);
     }
     if let Some(arg) = log_target(line) {
-        // a `log` argument is a list of expressions; render and concatenate each
+        // a `log` argument is a list of expressions; render and concatenate each.
+        // Goes through `resolve::eval_value` (not the plain scalar folder) so a
+        // reduction (`log max t`price`) or a cast on a column expression works
+        // the same as it does in any other value position.
         let mut text = String::new();
         for expr in parse_expr_seq(tokenise(arg)?)? {
-            text.push_str(&fmt_log_val(&vm.eval_scalar(&expr)?));
+            let val = match resolve::eval_value(vm, &expr)? {
+                resolve::EvalValue::Scalar(v) => v,
+                resolve::EvalValue::Frame { .. } => {
+                    return Err(QplError::Runtime(
+                        "log expects a scalar expression, got a table".into(),
+                    ))
+                }
+            };
+            text.push_str(&fmt_log_val(&val));
         }
         vm.emit(&text);
         return Ok(());
@@ -373,7 +385,33 @@ fn disassemble(source: &str) -> Result<String, QplError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cfg_directive, logical_statements, log_target, wants_more};
+    use super::{cfg_directive, eval_line, logical_statements, log_target, wants_more};
+    use crate::vm::Vm;
+
+    /// Run `line` through [`eval_line`] and return whatever it wrote via
+    /// `Vm::emit`, by pointing the stdout-log tee at a scratch file.
+    fn logged(vm: &mut Vm, line: &str) -> String {
+        let path = std::env::temp_dir().join(format!("qpl_repl_test_{:?}", std::thread::current().id()));
+        vm.stdout_log = Some(std::fs::File::create(&path).unwrap());
+        eval_line(line, vm).expect("eval_line");
+        vm.stdout_log = None;
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        out.trim_end().to_string()
+    }
+
+    #[test]
+    fn log_evaluates_a_reduction_directly() {
+        // regression: `log max t`price` (with or without the parens the README
+        // recommends for a call/reduction) used to fail — `eval_scalar` cannot
+        // resolve a table/column expression, only a plain scalar fold.
+        let mut vm = Vm::new();
+        vm.tables.insert(
+            "t".into(),
+            polars::df!["price" => [1.0f64, 2.0, 3.0]].unwrap(),
+        );
+        assert_eq!(logged(&mut vm, "log (max t`price)"), "3");
+    }
 
     #[test]
     fn wants_more_detects_unfinished_input() {

@@ -380,6 +380,48 @@ impl Vm {
         }
     }
 
+    /// Build the Polars expr for a column-context cast (`` type$expr ``) applied
+    /// to `expr`. `frame` (the active frame, when there is one) is consulted to
+    /// tell a string source column apart from an already-typed one, since the
+    /// target alone doesn't say what `expr` is.
+    ///
+    /// String → temporal casts route through Polars' string datetime/time
+    /// parser: `expr.cast(Date/Datetime/Time)` on a String is deprecated (gone
+    /// in Polars 2.0). `to_datetime` infers the format per value (ISO *and*
+    /// kdb's dotted `2024.03.15`), so `` `date$ `` / `` `month$ `` parse there
+    /// and then truncate to a real `Date`; `` `timestamp$ `` keeps the time
+    /// part; `` `time$ `` uses the time parser. Every *other* source dtype — a
+    /// column already `Date` / `Datetime` / `Time`, or a raw integer offset
+    /// (kdb `` `date$8000 ``-style) — takes a plain `.cast()`.
+    pub(crate) fn build_cast_expr(
+        &self,
+        target: &ast::CastTarget,
+        expr: Expr,
+        frame: Option<&LazyFrame>,
+    ) -> Result<Expr, QplError> {
+        let dtype = self.resolve_cast_target(target)?;
+        let temporal_target =
+            matches!(dtype, DataType::Date | DataType::Datetime(_, _) | DataType::Time);
+        Ok(if temporal_target && expr_dtype_is_string(frame, &expr)? {
+            let to_datetime = |e: Expr| {
+                e.str().to_datetime(
+                    None,
+                    None,
+                    StrptimeOptions::default(),
+                    lit("raise"),
+                )
+            };
+            match &dtype {
+                DataType::Date => to_datetime(expr).dt().date(),
+                DataType::Datetime(_, _) => to_datetime(expr),
+                DataType::Time => expr.str().to_time(StrptimeOptions::default()),
+                _ => unreachable!("temporal_target guards this to Date/Datetime/Time"),
+            }
+        } else {
+            expr.cast(dtype)
+        })
+    }
+
     /// Resolves a column-context cast target to a concrete Polars `DataType`.
     fn resolve_cast_target(&self, target: &ast::CastTarget) -> Result<DataType, QplError> {
         match target {
@@ -722,40 +764,7 @@ impl Vm {
 
                 Instruction::Cast(target) => {
                     let expr = pop1(&mut stack)?.unwrap_expr()?;
-                    // String → temporal casts route through Polars' string
-                    // datetime/time parser: `expr.cast(Date/Datetime/Time)` on a
-                    // String is deprecated (gone in Polars 2.0). `to_datetime`
-                    // infers the format per value (ISO *and* kdb's dotted
-                    // `2024.03.15`), so `` `date$ `` / `` `month$ `` parse there
-                    // and then truncate to a real `Date`; `` `timestamp$ `` keeps
-                    // the time part; `` `time$ `` uses the time parser.
-                    //
-                    // Every *other* source dtype — a column already `Date` /
-                    // `Datetime` / `Time`, or a raw integer offset (kdb
-                    // `` `date$8000 ``-style) — takes a plain `.cast()`; probe the
-                    // expression's actual resolved dtype against the active frame
-                    // to decide (the target alone doesn't say what `expr` is).
-                    let dtype = self.resolve_cast_target(&target)?;
-                    let temporal_target =
-                        matches!(dtype, DataType::Date | DataType::Datetime(_, _) | DataType::Time);
-                    let casted = if temporal_target && expr_dtype_is_string(frame.as_ref(), &expr)? {
-                        let to_datetime = |e: Expr| {
-                            e.str().to_datetime(
-                                None,
-                                None,
-                                StrptimeOptions::default(),
-                                lit("raise"),
-                            )
-                        };
-                        match &dtype {
-                            DataType::Date => to_datetime(expr).dt().date(),
-                            DataType::Datetime(_, _) => to_datetime(expr),
-                            DataType::Time => expr.str().to_time(StrptimeOptions::default()),
-                            _ => unreachable!("temporal_target guards this to Date/Datetime/Time"),
-                        }
-                    } else {
-                        expr.cast(dtype)
-                    };
+                    let casted = self.build_cast_expr(&target, expr, frame.as_ref())?;
                     stack.push(StackObj::Expr(casted));
                 }
 
@@ -2199,6 +2208,18 @@ mod tests {
         let df = sorted(run(make_vm(), "select total: sum c2 by c1 from t"), "c1");
         assert_eq!(strs(&df, "c1"),    vec!["a", "b", "c"]);
         assert_eq!(i64s(&df, "total"), vec![40, 20, 15]);
+    }
+
+    #[test]
+    fn by_key_reprojected_by_name_does_not_duplicate_the_column() {
+        // regression: `group_by(keys).agg(proj)` already carries the key
+        // column through, so also projecting it by name used to hand Polars
+        // two columns called "c1" and panic.
+        let df = sorted(run(make_vm(), "select c1, c2, r: 1 diff c2 by c1 from t"), "c1");
+        // one row per group; "c1" appears exactly once in the schema (not
+        // duplicated by both the group key and the projection)
+        assert_eq!(strs(&df, "c1"), vec!["a", "b", "c"]);
+        assert_eq!(df.get_column_names().iter().filter(|n| n.as_str() == "c1").count(), 1);
     }
 
     #[test]

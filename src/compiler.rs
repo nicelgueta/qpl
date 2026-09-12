@@ -190,6 +190,11 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
 
     // By phrase
     let has_by = sel.by.is_some();
+    let by_names: Vec<String> = sel.by.as_ref().map_or(vec![], |keys| {
+        keys.iter()
+            .filter_map(|alias| alias.name.clone().or_else(|| implicit_alias(&alias.expr)))
+            .collect()
+    });
     if let Some(keys) = &sel.by {
         for alias in keys {
             compile_expr(&alias.expr, out)?;
@@ -200,14 +205,20 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
         out.push(Instruction::BuildKeys(keys.len()));
     }
 
-    // Select phrase
+    // Select phrase — `group_by(keys).agg(proj)` already carries the key
+    // columns through, so re-projecting a column under the same name as a
+    // `by` key would hand Polars two columns with one name; skip it.
+    let mut proj_count = 0;
     for alias in &sel.cols {
+        let name = alias.name.clone().or_else(|| implicit_alias(&alias.expr));
+        if has_by && name.as_deref().is_some_and(|n| by_names.iter().any(|k| k == n)) {
+            continue;
+        }
         compile_expr(&alias.expr, out)?;
-        out.push(Instruction::Alias {
-            name: alias.name.clone().or_else(|| implicit_alias(&alias.expr)),
-        });
+        out.push(Instruction::Alias { name });
+        proj_count += 1;
     }
-    out.push(Instruction::BuildProj { count: sel.cols.len(), exclude: vec![], predicates: 0 });
+    out.push(Instruction::BuildProj { count: proj_count, exclude: vec![], predicates: 0 });
 
     out.push(if has_by { Instruction::SelectBy } else { Instruction::Select });
     if let Some(order) = &sel.order {
@@ -697,6 +708,35 @@ mod tests {
             from_table("trades"),
             col("sym"), alias("s"), BuildKeys(1),
             col("px"), call("sum", 1), alias("px"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
+            SelectBy, Result,
+        ]);
+    }
+
+    #[test]
+    fn by_key_reprojected_by_name_is_deduped() {
+        // `group_by(keys).agg(proj)` already carries the key columns through;
+        // re-projecting `sym` under its own name would hand Polars two columns
+        // named `sym`, so the compiler drops it from the projection phase.
+        assert_eq!(compile_src("select sym, price, ret: 1 diff price by sym from trades"), vec![
+            from_table("trades"),
+            col("sym"), alias("sym"), BuildKeys(1),
+            col("price"), alias("price"),
+            col("price"), int(1), call("diff", 2), alias("ret"),
+            BuildProj { count: 2, exclude: vec![], predicates: 0 },
+            SelectBy, Result,
+        ]);
+    }
+
+    #[test]
+    fn by_key_reprojected_under_an_alias_is_kept() {
+        // only a name collision with the key is dropped — an *aliased*
+        // reprojection of the key column is a distinct output name and stays.
+        assert_eq!(compile_src("select s: sym, price by sym from trades"), vec![
+            from_table("trades"),
+            col("sym"), alias("sym"), BuildKeys(1),
+            col("sym"), alias("s"),
+            col("price"), alias("price"),
+            BuildProj { count: 2, exclude: vec![], predicates: 0 },
             SelectBy, Result,
         ]);
     }
