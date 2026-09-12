@@ -34,6 +34,11 @@
     "body": "${1:plan}: lazy select ${2:cols} from load \"${3:path.parquet}\" where ${4:pred}\n${1:plan} sink \"${5:out.parquet}\"",
     "description": "bind a lazy plan and sink it to disk without materialising early"
   },
+  "like": {
+    "prefix": "like",
+    "body": "select ${1:cols} from ${2:table} where ${3:col} like \"${4:pattern}\"",
+    "description": "q-glob match: * any sequence, ? one char, [..] a class"
+  },
   "conditional": {
     "prefix": "cond",
     "body": "?[${1:pred1}; ${2:val1}; ${3:pred2}; ${4:val2}; ${5:default}]",

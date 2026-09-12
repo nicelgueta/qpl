@@ -111,7 +111,7 @@ pub struct SelectStmt {
     pub by: Option<Vec<Alias>>,
     pub where_: Option<Vec<Expr>>,
     pub order: Option<Vec<(String, bool)>>,
-    pub join: Option<(TableSource, Value, Value, JoinType)>,
+    pub join: Option<(Box<TableExpr>, Value, Value, JoinType)>,
     pub update: bool,
     pub delete: bool,
 }

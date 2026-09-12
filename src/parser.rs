@@ -208,6 +208,16 @@ impl Parser {
     fn parse_table_expr(&mut self) -> Result<TableExpr, QplError> {
         let peek = self.peek().clone();
         match peek {
+            // `(<table-expr>)` — the parens give the parser an explicit end
+            // point, which is what lets a join's right side (see `parse_join`)
+            // hold an arbitrary table expression without the trailing
+            // right_on symbols being ambiguous with a nested select's own join.
+            TokenKind::LParen => {
+                self.next();
+                let inner = self.parse_table_expr()?;
+                self.eat(&TokenKind::RParen)?;
+                Ok(inner)
+            }
             TokenKind::Select => Ok(TableExpr::Select(self.parse_query(false, false)?)),
             TokenKind::Update => Ok(TableExpr::Select(self.parse_query(true, false)?)),
             TokenKind::Delete => Ok(TableExpr::Select(self.parse_query(false, true)?)),
@@ -470,6 +480,17 @@ impl Parser {
                 right: Box::new(right),
             });
         }
+        // `like`: q-glob match, a real binary operator like `=`/`<>` — just
+        // spelled as a bareword rather than an `Op` token.
+        if matches!(self.peek(), TokenKind::Name(n) if n == "like") {
+            self.next();
+            let right = self.parse_expr_inner(windows)?;
+            return Ok(Expr::BinOp {
+                left: Box::new(left),
+                op: "like".into(),
+                right: Box::new(right),
+            });
+        }
         // call: left(args)
         if let Expr::ColRef(name) = &left {
             if is_noun_start(self.peek()) {
@@ -698,7 +719,7 @@ impl Parser {
 
     /// format for the join phrase is: select ... from tbl1`id`name lj|ij|rj tbl2`id`f_name
     /// returns (join_src, left_on, right_on, join_type)
-    fn parse_join(&mut self) -> Result<(TableSource, Value, Value, JoinType), QplError> {
+    fn parse_join(&mut self) -> Result<(Box<TableExpr>, Value, Value, JoinType), QplError> {
         let mut left_on = Vec::new();
         let mut right_on = Vec::new();
         while matches!(self.peek(), TokenKind::Symbol(_)) {
@@ -718,7 +739,15 @@ impl Parser {
             },
             other => return Err(QplError::Parse(format!("expected join type (lj|ij|rj), got {:?}", other))),
         };
-        let join_src = self.parse_tbl_src_expr()?;
+        // unparenthesised: a bare name or `load "path"`, same as always — the
+        // trailing right_on symbols would otherwise be ambiguous with a nested
+        // select's own join. Wrap it in parens — `(select ...)` — to join
+        // against any other table expression.
+        let join_src = if self.peek() == &TokenKind::LParen {
+            Box::new(self.parse_table_expr()?)
+        } else {
+            Box::new(TableExpr::Source(self.parse_tbl_src_expr()?))
+        };
         while matches!(self.peek(), TokenKind::Symbol(_)) {
             if let TokenKind::Symbol(s) = self.next() {
                 right_on.push(s);
@@ -1237,6 +1266,12 @@ mod tests {
     }
 
     #[test]
+    fn where_like() {
+        let s = sel(r#"select px from trades where sym like "AA*""#);
+        assert_eq!(s.where_, Some(vec![binop(cref("sym"), "like", Expr::Lit(Value::Str("AA*".into())))]));
+    }
+
+    #[test]
     fn where_multiple_conditions() {
         let s = sel("select px from trades where sym = `AAPL, qty > 0");
         assert_eq!(s.where_, Some(vec![
@@ -1493,6 +1528,32 @@ mod tests {
             }
             other => panic!("expected cols, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn join_right_side_without_parens_is_a_bare_source() {
+        let s = sel("select price from trades `sym lj quotes `sym");
+        let (join_src, ..) = s.join.expect("expected a join");
+        assert!(matches!(*join_src, TableExpr::Source(TableSource::InMem(ref n)) if n == "quotes"));
+    }
+
+    #[test]
+    fn join_right_side_without_parens_rejects_a_table_expr() {
+        assert!(parse(tokenise("select price from trades `sym lj distinct quotes `sym").unwrap()).is_err());
+    }
+
+    #[test]
+    fn join_right_side_accepts_a_parenthesised_table_expr() {
+        let s = sel("select price from trades `sym lj (distinct quotes) `sym");
+        let (join_src, ..) = s.join.expect("expected a join");
+        assert!(matches!(*join_src, TableExpr::BuiltIn(BuiltIn::Distinct(_))));
+    }
+
+    #[test]
+    fn join_right_side_accepts_a_parenthesised_nested_select() {
+        let s = sel("select price from trades `sym lj (select sym, bid from quotes) `sym");
+        let (join_src, ..) = s.join.expect("expected a join");
+        assert!(matches!(*join_src, TableExpr::Select(_)));
     }
 
     #[test]

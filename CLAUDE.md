@@ -114,3 +114,21 @@ instructions), `opcodes` (new `Instruction` + `Display`), `vm` (execute it) —
 but prefer to stop as early in that chain as you can.
 Add `#[cfg(test)]` cases in each file you touch and, where it's a user-visible
 feature, a runnable snippet under `examples/` and a note in `README.md`.
+
+**Every user-visible language change (new keyword, operator, or builtin) must
+also update [`tools/vscode/`](tools/vscode/)** — this is not optional cleanup,
+do it in the same change:
+- `src/vocabulary.ts` — add the keyword/operator to the relevant list
+  (`STATEMENT_KEYWORDS`, `BUILTIN_KEYWORDS`, `JOIN_OPERATORS`, `WORD_OPERATORS`,
+  `AGGREGATES`) and give it an entry in `KEYWORD_DETAIL`/`AGGREGATE_DETAIL`.
+- `syntaxes/qpl.tmLanguage.json` — add it to the matching grammar rule so it
+  highlights (validate with `python3 -c "import json; json.load(open(...))"`).
+- `src/extension.ts` — only if the new vocabulary list isn't already wired
+  into the completion provider's loops.
+- `snippets/qpl.json` — add a snippet if the feature has a common invocation
+  shape worth autocompleting.
+- `README.md` — mention it in the feature list.
+- Verify with `npx tsc -p ./ --noEmit` from `tools/vscode/`.
+
+Don't touch `CHANGELOG.md`/version bumps for this — those are a separate,
+maintainer-driven release step, not tied to individual language changes.

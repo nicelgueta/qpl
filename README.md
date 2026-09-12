@@ -231,6 +231,17 @@ cols select from trades where size > 100                / cols on a nested selec
 select sym, price from load "data/trades.parquet"        / from a load directly
 ```
 
+A join's right side (`` `sym lj/ij/rj <table> `sym ``) is a bare table name or
+`load "path"` by default; wrap it in parens to join against any other table
+expression — the parens give the parser an explicit end point, otherwise a
+nested select's own join would swallow the outer `right_on` symbols:
+
+```q
+select price, bid from trades `sym lj quotes `sym                            / bare name
+select price, bid from trades `sym lj (distinct quotes) `sym                 / any table expr, parenthesised
+select price, bid from trades `sym lj (select sym, bid from quotes where bid > 0) `sym
+```
+
 `update` returns the whole table with the named columns replaced or added:
 
 ```q
@@ -323,6 +334,7 @@ a lazy binding, then a table. `t2: trades` copies the table under a new name.
 |---|---|
 | arithmetic | `+` `-` `*` `%` (`%` is division, q convention) |
 | comparison | `=` `<>` `!=` `<` `<=` `>` `>=` |
+| pattern match | `<str/sym> like <pattern>` — q-style glob, see below |
 | logical | `&` `\|` |
 | conditional | `?[cond; then; cond2; then2; ...; else]` — vectorised, nests for else-if |
 | cast | `type$expr` — see [Casts](#casts) |
@@ -340,6 +352,19 @@ select neg_mv: -market_value from trades
 select mv: 2 round market_value from trades          / round to 2 dp
 select p95: 0.95 quantile price by sym from trades   / 95th percentile
 select sym, price, ret: 1 diff price by sym from trades   / row-over-row change
+```
+
+`like` tests a string or symbol against a glob pattern, [same as q](https://code.kx.com/q/ref/like/):
+`*` matches any sequence (including empty), `?` matches exactly one character,
+and `[abc]` / `[a-z]` / `[^abc]` are character classes (case-sensitive; no
+pattern characters means an exact match). Escape a pattern character by
+putting it in its own one-character class — `[*]`, `[?]`, `[[]`, `[]]`:
+
+```q
+select sym from trades where sym like "AA*"          / starts with AA
+select sym from trades where sym like "[AM]*"        / starts with A or M
+select sym from trades where sym like "?A?L"         / exactly 4 chars, A then L
+select from trades where not sym like "AAPL"         / negate with `not`
 ```
 
 `round` and the other **dyadic verbs** are q-style: the left operand is a

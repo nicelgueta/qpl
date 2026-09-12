@@ -13,8 +13,8 @@ bool-vector literals, statement keywords (`select`, `by`, `from`, `where`,
 builtin keywords (`load`, `sink`, `cols`, `lazy`, `collect`) and `.qpl.*`
 builtin functions (`.qpl.cfg`), aggregates (`sum`, `avg`, `count`, `round`, ...),
 cast types (`f64$x`), the operator functions `?` `$` `::` `!` `#`, join
-operators (`lj`, `ij`, `rj`), assignments, `\d` / `\l` / `\1` REPL lines, and
-the virtual `i` column. Plus line comments,
+operators (`lj`, `ij`, `rj`), the `like` glob-match operator, assignments,
+`\d` / `\l` / `\1` REPL lines, and the virtual `i` column. Plus line comments,
 bracket matching and auto-closing pairs.
 
 ### Completion & snippets

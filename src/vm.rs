@@ -1071,9 +1071,19 @@ fn scalar_binop(l: ast::Value, r: ast::Value, op: &str) -> Result<ast::Value, Qp
         (Float(a), Float(b), "<=")       => Bool(a <= b),
         (Float(a), Float(b), ">=")       => Bool(a >= b),
         (Str(a),   Str(b),   "+")        => Str(a + &b),
+        (Str(a) | Sym(a), Str(b) | Sym(b), "like") => Bool(like_match(&a, &b)?),
         (l, r, op) => return Err(QplError::Runtime(
             format!("cannot apply '{op}' to {l:?} and {r:?}"))),
     })
+}
+
+/// Scalar counterpart of `apply_binop`'s `"like"` arm: matches `text` against
+/// a q-glob `pattern` directly, with no Polars column involved.
+fn like_match(text: &str, pattern: &str) -> Result<bool, QplError> {
+    let regex_src = like_pattern_to_regex(pattern);
+    regex::Regex::new(&regex_src)
+        .map(|re| re.is_match(text))
+        .map_err(|e| QplError::Runtime(format!("invalid 'like' pattern '{pattern}': {e}")))
 }
 
 /// Casts a scalar [`Value`] to the family named by `dtype` — the same type
@@ -1398,6 +1408,14 @@ fn build_window(
 }
 
 fn apply_binop(left: Expr, right: Expr, op: &str) -> Result<Expr, QplError> {
+    if op == "like" {
+        let pattern = match &right {
+            Expr::Literal(lv) => lv.extract_str(),
+            _ => None,
+        }.ok_or_else(|| QplError::Runtime("'like's pattern must be a string literal".into()))?;
+        let regex = like_pattern_to_regex(pattern);
+        return Ok(left.str().contains(lit(regex), true));
+    }
     Ok(match op {
         "+"        => left + right,
         "-"        => left - right,
@@ -1413,6 +1431,67 @@ fn apply_binop(left: Expr, right: Expr, op: &str) -> Result<Expr, QplError> {
         "|"        => left.or(right),
         _          => return Err(QplError::Runtime(format!("unknown operator '{op}'"))),
     })
+}
+
+/// Translates a q-style `like` glob pattern into an anchored regex.
+///
+/// q's glob syntax: `*` matches any sequence (incl. empty), `?` matches any
+/// single character, `[abc]` / `[a-z]` / `[^abc]` are character classes. A
+/// pattern character loses its special meaning inside `[...]` — including a
+/// literal `]`, which is only a class member (not the closing bracket) when
+/// it's the first character after `[` or `[^`, e.g. `[]]` matches `]`.
+fn like_pattern_to_regex(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let n = chars.len();
+    let mut out = String::from("^(?:");
+    let mut i = 0;
+    while i < n {
+        match chars[i] {
+            '*' => { out.push_str(".*"); i += 1; }
+            '?' => { out.push('.'); i += 1; }
+            '[' => {
+                let open = i;
+                i += 1;
+                let mut class = String::new();
+                if i < n && chars[i] == '^' {
+                    class.push('^');
+                    i += 1;
+                }
+                if i < n && chars[i] == ']' {
+                    class.push_str("\\]");
+                    i += 1;
+                }
+                while i < n && chars[i] != ']' {
+                    // `\` and `[` are the only characters the regex crate
+                    // still treats specially inside a class.
+                    if chars[i] == '\\' || chars[i] == '[' {
+                        class.push('\\');
+                    }
+                    class.push(chars[i]);
+                    i += 1;
+                }
+                if i < n {
+                    i += 1; // consume closing ']'
+                    out.push('[');
+                    out.push_str(&class);
+                    out.push(']');
+                } else {
+                    // unterminated class: treat the '[' as a literal character
+                    out.push_str("\\[");
+                    i = open + 1;
+                }
+            }
+            c => {
+                if "\\.+^$|(){}".contains(c) {
+                    out.push('\\');
+                }
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out.push_str(")$");
+    out
 }
 
 // fn ap
@@ -1567,6 +1646,52 @@ mod tests {
             expr: Box::new(ast::Expr::ColRef("o".into())),
         };
         assert_eq!(vm.eval_scalar(&expr).expect("eval"), ast::Value::Sym("out.parquet".into()));
+    }
+
+    fn like(text: &str, pattern: &str) -> ast::Expr {
+        ast::Expr::BinOp {
+            left: Box::new(ast::Expr::Lit(ast::Value::Str(text.into()))),
+            op: "like".into(),
+            right: Box::new(ast::Expr::Lit(ast::Value::Str(pattern.into()))),
+        }
+    }
+
+    #[test]
+    fn like_matches_per_q_glob_semantics() {
+        let vm = make_vm();
+        let cases: &[(&str, &str, bool)] = &[
+            ("quick",   "qu?ck",       true),   // ? = any single char
+            ("quickly", "quick*",      true),   // * = any sequence, incl. empty
+            ("quick",   "quick*",      true),
+            ("brown",   "br[ao]wn",    true),   // char class
+            ("brown",   "br[eiu]wn",   false),
+            ("br0wn",   "br[0-3]wn",   true),   // range
+            ("br9wn",   "br[0-3]wn",   false),
+            ("brown",   "[^cf]rown",   true),   // negated class
+            ("crown",   "[^cf]rown",   false),
+            ("brown",   "brown",       true),   // no pattern chars = exact match
+            ("brownx",  "brown",       false),
+            ("BROWN",   "brown",       false),  // case-sensitive
+            ("br*wn",   "br[*]wn",     true),   // escaping via a single-char class
+            ("br?wn",   "br[?]wn",     true),
+            ("br]wn",   "[bf]r[]]wn",  true),
+            ("a[c",     "a[[]c",       true),
+        ];
+        for (text, pattern, expect) in cases {
+            let got = vm.eval_scalar(&like(text, pattern)).expect("eval");
+            assert_eq!(got, ast::Value::Bool(*expect), "{text:?} like {pattern:?}");
+        }
+    }
+
+    #[test]
+    fn like_treats_symbol_and_string_uniformly() {
+        let vm = make_vm();
+        let expr = ast::Expr::BinOp {
+            left: Box::new(ast::Expr::Sym("quick".into())),
+            op: "like".into(),
+            right: Box::new(ast::Expr::Lit(ast::Value::Str("qu?ck".into()))),
+        };
+        assert_eq!(vm.eval_scalar(&expr).expect("eval"), ast::Value::Bool(true));
     }
 
     #[test]
@@ -2128,6 +2253,31 @@ mod tests {
     }
 
     #[test]
+    fn where_like_exact_match() {
+        let df = run(make_vm(), r#"select c2 from t where c1 like "a""#);
+        assert_eq!(i64s(&df, "c2"), vec![10, 30]);
+    }
+
+    #[test]
+    fn where_like_char_class() {
+        let df = sorted(run(make_vm(), r#"select c2 from t where c1 like "[ab]""#), "c2");
+        assert_eq!(i64s(&df, "c2"), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn where_like_negated_char_class() {
+        let df = run(make_vm(), r#"select c2 from t where c1 like "[^ab]""#);
+        assert_eq!(i64s(&df, "c2"), vec![15]);
+    }
+
+    #[test]
+    fn where_like_wildcard_on_symbol() {
+        // symbols and strings are matched uniformly
+        let df = run(make_vm(), "select c2 from t where c1 like `a");
+        assert_eq!(i64s(&df, "c2"), vec![10, 30]);
+    }
+
+    #[test]
     fn where_multiple_successive() {
         // c2>10 removes the row where c2=10; c2<30 then removes c2=30
         let df = run(make_vm(), "select c2 from t where c2>10, c2<30");
@@ -2316,6 +2466,45 @@ mod tests {
     fn cols_accepts_a_nested_select() {
         let df = run(make_vm(), "cols select c1, c2 from t where c2>0");
         assert_eq!(strs(&df, "column"), vec!["c1", "c2"]);
+    }
+
+    // --- join ---
+
+    fn make_join_vm() -> Vm {
+        let mut vm = Vm::new();
+        vm.tables.insert("trades".into(), df![
+            "sym"   => ["a", "a", "b"],
+            "price" => [10i64, 20, 30],
+        ].unwrap());
+        vm.tables.insert("quotes".into(), df![
+            "sym" => ["a", "b", "c"],
+            "bid"  => [1i64, 2, 3],
+        ].unwrap());
+        vm
+    }
+
+    #[test]
+    fn join_right_side_is_a_bare_name_without_parens() {
+        let df = sorted(run(make_join_vm(), "select price, bid from trades `sym lj quotes `sym"), "price");
+        assert_eq!(i64s(&df, "price"), vec![10, 20, 30]);
+        assert_eq!(opt_i64s(&df, "bid"), vec![Some(1), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn join_right_side_rejects_a_table_expr_without_parens() {
+        let tokens = tokenise("select price, bid from trades `sym lj distinct quotes `sym").expect("lex");
+        assert!(parse(tokens).is_err());
+    }
+
+    #[test]
+    fn join_right_side_accepts_a_parenthesised_table_expr() {
+        let df = sorted(
+            run(make_join_vm(), "select price, bid from trades `sym lj (select sym, bid from quotes where bid > 1) `sym"),
+            "price",
+        );
+        assert_eq!(i64s(&df, "price"), vec![10, 20, 30]);
+        // the quote for sym "a" (bid=1) is filtered out of the join's right side
+        assert_eq!(opt_i64s(&df, "bid"), vec![None, None, Some(2)]);
     }
 
     // --- lazy / collect ---

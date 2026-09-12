@@ -75,7 +75,7 @@
       "patterns": [
         {
           "name": "keyword.control.qpl",
-          "match": "\\b(select|by|from|where|over|order|asc|desc|distinct|limit|drop|update|delete|lj|ij|rj)\\b"
+          "match": "\\b(select|by|from|where|over|order|asc|desc|distinct|limit|drop|update|delete|lj|ij|rj|like)\\b"
         },
         {
           "name": "keyword.other.qpl",

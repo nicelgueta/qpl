@@ -25,6 +25,11 @@ select sym, price from trades where size > 100, price < 400
 log "combine predicates with & (and) / | (or); parenthesise, q has no precedence"
 select from trades where (size > 400) | (price < 141)
 
+log "like: q-style glob match — * any sequence, ? any single char, [..] a class"
+select sym from trades where sym like "AA*"
+select sym from trades where sym like "[AM]*"
+select from trades where not sym like "AAPL"
+
 log "group-by aggregation"
 select traded: sum size, apx: avg price by sym, side from trades
 

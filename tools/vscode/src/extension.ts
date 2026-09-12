@@ -5,7 +5,7 @@ import * as path from 'path';
 import { spawnSync } from 'child_process';
 import {
   AGGREGATES, AGGREGATE_DETAIL, BUILTIN_KEYWORDS, CAST_TYPES,
-  JOIN_OPERATORS, KEYWORD_DETAIL, STATEMENT_KEYWORDS,
+  JOIN_OPERATORS, KEYWORD_DETAIL, STATEMENT_KEYWORDS, WORD_OPERATORS,
 } from './vocabulary';
 import { demoTables, scanDocument } from './docScan';
 
@@ -207,6 +207,9 @@ class QplCompletionProvider implements vscode.CompletionItemProvider {
         items.push(this.item(kw, vscode.CompletionItemKind.Keyword, KEYWORD_DETAIL[kw]));
       }
       for (const op of JOIN_OPERATORS) {
+        items.push(this.item(op, vscode.CompletionItemKind.Operator, KEYWORD_DETAIL[op]));
+      }
+      for (const op of WORD_OPERATORS) {
         items.push(this.item(op, vscode.CompletionItemKind.Operator, KEYWORD_DETAIL[op]));
       }
     }

@@ -13,6 +13,8 @@ export const BUILTIN_KEYWORDS = ['load', 'sink', 'cols', 'lazy', 'collect'];
 
 export const JOIN_OPERATORS = ['lj', 'ij', 'rj'];
 
+export const WORD_OPERATORS = ['like'];
+
 export const AGGREGATES = [
   'sum', 'avg', 'mean', 'min', 'max', 'count', 'first', 'last', 'std', 'dev',
   'var', 'med', 'median', 'mode', 'modal', 'skew', 'kurt', 'kurtosis', 'any',
@@ -79,4 +81,5 @@ export const KEYWORD_DETAIL: Record<string, string> = {
   lj: 'left join',
   ij: 'inner join',
   rj: 'right join',
+  like: '<str/sym> like <pattern> — q-glob match (* any sequence, ? one char, [..] a class)',
 };

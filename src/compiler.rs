@@ -175,7 +175,7 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
         } else {
             return Err(QplError::Runtime(format!("Expected symbol for right_on, got {:?}", right_on)));
         };
-        out.push(Instruction::FromSrc(join_src.clone()));
+        compile_tbl_expr(join_src, out)?;
         out.push(Instruction::Result); // get the right frame onto the stack for the join
         out.push(Instruction::FrameExpr(PolarsFrameExpr::Join { l: left_count, r: right_count }));
     } else {
@@ -501,6 +501,16 @@ mod tests {
     }
 
     #[test]
+    fn where_like() {
+        assert_eq!(compile_src(r#"select px from trades where sym like "AA*""#), vec![
+            from_table("trades"),
+            col("sym"), sym("AA*"), op("like"), FrameExpr(PolarsFrameExpr::Filter(1)),
+            col("px"), alias("px"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
+            Select, Result,
+        ]);
+    }
+
+    #[test]
     fn where_multiple_subphrases() {
         // successive filters: spec says each subphrase applied to result of previous
         assert_eq!(compile_src("select px from trades where sym=`AAPL, qty>0"), vec![
@@ -623,6 +633,19 @@ mod tests {
             BuildProj { count: 0, exclude: vec![], predicates: 0 },
             Select, Result,
         ]);
+    }
+
+    #[test]
+    fn join_right_side_compiles_a_parenthesised_table_expr() {
+        // a parenthesised join RHS recurses through compile_tbl_expr, so
+        // `(distinct quotes)` compiles its own FrameExpr(Distinct) before
+        // the join is built, same as any other nested table expression.
+        let prog = compile_src("select price from trades `sym lj (distinct quotes) `sym");
+        assert!(prog.contains(&FrameExpr(PolarsFrameExpr::Distinct)));
+        assert!(matches!(
+            prog.iter().find(|i| matches!(i, FrameExpr(PolarsFrameExpr::Join { .. }))),
+            Some(FrameExpr(PolarsFrameExpr::Join { .. })),
+        ));
     }
 
     #[test]

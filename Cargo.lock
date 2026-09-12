@@ -2270,6 +2270,7 @@ dependencies = [
  "clap",
  "polars",
  "polars-ops",
+ "regex",
  "rustyline",
 ]
 

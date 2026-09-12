@@ -17,6 +17,11 @@ quotes: lazy load "examples/data/quotes.parquet"
 / 2. left-join quotes onto trades by sym (still lazy — the join is just plan nodes)
 enriched: select sym, side, price, size, bid, ask from trades `sym lj quotes `sym
 
+/ the join's right side can be any table expression too, not just a bare name —
+/ wrap it in parens to disambiguate it from a nested select's own join
+log "same join, but against a filtered subquery on the right"
+select sym, price, bid from trades `sym lj (select sym, bid from quotes where bid > 0) `sym
+
 / 3. derive spread + notional, keep the frame lazy by re-assigning the binding
 enriched: update spread: ask - bid, notional: price * size from enriched
 

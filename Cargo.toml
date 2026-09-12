@@ -14,11 +14,15 @@ clap = { version = "4.6.6", features = ["derive"] }
 # enable the temporal dtypes -- the `dtype-date` / `-datetime` / `-time` /
 # `-duration` features are separate and power qpl's date/time literals & casts.
 polars = { version = "0.55.2", default-features = false, features = ["fmt", "temporal", "lazy", "parquet", "csv", "strings", "is_in", "abs", "dtype-categorical", "dtype-date", "dtype-datetime", "dtype-time", "dtype-duration", "round_series", "rank", "mode", "moment", "diff",
-    "pct_change", "cum_agg", "rolling_window", "product"] }
+    "pct_change", "cum_agg", "rolling_window", "product", "regex"] }
 # pulled in only to name `RoundMode` (the `polars` facade re-exports it crate-privately);
 # already compiled as a transitive dep, same version.
 polars-ops = { version = "0.55.2", features = ["round_series"] }
 rustyline = "18.0.1"
+# `like`'s q-glob pattern is translated to an anchored regex, then matched with
+# this directly for scalars; polars' own (already-linked, transitive) regex
+# engine handles the column-expression case via `.str().contains(...)`.
+regex = "1"
 
 [profile.release]
 opt-level = "s"
