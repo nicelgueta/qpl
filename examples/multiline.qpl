@@ -9,7 +9,7 @@
 /   cargo run -- examples/multiline.qpl
 / ─────────────────────────────────────────────────────────────────────────────
 
-trades: load `examples/data/trades.parquet
+trades: load "examples/data/trades.parquet"
 
 log "a select broken across lines for readability"
 summary:

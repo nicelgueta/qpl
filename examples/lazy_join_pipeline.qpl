@@ -4,15 +4,15 @@
 / Reads two parquet files, joins them, derives columns, aggregates, sorts, and
 / streams the result straight to another parquet file. Nothing is ever
 / materialised into an in-memory table — every binding stays a lazy plan and the
-/ only execution happens when `>>` sinks the final plan to disk.
+/ only execution happens when `sink` writes the final plan to disk.
 /
 / Run from the repo root:
 /   cargo run -- examples/lazy_join_pipeline.qpl
 / ─────────────────────────────────────────────────────────────────────────────
 
 / 1. scan both inputs as lazy plans (no IO yet)
-trades: lazy load `examples/data/trades.parquet
-quotes: lazy load `examples/data/quotes.parquet
+trades: lazy load "examples/data/trades.parquet"
+quotes: lazy load "examples/data/quotes.parquet"
 
 / 2. left-join quotes onto trades by sym (still lazy — the join is just plan nodes)
 enriched: select sym, side, price, size, bid, ask from trades `sym lj quotes `sym
@@ -32,6 +32,6 @@ summary
 
 o: "examples/data/market_summary.parquet"
 / 6. the ONLY execution: stream the final plan to parquet without collecting
-summary >> `$o
+summary sink o
 
 log "created parquet file: '" o "'"

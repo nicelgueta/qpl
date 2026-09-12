@@ -93,16 +93,16 @@ qpl — the whole thing is one statement:
 ```q
 select tot: sum price * size, avg_spread: avg ask - bid, n: count price
     by csym: `$sym, side, band: ?[size >= 1000; `large; size >= 250; `mid; `small]
-    from << `trades.parquet `sym lj << `quotes.parquet `sym where price > 0
+    from load "trades.parquet" `sym lj load "quotes.parquet" `sym where price > 0
     order tot desc
-    >> `summary.parquet
+    sink "summary.parquet"
 ```
 
 But the same pipeline is more naturally built up **one statement at a time** in
 the REPL — see [Working incrementally](#working-incrementally):
 
 ```q
-j: select sym, side, price, size, bid, ask from << `trades.parquet `sym lj << `quotes.parquet `sym where price > 0
+j: select sym, side, price, size, bid, ask from load "trades.parquet" `sym lj load "quotes.parquet" `sym where price > 0
 j  / check the table so far
 j: update spread: ask - bid, notional: price * size from j
 / try the next step without committing — don't assign, just look
@@ -111,7 +111,7 @@ update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from j
 j: update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from j
 cols j                                     / check the schema so far
 select tot: sum notional, avg_spread: avg spread, n: count price by csym: `$sym, side, band from j order tot desc
-j >> `summary.parquet
+j sink "summary.parquet"
 ```
 
 ## Install
@@ -134,7 +134,7 @@ qpl -i script.qpl   # run a script, then drop into the REPL
 qpl) select sym, price from trades where price > 200
 qpl) select avg price by sym from trades
 qpl) t: select from trades where size > 100     / bind a table
-qpl) t >> `big.parquet                           / write it out
+qpl) t sink "big.parquet"                       / write it out
 ```
 
 Runnable scripts are in [`examples/`](examples/) — e.g.
@@ -153,7 +153,7 @@ There's no re-running a growing query, no stacking CTEs, no scrolling up to edit
 and resubmit a 30-line block — the loop is *type a line, look, type the next*.
 
 ```q
-qpl) t: << `trades.parquet          / bind a table
+qpl) t: load "trades.parquet"      / bind a table
 qpl) t                              / look at it
 qpl) cols t                         / ...or just its schema
 
@@ -165,7 +165,7 @@ qpl) update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from t
 qpl) t: update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from t   / keep it
 
 qpl) select traded: sum notional by sym, side, band from t order traded desc
-qpl) t >> `out.parquet
+qpl) t sink "out.parquet"
 ```
 
 Things that make the loop tight:
@@ -175,7 +175,7 @@ Things that make the loop tight:
   Assign only once you're happy.
 - **`\d <stmt>`** — show the compiled plan without executing anything.
 - **`lazy`** binds a *plan* rather than a table: nothing touches disk until a
-  `collect` or `>>`, so building a large pipeline is instant and you pay for it
+  `collect` or `sink`, so building a large pipeline is instant and you pay for it
   once, at the end.
 - In the [VSCode extension](tools/vscode/), **Ctrl+Enter** sends the current line
   or selection to this same session.
@@ -205,7 +205,7 @@ reductions, slicing (`n#`) and indexing.
 ### select / update / delete
 
 ```
-select <cols> from <table> [by <keys>] [where <preds>] [order <col> <asc|desc>, ...]
+select <cols> from <table-expr> [by <keys>] [where <preds>] [order <col> <asc|desc>, ...]
 ```
 
 ```q
@@ -219,6 +219,16 @@ select from trades where size > 100, price < 400  / comma-separated preds = AND
 select from trades where (size > 400) | (side = "buy")   / & / | for and / or
 select from trades where 10100000b               / boolean-vector mask
 select from trades order sym asc, price desc
+```
+
+`from` takes any table expression, not just a table name — a nested `select`, a
+`load`, `distinct`, `lazy`, and so on all work, and this composes with the
+table operators below too:
+
+```q
+select from select price from trades where price > 100  / from a nested select
+cols select from trades where size > 100                / cols on a nested select
+select sym, price from load "data/trades.parquet"        / from a load directly
 ```
 
 `update` returns the whole table with the named columns replaced or added:
@@ -537,15 +547,13 @@ fully supported) — those are planned.
 ### Symbols, categoricals & enums
 
 Outside a table expression, `` `foo `` is a **symbol** — a distinct value kind
-that names a column or a path. (Tables are named, not symboled: write `trades`,
+that names a column. (Tables are named, not symboled: write `trades`,
 not `` `trades ``.) A symbol literal is a bareword (letters, digits, `_` `-`
 `.` `/`) — it can't contain a space. `` `$expr `` interns a *string* into a
 symbol, so a value with spaces or other punctuation goes through a string
 literal instead:
 
 ```q
-o: "out/summary.parquet"
-t >> `$o                       / use a string variable as a path
 role: `$"Analytics Engineer"   / a symbol with a space — quote it, then intern it
 ```
 
@@ -577,25 +585,23 @@ re-keys it). Values absent from an enum become null.
 
 ### Reading & writing files
 
-`load` (or the `<<` operator) reads a parquet or CSV file. On its own it is
+`load` reads a parquet or CSV file, taking a string path. On its own it is
 **eager** — `t: load ...` materialises a table straight away. Prefix it with
 [`lazy`](#lazy--collect) to keep it as a deferred scan instead.
 
 ```q
-select avg price by sym from load `data/trades.parquet
-t: load `data/trades.parquet     / eager — reads the file now, binds a table
-t: << `data/trades.parquet       / same, operator form
-t: lazy load `data/trades.parquet   / deferred — binds a plan, no IO yet
-select from << `data/quotes.csv
+select avg price by sym from load "data/trades.parquet"
+t: load "data/trades.parquet"        / eager — reads the file now, binds a table
+t: lazy load "data/trades.parquet"   / deferred — binds a plan, no IO yet
+select from load "data/quotes.csv"
 ```
 
-`sink` (or `>>`) streams a **table expression** to a file — a table name, a
-`select ...`, an `update ...`:
+`sink` streams a **table expression** to a file, also taking a string path — a
+table name, a `select ...`, an `update ...`:
 
 ```q
-trades >> `summary.parquet
-trades sink `summary.parquet
-select sym, price from trades where size > 100 >> `big_trades.parquet
+trades sink "summary.parquet"
+select sym, price from trades where size > 100 sink "big_trades.parquet"
 ```
 
 `cols` shows a table's schema (works on lazy bindings too):
@@ -628,8 +634,8 @@ to a DataFrame) or `sink` (stream to a file) — so a whole pipeline can process
 **larger-than-RAM** data in a single pass.
 
 ```q
-t: lazy load `trades.parquet
-q: lazy select sym, bid, ask from load `quotes.parquet
+t: lazy load "trades.parquet"
+q: lazy select sym, bid, ask from load "quotes.parquet"
 ```
 
 Extend a plan by **re-assigning the binding** — each step just adds plan nodes,
@@ -663,7 +669,7 @@ j: select traded: sum notional, n: count price by sym, side from j
 
 ```q
 tm: collect j
-j >> `summary.parquet
+j sink "summary.parquet"
 ```
 
 [`examples/lazy_join_pipeline.qpl`](examples/lazy_join_pipeline.qpl) is a
@@ -753,7 +759,6 @@ select mv: 2 round market_value from trades
 | `.qpl.d` `.qpl.t` `.qpl.p` `.qpl.n` | now: date / time / timestamp / timespan (UTC) |
 | `!` | `col!bool` sort map; `` u8!`$x `` -> categorical physical width |
 | `::` | enum cast (`` lvl::`$x ``) |
-| `<<` `>>` | load / sink |
 | `#` | limit (`10#t`); take / slice a list (`3#l`, `-3#l`) |
 | `[...]` | positional index into a list (`l[0]`, `l[1 2 3]`) |
 | `_` | drop columns (`` `a`b _ t ``) |

@@ -49,7 +49,11 @@ fn compile_stmt(stmt: &Stmt, out: &mut Vec<Instruction>) -> Result<(), QplError>
 pub(crate) fn compile_tbl_expr(tbl_expr: &TableExpr, out: &mut Vec<Instruction>) -> Result<(), QplError> {
     match tbl_expr {
         TableExpr::Select(sel) => compile_select(sel, out),
-        TableExpr::BuiltIn(func) => compile_builtin(func, out)
+        TableExpr::BuiltIn(func) => compile_builtin(func, out),
+        TableExpr::Source(src) => {
+            out.push(Instruction::FromSrc(src.clone()));
+            Ok(())
+        }
     }
 }
 
@@ -101,7 +105,7 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), 
 
 fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), QplError> {
     if sel.delete {
-        out.push(Instruction::FromSrc(sel.from.clone()));
+        compile_tbl_expr(&sel.from, out)?;
         if let Some(preds) = &sel.where_ {
             for (index, expr) in preds.iter().enumerate() {
                 compile_expr(expr, out)?;
@@ -119,7 +123,7 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
     }
 
     if sel.update {
-        out.push(Instruction::FromSrc(sel.from.clone()));
+        compile_tbl_expr(&sel.from, out)?;
         if let Some(preds) = &sel.where_ {
             for expr in preds {
                 compile_expr(expr, out)?;
@@ -152,7 +156,7 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
     
     // Join phrase - done first so that the join is applied before any where clause filters
     if let Some((join_src, left_on, right_on, join_type)) = &sel.join {
-        out.push(Instruction::FromSrc(sel.from.clone()));
+        compile_tbl_expr(&sel.from, out)?;
         out.push(Instruction::Result); // get the left frame onto the stack for the join
         out.push(Instruction::PushPolarsArg(PolarsStackArg::Join(join_type.clone())));
         let left_count = if let Value::SymVec(s) = left_on {
@@ -176,7 +180,7 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
         out.push(Instruction::FrameExpr(PolarsFrameExpr::Join { l: left_count, r: right_count }));
     } else {
         // From phrase
-        out.push(Instruction::FromSrc(sel.from.clone()));
+        compile_tbl_expr(&sel.from, out)?;
     }
 
     // Where phrase: each subphrase is a successive filter (spec: evaluated left-to-right)
@@ -567,7 +571,6 @@ mod tests {
     fn collect_appends_a_collect_instruction() {
         assert_eq!(compile_src("tm: collect t"), vec![
             from_table("t"),
-            BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
             Collect, Result, Assign("tm".into()),
         ]);
     }
@@ -594,19 +597,32 @@ mod tests {
 
     #[test]
     fn sink_is_terminal_without_trailing_result() {
-        let prog = compile_src("t >> `out.parquet");
+        let prog = compile_src("t sink \"out.parquet\"");
         assert_eq!(prog, vec![
             from_table("t"),
-            BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
-            Eval(Expr::Sym("out.parquet".into())), Sink,
+            Eval(Expr::Lit(Value::Str("out.parquet".into()))), Sink,
         ]);
     }
 
     #[test]
     fn sink_after_a_select_compiles() {
-        let prog = compile_src("select price from trades >> `out.parquet");
+        let prog = compile_src("select price from trades sink \"out.parquet\"");
         assert!(prog.last() == Some(&Sink));
         assert!(!prog.contains(&Result));
+    }
+
+    #[test]
+    fn from_compiles_a_nested_select() {
+        // the outer select's own `select`/`from` compiles around whatever
+        // instructions the inner select compiles to.
+        let prog = compile_src("select from select price from trades");
+        assert_eq!(prog, vec![
+            from_table("trades"), col("price"), alias("price"),
+            BuildProj { count: 1, exclude: vec![], predicates: 0 },
+            Select,
+            BuildProj { count: 0, exclude: vec![], predicates: 0 },
+            Select, Result,
+        ]);
     }
 
     #[test]

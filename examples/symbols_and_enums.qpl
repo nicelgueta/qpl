@@ -12,7 +12,7 @@
 /   cargo run -- examples/symbols_and_enums.qpl
 / ─────────────────────────────────────────────────────────────────────────────
 
-trades: load `examples/data/trades.parquet
+trades: load "examples/data/trades.parquet"
 
 log "an enum definition: an ordered symbol vector stored in a global"
 band_levels: `low`mid`high
@@ -33,7 +33,7 @@ out: select
 cols out
 select from out
 
-log "sink a table by name; the path comes from a string variable (`$ interns it)"
+log "sink a table by name; the path comes from a string variable"
 dest: "examples/data/symbols_and_enums.parquet"
-out >> `$dest
+out sink dest
 log "wrote " dest

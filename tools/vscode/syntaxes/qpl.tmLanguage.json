@@ -105,10 +105,6 @@
     "operator": {
       "patterns": [
         {
-          "name": "keyword.other.qpl",
-          "match": "<<|>>"
-        },
-        {
           "comment": "multi-char comparisons — matched before bare `!` so `!=` wins",
           "name": "keyword.operator.qpl",
           "match": "<>|!=|<=|>="

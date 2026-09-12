@@ -6,7 +6,7 @@
 / ─────────────────────────────────────────────────────────────────────────────
 
 / load is eager - so creates a table directly
-trades: load `examples/data/trades.parquet
+trades: load "examples/data/trades.parquet"
 
 log "projection + aliasing"
 select sym, px: price, qty: size from trades
@@ -33,3 +33,9 @@ select sym, tier: ?[price > 400; `high; price > 180; `mid; `low] from trades
 
 log "order + type cast (order by columns that survive the projection)"
 select sym, sz: f64$size from trades order sym asc, sz desc
+
+log "from takes any table expression, not just a table name — here, a nested select"
+select sym from select sym, price from trades where price > 150
+
+log "table operators compose the same way — cols on a nested select"
+cols select sym, price from trades where size > 100

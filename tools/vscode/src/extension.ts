@@ -160,7 +160,7 @@ async function runFileOrSelection() {
   term.sendText(`\\l ${scratchFile}`, true);
 }
 
-const TABLE_CONTEXT_RE = /\b(from|by|drop|collect|sink|load)\s+(?:<<\s*)?[A-Za-z_`.\w/-]*$/;
+const TABLE_CONTEXT_RE = /\b(from|by|drop|collect|sink|load)\s+[A-Za-z_`.\w/-]*$/;
 
 /** Static + document-derived completion for qpl: keywords, aggregates, cast
  * types, join operators, snippets-adjacent identifiers, and names seen in

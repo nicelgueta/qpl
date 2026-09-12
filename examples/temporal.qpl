@@ -46,7 +46,7 @@ log "parsed     " "p"$"2024.06.01D12:00:00"   / 2024.06.01D12:00:00.000000000
 log "today      " .qpl.d
 
 / temporal literals project as Polars-native typed columns
-trades: load `examples/data/trades.parquet
+trades: load "examples/data/trades.parquet"
 select sym, asof: 2024.03.15D09:30:00.000000000 from trades
 
 / column-context string->temporal casts parse via Polars' string parser

@@ -9,7 +9,7 @@
 /   cargo run -- examples/column_expressions.qpl
 / ─────────────────────────────────────────────────────────────────────────────
 
-trades: load `examples/data/trades.parquet
+trades: load "examples/data/trades.parquet"
 
 / ── a column as a list ──────────────────────────────────────────────────────
 log "`table`col` and a one-column `select` are equivalent"

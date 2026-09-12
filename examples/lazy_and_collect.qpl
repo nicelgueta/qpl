@@ -6,7 +6,7 @@
 / ─────────────────────────────────────────────────────────────────────────────
 
 log "`lazy` as the first token stores the query PLAN under a name, not a table - nothing touches the file yet"
-t: lazy load `examples/data/trades.parquet
+t: lazy load "examples/data/trades.parquet"
 
 log "extend the plan by re-assigning the binding - still lazy, still no execution"
 t: select sym, side, price, size from t where size > 100

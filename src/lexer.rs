@@ -285,24 +285,6 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     i = j;
                     continue;
                 }
-                // handle special cases for sink and load operators
-                // '>>' is the sink operator, and '<<' is the load operator
-                if chars[i] == '>' && chars[j] == '>' {
-                    tokens.push(Token {
-                        kind: TokenKind::Sink,
-                        pos: start,
-                    });
-                    i = j + 1;
-                    continue;
-                } else if chars[i] == '<' && chars[j] == '<' {
-                    tokens.push(Token {
-                        kind: TokenKind::Load,
-                        pos: start,
-                    });
-                    i = j + 1;
-                    continue;
-
-                };
                 // only `<= >= <>` are real multi-char operators; never glom a
                 // following `+ - * $` etc. onto an operator (`int$-1`, `a%-b`)
                 while j < n && "=<>".contains(chars[j]) {
@@ -489,6 +471,14 @@ mod tests {
     }
 
     #[test]
+    fn string_escaped_quote_mid_sentence() {
+        assert_eq!(
+            kinds(r#""my name is \"John\"""#),
+            vec![TokenKind::Str(r#"my name is "John""#.into())],
+        );
+    }
+
+    #[test]
     fn string_escape_sequences() {
         assert_eq!(kinds(r#""\n\t""#), vec![TokenKind::Str("\n\t".into())]);
     }
@@ -582,6 +572,17 @@ mod tests {
     #[test]
     fn show_is_no_longer_a_keyword() {
         assert_eq!(kinds("show"), vec![TokenKind::Name("show".into())]);
+    }
+
+    #[test]
+    fn load_and_sink_are_keywords() {
+        assert_eq!(kinds("load sink"), vec![TokenKind::Load, TokenKind::Sink]);
+    }
+
+    #[test]
+    fn angle_bracket_pairs_are_not_load_or_sink() {
+        assert_eq!(kinds("<<"), vec![TokenKind::Op("<<".into())]);
+        assert_eq!(kinds(">>"), vec![TokenKind::Op(">>".into())]);
     }
 
     #[test]

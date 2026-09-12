@@ -161,13 +161,13 @@ impl Parser {
     }
 
     fn parse_body(&mut self) -> Result<Stmt, QplError> {
-        // `<name> >> <path>` — sink a table referenced by name.
+        // `<name> sink <path>` — sink a table referenced by name.
         if matches!(self.peek(), TokenKind::Name(_)) && self.peek2() == &TokenKind::Sink {
             let name = match self.next() {
                 TokenKind::Name(n) => n,
                 _ => unreachable!(),
             };
-            self.next(); // `>>` / `sink`
+            self.next(); // `sink`
             let path = self.parse_expr()?;
             return Ok(Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink {
                 src: Box::new(table_ref(name)),
@@ -180,15 +180,15 @@ impl Parser {
         let leading_int = matches!(self.peek(), TokenKind::Int(_));
         let int_table = leading_int && self.peek2() == &TokenKind::Limit;
         // `\`c!01b <tbl>` / `\`a\`b drop <tbl>` — a table op keyed off a leading
-        // symbol. A bare `\`x` (or `\`x >> …`) is a symbol value, not a table.
+        // symbol. A bare `\`x` is a symbol value, not a table.
         let sym_table_op = matches!(self.peek(), TokenKind::Symbol(_) | TokenKind::SymbolVec(_))
             && (matches!(self.peek2(), TokenKind::Bang | TokenKind::Drop)
                 || matches!(self.peek2(), TokenKind::Name(n) if n == "_"));
         if (is_table_expr_start(self.peek()) && !leading_int) || int_table || sym_table_op {
             let tbl_expr = self.parse_table_expr()?;
-            // postfix sink: `<table-expr> >> <path>` / `<table-expr> sink <path>`
+            // postfix sink: `<table-expr> sink <path>`
             if matches!(self.peek(), TokenKind::Sink) {
-                self.next(); // consume `>>` / `sink`
+                self.next(); // consume `sink`
                 let path = self.parse_expr()?;
                 return Ok(Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink {
                     src: Box::new(tbl_expr),
@@ -234,17 +234,8 @@ impl Parser {
                 // standalone: load "path" → select all from the file
                 self.next();
                 match self.next() {
-                    TokenKind::Symbol(path) => Ok(TableExpr::Select(SelectStmt {
-                        cols: vec![],
-                        from: TableSource::Load(path),
-                        by: None,
-                        where_: None,
-                        order: None,
-                        join: None,
-                        update: false,
-                        delete: false,
-                    })),
-                    other => Err(QplError::Parse(format!("expected file path symbol after 'load', got {other:?}"))),
+                    TokenKind::Str(path) => Ok(TableExpr::Source(TableSource::Load(path))),
+                    other => Err(QplError::Parse(format!("expected file path string after 'load', got {other:?}"))),
                 }
             }
             TokenKind::Cols => {
@@ -263,7 +254,7 @@ impl Parser {
             TokenKind::Symbol(s) => {
                 self.next(); // consume the symbol
                 match self.peek() {
-                    // `\`tbl` / `\`tbl >> path` used to name a table — tables are
+                    // `\`tbl` / `\`tbl sink path` used to name a table — tables are
                     // referenced by name now, so this is a plain symbol value.
                     TokenKind::Eof | TokenKind::Sink => Err(QplError::Parse(format!(
                         "reference tables by name, not by symbol: write '{s}', not '`{s}'"
@@ -347,7 +338,7 @@ impl Parser {
             by = Some(self.parse_phrase(&[TokenKind::From])?);
         }
         self.eat(&TokenKind::From)?;
-        let from = self.parse_tbl_src_expr()?;
+        let from = Box::new(self.parse_table_expr()?);
         let mut join = None;
         if !update && !delete && matches!(self.peek(), TokenKind::Symbol(_)) {
             join = Some(self.parse_join()?);
@@ -657,16 +648,7 @@ impl Parser {
     fn parse_lazy_operand(&mut self) -> Result<TableExpr, QplError> {
         if let TokenKind::Name(name) = self.peek().clone() {
             self.next();
-            return Ok(TableExpr::Select(SelectStmt {
-                cols: vec![],
-                from: TableSource::InMem(name),
-                by: None,
-                where_: None,
-                order: None,
-                join: None,
-                update: false,
-                delete: false,
-            }));
+            return Ok(table_ref(name));
         }
         self.parse_table_expr()
     }
@@ -675,8 +657,8 @@ impl Parser {
         match self.next() {
             TokenKind::Name(name) => Ok(TableSource::InMem(name)),
             TokenKind::Load => match self.next() {
-                TokenKind::Symbol(path) => Ok(TableSource::Load(path)),
-                other => Err(QplError::Parse(format!("expected file path after 'load', got {other:?}"))),
+                TokenKind::Str(path) => Ok(TableSource::Load(path)),
+                other => Err(QplError::Parse(format!("expected file path string after 'load', got {other:?}"))),
             },
             other => Err(QplError::Parse(format!("expected table name or load expression, got {other:?}"))),
         }
@@ -834,7 +816,7 @@ impl Parser {
         };
         Ok(Expr::Table(Box::new(TableExpr::Select(SelectStmt {
             cols,
-            from: TableSource::InMem(table),
+            from: Box::new(TableExpr::Source(TableSource::InMem(table))),
             by: None,
             where_,
             order: None,
@@ -1057,16 +1039,7 @@ fn is_table_expr_start(token: &TokenKind) -> bool {
 
 /// A `SelectStmt` that reads a whole in-memory table by name.
 fn table_ref(name: String) -> TableExpr {
-    TableExpr::Select(SelectStmt {
-        cols: vec![],
-        from: TableSource::InMem(name),
-        by: None,
-        where_: None,
-        order: None,
-        join: None,
-        update: false,
-        delete: false,
-    })
+    TableExpr::Source(TableSource::InMem(name))
 }
 
 #[cfg(test)]
@@ -1144,7 +1117,7 @@ mod tests {
     fn select_single_col() {
         let s = sel("select px from trades");
         assert_eq!(s.cols, vec![col(cref("px"))]);
-        assert_eq!(s.from, TableSource::InMem("trades".into()));
+        assert_eq!(*s.from, TableExpr::Source(TableSource::InMem("trades".into())));
         assert_eq!(s.by, None);
         assert_eq!(s.where_, None);
     }
@@ -1160,7 +1133,7 @@ mod tests {
         // select from t returns all columns
         let s = sel("select from t");
         assert_eq!(s.cols, vec![]);
-        assert_eq!(s.from, TableSource::InMem("t".into()));
+        assert_eq!(*s.from, TableExpr::Source(TableSource::InMem("t".into())));
     }
 
     // --- aliases ---
@@ -1364,7 +1337,7 @@ mod tests {
     #[test]
     fn reference_a_table_by_symbol_is_rejected() {
         // `\`name` is a plain symbol value or an outright parse error — never a table
-        for source in ["`trades", "`trades >> `out.parquet", "distinct `t", "3#`trades"] {
+        for source in ["`trades", "`trades sink \"out.parquet\"", "distinct `t", "3#`trades"] {
             let parsed = parse(tokenise(source).expect("lex"));
             assert!(
                 !matches!(parsed, Ok(Stmt::RetTable(_))),
@@ -1410,7 +1383,7 @@ mod tests {
 
     #[test]
     fn lazy_wraps_a_table_expr() {
-        match p("t: lazy load `x.parquet") {
+        match p("t: lazy load \"x.parquet\"") {
             Stmt::Assign { name, body } => {
                 assert_eq!(name, "t");
                 assert!(matches!(
@@ -1431,7 +1404,7 @@ mod tests {
                     Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Collect(inner))) => {
                         assert!(matches!(
                             *inner,
-                            TableExpr::Select(SelectStmt { from: TableSource::InMem(ref n), .. }) if n == "t"
+                            TableExpr::Source(TableSource::InMem(ref n)) if n == "t"
                         ));
                     }
                     other => panic!("expected collect body, got {other:?}"),
@@ -1442,14 +1415,14 @@ mod tests {
     }
 
     #[test]
-    fn sink_takes_a_table_name_on_the_left_and_a_symbol_path() {
-        match p("t >> `out.parquet") {
+    fn sink_takes_a_table_name_on_the_left_and_a_string_path() {
+        match p("t sink \"out.parquet\"") {
             Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink { src, path })) => {
                 assert!(matches!(
                     src.as_ref(),
-                    TableExpr::Select(SelectStmt { from: TableSource::InMem(n), .. }) if n == "t"
+                    TableExpr::Source(TableSource::InMem(n)) if n == "t"
                 ));
-                assert_eq!(path, Expr::Sym("out.parquet".into()));
+                assert_eq!(path, Expr::Lit(Value::Str("out.parquet".into())));
             }
             other => panic!("expected sink, got {other:?}"),
         }
@@ -1458,7 +1431,7 @@ mod tests {
     #[test]
     fn sink_accepts_a_full_select_on_the_left() {
         assert!(matches!(
-            p("select price from trades >> `out.parquet"),
+            p("select price from trades sink \"out.parquet\""),
             Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink { src, .. }))
                 if matches!(src.as_ref(), TableExpr::Select(_))
         ));
@@ -1466,22 +1439,70 @@ mod tests {
 
     #[test]
     fn sink_rejects_a_symbol_on_the_left() {
-        // tables are named, not symboled — `\`t >> …` no longer parses
-        assert!(parse(tokenise("`t >> `out.parquet").unwrap()).is_err());
+        // tables are named, not symboled
+        assert!(parse(tokenise("`t sink \"out.parquet\"").unwrap()).is_err());
     }
 
     #[test]
-    fn sink_path_can_cast_a_string_var_to_a_symbol() {
-        // `\`$o` — intern the string held in `o` into a symbol path
-        match p("t >> `$o") {
-            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink { path, .. })) => {
-                assert!(matches!(
-                    &path,
-                    Expr::Cast { target: CastTarget::Sym, expr }
-                        if **expr == Expr::ColRef("o".into())
-                ));
+    fn load_standalone_takes_a_string_path() {
+        match p("load \"x.parquet\"") {
+            Stmt::RetTable(TableExpr::Source(TableSource::Load(path))) => {
+                assert_eq!(path, "x.parquet");
             }
-            other => panic!("expected sink, got {other:?}"),
+            other => panic!("expected load, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_standalone_rejects_a_symbol_path() {
+        assert!(parse(tokenise("load `x.parquet").unwrap()).is_err());
+    }
+
+    #[test]
+    fn load_as_table_source_takes_a_string_path() {
+        let s = sel("select price from load \"x.parquet\"");
+        assert!(matches!(*s.from, TableExpr::Source(TableSource::Load(ref path)) if path == "x.parquet"));
+    }
+
+    #[test]
+    fn load_as_table_source_rejects_a_symbol_path() {
+        assert!(parse(tokenise("select price from load `x.parquet").unwrap()).is_err());
+    }
+
+    #[test]
+    fn from_accepts_a_nested_select() {
+        let s = sel("select from select price from trades");
+        assert!(matches!(
+            *s.from,
+            TableExpr::Select(SelectStmt { from: ref inner, .. })
+                if matches!(**inner, TableExpr::Source(TableSource::InMem(ref n)) if n == "trades")
+        ));
+    }
+
+    #[test]
+    fn from_accepts_a_builtin_table_expr() {
+        let s = sel("select from distinct trades");
+        assert!(matches!(*s.from, TableExpr::BuiltIn(BuiltIn::Distinct(_))));
+    }
+
+    #[test]
+    fn cols_accepts_a_nested_select() {
+        match p("cols select from trades where price > 0") {
+            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Cols(inner))) => {
+                assert!(matches!(*inner, TableExpr::Select(_)));
+            }
+            other => panic!("expected cols, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn angle_bracket_pairs_do_not_parse_as_load_or_sink() {
+        assert!(parse(tokenise("t: << \"x.parquet\"").unwrap()).is_err());
+        match p("t >> \"out.parquet\"") {
+            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink { .. })) => {
+                panic!("`>>` should not be recognised as sink")
+            }
+            _ => {}
         }
     }
 
@@ -1728,7 +1749,7 @@ mod tests {
         let s = sel("select dbl: c3*2 by c1 from t where c2>15");
         assert_eq!(s.cols, vec![named("dbl", binop(cref("c3"), "*", Expr::Lit(Value::Int(2))))]);
         assert_eq!(s.by, Some(vec![col(cref("c1"))]));
-        assert_eq!(s.from, TableSource::InMem("t".into()));
+        assert_eq!(*s.from, TableExpr::Source(TableSource::InMem("t".into())));
         assert_eq!(s.where_, Some(vec![binop(cref("c2"), ">", Expr::Lit(Value::Int(15)))]));
     }
 }

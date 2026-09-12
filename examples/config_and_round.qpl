@@ -5,7 +5,7 @@
 /   cargo run -- examples/config_and_round.qpl
 / ─────────────────────────────────────────────────────────────────────────────
 
-trades: load `examples/data/trades.parquet
+trades: load "examples/data/trades.parquet"
 
 log "`.qpl.cfg key=value ...` sets session-wide knobs; a bare `.qpl.cfg` prints them"
 .qpl.cfg maxrow=4 maxcol=6

@@ -107,7 +107,7 @@ pub enum TableSource {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
     pub cols: Vec<Alias>,
-    pub from: TableSource,
+    pub from: Box<TableExpr>,
     pub by: Option<Vec<Alias>>,
     pub where_: Option<Vec<Expr>>,
     pub order: Option<Vec<(String, bool)>>,
@@ -120,6 +120,9 @@ pub struct SelectStmt {
 pub enum TableExpr {
     Select(SelectStmt),
     BuiltIn(BuiltIn),
+    /// a bare table name or a `load "path"` — the base case a `from` clause
+    /// eventually bottoms out at once any nested table expressions are peeled away.
+    Source(TableSource),
 }
 
 #[derive(Debug, Clone, PartialEq)]

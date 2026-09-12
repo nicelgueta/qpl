@@ -31,7 +31,7 @@
   },
   "lazy pipeline": {
     "prefix": "lazyp",
-    "body": "${1:plan}: lazy select ${2:cols} from << `${3:path.parquet} where ${4:pred}\n${1:plan} >> `${5:out.parquet}",
+    "body": "${1:plan}: lazy select ${2:cols} from load \"${3:path.parquet}\" where ${4:pred}\n${1:plan} sink \"${5:out.parquet}\"",
     "description": "bind a lazy plan and sink it to disk without materialising early"
   },
   "conditional": {

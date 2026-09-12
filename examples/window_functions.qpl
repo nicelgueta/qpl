@@ -5,7 +5,7 @@
 /   cargo run -- examples/window_functions.qpl
 / ─────────────────────────────────────────────────────────────────────────────
 
-trades: load `examples/data/trades.parquet
+trades: load "examples/data/trades.parquet"
 
 log "partition aggregate broadcast back to every row (SQL: max(price) OVER (PARTITION BY sym))"
 select sym, price, top: max price over `sym from trades

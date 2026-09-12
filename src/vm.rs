@@ -534,8 +534,8 @@ impl Vm {
                 Instruction::Sink => {
                     let path = pop1(&mut stack)?.unwrap_scalar()?;
                     let path_str = match path {
-                        Value::Sym(s) | Value::Str(s) => s,
-                        _ => return Err(QplError::Runtime(format!("expected a symbol or string path for sink, got {path:?}"))),
+                        Value::Str(s) => s,
+                        _ => return Err(QplError::Runtime(format!("expected a string path for sink, got {path:?}"))),
                     };
                     let lf = require_frame(&mut frame)?;
                     sink_file(lf, &path_str)?
@@ -1570,6 +1570,42 @@ mod tests {
     }
 
     #[test]
+    fn sink_and_load_round_trip_with_a_string_path() {
+        let path = std::env::temp_dir().join("qpl_vm_test_sink_round_trip.csv");
+        let path_str = path.to_str().unwrap();
+
+        run_instructions(make_vm(), &format!("t sink \"{path_str}\""));
+
+        let df = run(Vm::new(), &format!("load \"{path_str}\""));
+        assert_eq!(df.height(), 4);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn sink_rejects_a_symbol_path_at_runtime() {
+        let mut vm = make_vm();
+        let tokens = tokenise("t sink `out.parquet").expect("lex");
+        let stmt = parse(tokens).expect("parse");
+        let prog = compile(&stmt).expect("compile");
+        match vm.eval(prog) {
+            Err(QplError::Runtime(_)) => {}
+            Err(e) => panic!("expected a runtime error, got {e:?}"),
+            Ok(_) => panic!("expected sink to reject a symbol path, but it succeeded"),
+        }
+    }
+
+    #[test]
+    fn angle_bracket_pairs_do_not_sink() {
+        let mut vm = make_vm();
+        let tokens = tokenise("t >> \"qpl_vm_test_should_not_be_created.parquet\"").expect("lex");
+        let stmt = parse(tokens).expect("parse");
+        let prog = compile(&stmt).expect("compile");
+        assert!(vm.eval(prog).is_err());
+        assert!(!std::path::Path::new("qpl_vm_test_should_not_be_created.parquet").exists());
+    }
+
+    #[test]
     fn scalar_cast_covers_every_family() {
         use ast::Value::*;
         // float -> int truncates; the width name is accepted but folds to i64
@@ -2261,6 +2297,25 @@ mod tests {
         );
         assert_eq!(strs(&df, "c1"),    vec!["a", "b"]);
         assert_eq!(i64s(&df, "total"), vec![30, 20]);
+    }
+
+    #[test]
+    fn from_accepts_a_nested_select() {
+        let df = sorted(run(make_vm(), "select from select c2 from t"), "c2");
+        assert_eq!(df.get_column_names(), vec!["c2"]);
+        assert_eq!(i64s(&df, "c2"), vec![10, 15, 20, 30]);
+    }
+
+    #[test]
+    fn where_applies_to_the_outer_select_around_a_nested_from() {
+        let df = sorted(run(make_vm(), "select c2 from select c1, c2 from t where c2>10"), "c2");
+        assert_eq!(i64s(&df, "c2"), vec![15, 20, 30]);
+    }
+
+    #[test]
+    fn cols_accepts_a_nested_select() {
+        let df = run(make_vm(), "cols select c1, c2 from t where c2>0");
+        assert_eq!(strs(&df, "column"), vec!["c1", "c2"]);
     }
 
     // --- lazy / collect ---
