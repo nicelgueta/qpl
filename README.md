@@ -5,7 +5,9 @@ frames. Write concise select statements; Polars runs them fast. Single binary,
 zero dependencies — no Python, no Polars install needed.
 
 There's also a [VSCode extension](tools/vscode/) — syntax highlighting plus a
-Ctrl+Enter REPL for sending lines straight from the editor.
+Ctrl+Enter REPL for sending lines straight from the editor — and this same
+documentation as a browsable book at
+[nicelgueta.github.io/qpl](https://nicelgueta.github.io/qpl).
 
 ## Table of Contents
 

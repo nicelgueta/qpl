@@ -1,4 +1,4 @@
-.PHONY: build release test run bump
+.PHONY: build release test run bump book book-build
 
 build:
 	cargo build
@@ -11,6 +11,14 @@ test:
 
 run:
 	cargo run
+
+# Serve the mdbook locally and open it in a browser.
+book:
+	mdbook serve --open book
+
+# Build the mdbook to book/book/.
+book-build:
+	mdbook build book
 
 # Bump the version in Cargo.toml, e.g. `make bump patch`.
 bump:

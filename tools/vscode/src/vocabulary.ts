@@ -9,13 +9,18 @@ export const STATEMENT_KEYWORDS = [
   'distinct', 'limit', 'drop', 'update', 'delete',
 ];
 
-export const BUILTIN_KEYWORDS = ['load', 'sink', 'cols', 'lazy', 'collect', 'til', 'zip'];
+// `hopen`/`await`/`async` are grouped with the other builtins (not
+// AGGREGATES/WORD_OPERATORS) so they share load/sink/cols's highlighting
+// colour — `ipc` feature only.
+export const BUILTIN_KEYWORDS = [
+  'load', 'sink', 'cols', 'lazy', 'collect', 'til', 'zip', 'hopen', 'await', 'async',
+];
 
 export const JOIN_OPERATORS = ['lj', 'ij', 'rj'];
 
-// `dispatch`/`async` are bareword infix operators (`<conn> [async] dispatch
-// <rest>`), same shape as `like` — `ipc` feature only.
-export const WORD_OPERATORS = ['like', 'dispatch', 'async'];
+// `dispatch` is a bareword infix operator (`<conn> [async] dispatch <rest>`),
+// same shape as `like` — `ipc` feature only.
+export const WORD_OPERATORS = ['like', 'dispatch'];
 
 export const AGGREGATES = [
   'sum', 'avg', 'mean', 'min', 'max', 'count', 'first', 'last', 'std', 'dev',
@@ -25,10 +30,6 @@ export const AGGREGATES = [
   'abs', 'neg', 'not', 'string', 'n_unique', 'round', 'quantile', 'pctl',
   'shift', 'lag', 'lead', 'diff', 'pctchange', 'rolling', 'rn', 'rank',
   'drank',
-  // not aggregates, but callable barewords (`hopen 5001`, `await resp`) —
-  // grouped here since this is qpl's "function-shaped completion" bucket.
-  // `ipc` feature only.
-  'hopen', 'await',
 ];
 
 export const CAST_TYPES = [
@@ -63,8 +64,6 @@ export const AGGREGATE_DETAIL: Record<string, string> = {
   lead: 'lead(expr) — next value (with `over`)',
   diff: 'diff(expr) — difference from previous value',
   rolling: 'rolling(expr) — rolling window aggregate',
-  hopen: 'hopen <port | "host:port"> — open a read-only IPC connection; `w!hopen` opens a write handle (`ipc` feature)',
-  await: 'await <pending> — resolve an `async dispatch` reply (`ipc` feature)',
 };
 
 export const KEYWORD_DETAIL: Record<string, string> = {
@@ -92,6 +91,8 @@ export const KEYWORD_DETAIL: Record<string, string> = {
   like: '<str/sym> like <pattern> — q-glob match (* any sequence, ? one char, [..] a class)',
   dispatch: '<conn> dispatch <stmt> — send a statement to a connection, block for the reply (`ipc` feature)',
   async: '<conn> async dispatch <stmt> — like dispatch, but returns immediately (`ipc` feature)',
+  hopen: 'hopen <port | "host:port"> — open a read-only IPC connection; `w!hopen` opens a write handle (`ipc` feature)',
+  await: 'await <pending> — resolve an `async dispatch` reply (`ipc` feature)',
   '\\port': '\\port <n> — start serving on port n; bare \\port stops (`ipc` feature, REPL only)',
   til: 'til <n> — list 0..n-1  |  <lo> til <hi> — list lo..hi-1',
   zip: 'zip `k1`k2!v1 v2 — build a table from a dict of named lists',
