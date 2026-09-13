@@ -44,6 +44,14 @@ pub struct Vm {
     /// `ipc` feature only.
     #[cfg(feature = "ipc")]
     pub next_handle: i64,
+    /// Transient permission for the one dispatched request currently being
+    /// evaluated, if any — `Some(Read)`/`Some(Write)` only for the duration
+    /// of `Vm::with_request_permission`'s closure, `None` otherwise. Never
+    /// set for local REPL/script input, regardless of whether a port is
+    /// open, so a read handle can only ever restrict a *remote* caller.
+    /// `ipc` feature only.
+    #[cfg(feature = "ipc")]
+    pub request_mode: Option<crate::ipc::HandleMode>,
 }
 
 /// One user-function call frame: params and any names the body binds, isolated
@@ -204,7 +212,40 @@ impl Vm {
             pending: HashMap::new(),
             #[cfg(feature = "ipc")]
             next_handle: 0,
+            #[cfg(feature = "ipc")]
+            request_mode: None,
         }
+    }
+
+    /// Run `f` with the transient per-request permission set to `mode` for
+    /// its duration, then cleared — so it can never leak into subsequent
+    /// local input. Used by the `\port` server loop, wrapped around the
+    /// evaluation of exactly one dispatched command.
+    #[cfg(feature = "ipc")]
+    pub fn with_request_permission<T>(
+        &mut self,
+        mode: crate::ipc::HandleMode,
+        f: impl FnOnce(&mut Vm) -> T,
+    ) -> T {
+        self.request_mode = Some(mode);
+        let result = f(self);
+        self.request_mode = None;
+        result
+    }
+
+    /// Errors out `what` when the request currently being evaluated (if any)
+    /// arrived over a read-only `hopen` connection. A no-op for local
+    /// input — `request_mode` is only ever set for the duration of one
+    /// dispatched command (see `with_request_permission`).
+    #[cfg_attr(not(feature = "ipc"), allow(unused_variables))]
+    fn check_write_allowed(&self, what: &str) -> Result<(), QplError> {
+        #[cfg(feature = "ipc")]
+        if self.request_mode == Some(crate::ipc::HandleMode::Read) {
+            return Err(QplError::Runtime(format!(
+                "{what} is not allowed over a read-only connection (open with `w!hopen` for a write handle)"
+            )));
+        }
+        Ok(())
     }
 
     /// Push a fresh call frame (a user-function call). The caller is
@@ -332,6 +373,7 @@ impl Vm {
     /// Point stdout logging at `path` (created / appended). Passing an empty
     /// path detaches any current log.
     pub fn set_stdout_log(&mut self, path: &str) -> Result<(), QplError> {
+        self.check_write_allowed("\\1 (stdout log)")?;
         if path.is_empty() {
             self.stdout_log = None;
             return Ok(());
@@ -551,6 +593,7 @@ impl Vm {
                     }
                 }
                 Instruction::Sink => {
+                    self.check_write_allowed("sink")?;
                     let path = pop1(&mut stack)?.unwrap_scalar()?;
                     let path_str = match path {
                         Value::Str(s) => s,
@@ -810,6 +853,7 @@ impl Vm {
                 }
 
                 Instruction::Assign(name) => {
+                    self.check_write_allowed("assignment")?;
                     match pop1(&mut stack)? {
                         StackObj::Scalar(s) => {
                             self.bind_global(name, s);
@@ -1740,6 +1784,80 @@ mod tests {
             Err(QplError::Runtime(_)) => {}
             Err(e) => panic!("expected a runtime error, got {e:?}"),
             Ok(_) => panic!("expected sink to reject a symbol path, but it succeeded"),
+        }
+    }
+
+    // --- phase 2: per-connection read/write permission (`ipc` feature) ---
+
+    #[cfg(feature = "ipc")]
+    mod request_permission {
+        use super::*;
+        use crate::ipc::HandleMode;
+
+        fn assert_read_only_rejects(src: &str) {
+            let mut vm = make_vm();
+            let err = vm
+                .with_request_permission(HandleMode::Read, |vm| run_vm(src, vm))
+                .expect_err(&format!("expected '{src}' to be rejected over a read handle"));
+            assert!(matches!(err, QplError::Runtime(_)));
+            // the transient flag must not leak into the next call
+            assert_eq!(vm.request_mode, None);
+        }
+
+        fn assert_write_allows(src: &str) {
+            let mut vm = make_vm();
+            vm.with_request_permission(HandleMode::Write, |vm| run_vm(src, vm))
+                .unwrap_or_else(|e| panic!("expected '{src}' to succeed over a write handle: {e}"));
+            assert_eq!(vm.request_mode, None);
+        }
+
+        #[test]
+        fn read_handle_rejects_assignment() {
+            assert_read_only_rejects("x: 1");
+        }
+
+        #[test]
+        fn read_handle_rejects_table_assignment() {
+            assert_read_only_rejects("u: select from t");
+        }
+
+        #[test]
+        fn read_handle_rejects_sink() {
+            assert_read_only_rejects(r#"t sink "qpl_vm_test_read_only_sink.parquet""#);
+            assert!(!std::path::Path::new("qpl_vm_test_read_only_sink.parquet").exists());
+        }
+
+        #[test]
+        fn write_handle_allows_assignment() {
+            assert_write_allows("x: 1");
+        }
+
+        #[test]
+        fn write_handle_allows_sink() {
+            let path = "qpl_vm_test_write_handle_sink.parquet";
+            assert_write_allows(&format!(r#"t sink "{path}""#));
+            assert!(std::path::Path::new(path).exists());
+            std::fs::remove_file(path).ok();
+        }
+
+        #[test]
+        fn read_handle_does_not_reject_a_plain_select() {
+            // only assignment / sink / stdout-log are gated — an ordinary query
+            // (no write) must still work over a read handle.
+            let mut vm = make_vm();
+            vm.with_request_permission(HandleMode::Read, |vm| run_vm("select from t", vm))
+                .expect("a read-only select must succeed");
+        }
+
+        #[test]
+        fn local_input_is_never_restricted_regardless_of_request_mode() {
+            // `request_mode` only exists for the duration of a dispatched
+            // request; local calls (nothing wraps them in
+            // `with_request_permission`) always see `None` and are unaffected,
+            // even on a server that also happens to have read handles connected.
+            let mut vm = make_vm();
+            assert_eq!(vm.request_mode, None);
+            run_vm("x: 1", &mut vm).expect("local assignment always allowed");
         }
     }
 

@@ -63,7 +63,7 @@ export const AGGREGATE_DETAIL: Record<string, string> = {
   lead: 'lead(expr) — next value (with `over`)',
   diff: 'diff(expr) — difference from previous value',
   rolling: 'rolling(expr) — rolling window aggregate',
-  hopen: 'hopen <port | "host:port"> — open an IPC connection (`ipc` feature)',
+  hopen: 'hopen <port | "host:port"> — open a read-only IPC connection; `w!hopen` opens a write handle (`ipc` feature)',
   await: 'await <pending> — resolve an `async dispatch` reply (`ipc` feature)',
 };
 

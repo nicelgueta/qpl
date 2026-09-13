@@ -32,6 +32,16 @@ impl Parser {
             &TokenKind::Eof
         }
     }
+    /// Is the parser sat right before `` `w!hopen ``? Distinguishes the
+    /// write-mode connection modifier from the superficially similar
+    /// `` `c!01b t `` sort-map / `` `a`b!... `` table-op grammar, both of
+    /// which are also `Symbol` immediately followed by `Bang`.
+    fn is_whopen_modifier(&self) -> bool {
+        matches!(self.peek(), TokenKind::Symbol(s) if s == "w")
+            && self.peek2() == &TokenKind::Bang
+            && matches!(self.peek3(), TokenKind::Name(n) if n == "hopen")
+    }
+
     fn next(&mut self) -> TokenKind {
         if self.i < self.tokens.len() {
             let kind = self.tokens[self.i].kind.clone();
@@ -81,8 +91,9 @@ impl Parser {
                 // vector value (e.g. an enum definition), and a bare `\`x` is a
                 // plain symbol — tables are referenced by name, never by symbol.
                 TokenKind::Symbol(_) | TokenKind::SymbolVec(_)
-                    if matches!(self.peek2(), TokenKind::Bang | TokenKind::Drop)
-                        || matches!(self.peek2(), TokenKind::Name(n) if n == "_") =>
+                    if !self.is_whopen_modifier()
+                        && (matches!(self.peek2(), TokenKind::Bang | TokenKind::Drop)
+                            || matches!(self.peek2(), TokenKind::Name(n) if n == "_")) =>
                 {
                     self.assign_from_body(name)
                 }
@@ -181,7 +192,8 @@ impl Parser {
         let int_table = leading_int && self.peek2() == &TokenKind::Limit;
         // `\`c!01b <tbl>` / `\`a\`b drop <tbl>` — a table op keyed off a leading
         // symbol. A bare `\`x` is a symbol value, not a table.
-        let sym_table_op = matches!(self.peek(), TokenKind::Symbol(_) | TokenKind::SymbolVec(_))
+        let sym_table_op = !self.is_whopen_modifier()
+            && matches!(self.peek(), TokenKind::Symbol(_) | TokenKind::SymbolVec(_))
             && (matches!(self.peek2(), TokenKind::Bang | TokenKind::Drop)
                 || matches!(self.peek2(), TokenKind::Name(n) if n == "_"));
         if (is_table_expr_start(self.peek()) && !leading_int) || int_table || sym_table_op {
@@ -444,6 +456,25 @@ impl Parser {
         // a modifier token between the type and the `` `$ `` cast operator
         if let Some(cast) = self.parse_modified_cast(&left, false)? {
             return self.finish_window(cast, windows);
+        }
+
+        // `` `w!hopen <addr> `` — a write-mode IPC connection handle (bare
+        // `hopen` is read-only by default). Reuses the same bang-modifier
+        // convention as `` u8!`$col ``/`` `c!01b t ``; `w` is the only
+        // accepted modifier. Lowered to `Call { func: "whopen", .. }` so
+        // `resolve::eval_value` needs no new AST node for it.
+        if let (Expr::Sym(w), TokenKind::Bang) = (&left, self.peek()) {
+            if w == "w" {
+                self.next(); // consume '!'
+                return match self.parse_expr_inner(windows)? {
+                    Expr::Call { func, args } if func == "hopen" => {
+                        self.finish_window(Expr::Call { func: "whopen".into(), args }, windows)
+                    }
+                    other => Err(QplError::Parse(format!(
+                        "expected 'hopen' after `w!, got {other:?}"
+                    ))),
+                };
+            }
         }
 
         // infix dyadic verbs: `<param> verb <expr>` (q-style). `param` is `left`;
@@ -1958,6 +1989,53 @@ mod tests {
         assert_eq!(s.by, Some(vec![col(cref("c1"))]));
         assert_eq!(*s.from, TableExpr::Source(TableSource::InMem("t".into())));
         assert_eq!(s.where_, Some(vec![binop(cref("c2"), ">", Expr::Lit(Value::Int(15)))]));
+    }
+
+    // --- `` `w!hopen `` write-mode connection modifier ---
+
+    #[test]
+    fn bare_hopen_stays_hopen() {
+        match p("hopen 5001") {
+            Stmt::SingleVar(Expr::Call { func, args }) => {
+                assert_eq!(func, "hopen");
+                assert_eq!(args, vec![Expr::Lit(Value::Int(5001))]);
+            }
+            other => panic!("expected SingleVar(Call), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bang_w_modifier_lowers_hopen_to_whopen() {
+        match p("`w!hopen 5001") {
+            Stmt::SingleVar(Expr::Call { func, args }) => {
+                assert_eq!(func, "whopen");
+                assert_eq!(args, vec![Expr::Lit(Value::Int(5001))]);
+            }
+            other => panic!("expected SingleVar(Call), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bang_w_modifier_works_in_an_assignment() {
+        match p("conn: `w!hopen 5001") {
+            Stmt::ScalarAssign { name, expr: Expr::Call { func, .. } } => {
+                assert_eq!(name, "conn");
+                assert_eq!(func, "whopen");
+            }
+            other => panic!("expected ScalarAssign(Call), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bang_modifier_other_than_w_is_a_parse_error() {
+        let tokens = tokenise("`x!hopen 5001").expect("lex error");
+        assert!(parse(tokens).is_err());
+    }
+
+    #[test]
+    fn bang_w_modifier_requires_hopen() {
+        let tokens = tokenise("`w!1+1").expect("lex error");
+        assert!(parse(tokens).is_err());
     }
 }
 

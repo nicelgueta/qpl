@@ -133,16 +133,23 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
             Ok(EvalValue::Scalar(if atom { scalarise(picked)? } else { picked }))
         }
 
-        // `conn: hopen 5001` / `hopen "host:5001"`.
+        // `conn: hopen 5001` / `hopen "host:5001"` — a read-only handle (the
+        // default). `` `w!hopen 5001 `` (parsed as `Call { func: "whopen", .. }`,
+        // see `Parser::parse_expr_inner`) opens a write handle instead.
         #[cfg(feature = "ipc")]
-        Expr::Call { func, args } if func == "hopen" && args.len() == 1 => {
+        Expr::Call { func, args } if (func == "hopen" || func == "whopen") && args.len() == 1 => {
             let addr = match expect_scalar(eval_value(vm, &args[0])?)? {
                 Value::Str(s) | Value::Sym(s) => s,
                 Value::Int(n) => n.to_string(),
                 other => return Err(QplError::Runtime(
                     format!("hopen expects a port or \"host:port\", got {other:?}"))),
             };
-            let conn = crate::ipc::hopen(&addr)?;
+            let mode = if func == "whopen" {
+                crate::ipc::HandleMode::Write
+            } else {
+                crate::ipc::HandleMode::Read
+            };
+            let conn = crate::ipc::hopen(&addr, mode)?;
             let id = vm.next_handle;
             vm.next_handle += 1;
             vm.connections.insert(id, conn);
@@ -161,7 +168,9 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
             eval_result_to_value(crate::ipc::await_reply(rx)?)
         }
         #[cfg(not(feature = "ipc"))]
-        Expr::Call { func, args } if (func == "hopen" || func == "await") && args.len() == 1 => {
+        Expr::Call { func, args }
+            if (func == "hopen" || func == "whopen" || func == "await") && args.len() == 1 =>
+        {
             Err(QplError::Runtime(format!("'{func}' requires qpl to be built with `--features ipc`")))
         }
 

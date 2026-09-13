@@ -53,6 +53,13 @@ fn to_tcp_uri(addr: &str) -> String {
     }
 }
 
+/// Render a `PeerIdentity` (an opaque per-socket UUID) as a short hex tag for
+/// the connect/disconnect log lines — just enough to tell two concurrently
+/// connected clients apart, not a meaningful identity on its own.
+fn short_peer_id(id: &zeromq::util::PeerIdentity) -> String {
+    id.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
 fn build_runtime() -> Result<tokio::runtime::Runtime, QplError> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -64,6 +71,35 @@ fn build_runtime() -> Result<tokio::runtime::Runtime, QplError> {
 // client: hopen / dispatch / async dispatch / await
 // ---------------------------------------------------------------------------
 
+/// Per-connection permission, decided by the client at `hopen` time and
+/// enforced by the server on every request dispatched from that connection —
+/// never on the server's own local/interactive input (see
+/// `vm::Vm::with_request_permission`). Bare `hopen` is `Read` (the default);
+/// `` `w!hopen `` asks for `Write`. Carried on the wire as a single tag byte
+/// prepended to the command text (`tag`/`from_tag`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HandleMode {
+    Read,
+    Write,
+}
+
+impl HandleMode {
+    fn tag(self) -> u8 {
+        match self {
+            HandleMode::Read => b'R',
+            HandleMode::Write => b'W',
+        }
+    }
+
+    fn from_tag(b: u8) -> Option<Self> {
+        match b {
+            b'R' => Some(HandleMode::Read),
+            b'W' => Some(HandleMode::Write),
+            _ => None,
+        }
+    }
+}
+
 type ReplyTx = mpsc::Sender<Result<EvalResult, QplError>>;
 pub type ReplyRx = mpsc::Receiver<Result<EvalResult, QplError>>;
 type ConnRequest = (String, ReplyTx);
@@ -74,12 +110,15 @@ type ConnRequest = (String, ReplyTx);
 /// lifetime, matching REQ's strict lock-step request/reply protocol.
 pub struct ClientConn {
     tx: mpsc::Sender<ConnRequest>,
+    pub mode: HandleMode,
 }
 
 /// `hopen <addr>` — connect and spawn the connection's worker thread. Blocks
 /// until the connection either succeeds or fails, so a bad address/unreachable
-/// host is reported immediately rather than on the first `dispatch`.
-pub fn hopen(addr: &str) -> Result<ClientConn, QplError> {
+/// host is reported immediately rather than on the first `dispatch`. `mode`
+/// (from the client's `hopen` / `` `w!hopen `` spelling) is tagged onto every
+/// request this connection ever sends, for the server to enforce.
+pub fn hopen(addr: &str, mode: HandleMode) -> Result<ClientConn, QplError> {
     let uri = to_tcp_uri(addr);
     let (tx, rx) = mpsc::channel::<ConnRequest>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
@@ -101,14 +140,14 @@ pub fn hopen(addr: &str) -> Result<ClientConn, QplError> {
             }
             let _ = ready_tx.send(Ok(()));
             while let Ok((command, reply_tx)) = rx.recv() {
-                let result = dispatch_once(&mut req, &command).await;
+                let result = dispatch_once(&mut req, mode, &command).await;
                 let _ = reply_tx.send(result);
             }
         });
     });
 
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(ClientConn { tx }),
+        Ok(Ok(())) => Ok(ClientConn { tx, mode }),
         Ok(Err(e)) => Err(QplError::Runtime(format!("hopen '{addr}': {e}"))),
         Err(_) => Err(QplError::Runtime(format!("hopen '{addr}': connection thread died"))),
     }
@@ -116,10 +155,13 @@ pub fn hopen(addr: &str) -> Result<ClientConn, QplError> {
 
 async fn dispatch_once(
     req: &mut zeromq::ReqSocket,
+    mode: HandleMode,
     command: &str,
 ) -> Result<EvalResult, QplError> {
     use zeromq::{SocketRecv, SocketSend};
-    req.send(command.into()).await.map_err(rt)?;
+    let mut payload = vec![mode.tag()];
+    payload.extend_from_slice(command.as_bytes());
+    req.send(payload.into()).await.map_err(rt)?;
     let msg = req.recv().await.map_err(rt)?;
     let bytes: Vec<u8> = msg.try_into().map_err(|e: &str| QplError::Runtime(e.into()))?;
     decode_response(&bytes)
@@ -154,9 +196,11 @@ pub fn await_reply(rx: ReplyRx) -> Result<EvalResult, QplError> {
 // ---------------------------------------------------------------------------
 
 /// One request received on the listening socket, forwarded to the main
-/// thread (which owns the one and only `Vm`) for evaluation. `reply_tx` is
-/// how the encoded response bytes get back to the listener thread to send.
-pub type PortRequest = (String, mpsc::Sender<Vec<u8>>);
+/// thread (which owns the one and only `Vm`) for evaluation. `mode` is that
+/// connection's permission (decoded from the wire tag `dispatch_once`
+/// prepends), applied only for the duration of this one request. `reply_tx`
+/// is how the encoded response bytes get back to the listener thread to send.
+pub type PortRequest = (HandleMode, String, mpsc::Sender<Vec<u8>>);
 
 /// A running `\port` listener. Dropping it (or calling `close`) signals the
 /// listener thread to stop accepting new requests and joins it — any request
@@ -206,6 +250,9 @@ pub fn start_server(port: u16, main_tx: mpsc::Sender<PortRequest>) -> Result<Ser
         rt.block_on(async move {
             use zeromq::Socket;
             let mut rep = zeromq::RepSocket::new();
+            // registered before `bind` so no `Accepted` event can be missed —
+            // this is just an mpsc channel handle, nothing to race with the bind.
+            let mut events = rep.monitor();
             if let Err(e) = rep.bind(&format!("tcp://127.0.0.1:{port}")).await {
                 let _ = ready_tx.send(Err(e.to_string()));
                 return;
@@ -215,21 +262,48 @@ pub fn start_server(port: u16, main_tx: mpsc::Sender<PortRequest>) -> Result<Ser
                 use zeromq::{SocketRecv, SocketSend};
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
+                    // TCP-level accept/close on the listening socket — printed
+                    // for operator visibility only, no effect on `Vm` state
+                    // (that's `HandleMode`, decided per request, not per socket).
+                    // Caveat: `Accepted` fires reliably, but this version of the
+                    // `zeromq` crate only emits `Disconnected` when a peer's
+                    // stream ends with a protocol-level error — a clean close
+                    // (the common case: the client process just exits) is
+                    // dropped silently a layer down (`FairQueue::poll_next`,
+                    // the `Poll::Ready(None)` arm) without notifying `monitor()`.
+                    Ok(event) = events.recv() => {
+                        match event {
+                            zeromq::SocketEvent::Accepted(endpoint, peer_id) => {
+                                println!("qpl: client connected from {endpoint} ({})", short_peer_id(&peer_id));
+                            }
+                            zeromq::SocketEvent::Disconnected(peer_id) => {
+                                println!("qpl: client disconnected ({})", short_peer_id(&peer_id));
+                            }
+                            _ => {}
+                        }
+                    }
                     recv = rep.recv() => {
                         let msg = match recv {
                             Ok(msg) => msg,
                             Err(_) => continue,
                         };
-                        let command = match Vec::<u8>::try_from(msg) {
-                            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                        let bytes: Vec<u8> = match msg.try_into() {
+                            Ok(bytes) => bytes,
                             Err(_) => continue,
+                        };
+                        let (mode, command) = match bytes.split_first() {
+                            Some((&tag, rest)) => match HandleMode::from_tag(tag) {
+                                Some(mode) => (mode, String::from_utf8_lossy(rest).into_owned()),
+                                None => continue,
+                            },
+                            None => continue,
                         };
                         // hand off to the main thread and block this (otherwise
                         // idle) listener thread for the reply — fine, since REP
                         // can't accept another request until this one replies
                         // anyway.
                         let (reply_tx, reply_rx) = mpsc::channel();
-                        if main_tx.send((command, reply_tx)).is_err() {
+                        if main_tx.send((mode, command, reply_tx)).is_err() {
                             break;
                         }
                         let response = reply_rx.recv().unwrap_or_default();
@@ -575,7 +649,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<PortRequest>();
         let handle = start_server(port, tx).expect("bind");
         thread::spawn(move || {
-            while let Ok((command, reply_tx)) = rx.recv() {
+            while let Ok((_mode, command, reply_tx)) = rx.recv() {
                 let _ = reply_tx.send(encode_result(&respond(&command)));
             }
         });
@@ -588,7 +662,7 @@ mod tests {
             assert_eq!(cmd, "1+1");
             Ok(EvalResult::Scalar(ast::Value::Int(2)))
         });
-        let conn = hopen("28901").expect("hopen");
+        let conn = hopen("28901", HandleMode::Read).expect("hopen");
         match dispatch_blocking(&conn, "1+1".into()) {
             Ok(EvalResult::Scalar(ast::Value::Int(2))) => {}
             other => panic!("expected Scalar(2), got {other:?}"),
@@ -601,7 +675,7 @@ mod tests {
         let server = spawn_stub_server(28902, |_cmd| {
             Ok(EvalResult::Table(df!["a" => [1i64, 2]].unwrap()))
         });
-        let conn = hopen("28902").expect("hopen");
+        let conn = hopen("28902", HandleMode::Read).expect("hopen");
         match dispatch_blocking(&conn, "select from t".into()) {
             Ok(EvalResult::Table(df)) => assert_eq!(df, df!["a" => [1i64, 2]].unwrap()),
             other => panic!("expected a table, got {other:?}"),
@@ -612,7 +686,7 @@ mod tests {
     #[test]
     fn dispatch_surfaces_a_remote_error_locally() {
         let server = spawn_stub_server(28903, |_cmd| Err(QplError::Runtime("nope".into())));
-        let conn = hopen("28903").expect("hopen");
+        let conn = hopen("28903", HandleMode::Read).expect("hopen");
         let err = dispatch_blocking(&conn, "bad".into()).expect_err("expected an error");
         assert_eq!(err.to_string(), QplError::Runtime("nope".into()).to_string());
         server.close();
@@ -621,7 +695,7 @@ mod tests {
     #[test]
     fn async_dispatch_then_await_resolves_the_same_reply() {
         let server = spawn_stub_server(28904, |_cmd| Ok(EvalResult::Scalar(ast::Value::Int(99))));
-        let conn = hopen("28904").expect("hopen");
+        let conn = hopen("28904", HandleMode::Read).expect("hopen");
         let rx = enqueue(&conn, "slow query".into()).expect("enqueue");
         // the request is already in flight; await just waits for it
         match await_reply(rx) {
@@ -634,8 +708,8 @@ mod tests {
     #[test]
     fn two_connections_to_the_same_server_are_independent() {
         let server = spawn_stub_server(28905, |cmd| Ok(EvalResult::Scalar(ast::Value::Str(cmd.to_string()))));
-        let a = hopen("28905").expect("hopen a");
-        let b = hopen("28905").expect("hopen b");
+        let a = hopen("28905", HandleMode::Read).expect("hopen a");
+        let b = hopen("28905", HandleMode::Write).expect("hopen b");
         match dispatch_blocking(&a, "from-a".into()) {
             Ok(EvalResult::Scalar(ast::Value::Str(s))) => assert_eq!(s, "from-a"),
             other => panic!("unexpected: {other:?}"),
@@ -644,6 +718,37 @@ mod tests {
             Ok(EvalResult::Scalar(ast::Value::Str(s))) => assert_eq!(s, "from-b"),
             other => panic!("unexpected: {other:?}"),
         }
+        server.close();
+    }
+
+    /// The wire mode tag (prepended by `dispatch_once`) must actually reach the
+    /// listener thread's decoding, not just get ignored by a stub that skips
+    /// straight to `respond` — this is the one piece `spawn_stub_server`-based
+    /// tests above don't exercise, since their `respond` closures never look at
+    /// the connection's mode.
+    #[test]
+    fn mode_tag_round_trips_through_the_real_listener() {
+        let (tx, rx) = mpsc::channel::<PortRequest>();
+        let server = start_server(28907, tx).expect("bind");
+        thread::spawn(move || {
+            while let Ok((mode, command, reply_tx)) = rx.recv() {
+                let echoed = format!("{mode:?}:{command}");
+                let _ = reply_tx.send(encode_result(&Ok(EvalResult::Scalar(ast::Value::Str(echoed)))));
+            }
+        });
+
+        let read_conn = hopen("28907", HandleMode::Read).expect("hopen read");
+        match dispatch_blocking(&read_conn, "cmd".into()) {
+            Ok(EvalResult::Scalar(ast::Value::Str(s))) => assert_eq!(s, "Read:cmd"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let write_conn = hopen("28907", HandleMode::Write).expect("hopen write");
+        match dispatch_blocking(&write_conn, "cmd".into()) {
+            Ok(EvalResult::Scalar(ast::Value::Str(s))) => assert_eq!(s, "Write:cmd"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
         server.close();
     }
 }

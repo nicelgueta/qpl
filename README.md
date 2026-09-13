@@ -836,6 +836,26 @@ A dispatched assignment (`conn dispatch t: select from u`) has nothing to
 print, same as it would locally — the client gets back a boolean acknowledgment
 rather than a value to bind.
 
+**Read vs. write handles**: bare `hopen` opens a **read-only** connection —
+the default. The server rejects anything that writes to its session when
+dispatched from a read handle: an assignment (`x: ...`, `t: select ...`),
+`sink`, and `\1`. Everything else (`select`/`update`/`delete`, building a
+lazy pipeline, etc.) still works. `` `w!hopen `` opens a **write** handle
+instead, with none of those restrictions:
+
+```q
+ro: hopen 5001                          / read-only (default)
+ro dispatch t: select from trades       / rejected by the server
+ro dispatch select from trades          / fine — no write involved
+
+rw: `w!hopen 5001                       / write handle
+rw dispatch t: select from trades       / allowed
+```
+
+The permission is decided by the client at `hopen` time and enforced by the
+server per request — it only ever applies to commands arriving over a
+connection, never to the server operator's own local REPL/script input.
+
 ### Operator reference
 
 | Operator | Meaning |
@@ -855,7 +875,7 @@ rather than a value to bind.
 | `#` | limit (`10#t`); take / slice a list (`3#l`, `-3#l`) |
 | `[...]` | positional index into a list (`l[0]`, `l[1 2 3]`) |
 | `_` | drop columns (`` `a`b _ t ``) |
-| `hopen` `dispatch` `async dispatch` `await` | IPC client — see [IPC](#ipc) (`--features ipc`) |
+| `hopen` `` `w!hopen `` `dispatch` `async dispatch` `await` | IPC client — see [IPC](#ipc) (`--features ipc`) |
 
 ## REPL
 

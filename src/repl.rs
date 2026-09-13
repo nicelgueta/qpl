@@ -121,8 +121,8 @@ pub fn start(vm: &mut Vm) {
         if let Some(session) = port_session.as_mut() {
             match session.poll() {
                 PortEvent::Line(line) => process_submitted(&line, vm),
-                PortEvent::Request(command, reply_tx) => {
-                    let result = eval_for_dispatch(&command, vm);
+                PortEvent::Request(mode, command, reply_tx) => {
+                    let result = vm.with_request_permission(mode, |vm| eval_for_dispatch(&command, vm));
                     let _ = reply_tx.send(crate::ipc::encode_result(&result));
                 }
                 PortEvent::StdinClosed => break,
@@ -269,7 +269,7 @@ struct PortSession {
 #[cfg(feature = "ipc")]
 enum PortEvent {
     Line(String),
-    Request(String, std::sync::mpsc::Sender<Vec<u8>>),
+    Request(crate::ipc::HandleMode, String, std::sync::mpsc::Sender<Vec<u8>>),
     StdinClosed,
 }
 
@@ -315,9 +315,9 @@ impl PortSession {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
             if let Some((_, rx)) = &self.port
-                && let Ok((command, reply_tx)) = rx.try_recv()
+                && let Ok((mode, command, reply_tx)) = rx.try_recv()
             {
-                return PortEvent::Request(command, reply_tx);
+                return PortEvent::Request(mode, command, reply_tx);
             }
             std::thread::sleep(std::time::Duration::from_millis(15));
         }
