@@ -1,4 +1,4 @@
-.PHONY: build release test run bump book book-build
+.PHONY: build release test run bump book book-build book-deploy
 
 build:
 	cargo build
@@ -19,6 +19,11 @@ book:
 # Build the mdbook to book/book/.
 book-build:
 	mdbook build book
+
+# Build the mdbook and copy it into ../nicelgueta.github.io/qpl. Leaves the
+# result unstaged there for manual review/commit.
+book-deploy:
+	@./scripts/deploy-book.sh
 
 # Bump the version in Cargo.toml, e.g. `make bump patch`.
 bump:
