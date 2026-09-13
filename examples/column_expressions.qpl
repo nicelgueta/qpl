@@ -50,3 +50,29 @@ trades`price[2 3]         / the 3rd and 4th prices
 log "a name is looked up as a global, then a lazy frame, then a table"
 t2: trades                / copies the table
 2#t2                       / `n#` on a whole table stays a table
+
+/ ── vector arithmetic ───────────────────────────────────────────────────────
+/ every list is a Polars Series under the hood, so the usual operators apply
+/ elementwise between a list and a scalar, or between two same-length lists
+/ (a length-1 side broadcasts).
+log "list + scalar, scalar + list, list op list, and comparisons are all elementwise"
+nums + 2                  / i64[5]: 12 22 32 42 52
+2 * nums                  / i64[5]: 20 40 60 80 100
+nums > 25                 / bool[5]: 00111
+sizes: trades`size
+prices - prices[0]        / every price minus the first row, broadcast
+
+log "a temporal column materialises to its typed list (e.g. TimestampVec), which shifts the same way a temporal scalar does"
+ts: trades`ts
+ts + 0D00:01:00.000000000 / every timestamp shifted forward one minute
+
+/ ── filtering a list with `where` ───────────────────────────────────────────
+/ `<list-expr> where <predicate>` filters a list elementwise; `x` is the
+/ current element. This is a different `where` from the one attached to a
+/ `` table`col `` column expression (which filters table rows by any other
+/ column before projecting) — chaining the two needs parentheses.
+log "list `where`: x is the current element, a comma joins predicates with AND"
+nums where x > 25              / i64[3]: 30 40 50
+nums where x > 10, x < 50      / i64[3]: 20 30 40
+prices where x > 400           / filter an already-materialised list by its own values
+(prices where x > 200) where x < 415   / chaining needs parens

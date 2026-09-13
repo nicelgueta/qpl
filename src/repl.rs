@@ -323,13 +323,71 @@ fn system_command(line: &str, vm: &mut Vm) -> Option<Result<(), QplError>> {
     Some(vm.set_stdout_log(path))
 }
 
+/// kdb-style tag for a vector kind, used as the `<tag>[<n>]:` prefix.
+fn vec_tag(kind: ast::VecKind) -> &'static str {
+    use ast::VecKind::*;
+    match kind {
+        Int => "i64", Float => "f64", Sym => "sym", Str => "str", Bool => "bool",
+        Date => "date", Month => "month", Time => "time", Minute => "minute",
+        Second => "second", Timestamp => "timestamp", Timespan => "timespan",
+    }
+}
+
+/// The scalar `Value` a raw temporal-vector element (its kdb integer offset)
+/// corresponds to, so it can be rendered through `temporal::format_temporal`.
+fn temporal_scalar_of(kind: ast::VecKind, n: i64) -> ast::Value {
+    use ast::VecKind::*;
+    match kind {
+        Date => ast::Value::Date(n as i32),
+        Month => ast::Value::Month(n as i32),
+        Time => ast::Value::Time(n),
+        Minute => ast::Value::Minute(n as i32),
+        Second => ast::Value::Second(n as i32),
+        Timestamp => ast::Value::Timestamp(n),
+        Timespan => ast::Value::Timespan(n),
+        _ => unreachable!("not a temporal vector kind"),
+    }
+}
+
+/// Space-separated rendering of a vector `Value`'s elements. `quote_str`
+/// selects the pretty (`"a" "b"`) vs. raw (`log`/`1`, `a b`) string form.
+fn fmt_vec_elems(kind: ast::VecKind, s: &polars::prelude::Series, quote_str: bool) -> String {
+    use ast::VecKind::*;
+    let ca_str = || s.str().expect("SymVec/StrVec backed by a string Series");
+    match kind {
+        Sym => ca_str().iter().flatten().map(|x| format!("`{x}")).collect(),
+        Str => {
+            if quote_str {
+                ca_str().iter().flatten().map(|x| format!("\"{x}\" ")).collect::<String>().trim_end().to_string()
+            } else {
+                ca_str().iter().flatten().collect::<Vec<_>>().join(" ")
+            }
+        }
+        Bool => s.bool().expect("BoolVec backed by a bool Series")
+            .iter().flatten().map(|b| if b { "1" } else { "0" }).collect(),
+        Int => s.i64().expect("IntVec backed by an i64 Series")
+            .iter().flatten().map(|n| n.to_string()).collect::<Vec<_>>().join(" "),
+        Float => s.f64().expect("FloatVec backed by an f64 Series")
+            .iter().flatten().map(|f| f.to_string()).collect::<Vec<_>>().join(" "),
+        Date | Month | Minute | Second => s.i32().expect("temporal vector backed by an i32 Series")
+            .iter().flatten()
+            .map(|n| temporal::format_temporal(&temporal_scalar_of(kind, n as i64)).unwrap())
+            .collect::<Vec<_>>().join(" "),
+        Time | Timestamp | Timespan => s.i64().expect("temporal vector backed by an i64 Series")
+            .iter().flatten()
+            .map(|n| temporal::format_temporal(&temporal_scalar_of(kind, n)).unwrap())
+            .collect::<Vec<_>>().join(" "),
+    }
+}
+
 /// Render a value for `log` / `1`: raw text, no type prefix or quoting.
 fn fmt_log_val(v: &ast::Value) -> String {
+    if let Some((kind, s)) = v.as_vec() {
+        return fmt_vec_elems(kind, s, false);
+    }
     match v {
         ast::Value::Str(s)   => s.clone(),
         ast::Value::Sym(s)   => s.clone(),
-        ast::Value::SymVec(v)=> v.iter().map(|s| format!("`{s}")).collect(),
-        ast::Value::StrVec(v)=> v.join(" "),
         ast::Value::Int(n)   => n.to_string(),
         ast::Value::Float(f) => f.to_string(),
         ast::Value::Bool(b)  => b.to_string(),
@@ -350,16 +408,14 @@ fn fmt_val(v: &ast::Value) -> String {
         };
         return format!("{tag}: {text}");
     }
+    if let Some((kind, s)) = v.as_vec() {
+        return format!("{}[{}]: {}", vec_tag(kind), s.len(), fmt_vec_elems(kind, s, true));
+    }
     match v {
         ast::Value::Int(n)   => format!("i64: {n}"),
         ast::Value::Float(f) => format!("f64: {f}"),
         ast::Value::Str(s)   => format!("str: \"{s}\""),
         ast::Value::Sym(s)   => format!("sym: `{s}"),
-        ast::Value::SymVec(v)=> format!("sym[{}]: {}", v.len(), v.iter().map(|s| format!("`{s}")).collect::<String>()),
-        ast::Value::StrVec(v)=> format!("str[{}]: {}", v.len(), v.iter().map(|s| format!("\"{s}\" ")).collect::<String>().trim_end()),
-        ast::Value::IntVec(v)=> format!("i64[{}]: {}", v.len(), v.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" ")),
-        ast::Value::FloatVec(v)=> format!("f64[{}]: {}", v.len(), v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(" ")),
-        ast::Value::BoolVec(v)=> format!("bool[{}]: {}", v.len(), v.iter().map(|b| if *b {"1"} else {"0"}).collect::<String>()),
         ast::Value::Bool(b)  => format!("bool: {b}"),
         // temporal variants are handled by the early return above; this keeps
         // the match total without a panic path if a new `Value` is added

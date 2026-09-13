@@ -729,7 +729,7 @@ impl Parser {
                 unreachable!()
             }
         }
-        let left_on = Value::SymVec(left_on);
+        let left_on = crate::ast::sym_vec(left_on);
         let join_type = match self.next() {
             TokenKind::Name(n) => match n.as_str() {
                 "lj" => JoinType::Left,
@@ -755,7 +755,7 @@ impl Parser {
                 unreachable!()
             }
         }
-        let right_on = Value::SymVec(right_on);
+        let right_on = crate::ast::sym_vec(right_on);
         Ok((join_src, left_on, right_on, join_type))
     }
 
@@ -831,6 +831,24 @@ impl Parser {
             }
             break;
         }
+
+        // `<list-expr> where <predicate>[, <predicate>...]` — elementwise
+        // filter on a list value, predicates written against `x` (a plain
+        // column reference into the list's own materialisation). Distinct
+        // from the `` name`col `` + `where` sugar in `finish_table_ref`,
+        // which is already fully consumed by the time we get here, so a
+        // single `where` is never double-handled. A *second* chained `where`
+        // (`` t`price where size>100 where x>50 ``) is not reliably
+        // supported: with no operator precedence in this grammar, the
+        // trailing `where` attaches to whichever noun it immediately follows
+        // inside the first predicate, not necessarily to the outer clause —
+        // parenthesise instead: `` (t`price where size>100) where x>50 ``.
+        if self.peek() == &TokenKind::Where {
+            self.next();
+            let where_ = self.parse_where()?.expect("parse_where always returns Some");
+            e = Expr::ListWhere { list: Box::new(e), where_ };
+        }
+
         Ok(e)
     }
 
@@ -906,7 +924,7 @@ impl Parser {
         Some(if ns.len() == 1 {
             Expr::Lit(Value::Int(ns[0]))
         } else {
-            Expr::Lit(Value::IntVec(ns))
+            Expr::Lit(crate::ast::int_vec(ns))
         })
     }
 
@@ -920,8 +938,8 @@ impl Parser {
             TokenKind::Float(n)    => Ok(Expr::Lit(Value::Float(n))),
             TokenKind::Str(s)      => Ok(Expr::Lit(Value::Str(s))),
             TokenKind::Bool(b)     => Ok(Expr::Lit(Value::Bool(b))),
-            TokenKind::BoolVec(v)  => Ok(Expr::Lit(Value::BoolVec(v))),
-            TokenKind::SymbolVec(v)=> Ok(Expr::Lit(Value::SymVec(v))),
+            TokenKind::BoolVec(v)  => Ok(Expr::Lit(crate::ast::bool_vec(v))),
+            TokenKind::SymbolVec(v)=> Ok(Expr::Lit(crate::ast::sym_vec(v))),
             TokenKind::Symbol(s)   => Ok(Expr::Sym(s)),
             TokenKind::Temporal(v) => Ok(Expr::Lit(v)),
             TokenKind::Name(n) if n == "i" => Ok(Expr::IColRef),
@@ -1674,7 +1692,7 @@ mod tests {
         match p("lvl: `low`mid`high") {
             Stmt::ScalarAssign { name, expr } => {
                 assert_eq!(name, "lvl");
-                assert_eq!(expr, Expr::Lit(Value::SymVec(vec![
+                assert_eq!(expr, Expr::Lit(crate::ast::sym_vec(vec![
                     "low".into(), "mid".into(), "high".into(),
                 ])));
             }

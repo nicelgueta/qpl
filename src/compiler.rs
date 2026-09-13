@@ -159,19 +159,21 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
         compile_tbl_expr(&sel.from, out)?;
         out.push(Instruction::Result); // get the left frame onto the stack for the join
         out.push(Instruction::PushPolarsArg(PolarsStackArg::Join(join_type.clone())));
-        let left_count = if let Value::SymVec(s) = left_on {
-            for s in s {
-                out.push(Instruction::PushColRef(s.clone()));
-            };
-            s.len()
+        let left_count = if let Value::SymVec(_) = left_on {
+            let names = left_on.vec_strings().map_err(QplError::Runtime)?;
+            for name in &names {
+                out.push(Instruction::PushColRef(name.clone()));
+            }
+            names.len()
         } else {
             return Err(QplError::Runtime(format!("Expected symbol for left_on, got {:?}", left_on)));
         };
-        let right_count = if let Value::SymVec(s) = right_on {
-            for s in s {
-                out.push(Instruction::PushColRef(s.clone()));
-            };
-            s.len()
+        let right_count = if let Value::SymVec(_) = right_on {
+            let names = right_on.vec_strings().map_err(QplError::Runtime)?;
+            for name in &names {
+                out.push(Instruction::PushColRef(name.clone()));
+            }
+            names.len()
         } else {
             return Err(QplError::Runtime(format!("Expected symbol for right_on, got {:?}", right_on)));
         };
@@ -350,6 +352,8 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
             "positional indexing is only valid outside a select projection".into())),
         Expr::Apply { .. } => return Err(QplError::Compile(
             "a user function call `f[..]` is only valid outside a select projection".into())),
+        Expr::ListWhere { .. } => return Err(QplError::Compile(
+            "a list `where` is only valid outside a select projection".into())),
     }
     Ok(())
 }

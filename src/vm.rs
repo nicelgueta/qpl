@@ -359,7 +359,13 @@ impl Vm {
                 .cloned()
                 .ok_or_else(|| QplError::Runtime(format!("undefined variable '{name}'"))),
             ast::Expr::BinOp { left, op, right } => {
-                scalar_binop(self.eval_scalar(left)?, self.eval_scalar(right)?, op)
+                let l = self.eval_scalar(left)?;
+                let r = self.eval_scalar(right)?;
+                if l.as_vec().is_some() || r.as_vec().is_some() {
+                    vector_binop(l, r, op)
+                } else {
+                    scalar_binop(l, r, op)
+                }
             }
             // `.qpl.d` / `.qpl.t` / `.qpl.p` / `.qpl.n` — nullary now-functions
             ast::Expr::Call { func, args } if func.starts_with(".qpl.") && args.is_empty() => {
@@ -447,7 +453,7 @@ impl Vm {
             // from the global symbol vector `name`
             ast::CastTarget::Enum(name) => {
                 let cats = match self.lookup_global(name) {
-                    Some(Value::SymVec(v)) => v,
+                    Some(v @ Value::SymVec(_)) => v.vec_strings().map_err(QplError::Runtime)?,
                     Some(other) => return Err(QplError::Runtime(format!(
                         "'{name}' is not an enum (expected a symbol vector, got {other:?})"
                     ))),
@@ -882,13 +888,10 @@ pub(crate) fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
         ast::Value::Str(s)     => lit(s),
         ast::Value::Sym(s)     => lit(s),
         ast::Value::Bool(b)    => lit(b),
-        ast::Value::IntVec(v)  => Series::new("".into(), v.as_slice()).lit(),
-        ast::Value::FloatVec(v)=> Series::new("".into(), v.as_slice()).lit(),
-        ast::Value::BoolVec(v) => Series::new("".into(), v.as_slice()).lit(),
-        ast::Value::SymVec(v) | ast::Value::StrVec(v) => {
-            let strs: Vec<&str> = v.iter().map(String::as_str).collect();
-            Series::new("".into(), strs.as_slice()).lit()
-        }
+        ast::Value::IntVec(s)   => s.lit(),
+        ast::Value::FloatVec(s) => s.lit(),
+        ast::Value::BoolVec(s)  => s.lit(),
+        ast::Value::SymVec(s) | ast::Value::StrVec(s) => s.lit(),
         // temporal scalars carry a kdb offset; re-base to the Polars 1970 epoch
         // and give the literal its Polars dtype so it composes with columns.
         ast::Value::Date(d) => {
@@ -905,6 +908,30 @@ pub(crate) fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
             lit(ns + temporal::NS_2000_TO_1970).cast(DataType::Datetime(TimeUnit::Nanoseconds, None))
         }
         ast::Value::Timespan(ns) => lit(ns).cast(DataType::Duration(TimeUnit::Nanoseconds)),
+        // typed temporal vectors: same offset-rebasing as their scalar
+        // counterparts, applied elementwise via Series/Expr arithmetic.
+        ast::Value::DateVec(s) => (s.lit() + lit(temporal::DAYS_2000_TO_1970)).cast(DataType::Date),
+        ast::Value::MonthVec(s) => {
+            let days: Vec<i32> = s
+                .i32()?
+                .into_no_null_iter()
+                .map(|mo| temporal::days_from_civil(2000 + mo.div_euclid(12), (mo.rem_euclid(12) + 1) as u32, 1))
+                .collect();
+            Series::new("".into(), days).lit().cast(DataType::Date)
+        }
+        ast::Value::TimeVec(s) => s.lit().cast(DataType::Time),
+        ast::Value::MinuteVec(s) => {
+            let ns: Vec<i64> = s.i32()?.into_no_null_iter().map(|m| m as i64 * 60_000_000_000).collect();
+            Series::new("".into(), ns).lit().cast(DataType::Time)
+        }
+        ast::Value::SecondVec(s) => {
+            let ns: Vec<i64> = s.i32()?.into_no_null_iter().map(|sec| sec as i64 * 1_000_000_000).collect();
+            Series::new("".into(), ns).lit().cast(DataType::Time)
+        }
+        ast::Value::TimestampVec(s) => {
+            (s.lit() + lit(temporal::NS_2000_TO_1970)).cast(DataType::Datetime(TimeUnit::Nanoseconds, None))
+        }
+        ast::Value::TimespanVec(s) => s.lit().cast(DataType::Duration(TimeUnit::Nanoseconds)),
     })
 }
 
@@ -1075,6 +1102,21 @@ fn scalar_binop(l: ast::Value, r: ast::Value, op: &str) -> Result<ast::Value, Qp
         (l, r, op) => return Err(QplError::Runtime(
             format!("cannot apply '{op}' to {l:?} and {r:?}"))),
     })
+}
+
+/// `<vector> op <scalar>` / `<scalar> op <vector>` / `<vector> op <vector>` —
+/// at least one operand is a vector `Value`. Reuses the same literal→`Expr`
+/// bridge (`ast_val_to_expr`) and operator table (`apply_binop`) the table
+/// pipeline uses for column expressions, so a vector composes with a scalar
+/// exactly like a Polars column would (broadcasting a length-1 side, and
+/// applying the same dtype/temporal promotion rules Polars applies to
+/// columns) — this is the native vectorised path `scalar_binop` doesn't cover.
+fn vector_binop(l: ast::Value, r: ast::Value, op: &str) -> Result<ast::Value, QplError> {
+    let l_expr = ast_val_to_expr(l)?;
+    let r_expr = ast_val_to_expr(r)?;
+    let expr = apply_binop(l_expr, r_expr, op)?.alias("r");
+    let df = df!("_" => [0i64])?.lazy().select([expr]).collect()?;
+    resolve::column_to_value(df.column("r")?)
 }
 
 /// Scalar counterpart of `apply_binop`'s `"like"` arm: matches `text` against
@@ -2011,7 +2053,7 @@ mod tests {
     #[test]
     fn enum_cast_builds_an_enum_column_from_a_global() {
         let mut vm = make_vm();
-        vm.globals.insert("e".into(), ast::Value::SymVec(vec!["a".into(), "b".into(), "c".into()]));
+        vm.globals.insert("e".into(), ast::sym_vec(vec!["a".into(), "b".into(), "c".into()]));
         let df = run(vm, "select lvl: e::`$c1 from t");
         assert!(df.column("lvl").unwrap().dtype().is_enum());
     }
@@ -2019,7 +2061,7 @@ mod tests {
     #[test]
     fn enum_cast_maps_unknown_labels_to_null() {
         let mut vm = make_vm();
-        vm.globals.insert("e".into(), ast::Value::SymVec(vec!["a".into(), "b".into()]));
+        vm.globals.insert("e".into(), ast::sym_vec(vec!["a".into(), "b".into()]));
         let df = run(vm, "select lvl: e::`$c1 from t");
         // c1 = [a, b, a, c] — the "c" row is not in the enum
         assert_eq!(df.column("lvl").unwrap().null_count(), 1);
@@ -2043,7 +2085,7 @@ mod tests {
         vm.eval(prog).expect("eval");
         assert_eq!(
             vm.globals.get("e"),
-            Some(&ast::Value::SymVec(vec!["low".into(), "mid".into(), "high".into()])),
+            Some(&ast::sym_vec(vec!["low".into(), "mid".into(), "high".into()])),
         );
     }
 
@@ -2097,9 +2139,69 @@ mod tests {
     #[test]
     fn hash_take_on_a_column_expression_is_a_list() {
         match run_instructions(make_vm(), "2#select c1 from t") {
-            EvalResult::Scalar(ast::Value::StrVec(v)) => assert_eq!(v, vec!["a", "b"]),
+            EvalResult::Scalar(v @ ast::Value::StrVec(_)) => assert_eq!(v.vec_strings().unwrap(), vec!["a", "b"]),
             EvalResult::Scalar(other) => panic!("expected a str list, got scalar {other:?}"),
             _ => panic!("expected a scalar str list"),
+        }
+    }
+
+    #[test]
+    fn vector_plus_scalar_is_elementwise() {
+        let mut vm = make_vm();
+        run_vm("l: 12 34", &mut vm).unwrap();
+        assert_eq!(scalar_v(&mut vm, "l + 2"), ast::int_vec(vec![14, 36]));
+        assert_eq!(scalar_v(&mut vm, "2 + l"), ast::int_vec(vec![14, 36]));
+    }
+
+    #[test]
+    fn vector_plus_vector_is_elementwise() {
+        let mut vm = make_vm();
+        run_vm("l: 12 34", &mut vm).unwrap();
+        assert_eq!(scalar_v(&mut vm, "l - (1 2)"), ast::int_vec(vec![11, 32]));
+    }
+
+    #[test]
+    fn vector_comparison_yields_a_bool_vector() {
+        let mut vm = make_vm();
+        run_vm("l: 12 34", &mut vm).unwrap();
+        assert_eq!(scalar_v(&mut vm, "l > 20"), ast::bool_vec(vec![false, true]));
+    }
+
+    #[test]
+    fn mismatched_vector_lengths_are_a_runtime_error() {
+        let mut vm = make_vm();
+        run_vm("l: 1 2 3", &mut vm).unwrap();
+        assert!(run_vm("l + (1 2)", &mut vm).is_err());
+    }
+
+    fn scalar_v(vm: &mut Vm, src: &str) -> ast::Value {
+        match run_vm(src, vm).expect("run") {
+            EvalResult::Scalar(v) => v,
+            _ => panic!("expected a scalar result"),
+        }
+    }
+
+    #[test]
+    fn every_vec_kind_round_trips_through_scalarise_and_take() {
+        use ast::VecKind::*;
+        let cases: Vec<(ast::VecKind, ast::Value)> = vec![
+            (Int, ast::int_vec(vec![1, 2, 3])),
+            (Float, ast::float_vec(vec![1.0, 2.0, 3.0])),
+            (Bool, ast::bool_vec(vec![true, false, true])),
+            (Sym, ast::sym_vec(vec!["a".into(), "b".into(), "c".into()])),
+            (Str, ast::str_vec(vec!["a".into(), "b".into(), "c".into()])),
+            (Date, ast::date_vec(vec![0, 1, 2])),
+            (Month, ast::month_vec(vec![0, 1, 2])),
+            (Time, ast::time_vec(vec![0, 1, 2])),
+            (Minute, ast::minute_vec(vec![0, 1, 2])),
+            (Second, ast::second_vec(vec![0, 1, 2])),
+            (Timestamp, ast::timestamp_vec(vec![0, 1, 2])),
+            (Timespan, ast::timespan_vec(vec![0, 1, 2])),
+        ];
+        for (kind, v) in cases {
+            let (got_kind, s) = v.as_vec().expect("is a vector");
+            assert_eq!(got_kind, kind);
+            assert_eq!(s.len(), 3);
         }
     }
 
