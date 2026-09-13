@@ -9,7 +9,7 @@
 
 use polars::prelude::*;
 
-use crate::ast::{self, Expr, TableExpr, Value};
+use crate::ast::{self, Alias, Expr, SelectStmt, TableExpr, TableSource, Value};
 use crate::errors::QplError;
 use crate::vm::{Lookup, Vm};
 #[cfg(feature = "ipc")]
@@ -122,7 +122,7 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
             let list = to_list(vm, expr)?;
             let (idxs, atom) = match vm.eval_scalar(idx)? {
                 Value::Int(n) => (vec![n], true),
-                Value::IntVec(v) => (v, false),
+                v @ Value::IntVec(_) => (v.as_vec().unwrap().1.i64().map_err(rt)?.into_no_null_iter().collect(), false),
                 other => {
                     return Err(QplError::Runtime(format!(
                         "index must be an int or int vector, got {other:?}"
@@ -173,6 +173,13 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
         {
             Err(QplError::Runtime(format!("'{func}' requires qpl to be built with `--features ipc`")))
         }
+        // `til 5` / `10 til 15` — a range list constructor, not a reduction
+        // over an existing list, so this is intercepted ahead of the generic
+        // `eval_call` below (which assumes `args[0]` is already a list/frame).
+        Expr::Call { func, args } if func == "til" => eval_til(vm, args),
+
+        // `zip `k1`k2!v1 v2` — build a table from a dict of named lists.
+        Expr::Call { func, args } if func == "zip" && args.len() == 1 => eval_zip(vm, &args[0]),
 
         // `sum trades`price`, `2 shift px`, `2 round px`, `cumsum px`, …
         Expr::Call { func, args } if (1..=2).contains(&args.len()) => eval_call(vm, func, args),
@@ -215,6 +222,9 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
                 right: Box::new(Expr::Lit(r)),
             })?))
         }
+
+        // `<list-expr> where <predicate>...` — elementwise filter on a list.
+        Expr::ListWhere { list, where_ } => eval_list_where(vm, list, where_),
 
         // `?[c1;v1;c2;v2;default]` in value context — a scalar conditional,
         // tree-walked so it short-circuits (needed for conditional recursion in
@@ -279,6 +289,112 @@ fn eval_table(vm: &mut Vm, te: &TableExpr) -> Result<EvalValue, QplError> {
 fn is_column_select(te: &TableExpr) -> bool {
     matches!(te, TableExpr::Select(sel)
         if sel.cols.len() == 1 && sel.by.is_none() && !sel.update && !sel.delete)
+}
+
+/// `<list-expr> where <predicate>...` — filter a list value elementwise
+/// (`nums where x > 10`; `x` is the current element, a plain column
+/// reference — see below). `list` is evaluated to a concrete list `Value`,
+/// then this reuses the exact same row-filter machinery a table's `where`
+/// clause uses (`compile_select`'s `FrameExpr(Filter(n))`): the list's
+/// one-column (named `x`, see `list_to_lazy`) materialisation is bound under
+/// a throwaway lazy-frame name no user source could ever spell (a NUL byte —
+/// the lexer never produces one), a `select x from <tmp> where <predicates>`
+/// is compiled and run against it, and the binding is dropped again.
+fn eval_list_where(vm: &mut Vm, list: &Expr, where_: &[Expr]) -> Result<EvalValue, QplError> {
+    const TMP: &str = "\0qpl_list_where";
+    let list_val = expect_scalar(eval_value(vm, list)?)?;
+    if !is_list_value(&list_val) {
+        return Err(QplError::Runtime(format!(
+            "'where' needs a list on the left, got {list_val:?}"
+        )));
+    }
+    vm.lazy_frames.insert(TMP.into(), list_to_lazy(list_val)?);
+    let sel = TableExpr::Select(SelectStmt {
+        cols: vec![Alias { name: None, expr: Expr::ColRef("x".into()) }],
+        from: Box::new(TableExpr::Source(TableSource::InMem(TMP.into()))),
+        by: None,
+        where_: Some(where_.to_vec()),
+        order: None,
+        join: None,
+        update: false,
+        delete: false,
+    });
+    let result = (|| {
+        let mut instrs = Vec::new();
+        crate::compiler::compile_tbl_expr(&sel, &mut instrs)?;
+        let (lf, _lazy) = vm.eval_frame(instrs)?;
+        let df = lf.collect().map_err(rt)?;
+        let col = df
+            .select_at_idx(0)
+            .ok_or_else(|| QplError::Runtime("'where' produced no columns".into()))?;
+        column_to_value(col)
+    })();
+    vm.lazy_frames.remove(TMP);
+    Ok(EvalValue::Scalar(result?))
+}
+
+/// `til n` → `0 .. n-1`; `lo til hi` → `lo .. hi-1`. The dyadic form is parsed
+/// through the shared "param verb value" infix grammar (parser.rs), whose
+/// convention is `args: [value, param]` — so here that's `[hi, lo]`, not
+/// `[lo, hi]`.
+fn eval_til(vm: &mut Vm, args: &[Expr]) -> Result<EvalValue, QplError> {
+    let int_of = |vm: &Vm, e: &Expr| -> Result<i64, QplError> {
+        match vm.eval_scalar(e)? {
+            Value::Int(n) => Ok(n),
+            other => Err(QplError::Runtime(format!("'til' expects an integer, got {other:?}"))),
+        }
+    };
+    let (lo, hi) = match args {
+        [n] => (0i64, int_of(vm, n)?),
+        [hi, lo] => (int_of(vm, lo)?, int_of(vm, hi)?),
+        _ => return Err(QplError::Runtime("'til' takes 1 or 2 arguments".into())),
+    };
+    if hi < lo {
+        return Err(QplError::Runtime(format!(
+            "'til': upper bound {hi} is less than lower bound {lo}"
+        )));
+    }
+    Ok(EvalValue::Scalar(ast::int_vec((lo..hi).collect())))
+}
+
+/// `zip `k1`k2!v1 v2` — evaluate each dict value to a list and assemble them,
+/// in order, into a table (kdb's `flip` of a column dict, under a friendlier
+/// name). Every value must be list-shaped and the same length.
+fn eval_zip(vm: &mut Vm, dict_expr: &Expr) -> Result<EvalValue, QplError> {
+    let pairs = match dict_expr {
+        Expr::Dict(pairs) => pairs,
+        other => {
+            return Err(QplError::Runtime(format!(
+                "'zip' expects a dict (`` `col1`col2!v1 v2 ``), got {other:?}"
+            )))
+        }
+    };
+    if pairs.is_empty() {
+        return Err(QplError::Runtime("'zip' needs at least one column".into()));
+    }
+    let mut len = None;
+    let mut columns = Vec::with_capacity(pairs.len());
+    for (name, expr) in pairs {
+        let list_val = expect_scalar(eval_value(vm, expr)?)?;
+        let (_, s) = list_val.as_vec().ok_or_else(|| {
+            QplError::Runtime(format!("'zip' column '{name}' is not a list: {list_val:?}"))
+        })?;
+        match len {
+            None => len = Some(s.len()),
+            Some(l) if l != s.len() => {
+                return Err(QplError::Runtime(format!(
+                    "'zip' columns have mismatched lengths: '{name}' has {}, expected {l}",
+                    s.len()
+                )))
+            }
+            _ => {}
+        }
+        let mut s = s.clone();
+        s.rename(name.as_str().into());
+        columns.push(Column::from(s));
+    }
+    let df = DataFrame::new(len.expect("checked non-empty above"), columns).map_err(rt)?;
+    Ok(EvalValue::Frame { lf: df.lazy(), lazy: false })
 }
 
 /// Coerce a value expression to a concrete list: materialise a single-column
@@ -435,11 +551,7 @@ fn is_reducer(f: &str) -> bool {
 
 /// Is this a list-shaped `Value` (as opposed to an atomic scalar)?
 fn is_list_value(v: &Value) -> bool {
-    matches!(
-        v,
-        Value::IntVec(_) | Value::FloatVec(_) | Value::StrVec(_)
-            | Value::SymVec(_) | Value::BoolVec(_)
-    )
+    v.as_vec().is_some()
 }
 
 fn first_col_name(lf: &LazyFrame) -> Result<String, QplError> {
@@ -453,36 +565,16 @@ fn first_col_name(lf: &LazyFrame) -> Result<String, QplError> {
 }
 
 fn list_to_lazy(list: Value) -> Result<LazyFrame, QplError> {
-    let s: Series = match list {
-        Value::IntVec(v) => Series::new("x".into(), v),
-        Value::FloatVec(v) => Series::new("x".into(), v),
-        Value::BoolVec(v) => Series::new("x".into(), v),
-        Value::StrVec(v) | Value::SymVec(v) => {
-            let strs: Vec<&str> = v.iter().map(String::as_str).collect();
-            Series::new("x".into(), strs)
-        }
-        Value::Int(n) => Series::new("x".into(), [n]),
-        Value::Float(n) => Series::new("x".into(), [n]),
-        Value::Bool(b) => Series::new("x".into(), [b]),
-        Value::Str(s) | Value::Sym(s) => Series::new("x".into(), [s]),
-        // temporal scalars: a 1-row frame via the shared literal bridge
-        v @ (Value::Date(_) | Value::Month(_) | Value::Time(_) | Value::Minute(_)
-            | Value::Second(_) | Value::Timestamp(_) | Value::Timespan(_)) => {
-            return Ok(df!("x" => [0i64])
-                .map_err(rt)?
-                .lazy()
-                .select([crate::vm::ast_val_to_expr(v)?.alias("x")]));
-        }
-        v @ (Value::Handle(_) | Value::Future(_)) => {
-            return Err(QplError::Runtime(format!("{v:?} is not a list or column expression")))
-        }
-    };
-    Ok(s.into_frame().lazy())
+    let expr = crate::vm::ast_val_to_expr(list)?.alias("x");
+    Ok(df!("_" => [0i64]).map_err(rt)?.lazy().select([expr]))
 }
 
 /// Materialise one collected column into a qpl list `Value`. Rejects
-/// null-containing columns and dtypes with no list representation.
-fn column_to_value(col: &Column) -> Result<Value, QplError> {
+/// null-containing columns and dtypes with no list representation. A temporal
+/// column materialises to its matching typed vector (`DateVec`,
+/// `TimestampVec`, …), carrying the same kdb integer offset its scalar
+/// counterpart does.
+pub(crate) fn column_to_value(col: &Column) -> Result<Value, QplError> {
     if col.null_count() > 0 {
         return Err(QplError::Runtime(format!(
             "column '{}' contains nulls and cannot be materialised into a list",
@@ -493,26 +585,24 @@ fn column_to_value(col: &Column) -> Result<Value, QplError> {
     if dt.is_categorical() || dt.is_enum() {
         let c = col.cast(&DataType::String).map_err(rt)?;
         let ca = c.str().map_err(rt)?;
-        return Ok(Value::SymVec(ca.iter().flatten().map(str::to_owned).collect()));
+        return Ok(ast::sym_vec(ca.iter().flatten().map(str::to_owned).collect()));
     }
     Ok(match dt {
         DataType::Boolean => {
-            Value::BoolVec(col.bool().map_err(rt)?.iter().flatten().collect())
+            ast::bool_vec(col.bool().map_err(rt)?.iter().flatten().collect())
         }
-        DataType::String => Value::StrVec(
+        DataType::String => ast::str_vec(
             col.str().map_err(rt)?.iter().flatten().map(str::to_owned).collect(),
         ),
         DataType::Float32 | DataType::Float64 => {
             let c = col.cast(&DataType::Float64).map_err(rt)?;
-            Value::FloatVec(c.f64().map_err(rt)?.into_no_null_iter().collect())
+            ast::float_vec(c.f64().map_err(rt)?.into_no_null_iter().collect())
         }
-        // temporal columns materialise to their kdb integer offsets (there is
-        // no typed temporal-vector `Value` yet — Phase 2).
         DataType::Date => {
             let c = col.cast(&DataType::Int32).map_err(rt)?;
-            Value::IntVec(
+            ast::date_vec(
                 c.i32().map_err(rt)?.into_no_null_iter()
-                    .map(|d| (d - crate::temporal::DAYS_2000_TO_1970) as i64).collect(),
+                    .map(|d| d - crate::temporal::DAYS_2000_TO_1970).collect(),
             )
         }
         // normalise to nanoseconds first — a column loaded from a file may be
@@ -521,7 +611,7 @@ fn column_to_value(col: &Column) -> Result<Value, QplError> {
             let c = col
                 .cast(&DataType::Datetime(TimeUnit::Nanoseconds, None)).map_err(rt)?
                 .cast(&DataType::Int64).map_err(rt)?;
-            Value::IntVec(
+            ast::timestamp_vec(
                 c.i64().map_err(rt)?.into_no_null_iter()
                     .map(|n| n - crate::temporal::NS_2000_TO_1970).collect(),
             )
@@ -530,16 +620,16 @@ fn column_to_value(col: &Column) -> Result<Value, QplError> {
             let c = col
                 .cast(&DataType::Duration(TimeUnit::Nanoseconds)).map_err(rt)?
                 .cast(&DataType::Int64).map_err(rt)?;
-            Value::IntVec(c.i64().map_err(rt)?.into_no_null_iter().collect())
+            ast::timespan_vec(c.i64().map_err(rt)?.into_no_null_iter().collect())
         }
         DataType::Time => {
             // Polars `Time` is always ns since midnight
             let c = col.cast(&DataType::Int64).map_err(rt)?;
-            Value::IntVec(c.i64().map_err(rt)?.into_no_null_iter().collect())
+            ast::time_vec(c.i64().map_err(rt)?.into_no_null_iter().collect())
         }
         d if d.is_integer() => {
             let c = col.cast(&DataType::Int64).map_err(rt)?;
-            Value::IntVec(c.i64().map_err(rt)?.into_no_null_iter().collect())
+            ast::int_vec(c.i64().map_err(rt)?.into_no_null_iter().collect())
         }
         other => {
             return Err(QplError::Runtime(format!(
@@ -551,74 +641,79 @@ fn column_to_value(col: &Column) -> Result<Value, QplError> {
 
 /// A one-element list collapses to the corresponding scalar.
 fn scalarise(v: Value) -> Result<Value, QplError> {
-    Ok(match v {
-        Value::IntVec(mut xs) if xs.len() == 1 => Value::Int(xs.pop().unwrap()),
-        Value::FloatVec(mut xs) if xs.len() == 1 => Value::Float(xs.pop().unwrap()),
-        Value::StrVec(mut xs) if xs.len() == 1 => Value::Str(xs.pop().unwrap()),
-        Value::SymVec(mut xs) if xs.len() == 1 => Value::Sym(xs.pop().unwrap()),
-        Value::BoolVec(mut xs) if xs.len() == 1 => Value::Bool(xs.pop().unwrap()),
-        other => {
-            return Err(QplError::Runtime(format!(
-                "expected a single value from the reduction, got {other:?}"
-            )))
+    let (kind, s) = v
+        .as_vec()
+        .ok_or_else(|| QplError::Runtime(format!("expected a single value from the reduction, got {v:?}")))?;
+    if s.len() != 1 {
+        return Err(QplError::Runtime(format!(
+            "expected a single value from the reduction, got a list of length {}",
+            s.len()
+        )));
+    }
+    any_value_to_scalar(kind, s.get(0).map_err(rt)?)
+}
+
+fn any_value_to_scalar(kind: ast::VecKind, av: AnyValue) -> Result<Value, QplError> {
+    use ast::VecKind::*;
+    let bad = || QplError::Runtime(format!("cannot convert {av:?} to a scalar '{kind:?}'"));
+    let as_str = |av: &AnyValue| -> Option<String> {
+        match av {
+            AnyValue::String(s) => Some((*s).to_owned()),
+            AnyValue::StringOwned(s) => Some(s.to_string()),
+            _ => None,
         }
+    };
+    Ok(match kind {
+        Int => Value::Int(av.extract::<i64>().ok_or_else(bad)?),
+        Float => Value::Float(av.extract::<f64>().ok_or_else(bad)?),
+        Bool => match av {
+            AnyValue::Boolean(b) => Value::Bool(b),
+            _ => return Err(bad()),
+        },
+        Sym => Value::Sym(as_str(&av).ok_or_else(bad)?),
+        Str => Value::Str(as_str(&av).ok_or_else(bad)?),
+        Date => Value::Date(av.extract::<i32>().ok_or_else(bad)?),
+        Month => Value::Month(av.extract::<i32>().ok_or_else(bad)?),
+        Time => Value::Time(av.extract::<i64>().ok_or_else(bad)?),
+        Minute => Value::Minute(av.extract::<i32>().ok_or_else(bad)?),
+        Second => Value::Second(av.extract::<i32>().ok_or_else(bad)?),
+        Timestamp => Value::Timestamp(av.extract::<i64>().ok_or_else(bad)?),
+        Timespan => Value::Timespan(av.extract::<i64>().ok_or_else(bad)?),
     })
 }
 
 fn take_list(v: Value, n: i64) -> Result<Value, QplError> {
-    Ok(match v {
-        Value::IntVec(xs) => Value::IntVec(head_tail(&xs, n)),
-        Value::FloatVec(xs) => Value::FloatVec(head_tail(&xs, n)),
-        Value::StrVec(xs) => Value::StrVec(head_tail(&xs, n)),
-        Value::SymVec(xs) => Value::SymVec(head_tail(&xs, n)),
-        Value::BoolVec(xs) => Value::BoolVec(head_tail(&xs, n)),
-        other => {
-            return Err(QplError::Runtime(format!(
-                "cannot slice {other:?} — not a list"
-            )))
-        }
-    })
-}
-
-fn head_tail<T: Clone>(xs: &[T], n: i64) -> Vec<T> {
-    let len = xs.len() as i64;
-    if n >= 0 {
-        xs[..n.clamp(0, len) as usize].to_vec()
+    let (kind, s) = v
+        .as_vec()
+        .ok_or_else(|| QplError::Runtime(format!("cannot slice {v:?} — not a list")))?;
+    let len = s.len() as i64;
+    let out = if n >= 0 {
+        s.head(Some(n.clamp(0, len) as usize))
     } else {
-        xs[(len - (-n).clamp(0, len)) as usize..].to_vec()
-    }
+        s.tail(Some((-n).clamp(0, len) as usize))
+    };
+    Ok(Value::from_vec(kind, out))
 }
 
 fn index_list(v: Value, idx: &[i64]) -> Result<Value, QplError> {
-    Ok(match v {
-        Value::IntVec(xs) => Value::IntVec(gather(&xs, idx)?),
-        Value::FloatVec(xs) => Value::FloatVec(gather(&xs, idx)?),
-        Value::StrVec(xs) => Value::StrVec(gather(&xs, idx)?),
-        Value::SymVec(xs) => Value::SymVec(gather(&xs, idx)?),
-        Value::BoolVec(xs) => Value::BoolVec(gather(&xs, idx)?),
-        other => {
-            return Err(QplError::Runtime(format!(
-                "cannot index {other:?} — not a list"
-            )))
-        }
-    })
+    let (kind, s) = v
+        .as_vec()
+        .ok_or_else(|| QplError::Runtime(format!("cannot index {v:?} — not a list")))?;
+    Ok(Value::from_vec(kind, gather(s, idx)?))
 }
 
-fn gather<T: Clone>(xs: &[T], idx: &[i64]) -> Result<Vec<T>, QplError> {
-    idx.iter()
-        .map(|&i| {
-            usize::try_from(i)
-                .ok()
-                .and_then(|u| xs.get(u))
-                .cloned()
-                .ok_or_else(|| {
-                    QplError::Runtime(format!(
-                        "index {i} out of range for a list of length {}",
-                        xs.len()
-                    ))
-                })
-        })
-        .collect()
+fn gather(s: &Series, idx: &[i64]) -> Result<Series, QplError> {
+    let len = s.len() as i64;
+    let mut vals = Vec::with_capacity(idx.len());
+    for &i in idx {
+        if i < 0 || i >= len {
+            return Err(QplError::Runtime(format!(
+                "index {i} out of range for a list of length {len}"
+            )));
+        }
+        vals.push(s.get(i as usize).map_err(rt)?);
+    }
+    Series::from_any_values_and_dtype(s.name().clone(), &vals, s.dtype(), false).map_err(rt)
 }
 
 #[cfg(test)]
@@ -656,7 +751,7 @@ mod tests {
 
     #[test]
     fn table_col_materialises_to_a_list() {
-        assert_eq!(scalar(&mut make_vm(), "t`c3"), Value::FloatVec(vec![1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(scalar(&mut make_vm(), "t`c3"), ast::float_vec(vec![1.0, 2.0, 3.0, 4.0]));
     }
 
     // --- functions ---
@@ -768,7 +863,7 @@ mod tests {
     fn one_column_select_in_assignment_materialises_to_a_list() {
         let mut vm = make_vm();
         assert!(matches!(run_vm("px: select c2 from t", &mut vm), Ok(EvalResult::Stored)));
-        assert_eq!(vm.globals.get("px"), Some(&Value::IntVec(vec![10, 20, 30, 15])));
+        assert_eq!(vm.globals.get("px"), Some(&ast::int_vec(vec![10, 20, 30, 15])));
     }
 
     #[test]
@@ -778,7 +873,41 @@ mod tests {
 
     #[test]
     fn where_filters_a_column_expression() {
-        assert_eq!(scalar(&mut make_vm(), "t`c2 where c2 > 15"), Value::IntVec(vec![20, 30]));
+        assert_eq!(scalar(&mut make_vm(), "t`c2 where c2 > 15"), ast::int_vec(vec![20, 30]));
+    }
+
+    #[test]
+    fn list_where_filters_a_bare_list_by_its_own_elements() {
+        let mut vm = make_vm();
+        run_vm("l: 10 20 30 40 50", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "l where x > 25"), ast::int_vec(vec![30, 40, 50]));
+    }
+
+    #[test]
+    fn list_where_supports_comma_separated_predicates() {
+        let mut vm = make_vm();
+        run_vm("l: 10 20 30 40 50", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "l where x > 10, x < 50"), ast::int_vec(vec![20, 30, 40]));
+    }
+
+    // `` t`c2 where <pred> `` is already claimed by the *existing* column-expr
+    // `where` sugar (a table row-filter by a real column, compiled through
+    // `finish_table_ref` before list-where's own postfix check ever runs) —
+    // list-where only kicks in on an operand that sugar didn't already
+    // consume. Chaining onto its *result* works once parenthesised, since
+    // the parenthesised expression is then a plain noun for list-where to
+    // attach to.
+    #[test]
+    fn list_where_chains_onto_a_parenthesised_column_expression_result() {
+        assert_eq!(
+            scalar(&mut make_vm(), "(t`c2 where c2 > 10) where x < 30"),
+            ast::int_vec(vec![20, 15]),
+        );
+    }
+
+    #[test]
+    fn list_where_on_a_non_list_value_is_a_runtime_error() {
+        assert!(run_vm("2 where x > 1", &mut make_vm()).is_err());
     }
 
     #[test]
@@ -806,19 +935,19 @@ mod tests {
     fn cast_a_column_expression_without_reducing() {
         assert_eq!(
             scalar(&mut make_vm(), "f64$t`c2"),
-            Value::FloatVec(vec![10.0, 20.0, 30.0, 15.0])
+            ast::float_vec(vec![10.0, 20.0, 30.0, 15.0])
         );
     }
 
     #[test]
     fn take_head_and_tail() {
-        assert_eq!(scalar(&mut make_vm(), "2#t`c2"), Value::IntVec(vec![10, 20]));
-        assert_eq!(scalar(&mut make_vm(), "-2#t`c2"), Value::IntVec(vec![30, 15]));
+        assert_eq!(scalar(&mut make_vm(), "2#t`c2"), ast::int_vec(vec![10, 20]));
+        assert_eq!(scalar(&mut make_vm(), "-2#t`c2"), ast::int_vec(vec![30, 15]));
     }
 
     #[test]
     fn positional_index_with_an_int_run() {
-        assert_eq!(scalar(&mut make_vm(), "(t`c2) 0 3"), Value::IntVec(vec![10, 15]));
+        assert_eq!(scalar(&mut make_vm(), "(t`c2) 0 3"), ast::int_vec(vec![10, 15]));
     }
 
     #[test]
@@ -827,9 +956,9 @@ mod tests {
         assert!(matches!(run_vm("l: 5 6 7 8 9", &mut vm), Ok(EvalResult::Stored)));
         // a single int picks an atom; an int run picks a sub-list
         assert_eq!(scalar(&mut vm, "l[0]"), Value::Int(5));
-        assert_eq!(scalar(&mut vm, "l[1 3 4]"), Value::IntVec(vec![6, 8, 9]));
+        assert_eq!(scalar(&mut vm, "l[1 3 4]"), ast::int_vec(vec![6, 8, 9]));
         // works directly on a column expression, and chains
-        assert_eq!(scalar(&mut vm, "t`c2[2 1]"), Value::IntVec(vec![30, 20]));
+        assert_eq!(scalar(&mut vm, "t`c2[2 1]"), ast::int_vec(vec![30, 20]));
         assert_eq!(scalar(&mut vm, "(t`c2)[0]"), Value::Int(10));
     }
 

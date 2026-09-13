@@ -9,7 +9,7 @@ export const STATEMENT_KEYWORDS = [
   'distinct', 'limit', 'drop', 'update', 'delete',
 ];
 
-export const BUILTIN_KEYWORDS = ['load', 'sink', 'cols', 'lazy', 'collect'];
+export const BUILTIN_KEYWORDS = ['load', 'sink', 'cols', 'lazy', 'collect', 'til', 'zip'];
 
 export const JOIN_OPERATORS = ['lj', 'ij', 'rj'];
 
@@ -93,4 +93,6 @@ export const KEYWORD_DETAIL: Record<string, string> = {
   dispatch: '<conn> dispatch <stmt> — send a statement to a connection, block for the reply (`ipc` feature)',
   async: '<conn> async dispatch <stmt> — like dispatch, but returns immediately (`ipc` feature)',
   '\\port': '\\port <n> — start serving on port n; bare \\port stops (`ipc` feature, REPL only)',
+  til: 'til <n> — list 0..n-1  |  <lo> til <hi> — list lo..hi-1',
+  zip: 'zip `k1`k2!v1 v2 — build a table from a dict of named lists',
 };

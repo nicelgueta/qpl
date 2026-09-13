@@ -1,6 +1,4 @@
-use std::collections::HashMap;
-
-use polars::prelude::JoinType;
+use polars::prelude::{JoinType, NamedFrom, Series};
 
 use crate::builtins::BuiltIn;
 
@@ -24,11 +22,6 @@ pub enum Value {
     Second(i32),    // seconds since midnight
     Timestamp(i64), // ns since 2000.01.01
     Timespan(i64),  // ns duration
-    IntVec(Vec<i64>),
-    FloatVec(Vec<f64>),
-    SymVec(Vec<String>),
-    StrVec(Vec<String>),
-    BoolVec(Vec<bool>),
     /// `conn: hopen 5001` — an opaque handle to an open IPC connection. Only
     /// meaningful as the left operand of `dispatch`/`async dispatch`. `ipc`
     /// feature only; the variant itself always exists so non-`ipc` builds
@@ -37,6 +30,116 @@ pub enum Value {
     /// `resp: conn async dispatch ...` — a pending response, resolved by
     /// `await`. `ipc` feature only (see `Handle`).
     Future(i64),
+    /// Vector variants are all backed by a Polars `Series` so that native
+    /// vectorised Polars operations (arithmetic, casts, gather/slice) apply
+    /// directly instead of hand-rolled Rust loops. Each carries the same raw
+    /// element representation as its scalar counterpart (e.g. `DateVec` holds
+    /// day offsets since 2000.01.01, matching `Date`) — conversion to/from a
+    /// native Polars dtype happens only in `vm::ast_val_to_expr` /
+    /// `resolve::column_to_value`. See [`VecKind`] for generic dispatch over
+    /// these variants.
+    IntVec(Series),
+    FloatVec(Series),
+    SymVec(Series),
+    StrVec(Series),
+    BoolVec(Series),
+    DateVec(Series),
+    MonthVec(Series),
+    TimeVec(Series),
+    MinuteVec(Series),
+    SecondVec(Series),
+    TimestampVec(Series),
+    TimespanVec(Series),
+}
+
+/// Which element type a vector `Value` variant holds. Lets list-shaped
+/// operations (materialise / index / take / scalarise) be written once,
+/// generically, instead of once per vector variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VecKind {
+    Int, Float, Sym, Str, Bool,
+    Date, Month, Time, Minute, Second, Timestamp, Timespan,
+}
+
+impl Value {
+    /// If `self` is a vector variant, its kind and backing `Series`.
+    pub fn as_vec(&self) -> Option<(VecKind, &Series)> {
+        use Value::*;
+        Some(match self {
+            IntVec(s) => (VecKind::Int, s),
+            FloatVec(s) => (VecKind::Float, s),
+            SymVec(s) => (VecKind::Sym, s),
+            StrVec(s) => (VecKind::Str, s),
+            BoolVec(s) => (VecKind::Bool, s),
+            DateVec(s) => (VecKind::Date, s),
+            MonthVec(s) => (VecKind::Month, s),
+            TimeVec(s) => (VecKind::Time, s),
+            MinuteVec(s) => (VecKind::Minute, s),
+            SecondVec(s) => (VecKind::Second, s),
+            TimestampVec(s) => (VecKind::Timestamp, s),
+            TimespanVec(s) => (VecKind::Timespan, s),
+            _ => return None,
+        })
+    }
+
+    /// Extract the string values of a `SymVec` / `StrVec` as owned `String`s.
+    pub fn vec_strings(&self) -> Result<Vec<String>, String> {
+        match self {
+            Value::SymVec(s) | Value::StrVec(s) => Ok(s
+                .str()
+                .map_err(|e| e.to_string())?
+                .iter()
+                .flatten()
+                .map(str::to_owned)
+                .collect()),
+            other => Err(format!("expected a symbol vector, got {other:?}")),
+        }
+    }
+
+    /// Build a vector `Value` of the given kind from a backing `Series`.
+    pub fn from_vec(kind: VecKind, s: Series) -> Value {
+        match kind {
+            VecKind::Int => Value::IntVec(s),
+            VecKind::Float => Value::FloatVec(s),
+            VecKind::Sym => Value::SymVec(s),
+            VecKind::Str => Value::StrVec(s),
+            VecKind::Bool => Value::BoolVec(s),
+            VecKind::Date => Value::DateVec(s),
+            VecKind::Month => Value::MonthVec(s),
+            VecKind::Time => Value::TimeVec(s),
+            VecKind::Minute => Value::MinuteVec(s),
+            VecKind::Second => Value::SecondVec(s),
+            VecKind::Timestamp => Value::TimestampVec(s),
+            VecKind::Timespan => Value::TimespanVec(s),
+        }
+    }
+}
+
+pub fn int_vec(v: Vec<i64>) -> Value { Value::IntVec(Series::new("".into(), v)) }
+pub fn float_vec(v: Vec<f64>) -> Value { Value::FloatVec(Series::new("".into(), v)) }
+pub fn bool_vec(v: Vec<bool>) -> Value { Value::BoolVec(Series::new("".into(), v)) }
+pub fn sym_vec(v: Vec<String>) -> Value { Value::SymVec(str_series(v)) }
+pub fn str_vec(v: Vec<String>) -> Value { Value::StrVec(str_series(v)) }
+pub fn date_vec(v: Vec<i32>) -> Value { Value::DateVec(Series::new("".into(), v)) }
+// `month` / `minute` / `second` have no native Polars dtype (only `date` /
+// `time` / `datetime` / `duration` do), so — matching `CastTarget::Prim`,
+// which only ever resolves those three for a *scalar* cast — nothing yet
+// materialises a `MonthVec`/`MinuteVec`/`SecondVec` from a real column.
+// These constructors exist so the type itself has full parity with every
+// other atomic scalar (see `VecKind`), ready for a future producer.
+#[allow(dead_code)]
+pub fn month_vec(v: Vec<i32>) -> Value { Value::MonthVec(Series::new("".into(), v)) }
+pub fn time_vec(v: Vec<i64>) -> Value { Value::TimeVec(Series::new("".into(), v)) }
+#[allow(dead_code)]
+pub fn minute_vec(v: Vec<i32>) -> Value { Value::MinuteVec(Series::new("".into(), v)) }
+#[allow(dead_code)]
+pub fn second_vec(v: Vec<i32>) -> Value { Value::SecondVec(Series::new("".into(), v)) }
+pub fn timestamp_vec(v: Vec<i64>) -> Value { Value::TimestampVec(Series::new("".into(), v)) }
+pub fn timespan_vec(v: Vec<i64>) -> Value { Value::TimespanVec(Series::new("".into(), v)) }
+
+fn str_series(v: Vec<String>) -> Series {
+    let strs: Vec<&str> = v.iter().map(String::as_str).collect();
+    Series::new("".into(), strs)
 }
 
 /// Target of a `$` / `` `$ `` cast.
@@ -57,7 +160,12 @@ pub enum Expr {
     Lit(Value),
     Sym(String),
     ColRef(String),
-    Dict(HashMap<String, Value>),
+    /// `` `k1`k2!v1 v2 `` — a dict literal: an ordered list of (key, value-expr)
+    /// pairs (order matters — it becomes column order when fed to `zip`).
+    /// Each value is parsed as a single noun; a compound expression needs
+    /// parens. Value context only, never lowered to stack instructions —
+    /// see `resolve::eval_value`'s `zip` handling.
+    Dict(Vec<(String, Expr)>),
     IColRef, // virtual i col (for indexing like: select i, col1, col2 from df)
     BinOp { left: Box<Expr>, op: String, right: Box<Expr>,},
     Call { func: String, args: Vec<Expr>,}, //  used for agg funcs like sum etc
@@ -103,6 +211,14 @@ pub enum Expr {
     /// context only, tree-walked by `resolve::eval_value` like `Table` above —
     /// there's nothing here for the compiler to lower.
     Dispatch { conn: Box<Expr>, command: String, is_async: bool },
+    /// `<expr> where <predicate>[, <predicate>...]` where `<expr>` is a *list*
+    /// value (not a table-column expression, which has its own `where` sugar
+    /// via `TableExpr::Select`'s `where_`) — filters the list elementwise.
+    /// Each predicate is written against `x`, a plain column reference that
+    /// resolves against the list's own (single, `x`-named) materialisation —
+    /// see `resolve::eval_value`'s `Expr::ListWhere` arm. Value context only,
+    /// never lowered to stack instructions.
+    ListWhere { list: Box<Expr>, where_: Vec<Expr> },
 }
 
 

@@ -481,11 +481,14 @@ impl Parser {
         // the value is the rest of the expression. They bind tighter than `over`,
         // so the value never swallows a window. The parser only records
         // `Call { func, args: [value, param] }`; `round` is lowered in the
-        // compiler, the rest dispatch through `apply_dyadic` in the VM.
+        // compiler, the rest dispatch through `apply_dyadic` in the VM — except
+        // `til`, a value-context list constructor handled by `resolve::eval_value`
+        // before it would ever reach that column-context dispatch (so `args`
+        // there means `[high, low]`, not `[column, param]`).
         if let TokenKind::Name(n) = self.peek()
             && matches!(n.as_str(),
                 "round" | "quantile" | "pctl" | "shift" | "lag" | "lead"
-                | "diff" | "pctchange")
+                | "diff" | "pctchange" | "til")
         {
             let name = n.clone();
             self.next();
@@ -777,7 +780,7 @@ impl Parser {
                 unreachable!()
             }
         }
-        let left_on = Value::SymVec(left_on);
+        let left_on = crate::ast::sym_vec(left_on);
         let join_type = match self.next() {
             TokenKind::Name(n) => match n.as_str() {
                 "lj" => JoinType::Left,
@@ -803,7 +806,7 @@ impl Parser {
                 unreachable!()
             }
         }
-        let right_on = Value::SymVec(right_on);
+        let right_on = crate::ast::sym_vec(right_on);
         Ok((join_src, left_on, right_on, join_type))
     }
 
@@ -824,7 +827,14 @@ impl Parser {
         let parenthesised = self.i > 0 && self.tokens[self.i - 1].kind == TokenKind::RParen;
 
         // `` name`col `` / `` name`c1`c2 `` — a column / table expression.
-        if let Expr::ColRef(name) = &e {
+        // Skipped when the backtick vector is immediately followed by `!`:
+        // that's `` <name> `k1`k2!v1 v2 `` — `name` is a call target (e.g.
+        // `zip`) and the backtick vector is that call's dict-literal
+        // argument, not a table-column reference. `name` is left as a bare
+        // `ColRef` so the "call: left(args)" juxtaposition below picks it up.
+        let dict_arg_follows = matches!(self.peek(), TokenKind::Symbol(_) | TokenKind::SymbolVec(_))
+            && self.peek2() == &TokenKind::Bang;
+        if let Expr::ColRef(name) = &e && !dict_arg_follows {
             match self.peek().clone() {
                 TokenKind::Symbol(s) => {
                     let name = name.clone();
@@ -839,6 +849,27 @@ impl Parser {
                 }
                 _ => {}
             }
+        }
+
+        // `` `k1`k2!v1 v2 `` / `` `k!v `` — a dict literal: a symbol (vector)
+        // key immediately followed by `!`, then one value noun per key. `` `w! ``
+        // is excluded here (even though it's a single-symbol key like any
+        // other) so it falls through to the whopen bang-modifier handled in
+        // `parse_expr_inner` — see the comment there.
+        let dict_keys: Option<Vec<String>> = match &e {
+            Expr::Sym(s) if s != "w" => Some(vec![s.clone()]),
+            Expr::Lit(v) if matches!(v.as_vec(), Some((VecKind::Sym, _))) => {
+                Some(v.vec_strings().map_err(QplError::Parse)?)
+            }
+            _ => None,
+        };
+        if let Some(keys) = dict_keys && self.peek() == &TokenKind::Bang {
+            self.next();
+            let mut pairs = Vec::with_capacity(keys.len());
+            for key in keys {
+                pairs.push((key, self.parse_noun()?));
+            }
+            e = Expr::Dict(pairs);
         }
 
         // positional index. Two forms, both chainable:
@@ -879,6 +910,24 @@ impl Parser {
             }
             break;
         }
+
+        // `<list-expr> where <predicate>[, <predicate>...]` — elementwise
+        // filter on a list value, predicates written against `x` (a plain
+        // column reference into the list's own materialisation). Distinct
+        // from the `` name`col `` + `where` sugar in `finish_table_ref`,
+        // which is already fully consumed by the time we get here, so a
+        // single `where` is never double-handled. A *second* chained `where`
+        // (`` t`price where size>100 where x>50 ``) is not reliably
+        // supported: with no operator precedence in this grammar, the
+        // trailing `where` attaches to whichever noun it immediately follows
+        // inside the first predicate, not necessarily to the outer clause —
+        // parenthesise instead: `` (t`price where size>100) where x>50 ``.
+        if self.peek() == &TokenKind::Where {
+            self.next();
+            let where_ = self.parse_where()?.expect("parse_where always returns Some");
+            e = Expr::ListWhere { list: Box::new(e), where_ };
+        }
+
         Ok(e)
     }
 
@@ -954,7 +1003,7 @@ impl Parser {
         Some(if ns.len() == 1 {
             Expr::Lit(Value::Int(ns[0]))
         } else {
-            Expr::Lit(Value::IntVec(ns))
+            Expr::Lit(crate::ast::int_vec(ns))
         })
     }
 
@@ -968,8 +1017,8 @@ impl Parser {
             TokenKind::Float(n)    => Ok(Expr::Lit(Value::Float(n))),
             TokenKind::Str(s)      => Ok(Expr::Lit(Value::Str(s))),
             TokenKind::Bool(b)     => Ok(Expr::Lit(Value::Bool(b))),
-            TokenKind::BoolVec(v)  => Ok(Expr::Lit(Value::BoolVec(v))),
-            TokenKind::SymbolVec(v)=> Ok(Expr::Lit(Value::SymVec(v))),
+            TokenKind::BoolVec(v)  => Ok(Expr::Lit(crate::ast::bool_vec(v))),
+            TokenKind::SymbolVec(v)=> Ok(Expr::Lit(crate::ast::sym_vec(v))),
             TokenKind::Symbol(s)   => Ok(Expr::Sym(s)),
             TokenKind::Temporal(v) => Ok(Expr::Lit(v)),
             TokenKind::Name(n) if n == "i" => Ok(Expr::IColRef),
@@ -1093,6 +1142,7 @@ fn is_noun_start(token: &TokenKind) -> bool {
         | TokenKind::Str(_)
         | TokenKind::Bool(_)
         | TokenKind::Symbol(_)
+        | TokenKind::SymbolVec(_)
         | TokenKind::BoolVec(_)
         | TokenKind::Temporal(_)
         | TokenKind::QplNow(_)
@@ -1851,7 +1901,7 @@ mod tests {
         match p("lvl: `low`mid`high") {
             Stmt::ScalarAssign { name, expr } => {
                 assert_eq!(name, "lvl");
-                assert_eq!(expr, Expr::Lit(Value::SymVec(vec![
+                assert_eq!(expr, Expr::Lit(crate::ast::sym_vec(vec![
                     "low".into(), "mid".into(), "high".into(),
                 ])));
             }

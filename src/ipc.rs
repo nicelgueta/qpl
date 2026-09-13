@@ -452,31 +452,42 @@ impl ast::Value {
             Timespan(n) => { out.push(ValueTag::Timespan as u8); out.extend_from_slice(&n.to_le_bytes()); }
             IntVec(v) => {
                 out.push(ValueTag::IntVec as u8);
+                let v = v.i64().unwrap();
                 out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for n in v { out.extend_from_slice(&n.to_le_bytes()); }
+                for n in v.into_no_null_iter() { out.extend_from_slice(&n.to_le_bytes()); }
             }
             FloatVec(v) => {
                 out.push(ValueTag::FloatVec as u8);
+                let v = v.f64().unwrap();
                 out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for n in v { out.extend_from_slice(&n.to_le_bytes()); }
+                for n in v.into_no_null_iter() { out.extend_from_slice(&n.to_le_bytes()); }
             }
             SymVec(v) => {
                 out.push(ValueTag::SymVec as u8);
+                let v = v.str().unwrap();
                 out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for s in v { push_str(out, s); }
+                for s in v.iter().flatten() { push_str(out, s); }
             }
             StrVec(v) => {
                 out.push(ValueTag::StrVec as u8);
+                let v = v.str().unwrap();
                 out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for s in v { push_str(out, s); }
+                for s in v.iter().flatten() { push_str(out, s); }
             }
             BoolVec(v) => {
                 out.push(ValueTag::BoolVec as u8);
+                let v = v.bool().unwrap();
                 out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for b in v { out.push(*b as u8); }
+                for b in v.iter().flatten() { out.push(b as u8); }
             }
             // connection/future handles never need to cross the wire themselves
             Handle(_) | Future(_) => {
+                out.push(ValueTag::Str as u8);
+                push_str(out, "<unrepresentable>");
+            }
+            // remaining temporal vector variants have no `hopen`/`dispatch` path today
+            DateVec(_) | MonthVec(_) | TimeVec(_) | MinuteVec(_) | SecondVec(_)
+            | TimestampVec(_) | TimespanVec(_) => {
                 out.push(ValueTag::Str as u8);
                 push_str(out, "<unrepresentable>");
             }
@@ -501,23 +512,23 @@ impl ast::Value {
             Timespan => ast::Value::Timespan(r.i64()?),
             IntVec => {
                 let n = r.u32()?;
-                ast::Value::IntVec((0..n).map(|_| r.i64()).collect::<Result<_, _>>()?)
+                ast::int_vec((0..n).map(|_| r.i64()).collect::<Result<_, _>>()?)
             }
             FloatVec => {
                 let n = r.u32()?;
-                ast::Value::FloatVec((0..n).map(|_| r.f64()).collect::<Result<_, _>>()?)
+                ast::float_vec((0..n).map(|_| r.f64()).collect::<Result<_, _>>()?)
             }
             SymVec => {
                 let n = r.u32()?;
-                ast::Value::SymVec((0..n).map(|_| r.string()).collect::<Result<_, _>>()?)
+                ast::sym_vec((0..n).map(|_| r.string()).collect::<Result<_, _>>()?)
             }
             StrVec => {
                 let n = r.u32()?;
-                ast::Value::StrVec((0..n).map(|_| r.string()).collect::<Result<_, _>>()?)
+                ast::str_vec((0..n).map(|_| r.string()).collect::<Result<_, _>>()?)
             }
             BoolVec => {
                 let n = r.u32()?;
-                ast::Value::BoolVec((0..n).map(|_| r.u8().map(|b| b != 0)).collect::<Result<_, _>>()?)
+                ast::bool_vec((0..n).map(|_| r.u8().map(|b| b != 0)).collect::<Result<_, _>>()?)
             }
         })
     }
@@ -585,11 +596,11 @@ mod tests {
             ast::Value::Second(3600),
             ast::Value::Timestamp(789),
             ast::Value::Timespan(-1000),
-            ast::Value::IntVec(vec![1, 2, 3]),
-            ast::Value::FloatVec(vec![1.5, 2.5]),
-            ast::Value::SymVec(vec!["a".into(), "b".into()]),
-            ast::Value::StrVec(vec!["x".into(), "y".into()]),
-            ast::Value::BoolVec(vec![true, false, true]),
+            ast::int_vec(vec![1, 2, 3]),
+            ast::float_vec(vec![1.5, 2.5]),
+            ast::sym_vec(vec!["a".into(), "b".into()]),
+            ast::str_vec(vec!["x".into(), "y".into()]),
+            ast::bool_vec(vec![true, false, true]),
         ];
         for v in cases {
             assert_eq!(roundtrip_value(v.clone()), v);
@@ -599,7 +610,7 @@ mod tests {
     #[test]
     fn value_round_trip_handles_empty_vectors_and_strings() {
         assert_eq!(roundtrip_value(ast::Value::Str("".into())), ast::Value::Str("".into()));
-        assert_eq!(roundtrip_value(ast::Value::IntVec(vec![])), ast::Value::IntVec(vec![]));
+        assert_eq!(roundtrip_value(ast::int_vec(vec![])), ast::int_vec(vec![]));
     }
 
     #[test]

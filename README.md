@@ -271,12 +271,13 @@ A **column expression** pulls one column out of a table *without* a surrounding
 ```q
 trades`price                 / backtick a column off a table name
 select price from trades     / a one-column select
-trades`price where size > 100   / a `where` may be attached (column expressions only)
+trades`price where size > 100   / a `where` may be attached
 ```
 
 Used as a value — assigned to a name, reduced, sliced or indexed — a column
 expression **materialises to a list** (`IntVec` / `FloatVec` / `StrVec` /
-`SymVec` / `BoolVec`; other column dtypes, and columns containing nulls, are an
+`SymVec` / `BoolVec`, or a typed temporal list such as `TimestampVec` for a
+datetime column; other column dtypes, and columns containing nulls, are an
 error). A bare one-column `select` typed on its own still prints as a table; it
 becomes a list only in a value position.
 
@@ -330,6 +331,60 @@ to it — filter before materialising.
 
 Bare names in a value position resolve at run time: first a scalar global, then
 a lazy binding, then a table. `t2: trades` copies the table under a new name.
+
+**Vector arithmetic** — every list is backed by a Polars `Series`, so the usual
+operators (arithmetic, comparison) apply elementwise between a list and a
+scalar, or between two lists of the same length (or one of length 1, which
+broadcasts):
+
+```q
+l: 12 34
+l + 2                        / i64[2]: 14 36
+2 * l                        / i64[2]: 24 68
+l > 20                       / bool[2]: 01
+trades`price - trades`price[0]  / list minus a broadcast scalar
+```
+
+Every atomic scalar type has a matching list type (`IntVec` `FloatVec`
+`SymVec` `StrVec` `BoolVec` `DateVec` `MonthVec` `TimeVec` `MinuteVec`
+`SecondVec` `TimestampVec` `TimespanVec`) — a temporal column materialises to
+its typed list rather than a raw integer offset:
+
+```q
+ts: trades`ts                        / a TimestampVec
+ts + 0D00:01:00.000000000            / shift every timestamp forward one minute
+```
+
+**Filtering a list** — `<list-expr> where <predicate>` filters a list
+elementwise; `x` in the predicate refers to the current element (a comma joins
+predicates with AND, same as a table's `where`):
+
+```q
+nums: 10 20 30 40 50
+nums where x > 25              / i64[3]: 30 40 50
+nums where x > 10, x < 50      / i64[3]: 20 30 40
+trades`price where x > 400     / filter an already-materialised list by its own values
+```
+
+This is a different `where` from the one on a `` table`col `` column
+expression (which filters table *rows* by any other column before
+projecting) — the two share the keyword but not a grammar rule, so chaining
+them needs parentheses: `` (trades`price where size>100) where x>400 ``.
+
+**Building lists and tables** — `til` generates a range list; `zip` builds a
+table from a dict of same-length named lists:
+
+```q
+til 5                           / i64[5]: 0 1 2 3 4
+10 til 15                       / i64[5]: 10 11 12 13 14
+
+a: til 20
+b: 2 * til 20
+tbl: zip `cola`colb!a b         / a 2-column table, 20 rows
+```
+
+A dict literal (`` `k1`k2!v1 v2 ``) pairs a symbol (vector) key with one value
+noun per key — a compound value expression needs parens, e.g. `` `a`b!(x+1) y ``.
 
 ### Expressions
 
@@ -870,12 +925,15 @@ connection, never to the server operator's own local REPL/script input.
 | `over` | window: `<expr> over `p [order `k asc]`; verbs `rn` / `rank` / `drank` |
 | `$` | cast (`f64$x`, `` `date$x ``, `"p"$s`); `` `$x `` -> categorical |
 | `.qpl.d` `.qpl.t` `.qpl.p` `.qpl.n` | now: date / time / timestamp / timespan (UTC) |
-| `!` | `col!bool` sort map; `` u8!`$x `` -> categorical physical width |
+| `!` | `col!bool` sort map; `` u8!`$x `` -> categorical physical width; `` `k1`k2!v1 v2 `` -> dict literal |
 | `::` | enum cast (`` lvl::`$x ``) |
 | `#` | limit (`10#t`); take / slice a list (`3#l`, `-3#l`) |
 | `[...]` | positional index into a list (`l[0]`, `l[1 2 3]`) |
 | `_` | drop columns (`` `a`b _ t ``) |
 | `hopen` `` `w!hopen `` `dispatch` `async dispatch` `await` | IPC client — see [IPC](#ipc) (`--features ipc`) |
+| `<list> where <pred>` | elementwise filter on a list; `x` is the current element |
+| `til` | `til n` -> `0..n-1`; `lo til hi` -> `lo..hi-1` |
+| `zip` | `zip `k1`k2!v1 v2` — build a table from a dict of named lists |
 
 ## REPL
 

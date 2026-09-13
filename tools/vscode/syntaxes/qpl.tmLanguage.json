@@ -79,7 +79,7 @@
         },
         {
           "name": "keyword.other.qpl",
-          "match": "\\b(load|sink|cols|lazy|collect)\\b"
+          "match": "\\b(load|sink|cols|lazy|collect|til|zip)\\b"
         }
       ]
     },

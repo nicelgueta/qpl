@@ -2299,7 +2299,7 @@ dependencies = [
 
 [[package]]
 name = "qpl"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "clap",
  "polars",
