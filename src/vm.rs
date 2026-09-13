@@ -2174,6 +2174,63 @@ mod tests {
         assert!(run_vm("l + (1 2)", &mut vm).is_err());
     }
 
+    #[test]
+    fn til_monadic_and_dyadic() {
+        let mut vm = make_vm();
+        assert_eq!(scalar_v(&mut vm, "til 5"), ast::int_vec(vec![0, 1, 2, 3, 4]));
+        assert_eq!(scalar_v(&mut vm, "10 til 15"), ast::int_vec(vec![10, 11, 12, 13, 14]));
+        assert_eq!(scalar_v(&mut vm, "til 0"), ast::int_vec(vec![]));
+        assert_eq!(scalar_v(&mut vm, "5 til 5"), ast::int_vec(vec![]));
+    }
+
+    #[test]
+    fn til_upper_below_lower_is_a_runtime_error() {
+        assert!(run_vm("5 til 2", &mut make_vm()).is_err());
+    }
+
+    #[test]
+    fn zip_builds_a_table_from_a_dict_of_named_lists() {
+        let mut vm = make_vm();
+        run_vm("a: til 5", &mut vm).unwrap();
+        run_vm("b: 2 * til 5", &mut vm).unwrap();
+        match run_vm("zip `cola`colb!a b", &mut vm).expect("run") {
+            EvalResult::Table(df) => {
+                let names: Vec<&str> = df.get_column_names().iter().map(|n| n.as_str()).collect();
+                assert_eq!(names, vec!["cola", "colb"]);
+                assert_eq!(
+                    df.column("cola").unwrap().i64().unwrap().into_no_null_iter().collect::<Vec<_>>(),
+                    vec![0, 1, 2, 3, 4],
+                );
+                assert_eq!(
+                    df.column("colb").unwrap().i64().unwrap().into_no_null_iter().collect::<Vec<_>>(),
+                    vec![0, 2, 4, 6, 8],
+                );
+            }
+            _ => panic!("expected a table"),
+        }
+    }
+
+    #[test]
+    fn zip_with_a_single_key_dict() {
+        let mut vm = make_vm();
+        run_vm("a: til 3", &mut vm).unwrap();
+        match run_vm("zip `only!a", &mut vm).expect("run") {
+            EvalResult::Table(df) => {
+                let names: Vec<&str> = df.get_column_names().iter().map(|n| n.as_str()).collect();
+                assert_eq!(names, vec!["only"]);
+            }
+            _ => panic!("expected a table"),
+        }
+    }
+
+    #[test]
+    fn zip_rejects_mismatched_column_lengths() {
+        let mut vm = make_vm();
+        run_vm("a: til 5", &mut vm).unwrap();
+        run_vm("c: til 3", &mut vm).unwrap();
+        assert!(run_vm("zip `cola`colb!a c", &mut vm).is_err());
+    }
+
     fn scalar_v(vm: &mut Vm, src: &str) -> ast::Value {
         match run_vm(src, vm).expect("run") {
             EvalResult::Scalar(v) => v,

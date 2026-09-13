@@ -450,11 +450,14 @@ impl Parser {
         // the value is the rest of the expression. They bind tighter than `over`,
         // so the value never swallows a window. The parser only records
         // `Call { func, args: [value, param] }`; `round` is lowered in the
-        // compiler, the rest dispatch through `apply_dyadic` in the VM.
+        // compiler, the rest dispatch through `apply_dyadic` in the VM — except
+        // `til`, a value-context list constructor handled by `resolve::eval_value`
+        // before it would ever reach that column-context dispatch (so `args`
+        // there means `[high, low]`, not `[column, param]`).
         if let TokenKind::Name(n) = self.peek()
             && matches!(n.as_str(),
                 "round" | "quantile" | "pctl" | "shift" | "lag" | "lead"
-                | "diff" | "pctchange")
+                | "diff" | "pctchange" | "til")
         {
             let name = n.clone();
             self.next();
@@ -776,7 +779,14 @@ impl Parser {
         let parenthesised = self.i > 0 && self.tokens[self.i - 1].kind == TokenKind::RParen;
 
         // `` name`col `` / `` name`c1`c2 `` — a column / table expression.
-        if let Expr::ColRef(name) = &e {
+        // Skipped when the backtick vector is immediately followed by `!`:
+        // that's `` <name> `k1`k2!v1 v2 `` — `name` is a call target (e.g.
+        // `zip`) and the backtick vector is that call's dict-literal
+        // argument, not a table-column reference. `name` is left as a bare
+        // `ColRef` so the "call: left(args)" juxtaposition below picks it up.
+        let dict_arg_follows = matches!(self.peek(), TokenKind::Symbol(_) | TokenKind::SymbolVec(_))
+            && self.peek2() == &TokenKind::Bang;
+        if let Expr::ColRef(name) = &e && !dict_arg_follows {
             match self.peek().clone() {
                 TokenKind::Symbol(s) => {
                     let name = name.clone();
@@ -791,6 +801,24 @@ impl Parser {
                 }
                 _ => {}
             }
+        }
+
+        // `` `k1`k2!v1 v2 `` / `` `k!v `` — a dict literal: a symbol (vector)
+        // key immediately followed by `!`, then one value noun per key.
+        let dict_keys: Option<Vec<String>> = match &e {
+            Expr::Sym(s) => Some(vec![s.clone()]),
+            Expr::Lit(v) if matches!(v.as_vec(), Some((VecKind::Sym, _))) => {
+                Some(v.vec_strings().map_err(QplError::Parse)?)
+            }
+            _ => None,
+        };
+        if let Some(keys) = dict_keys && self.peek() == &TokenKind::Bang {
+            self.next();
+            let mut pairs = Vec::with_capacity(keys.len());
+            for key in keys {
+                pairs.push((key, self.parse_noun()?));
+            }
+            e = Expr::Dict(pairs);
         }
 
         // positional index. Two forms, both chainable:
@@ -1063,6 +1091,7 @@ fn is_noun_start(token: &TokenKind) -> bool {
         | TokenKind::Str(_)
         | TokenKind::Bool(_)
         | TokenKind::Symbol(_)
+        | TokenKind::SymbolVec(_)
         | TokenKind::BoolVec(_)
         | TokenKind::Temporal(_)
         | TokenKind::QplNow(_)

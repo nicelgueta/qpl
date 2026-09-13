@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use polars::prelude::{JoinType, NamedFrom, Series};
 
 use crate::builtins::BuiltIn;
@@ -154,7 +152,12 @@ pub enum Expr {
     Lit(Value),
     Sym(String),
     ColRef(String),
-    Dict(HashMap<String, Value>),
+    /// `` `k1`k2!v1 v2 `` — a dict literal: an ordered list of (key, value-expr)
+    /// pairs (order matters — it becomes column order when fed to `zip`).
+    /// Each value is parsed as a single noun; a compound expression needs
+    /// parens. Value context only, never lowered to stack instructions —
+    /// see `resolve::eval_value`'s `zip` handling.
+    Dict(Vec<(String, Expr)>),
     IColRef, // virtual i col (for indexing like: select i, col1, col2 from df)
     BinOp { left: Box<Expr>, op: String, right: Box<Expr>,},
     Call { func: String, args: Vec<Expr>,}, //  used for agg funcs like sum etc

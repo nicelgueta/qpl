@@ -9,7 +9,7 @@ export const STATEMENT_KEYWORDS = [
   'distinct', 'limit', 'drop', 'update', 'delete',
 ];
 
-export const BUILTIN_KEYWORDS = ['load', 'sink', 'cols', 'lazy', 'collect'];
+export const BUILTIN_KEYWORDS = ['load', 'sink', 'cols', 'lazy', 'collect', 'til', 'zip'];
 
 export const JOIN_OPERATORS = ['lj', 'ij', 'rj'];
 
@@ -82,4 +82,6 @@ export const KEYWORD_DETAIL: Record<string, string> = {
   ij: 'inner join',
   rj: 'right join',
   like: '<str/sym> like <pattern> — q-glob match (* any sequence, ? one char, [..] a class)',
+  til: 'til <n> — list 0..n-1  |  <lo> til <hi> — list lo..hi-1',
+  zip: 'zip `k1`k2!v1 v2 — build a table from a dict of named lists',
 };

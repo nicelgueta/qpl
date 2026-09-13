@@ -92,6 +92,14 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
             Ok(EvalValue::Scalar(if atom { scalarise(picked)? } else { picked }))
         }
 
+        // `til 5` / `10 til 15` — a range list constructor, not a reduction
+        // over an existing list, so this is intercepted ahead of the generic
+        // `eval_call` below (which assumes `args[0]` is already a list/frame).
+        Expr::Call { func, args } if func == "til" => eval_til(vm, args),
+
+        // `zip `k1`k2!v1 v2` — build a table from a dict of named lists.
+        Expr::Call { func, args } if func == "zip" && args.len() == 1 => eval_zip(vm, &args[0]),
+
         // `sum trades`price`, `2 shift px`, `2 round px`, `cumsum px`, …
         Expr::Call { func, args } if (1..=2).contains(&args.len()) => eval_call(vm, func, args),
 
@@ -242,6 +250,70 @@ fn eval_list_where(vm: &mut Vm, list: &Expr, where_: &[Expr]) -> Result<EvalValu
     })();
     vm.lazy_frames.remove(TMP);
     Ok(EvalValue::Scalar(result?))
+}
+
+/// `til n` → `0 .. n-1`; `lo til hi` → `lo .. hi-1`. The dyadic form is parsed
+/// through the shared "param verb value" infix grammar (parser.rs), whose
+/// convention is `args: [value, param]` — so here that's `[hi, lo]`, not
+/// `[lo, hi]`.
+fn eval_til(vm: &mut Vm, args: &[Expr]) -> Result<EvalValue, QplError> {
+    let int_of = |vm: &Vm, e: &Expr| -> Result<i64, QplError> {
+        match vm.eval_scalar(e)? {
+            Value::Int(n) => Ok(n),
+            other => Err(QplError::Runtime(format!("'til' expects an integer, got {other:?}"))),
+        }
+    };
+    let (lo, hi) = match args {
+        [n] => (0i64, int_of(vm, n)?),
+        [hi, lo] => (int_of(vm, lo)?, int_of(vm, hi)?),
+        _ => return Err(QplError::Runtime("'til' takes 1 or 2 arguments".into())),
+    };
+    if hi < lo {
+        return Err(QplError::Runtime(format!(
+            "'til': upper bound {hi} is less than lower bound {lo}"
+        )));
+    }
+    Ok(EvalValue::Scalar(ast::int_vec((lo..hi).collect())))
+}
+
+/// `zip `k1`k2!v1 v2` — evaluate each dict value to a list and assemble them,
+/// in order, into a table (kdb's `flip` of a column dict, under a friendlier
+/// name). Every value must be list-shaped and the same length.
+fn eval_zip(vm: &mut Vm, dict_expr: &Expr) -> Result<EvalValue, QplError> {
+    let pairs = match dict_expr {
+        Expr::Dict(pairs) => pairs,
+        other => {
+            return Err(QplError::Runtime(format!(
+                "'zip' expects a dict (`` `col1`col2!v1 v2 ``), got {other:?}"
+            )))
+        }
+    };
+    if pairs.is_empty() {
+        return Err(QplError::Runtime("'zip' needs at least one column".into()));
+    }
+    let mut len = None;
+    let mut columns = Vec::with_capacity(pairs.len());
+    for (name, expr) in pairs {
+        let list_val = expect_scalar(eval_value(vm, expr)?)?;
+        let (_, s) = list_val.as_vec().ok_or_else(|| {
+            QplError::Runtime(format!("'zip' column '{name}' is not a list: {list_val:?}"))
+        })?;
+        match len {
+            None => len = Some(s.len()),
+            Some(l) if l != s.len() => {
+                return Err(QplError::Runtime(format!(
+                    "'zip' columns have mismatched lengths: '{name}' has {}, expected {l}",
+                    s.len()
+                )))
+            }
+            _ => {}
+        }
+        let mut s = s.clone();
+        s.rename(name.as_str().into());
+        columns.push(Column::from(s));
+    }
+    let df = DataFrame::new(len.expect("checked non-empty above"), columns).map_err(rt)?;
+    Ok(EvalValue::Frame { lf: df.lazy(), lazy: false })
 }
 
 /// Coerce a value expression to a concrete list: materialise a single-column

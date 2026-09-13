@@ -368,6 +368,21 @@ expression (which filters table *rows* by any other column before
 projecting) — the two share the keyword but not a grammar rule, so chaining
 them needs parentheses: `` (trades`price where size>100) where x>400 ``.
 
+**Building lists and tables** — `til` generates a range list; `zip` builds a
+table from a dict of same-length named lists:
+
+```q
+til 5                           / i64[5]: 0 1 2 3 4
+10 til 15                       / i64[5]: 10 11 12 13 14
+
+a: til 20
+b: 2 * til 20
+tbl: zip `cola`colb!a b         / a 2-column table, 20 rows
+```
+
+A dict literal (`` `k1`k2!v1 v2 ``) pairs a symbol (vector) key with one value
+noun per key — a compound value expression needs parens, e.g. `` `a`b!(x+1) y ``.
+
 ### Expressions
 
 | Kind | |
@@ -822,11 +837,14 @@ select mv: 2 round market_value from trades
 | `over` | window: `<expr> over `p [order `k asc]`; verbs `rn` / `rank` / `drank` |
 | `$` | cast (`f64$x`, `` `date$x ``, `"p"$s`); `` `$x `` -> categorical |
 | `.qpl.d` `.qpl.t` `.qpl.p` `.qpl.n` | now: date / time / timestamp / timespan (UTC) |
-| `!` | `col!bool` sort map; `` u8!`$x `` -> categorical physical width |
+| `!` | `col!bool` sort map; `` u8!`$x `` -> categorical physical width; `` `k1`k2!v1 v2 `` -> dict literal |
 | `::` | enum cast (`` lvl::`$x ``) |
 | `#` | limit (`10#t`); take / slice a list (`3#l`, `-3#l`) |
 | `[...]` | positional index into a list (`l[0]`, `l[1 2 3]`) |
 | `_` | drop columns (`` `a`b _ t ``) |
+| `<list> where <pred>` | elementwise filter on a list; `x` is the current element |
+| `til` | `til n` -> `0..n-1`; `lo til hi` -> `lo..hi-1` |
+| `zip` | `zip `k1`k2!v1 v2` — build a table from a dict of named lists |
 
 ## REPL
 

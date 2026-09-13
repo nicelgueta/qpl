@@ -76,3 +76,17 @@ nums where x > 25              / i64[3]: 30 40 50
 nums where x > 10, x < 50      / i64[3]: 20 30 40
 prices where x > 400           / filter an already-materialised list by its own values
 (prices where x > 200) where x < 415   / chaining needs parens
+
+/ ── building lists and tables: `til` and `zip` ─────────────────────────────
+/ `til n` generates 0..n-1; `lo til hi` generates lo..hi-1. `zip` builds a
+/ table from a dict of same-length named lists (`` `k1`k2!v1 v2 ``).
+log "til: a range list constructor"
+til 5              / i64[5]: 0 1 2 3 4
+10 til 15          / i64[5]: 10 11 12 13 14
+
+log "zip: assemble named lists into a table"
+a: til 20
+b: 2 * til 20
+tbl: zip `cola`colb!a b
+tbl
+cols tbl
