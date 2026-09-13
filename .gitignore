@@ -1,8 +1,7 @@
 /target
 
 # output written by the example scripts
-/examples/data/market_summary.parquet
-/examples/data/symbols_and_enums.parquet
+/examples/data/*
 
 # stdout logs written by examples/logging.qpl (and \1 in general)
 *.log
