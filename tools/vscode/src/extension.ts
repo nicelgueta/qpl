@@ -197,6 +197,7 @@ class QplCompletionProvider implements vscode.CompletionItemProvider {
         this.item('\\d', vscode.CompletionItemKind.Keyword, 'disassemble a statement'),
         this.item('\\1', vscode.CompletionItemKind.Keyword, 'toggle stdout logging to a file'),
         this.item('\\l', vscode.CompletionItemKind.Keyword, 'run a script file'),
+        this.item('\\port', vscode.CompletionItemKind.Keyword, KEYWORD_DETAIL['\\port']),
         this.item('log', vscode.CompletionItemKind.Keyword, 'print an expression to stdout'),
       );
     } else {

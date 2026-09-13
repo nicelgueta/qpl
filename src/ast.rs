@@ -29,6 +29,14 @@ pub enum Value {
     SymVec(Vec<String>),
     StrVec(Vec<String>),
     BoolVec(Vec<bool>),
+    /// `conn: hopen 5001` — an opaque handle to an open IPC connection. Only
+    /// meaningful as the left operand of `dispatch`/`async dispatch`. `ipc`
+    /// feature only; the variant itself always exists so non-`ipc` builds
+    /// don't need `#[cfg]` on every match over `Value`.
+    Handle(i64),
+    /// `resp: conn async dispatch ...` — a pending response, resolved by
+    /// `await`. `ipc` feature only (see `Handle`).
+    Future(i64),
 }
 
 /// Target of a `$` / `` `$ `` cast.
@@ -86,6 +94,15 @@ pub enum Expr {
     /// time when `f` names a function. Value context only; `func` is always an
     /// `Expr::ColRef` (higher-order use is unsupported).
     Apply { func: Box<Expr>, args: Vec<Expr> },
+    /// `<conn> dispatch <rest of statement>` / `<conn> async dispatch <rest>` —
+    /// ship `command` (the exact remaining source, reconstructed from tokens
+    /// at parse time) to the connection named by `conn` and evaluate it there
+    /// as if typed at that server's REPL. `is_async`: `dispatch` blocks for the
+    /// reply; `async dispatch` returns a `Value::Future` immediately, resolved
+    /// later by `await`. `ipc` feature only (see `Value::Handle`). Value
+    /// context only, tree-walked by `resolve::eval_value` like `Table` above —
+    /// there's nothing here for the compiler to lower.
+    Dispatch { conn: Box<Expr>, command: String, is_async: bool },
 }
 
 

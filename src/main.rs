@@ -12,6 +12,8 @@ pub mod repl;
 mod temporal;
 mod tokens;
 mod vm;
+#[cfg(feature = "ipc")]
+mod ipc;
 
 use clap::{ArgAction::SetTrue, Parser};
 

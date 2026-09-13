@@ -32,6 +32,7 @@ Ctrl+Enter REPL for sending lines straight from the editor.
   - [Multi-line statements](#multi-line-statements)
   - [Logging](#logging)
   - [Config](#config)
+  - [IPC](#ipc)
   - [Operator reference](#operator-reference)
 - [REPL](#repl)
 - [Architecture](#architecture)
@@ -120,7 +121,9 @@ j sink "summary.parquet"
 cargo install --path .
 ```
 
-Or grab a pre-built binary from [Releases](../../releases).
+Or grab a pre-built binary from [Releases](../../releases). Add `--features
+ipc` for the [IPC](#ipc) client/server (`hopen`/`dispatch`/`\port`) — off by
+default, and pulls in no extra dependencies unless enabled.
 
 ## Quickstart
 
@@ -768,6 +771,71 @@ current settings. Works in scripts and the REPL.
 select mv: 2 round market_value from trades
 ```
 
+### IPC
+
+Optional feature (`--features ipc`, off by default — see [Install](#install));
+adds no dependencies to a default build. Lets one qpl process act as a client
+to another over a plain REQ/REP socket pair ([`zeromq`](https://github.com/zeromq/zmq.rs),
+pure Rust, no libzmq system dependency).
+
+The problem this solves: a qpl session is normally a single process holding
+its own tables in memory — one script, one address space. IPC lets a second
+process reach into a *running* session instead of re-loading and re-computing
+everything itself, which is the same reason kdb+ shops lean on IPC so heavily.
+Concretely:
+
+- **A shared data process.** Load the big/slow-to-build tables once in a
+  long-lived server session (`qpl -i`), then have any number of short-lived
+  client scripts query it without paying that load cost themselves.
+- **Splitting compute from callers.** A scheduled job, a web backend, or a
+  notebook can `dispatch` a query and get back a real table/scalar, without
+  embedding qpl or re-implementing the query in whatever language it's
+  written in — the wire format is plain TCP, not qpl-specific.
+- **Fan-out across sessions.** A single client can `hopen` several servers
+  (e.g. one per dataset, or one per region) and `async dispatch` to all of
+  them, then `await` each — running independent queries concurrently instead
+  of one after another.
+- **Remote administration of a live session.** `dispatch` treats the request
+  exactly like a typed REPL line, so a client can bind new globals, extend a
+  lazy pipeline, or otherwise reshape the server's session state on the fly —
+  handy for poking at or updating a long-running process without restarting it.
+
+**Server**: `\port <n>` opens a listener; bare `\port` closes it. Only
+available in the interactive REPL (`qpl -i script.qpl`) — a script alone exits
+before anything could connect, so there's a REPL to keep the process alive.
+Once opened, every request is evaluated exactly like a typed REPL line
+(assignments mutate the server's session, `select`/`update`/`delete` all
+work), except the `\`-prefixed system commands (`\d`, `\l`, `\1`, `\port`
+itself), which are local session administration, not part of what a remote
+client dispatches.
+
+```q
+qpl -i --load-demo setup.qpl
+qpl) \port 5001        / start serving
+qpl) \port              / stop
+```
+
+**Client**: `hopen` opens a connection (a plain port number connects to
+`127.0.0.1`; a `"host:port"` string connects elsewhere); `dispatch` sends a
+whole statement to it and blocks for the reply; `async dispatch` returns
+immediately with a pending handle, resolved later by `await`. A table comes
+back as a real table, a scalar as a real scalar — both fully usable locally,
+same as if the query had run in-process.
+
+```q
+conn: hopen 5001                       / or hopen "db.internal:5001"
+resp: conn dispatch select from trades where price > 100
+resp                                    / a genuine table, queryable further
+
+pending: conn async dispatch select avg price by sym from trades
+/ ... do other things while the server works ...
+result: await pending
+```
+
+A dispatched assignment (`conn dispatch t: select from u`) has nothing to
+print, same as it would locally — the client gets back a boolean acknowledgment
+rather than a value to bind.
+
 ### Operator reference
 
 | Operator | Meaning |
@@ -787,6 +855,7 @@ select mv: 2 round market_value from trades
 | `#` | limit (`10#t`); take / slice a list (`3#l`, `-3#l`) |
 | `[...]` | positional index into a list (`l[0]`, `l[1 2 3]`) |
 | `_` | drop columns (`` `a`b _ t ``) |
+| `hopen` `dispatch` `async dispatch` `await` | IPC client — see [IPC](#ipc) (`--features ipc`) |
 
 ## REPL
 

@@ -13,7 +13,9 @@ export const BUILTIN_KEYWORDS = ['load', 'sink', 'cols', 'lazy', 'collect'];
 
 export const JOIN_OPERATORS = ['lj', 'ij', 'rj'];
 
-export const WORD_OPERATORS = ['like'];
+// `dispatch`/`async` are bareword infix operators (`<conn> [async] dispatch
+// <rest>`), same shape as `like` — `ipc` feature only.
+export const WORD_OPERATORS = ['like', 'dispatch', 'async'];
 
 export const AGGREGATES = [
   'sum', 'avg', 'mean', 'min', 'max', 'count', 'first', 'last', 'std', 'dev',
@@ -23,6 +25,10 @@ export const AGGREGATES = [
   'abs', 'neg', 'not', 'string', 'n_unique', 'round', 'quantile', 'pctl',
   'shift', 'lag', 'lead', 'diff', 'pctchange', 'rolling', 'rn', 'rank',
   'drank',
+  // not aggregates, but callable barewords (`hopen 5001`, `await resp`) —
+  // grouped here since this is qpl's "function-shaped completion" bucket.
+  // `ipc` feature only.
+  'hopen', 'await',
 ];
 
 export const CAST_TYPES = [
@@ -30,7 +36,7 @@ export const CAST_TYPES = [
   'u64', 'u32', 'u16', 'u8', 'bool', 'str', 'string',
 ];
 
-export const REPL_COMMANDS = ['\\d', '\\1', '\\l', 'log'];
+export const REPL_COMMANDS = ['\\d', '\\1', '\\l', '\\port', 'log'];
 
 /** Detail strings shown alongside completion items, keyed by identifier. */
 export const AGGREGATE_DETAIL: Record<string, string> = {
@@ -57,6 +63,8 @@ export const AGGREGATE_DETAIL: Record<string, string> = {
   lead: 'lead(expr) — next value (with `over`)',
   diff: 'diff(expr) — difference from previous value',
   rolling: 'rolling(expr) — rolling window aggregate',
+  hopen: 'hopen <port | "host:port"> — open an IPC connection (`ipc` feature)',
+  await: 'await <pending> — resolve an `async dispatch` reply (`ipc` feature)',
 };
 
 export const KEYWORD_DETAIL: Record<string, string> = {
@@ -82,4 +90,7 @@ export const KEYWORD_DETAIL: Record<string, string> = {
   ij: 'inner join',
   rj: 'right join',
   like: '<str/sym> like <pattern> — q-glob match (* any sequence, ? one char, [..] a class)',
+  dispatch: '<conn> dispatch <stmt> — send a statement to a connection, block for the reply (`ipc` feature)',
+  async: '<conn> async dispatch <stmt> — like dispatch, but returns immediately (`ipc` feature)',
+  '\\port': '\\port <n> — start serving on port n; bare \\port stops (`ipc` feature, REPL only)',
 };

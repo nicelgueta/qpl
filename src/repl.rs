@@ -106,7 +106,30 @@ pub fn start(vm: &mut Vm) {
     );
 
     let mut buf: Vec<String> = Vec::new();
+    #[cfg(feature = "ipc")]
+    let mut port_session: Option<PortSession> = None;
+
     loop {
+        // Once `\port` has been used at least once, service both stdin and
+        // any open listener by polling instead of a blocking `readline()` —
+        // that's what lets a request arriving over the socket interleave with
+        // whatever the operator is typing. This does mean losing rustyline's
+        // line-editing/history from that point on for the rest of the
+        // session; there's no clean way to hand stdin back to rustyline once
+        // another thread owns reading it.
+        #[cfg(feature = "ipc")]
+        if let Some(session) = port_session.as_mut() {
+            match session.poll() {
+                PortEvent::Line(line) => process_submitted(&line, vm),
+                PortEvent::Request(command, reply_tx) => {
+                    let result = eval_for_dispatch(&command, vm);
+                    let _ = reply_tx.send(crate::ipc::encode_result(&result));
+                }
+                PortEvent::StdinClosed => break,
+            }
+            continue;
+        }
+
         let prompt = if buf.is_empty() { "qpl) " } else { "  ...  " };
         match rl.readline(prompt) {
             Ok(line) => {
@@ -130,28 +153,15 @@ pub fn start(vm: &mut Vm) {
                     continue;
                 }
                 let _ = rl.add_history_entry(&src);
-                if let Some(inner) = src.strip_prefix("\\d").map(str::trim) {
-                    match disassemble(inner) {
-                        Ok(listing) => println!("{listing}"),
-                        Err(e) => eprintln!("{}", fmt_repl_error(&e)),
-                    }
-                    continue;
-                }
-                if let Some(path) = src.strip_prefix("\\l").map(str::trim) {
-                    if let Err(e) = run_script(path, vm) {
+                #[cfg(feature = "ipc")]
+                if let Some(rest) = src.strip_prefix("\\port").map(str::trim) {
+                    let session = port_session.get_or_insert_with(PortSession::new);
+                    if let Err(e) = handle_port_directive(rest, session) {
                         eprintln!("{}", fmt_repl_error(&e));
                     }
                     continue;
                 }
-                if let Some(result) = system_command(&src, vm) {
-                    if let Err(e) = result {
-                        eprintln!("{}", fmt_repl_error(&e));
-                    }
-                    continue;
-                }
-                if let Err(e) = match_run_vm(&src, vm, "<main>", 0) {
-                    eprintln!("{}", fmt_repl_error(&e))
-                };
+                process_submitted(&src, vm);
             }
             Err(ReadlineError::Interrupted) => {
                 // abandon a partial statement, or exit at an empty prompt
@@ -160,6 +170,156 @@ pub fn start(vm: &mut Vm) {
             }
             Err(ReadlineError::Eof) => break,
             Err(e) => { eprintln!("readline error: {e}"); break; }
+        }
+    }
+}
+
+/// `\d` / `\l` / `\1` / an ordinary statement — everything a submitted line
+/// can be *except* `\port`, which needs REPL-loop state (`PortSession`) this
+/// function doesn't have. Shared by both the normal (rustyline) input path
+/// and, once a port has been opened, the polling loop's stdin lines.
+fn process_submitted(src: &str, vm: &mut Vm) {
+    if let Some(inner) = src.strip_prefix("\\d").map(str::trim) {
+        match disassemble(inner) {
+            Ok(listing) => println!("{listing}"),
+            Err(e) => eprintln!("{}", fmt_repl_error(&e)),
+        }
+        return;
+    }
+    if let Some(path) = src.strip_prefix("\\l").map(str::trim) {
+        if let Err(e) = run_script(path, vm) {
+            eprintln!("{}", fmt_repl_error(&e));
+        }
+        return;
+    }
+    if let Some(result) = system_command(src, vm) {
+        if let Err(e) = result {
+            eprintln!("{}", fmt_repl_error(&e));
+        }
+        return;
+    }
+    if let Err(e) = match_run_vm(src, vm, "<main>", 0) {
+        eprintln!("{}", fmt_repl_error(&e));
+    }
+}
+
+/// `\port <n>` opens a listener (closing any previously open one first);
+/// bare `\port` closes it. Only reachable from `start()` — `\port` doesn't
+/// exist for script mode (`run_script` never calls this), per its being
+/// meaningless outside a long-lived interactive session.
+#[cfg(feature = "ipc")]
+fn handle_port_directive(rest: &str, session: &mut PortSession) -> Result<(), QplError> {
+    session.close_port();
+    if rest.is_empty() {
+        return Ok(());
+    }
+    let port: u16 = rest.parse()
+        .map_err(|_| QplError::Runtime(format!("\\port: expected a port number, got '{rest}'")))?;
+    session.open_port(port)
+}
+
+/// Evaluate one command received over `\port`, treating it exactly like a
+/// REPL line — `.qpl.cfg` directives, `log`/`1` writes, and ordinary
+/// statements (selects, updates, deletes, assignments, function defs) all
+/// work. `\`-prefixed system commands (`\d`, `\l`, `\1`, `\port` itself)
+/// are deliberately not reachable this way — they're local REPL/session
+/// administration, not part of the query language a remote client dispatches.
+#[cfg(feature = "ipc")]
+fn eval_for_dispatch(line: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
+    if let Some(args) = cfg_directive(line) {
+        apply_cfg(args, vm)?;
+        return Ok(EvalResult::Stored);
+    }
+    // `log_target` also recognises the terse `1 <expr>` stdout-write shorthand
+    // (kdb's `1 x` writes to stdout handle 1) — fine for a human typing at a
+    // local prompt, who'd naturally avoid it when they mean the number 1, but
+    // `command` here is machine-rendered text (`render_tokens`), which cannot
+    // make that same judgement call: `1 + 1` is indistinguishable at the
+    // string level from the `1 <expr>` directive. Dispatch only recognises
+    // the unambiguous `log ` spelling; a literal `1 ...` falls through to
+    // `run_vm` as an ordinary statement instead.
+    if let Some(arg) = log_target(line).filter(|_| !line.trim_start().starts_with(['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'])) {
+        let mut text = String::new();
+        for expr in parse_expr_seq(tokenise(arg)?)? {
+            let val = match resolve::eval_value(vm, &expr)? {
+                resolve::EvalValue::Scalar(v) => v,
+                resolve::EvalValue::Frame { .. } => {
+                    return Err(QplError::Runtime(
+                        "log expects a scalar expression, got a table".into(),
+                    ))
+                }
+            };
+            text.push_str(&fmt_log_val(&val));
+        }
+        vm.emit(&text);
+        return Ok(EvalResult::Stored);
+    }
+    run_vm(line, vm)
+}
+
+/// REPL-loop-side state for `\port`: a stdin-reader thread (spawned once, the
+/// first time `\port` is used) feeding lines to the polling loop in `start()`,
+/// plus whichever listener is currently open, if any.
+#[cfg(feature = "ipc")]
+struct PortSession {
+    stdin_rx: std::sync::mpsc::Receiver<String>,
+    port: Option<(crate::ipc::ServerHandle, std::sync::mpsc::Receiver<crate::ipc::PortRequest>)>,
+}
+
+#[cfg(feature = "ipc")]
+enum PortEvent {
+    Line(String),
+    Request(String, std::sync::mpsc::Sender<Vec<u8>>),
+    StdinClosed,
+}
+
+#[cfg(feature = "ipc")]
+impl PortSession {
+    fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::stdin().lock().lines() {
+                match line {
+                    Ok(l) => {
+                        if tx.send(l).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self { stdin_rx: rx, port: None }
+    }
+
+    fn open_port(&mut self, port: u16) -> Result<(), QplError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = crate::ipc::start_server(port, tx)?;
+        self.port = Some((handle, rx));
+        Ok(())
+    }
+
+    fn close_port(&mut self) {
+        if let Some((handle, _)) = self.port.take() {
+            handle.close();
+        }
+    }
+
+    /// Block until either a stdin line or a socket request is available.
+    fn poll(&mut self) -> PortEvent {
+        loop {
+            match self.stdin_rx.try_recv() {
+                Ok(line) => return PortEvent::Line(line),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return PortEvent::StdinClosed,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if let Some((_, rx)) = &self.port
+                && let Ok((command, reply_tx)) = rx.try_recv()
+            {
+                return PortEvent::Request(command, reply_tx);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
         }
     }
 }
@@ -411,6 +571,45 @@ mod tests {
             polars::df!["price" => [1.0f64, 2.0, 3.0]].unwrap(),
         );
         assert_eq!(logged(&mut vm, "log (max t`price)"), "3");
+    }
+
+    #[cfg(feature = "ipc")]
+    #[test]
+    fn dispatch_does_not_mistake_an_arithmetic_expression_for_the_1_stdout_shorthand() {
+        // regression: `render_tokens` renders `1+1` as `1 + 1` (the lexer is
+        // whitespace-insensitive, so this is a fine reconstruction on its own),
+        // but `log_target`'s `1 <expr>` shorthand (kdb's stdout handle 1) then
+        // misreads that leading "1 " as the directive, not the literal 1 — so
+        // `eval_for_dispatch` must not apply that shorthand to dispatched text.
+        let mut vm = Vm::new();
+        match super::eval_for_dispatch("1 + 1", &mut vm) {
+            Ok(crate::vm::EvalResult::Scalar(crate::ast::Value::Int(2))) => {}
+            other => panic!("expected Scalar(2), got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "ipc")]
+    #[test]
+    fn dispatch_still_supports_the_log_keyword_shorthand() {
+        let mut vm = Vm::new();
+        let path = std::env::temp_dir().join(format!("qpl_dispatch_log_test_{:?}", std::thread::current().id()));
+        vm.stdout_log = Some(std::fs::File::create(&path).unwrap());
+        super::eval_for_dispatch(r#"log "hi""#, &mut vm).expect("eval_for_dispatch");
+        vm.stdout_log = None;
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(out.trim_end(), "hi");
+    }
+
+    #[cfg(feature = "ipc")]
+    #[test]
+    fn dispatch_runs_an_ordinary_statement() {
+        let mut vm = Vm::new();
+        vm.tables.insert("t".into(), polars::df!["c" => [1i64, 2, 3]].unwrap());
+        match super::eval_for_dispatch("select c from t where c > 1", &mut vm) {
+            Ok(crate::vm::EvalResult::Table(df)) => assert_eq!(df.height(), 2),
+            other => panic!("expected a table, got {other:?}"),
+        }
     }
 
     #[test]

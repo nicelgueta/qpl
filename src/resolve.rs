@@ -12,6 +12,8 @@ use polars::prelude::*;
 use crate::ast::{self, Expr, TableExpr, Value};
 use crate::errors::QplError;
 use crate::vm::{Lookup, Vm};
+#[cfg(feature = "ipc")]
+use crate::vm::EvalResult;
 
 /// The outcome of evaluating a value expression: a concrete scalar / list, or a
 /// frame (a bare table name, a multi-column `select`, `n#<table>`).
@@ -35,6 +37,19 @@ fn expect_scalar(v: EvalValue) -> Result<ast::Value, QplError> {
     }
 }
 
+/// A dispatched command's outcome, on the client: a table binds like any
+/// other table (`t2: t`); a scalar/`Stored`/`Lazy` result folds to the same
+/// `Value` shape the REPL would show for it (see `Expr::Dispatch`).
+#[cfg(feature = "ipc")]
+fn eval_result_to_value(result: EvalResult) -> Result<EvalValue, QplError> {
+    Ok(match result {
+        EvalResult::Table(df) => EvalValue::Frame { lf: df.lazy(), lazy: false },
+        EvalResult::Scalar(v) => EvalValue::Scalar(v),
+        EvalResult::Stored => EvalValue::Scalar(Value::Bool(true)),
+        EvalResult::Lazy(text) => EvalValue::Scalar(Value::Str(text)),
+    })
+}
+
 /// Evaluate a value expression coming from `Instruction::Eval`.
 pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
     match expr {
@@ -46,6 +61,32 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
 
         // `f[a;b]` / `f[]` — user-function application.
         Expr::Apply { func, args } => apply_function(vm, func, args),
+
+        // `<conn> dispatch <cmd>` / `<conn> async dispatch <cmd>` — ship `cmd`
+        // to `conn` for remote evaluation. Value context only, like `Table`
+        // above; `command` is already-rendered source text (see `Expr::Dispatch`).
+        #[cfg(feature = "ipc")]
+        Expr::Dispatch { conn, command, is_async } => {
+            let handle = match expect_scalar(eval_value(vm, conn)?)? {
+                Value::Handle(id) => id,
+                other => return Err(QplError::Runtime(
+                    format!("dispatch expects a connection (from hopen), got {other:?}"))),
+            };
+            let client = vm.connections.get(&handle)
+                .ok_or_else(|| QplError::Runtime("dispatch: no such connection (closed?)".into()))?;
+            if *is_async {
+                let rx = crate::ipc::enqueue(client, command.clone())?;
+                let id = vm.next_handle;
+                vm.next_handle += 1;
+                vm.pending.insert(id, rx);
+                Ok(EvalValue::Scalar(Value::Future(id)))
+            } else {
+                eval_result_to_value(crate::ipc::dispatch_blocking(client, command.clone())?)
+            }
+        }
+        #[cfg(not(feature = "ipc"))]
+        Expr::Dispatch { .. } => Err(QplError::Runtime(
+            "dispatch requires qpl to be built with `--features ipc`".into())),
 
         // `f[x]` parsed as an index but `f` names a user function → monadic
         // application. Otherwise falls through to positional indexing below.
@@ -90,6 +131,38 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
             };
             let picked = index_list(list, &idxs)?;
             Ok(EvalValue::Scalar(if atom { scalarise(picked)? } else { picked }))
+        }
+
+        // `conn: hopen 5001` / `hopen "host:5001"`.
+        #[cfg(feature = "ipc")]
+        Expr::Call { func, args } if func == "hopen" && args.len() == 1 => {
+            let addr = match expect_scalar(eval_value(vm, &args[0])?)? {
+                Value::Str(s) | Value::Sym(s) => s,
+                Value::Int(n) => n.to_string(),
+                other => return Err(QplError::Runtime(
+                    format!("hopen expects a port or \"host:port\", got {other:?}"))),
+            };
+            let conn = crate::ipc::hopen(&addr)?;
+            let id = vm.next_handle;
+            vm.next_handle += 1;
+            vm.connections.insert(id, conn);
+            Ok(EvalValue::Scalar(Value::Handle(id)))
+        }
+        // `result: await resp` — resolve a pending `async dispatch` reply.
+        #[cfg(feature = "ipc")]
+        Expr::Call { func, args } if func == "await" && args.len() == 1 => {
+            let id = match expect_scalar(eval_value(vm, &args[0])?)? {
+                Value::Future(id) => id,
+                other => return Err(QplError::Runtime(format!(
+                    "await expects a pending response (from async dispatch), got {other:?}"))),
+            };
+            let rx = vm.pending.remove(&id).ok_or_else(|| QplError::Runtime(
+                "await: no such pending response (already awaited?)".into()))?;
+            eval_result_to_value(crate::ipc::await_reply(rx)?)
+        }
+        #[cfg(not(feature = "ipc"))]
+        Expr::Call { func, args } if (func == "hopen" || func == "await") && args.len() == 1 => {
+            Err(QplError::Runtime(format!("'{func}' requires qpl to be built with `--features ipc`")))
         }
 
         // `sum trades`price`, `2 shift px`, `2 round px`, `cumsum px`, …
@@ -390,6 +463,9 @@ fn list_to_lazy(list: Value) -> Result<LazyFrame, QplError> {
                 .map_err(rt)?
                 .lazy()
                 .select([crate::vm::ast_val_to_expr(v)?.alias("x")]));
+        }
+        v @ (Value::Handle(_) | Value::Future(_)) => {
+            return Err(QplError::Runtime(format!("{v:?} is not a list or column expression")))
         }
     };
     Ok(s.into_frame().lazy())

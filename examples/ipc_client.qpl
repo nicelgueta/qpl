@@ -1,0 +1,26 @@
+/ ─────────────────────────────────────────────────────────────────────────────
+/ IPC client half. Requires the `ipc` feature (off by default) and a server
+/ already listening — see examples/ipc_server.qpl. Run:
+/
+/   cargo run --features ipc -- examples/ipc_client.qpl
+/ ─────────────────────────────────────────────────────────────────────────────
+
+conn: hopen 5001
+
+log "blocking dispatch — a scalar comes back as a real scalar"
+r1: conn dispatch 1 + 1
+log r1
+
+log "dispatch a query — comes back as a real, further-queryable table"
+hot: conn dispatch select sym, price from trades where price > 150
+hot
+
+log "dispatch an assignment — mutates the server's own session; nothing to print"
+ack: conn dispatch summary: select avg price by sym from trades
+log ack
+
+log "async dispatch returns immediately; await resolves it later"
+pending: conn async dispatch select sym from trades
+/ ... the client is free to do other work here while the server computes ...
+result: await pending
+result

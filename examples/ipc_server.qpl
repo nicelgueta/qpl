@@ -1,0 +1,15 @@
+/ ─────────────────────────────────────────────────────────────────────────────
+/ IPC server half. Requires the `ipc` feature (off by default).
+/
+/ This script alone just sets up the demo tables — the actual `\port` command
+/ has to be typed at the REPL prompt (or piped after this script runs), since
+/ opening a port only makes sense in a long-lived interactive session. Run:
+/
+/   cargo run --features ipc -- -i --load-demo examples/ipc_server.qpl
+/   qpl) \port 5001
+/
+/ Then, in another terminal, run examples/ipc_client.qpl against it.
+/ `\port` (no argument) closes the listener again.
+/ ─────────────────────────────────────────────────────────────────────────────
+
+log "demo tables `trades` / `quotes` are ready — now run: \\port 5001"

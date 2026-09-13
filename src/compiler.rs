@@ -350,6 +350,8 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
             "positional indexing is only valid outside a select projection".into())),
         Expr::Apply { .. } => return Err(QplError::Compile(
             "a user function call `f[..]` is only valid outside a select projection".into())),
+        Expr::Dispatch { .. } => return Err(QplError::Compile(
+            "`dispatch` is only valid outside a select projection".into())),
     }
     Ok(())
 }

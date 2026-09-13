@@ -6,3 +6,5 @@
 # stdout logs written by examples/logging.qpl (and \1 in general)
 *.log
 *.vsix
+
+.claude/worktrees/

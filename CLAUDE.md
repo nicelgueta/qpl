@@ -24,6 +24,8 @@ cargo run -- --load-demo    # REPL preloaded with demo `trades` / `quotes` table
 cargo run -- script.qpl     # execute a script
 cargo run -- -i script.qpl  # execute a script, then drop into the REPL
 cargo run -- examples/lazy_join_pipeline.qpl   # run an example
+cargo build --features ipc                      # + hopen/dispatch/await, \port (see Architecture)
+cargo test --features ipc                       # ipc.rs's tests only run with the feature on
 ```
 
 There is no separate lint step configured; use `cargo clippy` and `cargo fmt` as normal.
@@ -71,6 +73,7 @@ carries across lines because the same `Vm` is reused.
 | `vm` | executes instructions against a `StackObj` stack, building a Polars `LazyFrame`; holds all interpreter state |
 | `repl` | REPL loop, script runner (`logical_statements` folds indented continuation lines into one statement; the interactive loop instead uses `wants_more` — brackets/trailing-comma/parse-cut-off — to decide whether to keep reading), demo tables, result formatting. Also home to the string-level features that never reach the VM: `\` system commands (`\d` disassemble, `\l <path>` run a script, `\1 <path>` stdout log) and the `log` / `1` stdout-write (`parser::parse_expr_seq` parses its space-separated args, each rendered via `eval_scalar` and concatenated). All printing goes through `Vm::emit`, which mirrors to the stdout log |
 | `errors` | `QplError` (Lex/Parse/Compile/Runtime variants) — the single error type threaded everywhere |
+| `ipc` | `ipc` feature only (`#[cfg(feature = "ipc")]`, `mod ipc;` in `main.rs` is itself gated). Client (`hopen`/`dispatch`/`async dispatch`/`await`) and server (`\port`) over a plain `zeromq` REQ/REP pair — see the IPC subsection below |
 
 ### VM state and evaluation model
 
@@ -96,6 +99,36 @@ expressions in later queries.
 
 The virtual column `i` (row index) is `PushIColRef` / `Expr::IColRef`, aliased
 to `x` in output per q convention.
+
+### IPC (`ipc` feature)
+
+Off by default; `zeromq`/`tokio` are `optional` deps in `Cargo.toml`, pulled in
+only by `ipc = ["dep:tokio", "dep:zeromq"]`. This is the one place the codebase
+is not fully synchronous, and it's deliberately confined: `Vm` itself is never
+shared across threads (no `Arc`/`Mutex` anywhere in it) — every connection's
+worker thread (client) and the listener thread (server, `\port`) only ever
+exchange owned `String`/`Vec<u8>` values over `std::sync::mpsc`, and the *only*
+thread that ever calls into `resolve::eval_value`/`vm::run_vm` is the main
+REPL thread, exactly as if the request had been typed locally. See `ipc.rs`'s
+module doc for the full design.
+
+`hopen`/`await` needed **zero** parser/lexer changes — they ride the existing
+generic bareword-call grammar (`sum price`, `not sym`), landing as new
+`Expr::Call` arms in `resolve::eval_value` (which has `&mut Vm`; `vm::eval_scalar`
+does not, and can't be the integration point for anything with side effects).
+`dispatch`/`async dispatch` needed one new `Expr::Dispatch` variant (value-context
+only, tree-walked like `Expr::Table` — nothing for the compiler to lower) plus a
+parser addition that captures the rest of the statement as raw text via
+`render_tokens` (an inverse-lexer in `parser.rs`), since the payload can be a
+whole table expression, not a scalar arg. `ast::Value` gained two variants,
+`Handle`/`Future`, for connection/pending-response handles — not `#[cfg]`-gated
+themselves (that would force every exhaustive `match` over `Value` elsewhere to
+grow a `#[cfg]` arm too), only the code that produces them is.
+
+The wire response mirrors `vm::EvalResult` (`ipc::encode_result`/`decode_response`):
+a table serialises via the existing Parquet writer/reader (already linked for
+`load`/`sink`, no new Polars feature), a scalar via a small hand-rolled
+tag+payload encoding for every `ast::Value` variant (no serde dependency).
 
 ## Making language changes
 

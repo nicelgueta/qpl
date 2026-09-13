@@ -491,6 +491,23 @@ impl Parser {
                 right: Box::new(right),
             });
         }
+        // `<conn> dispatch <rest>` / `<conn> async dispatch <rest>` — the payload
+        // is a whole statement (often a table expression, e.g. `select from t`),
+        // not a scalar `Expr`, so it can't be parsed as a normal argument; instead
+        // capture everything left in the token stream verbatim and reconstruct
+        // its source text (`render_tokens`) for the server to tokenise/parse/eval
+        // independently, exactly as if it were typed at that server's REPL.
+        let is_async_dispatch = matches!(self.peek(), TokenKind::Name(n) if n == "async")
+            && matches!(self.peek2(), TokenKind::Name(n) if n == "dispatch");
+        if is_async_dispatch || matches!(self.peek(), TokenKind::Name(n) if n == "dispatch") {
+            if is_async_dispatch {
+                self.next(); // consume `async`
+            }
+            self.next(); // consume `dispatch`
+            let command = render_tokens(&self.tokens[self.i..]);
+            self.i = self.tokens.len();
+            return Ok(Expr::Dispatch { conn: Box::new(left), command, is_async: is_async_dispatch });
+        }
         // call: left(args)
         if let Expr::ColRef(name) = &left {
             if is_noun_start(self.peek()) {
@@ -1071,6 +1088,85 @@ fn table_ref(name: String) -> TableExpr {
     TableExpr::Source(TableSource::InMem(name))
 }
 
+/// Reconstructs source text from a token slice — the inverse of the lexer,
+/// used by `dispatch` to ship the rest of a statement to another process as
+/// plain text (see `Expr::Dispatch`). The lexer is whitespace-insensitive
+/// around punctuation, so joining every rendered token with a single space is
+/// always safe: the result doesn't have to be byte-identical to what the user
+/// typed, only re-tokenise/re-parse to the same AST.
+fn render_tokens(tokens: &[Token]) -> String {
+    let mut parts = Vec::with_capacity(tokens.len());
+    for t in tokens {
+        let s = match &t.kind {
+            TokenKind::Select => "select".to_string(),
+            TokenKind::By => "by".to_string(),
+            TokenKind::From => "from".to_string(),
+            TokenKind::Where => "where".to_string(),
+            TokenKind::Over => "over".to_string(),
+            TokenKind::Order => "order".to_string(),
+            TokenKind::Asc => "asc".to_string(),
+            TokenKind::Desc => "desc".to_string(),
+            TokenKind::Distinct => "distinct".to_string(),
+            TokenKind::Limit => "limit".to_string(),
+            TokenKind::Drop => "drop".to_string(),
+            TokenKind::Update => "update".to_string(),
+            TokenKind::Delete => "delete".to_string(),
+            TokenKind::Load => "load".to_string(),
+            TokenKind::Sink => "sink".to_string(),
+            TokenKind::Cols => "cols".to_string(),
+            TokenKind::Lazy => "lazy".to_string(),
+            TokenKind::Collect => "collect".to_string(),
+            TokenKind::Name(n) => n.clone(),
+            TokenKind::Int(n) => n.to_string(),
+            TokenKind::Float(f) => f.to_string(),
+            TokenKind::Symbol(s) => format!("`{s}"),
+            TokenKind::SymbolVec(v) => v.iter().map(|s| format!("`{s}")).collect(),
+            TokenKind::Bool(b) => if *b { "1b".into() } else { "0b".into() },
+            TokenKind::BoolVec(v) => {
+                let bits: String = v.iter().map(|b| if *b { '1' } else { '0' }).collect();
+                format!("{bits}b")
+            }
+            TokenKind::Str(s) => render_str_literal(s),
+            TokenKind::Temporal(v) => crate::temporal::format_temporal(v)
+                .unwrap_or_else(|| format!("{v:?}")),
+            TokenKind::QplNow(name) => name.clone(),
+            TokenKind::Colon => ":".to_string(),
+            TokenKind::ColonColon => "::".to_string(),
+            TokenKind::Comma => ",".to_string(),
+            TokenKind::Semicolon => ";".to_string(),
+            TokenKind::LParen => "(".to_string(),
+            TokenKind::RParen => ")".to_string(),
+            TokenKind::LBracket => "[".to_string(),
+            TokenKind::RBracket => "]".to_string(),
+            TokenKind::LBrace => "{".to_string(),
+            TokenKind::RBrace => "}".to_string(),
+            TokenKind::Bang => "!".to_string(),
+            TokenKind::Hash => "#".to_string(),
+            TokenKind::Op(op) => op.clone(),
+            TokenKind::Eof => continue,
+        };
+        parts.push(s);
+    }
+    parts.join(" ")
+}
+
+fn render_str_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1269,6 +1365,56 @@ mod tests {
     fn where_like() {
         let s = sel(r#"select px from trades where sym like "AA*""#);
         assert_eq!(s.where_, Some(vec![binop(cref("sym"), "like", Expr::Lit(Value::Str("AA*".into())))]));
+    }
+
+    #[test]
+    fn dispatch_captures_the_rest_of_the_statement_as_text() {
+        match p("conn dispatch select from t where price > 100") {
+            Stmt::SingleVar(Expr::Dispatch { conn, command, is_async }) => {
+                assert_eq!(*conn, Expr::ColRef("conn".into()));
+                assert_eq!(command, "select from t where price > 100");
+                assert!(!is_async);
+            }
+            other => panic!("expected dispatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn async_dispatch_sets_the_async_flag() {
+        match p("resp: conn async dispatch select from t") {
+            Stmt::ScalarAssign { expr: Expr::Dispatch { command, is_async, .. }, .. } => {
+                assert_eq!(command, "select from t");
+                assert!(is_async);
+            }
+            other => panic!("expected async dispatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_command_round_trips_through_render_tokens() {
+        // the rendered text isn't necessarily byte-identical to the input, but
+        // it must re-tokenise/re-parse to the same AST the original would have.
+        let src = r#"select sym, px: price from trades where sym like "AA*""#;
+        let original = sel(src);
+        match p(&format!("conn dispatch {src}")) {
+            Stmt::SingleVar(Expr::Dispatch { command, .. }) => {
+                let roundtripped = sel(&command);
+                assert_eq!(roundtripped, original);
+            }
+            other => panic!("expected dispatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_string_literal_escaping_round_trips() {
+        let src = r#"conn dispatch select from t where s = "a \"quoted\" str""#;
+        match p(src) {
+            Stmt::SingleVar(Expr::Dispatch { command, .. }) => {
+                assert!(parse(tokenise(&command).unwrap()).is_ok());
+                assert!(command.contains(r#"a \"quoted\" str"#));
+            }
+            other => panic!("expected dispatch, got {other:?}"),
+        }
     }
 
     #[test]

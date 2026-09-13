@@ -31,6 +31,19 @@ pub struct Vm {
     pub stdout_log: Option<std::fs::File>,
     /// Session-wide knobs set from `.qpl.cfg key=value ...`.
     pub config: VmConfig,
+    /// Open `hopen` connections, keyed by the `Value::Handle` id returned to
+    /// the caller. `ipc` feature only.
+    #[cfg(feature = "ipc")]
+    pub connections: HashMap<i64, crate::ipc::ClientConn>,
+    /// Outstanding `async dispatch` replies, keyed by the `Value::Future` id;
+    /// removed and resolved by `await`. `ipc` feature only.
+    #[cfg(feature = "ipc")]
+    pub pending: HashMap<i64, crate::ipc::ReplyRx>,
+    /// Next id handed out by `hopen`/`async dispatch` — one counter shared by
+    /// both, so a `Value::Handle` and a `Value::Future` are never confusable.
+    /// `ipc` feature only.
+    #[cfg(feature = "ipc")]
+    pub next_handle: i64,
 }
 
 /// One user-function call frame: params and any names the body binds, isolated
@@ -185,6 +198,12 @@ impl Vm {
             scopes: Vec::new(),
             stdout_log: None,
             config: VmConfig::default(),
+            #[cfg(feature = "ipc")]
+            connections: HashMap::new(),
+            #[cfg(feature = "ipc")]
+            pending: HashMap::new(),
+            #[cfg(feature = "ipc")]
+            next_handle: 0,
         }
     }
 
@@ -813,6 +832,7 @@ impl Vm {
     }
 }
 
+#[derive(Debug)]
 pub enum EvalResult {
     Table(DataFrame),
     Stored,
@@ -905,6 +925,9 @@ pub(crate) fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
             lit(ns + temporal::NS_2000_TO_1970).cast(DataType::Datetime(TimeUnit::Nanoseconds, None))
         }
         ast::Value::Timespan(ns) => lit(ns).cast(DataType::Duration(TimeUnit::Nanoseconds)),
+        v @ (ast::Value::Handle(_) | ast::Value::Future(_)) => {
+            return Err(QplError::Runtime(format!("{v:?} cannot be used in a query expression")))
+        }
     })
 }
 

@@ -12,6 +12,7 @@ Runnable `.qpl` scripts. All paths assume you run them from the repo root.
 | [`lazy_and_collect.qpl`](lazy_and_collect.qpl) | `lazy` to keep a query plan, extend it by re-assignment, print the plan, `collect` to a table |
 | [`lazy_join_pipeline.qpl`](lazy_join_pipeline.qpl) | A full pipeline that scans two parquet files, joins, derives + aggregates + sorts, and sinks to parquet **without ever collecting** |
 | [`setup_data.qpl`](setup_data.qpl) | Regenerates the sample parquet inputs (already committed under `data/`) |
+| [`ipc_server.qpl`](ipc_server.qpl) / [`ipc_client.qpl`](ipc_client.qpl) | `hopen` / `dispatch` / `async dispatch` / `await` / `\port` — requires `--features ipc`, two processes |
 
 
 ## Sample data
@@ -41,3 +42,17 @@ qpl examples/lazy_join_pipeline.qpl
 
 
 `lazy_join_pipeline.qpl` writes `data/market_summary.parquet` when it runs.
+
+
+## IPC (optional feature)
+
+`ipc_server.qpl` / `ipc_client.qpl` need two terminals and the `ipc` feature:
+
+```bash
+# terminal 1 — server: runs the script, then drops into the REPL (`-i`)
+cargo run --features ipc -- -i --load-demo examples/ipc_server.qpl
+qpl) \port 5001
+
+# terminal 2 — client
+cargo run --features ipc -- examples/ipc_client.qpl
+```

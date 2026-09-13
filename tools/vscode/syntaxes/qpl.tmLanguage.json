@@ -23,7 +23,7 @@
       "match": "/.*$"
     },
     "repl": {
-      "match": "^\\s*(\\\\[d1]|log)\\b",
+      "match": "^\\s*(\\\\(?:[d1l]|port)|log)\\b",
       "captures": {
         "1": { "name": "keyword.other.repl.qpl" }
       }
@@ -75,7 +75,7 @@
       "patterns": [
         {
           "name": "keyword.control.qpl",
-          "match": "\\b(select|by|from|where|over|order|asc|desc|distinct|limit|drop|update|delete|lj|ij|rj|like)\\b"
+          "match": "\\b(select|by|from|where|over|order|asc|desc|distinct|limit|drop|update|delete|lj|ij|rj|like|dispatch|async)\\b"
         },
         {
           "name": "keyword.other.qpl",
@@ -92,7 +92,7 @@
     },
     "aggregate": {
       "name": "support.function.aggregate.qpl",
-      "match": "\\b(sum|avg|mean|min|max|count|first|last|std|dev|var|med|median|mode|modal|skew|kurt|kurtosis|any|all|prod|product|argmin|argmax|nnull|null_count|cumsum|cummax|cummin|cumprod|cumcount|ffill|bfill|abs|neg|not|string|n_unique|round|quantile|pctl|shift|lag|lead|diff|pctchange|rolling|rn|rank|drank)\\b"
+      "match": "\\b(sum|avg|mean|min|max|count|first|last|std|dev|var|med|median|mode|modal|skew|kurt|kurtosis|any|all|prod|product|argmin|argmax|nnull|null_count|cumsum|cummax|cummin|cumprod|cumcount|ffill|bfill|abs|neg|not|string|n_unique|round|quantile|pctl|shift|lag|lead|diff|pctchange|rolling|rn|rank|drank|hopen|await)\\b"
     },
     "index": {
       "name": "variable.language.index.qpl",

@@ -39,6 +39,11 @@
     "body": "select ${1:cols} from ${2:table} where ${3:col} like \"${4:pattern}\"",
     "description": "q-glob match: * any sequence, ? one char, [..] a class"
   },
+  "ipc dispatch": {
+    "prefix": "dispatch",
+    "body": "${1:conn}: hopen ${2:5001}\n${3:resp}: ${1:conn} dispatch ${4:select from t}",
+    "description": "hopen a connection and dispatch a statement to it (ipc feature)"
+  },
   "conditional": {
     "prefix": "cond",
     "body": "?[${1:pred1}; ${2:val1}; ${3:pred2}; ${4:val2}; ${5:default}]",

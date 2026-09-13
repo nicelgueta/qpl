@@ -23,6 +23,15 @@ rustyline = "18.0.1"
 # this directly for scalars; polars' own (already-linked, transitive) regex
 # engine handles the column-expression case via `.str().contains(...)`.
 regex = "1"
+# `ipc` (client hopen/dispatch/async/await, server `\port`): pure-Rust ZeroMQ,
+# no libzmq/system dependency (see the `ipc` feature below) — needs a small
+# async runtime to drive its REQ/REP sockets, confined to one thread per
+# connection / one thread for the listener; the rest of the VM stays sync.
+tokio = { version = "1", features = ["rt", "time"], optional = true }
+zeromq = { version = "0.5", optional = true }
+
+[features]
+ipc = ["dep:tokio", "dep:zeromq"]
 
 [profile.release]
 opt-level = "s"
