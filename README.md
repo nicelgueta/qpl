@@ -1,6 +1,6 @@
 # qpl — Quick Polars Query Language
 
-An agent-friendly, q/kdb+-inspired query language that compiles to Polars lazy
+An agent-friendly, q/kdb+-inspired programming language that compiles to Polars lazy
 frames. Write concise select statements; Polars runs them fast. Single binary,
 zero dependencies — no Python, no Polars install needed.
 
