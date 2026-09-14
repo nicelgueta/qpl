@@ -1,74 +1,25 @@
 # qpl — Quick Polars Query Language
 
-An agent-friendly, q/kdb+-inspired array programming language that uses a polars LazyFrame backend. Select statements are first-class; Polars runs them fast. Single binary,
-zero dependencies — no Python, no Polars install needed.
+qpl is a query language with two rather different parents. The syntax comes
+from kdb+/q, so it's terse to the point of looking cryptic until it suddenly
+doesn't. The engine underneath is [Polars](https://pola.rs), so the queries
+run at a speed competitive with DuckDB. Nothing else is involved: qpl is a
+single static binary, with no Python, no Polars install, and no runtime to
+set up.
 
-There's also a [VSCode extension](tools/vscode/) — syntax highlighting plus a
-Ctrl+Enter REPL for sending lines straight from the editor — and this same
-documentation as a browsable book at
-[nicelgueta.github.io/qpl](https://nicelgueta.github.io/qpl).
+The result is a language you can type a real query into faster than you could
+describe that query to someone else, and which will then chew through a
+parquet file considerably larger than the machine's memory.
 
-## Table of Contents
+📖 **[Read the book][book]** for the full guided tour. This README is the
+short version, and each section links to the chapter covering it properly.
 
-- [Why?](#why)
-  - [Polars](#polars)
-  - [Example](#example)
-- [Install](#install)
-- [Quickstart](#quickstart)
-- [Working incrementally](#working-incrementally)
-- [Language](#language)
-  - [Assignment](#assignment)
-  - [select / update / delete](#select--update--delete)
-  - [Column expressions & lists](#column-expressions--lists)
-  - [Expressions](#expressions)
-  - [Window functions](#window-functions)
-  - [Functions](#functions)
-  - [Casts](#casts)
-  - [Temporal types](#temporal-types)
-  - [Symbols, categoricals & enums](#symbols-categoricals--enums)
-  - [Reading & writing files](#reading--writing-files)
-  - [Table operators](#table-operators)
-  - [lazy / collect](#lazy--collect)
-  - [Comments](#comments)
-  - [Multi-line statements](#multi-line-statements)
-  - [Logging](#logging)
-  - [Config](#config)
-  - [IPC](#ipc)
-  - [Operator reference](#operator-reference)
-- [REPL](#repl)
-- [Architecture](#architecture)
-- [Releases](#releases)
-- [Roadmap](#roadmap)
+## What it looks like
 
-## Why?
+Read two parquet files, left-join them, derive columns, tag every row with a
+conditional, encode a key column, aggregate, sort, and write the result out.
 
-I often need to query large parquet files on cloud storage under time
-pressure, or knock out a quick transform job. DuckDB is great for this but isn’t great if you want to do scripty things. I usually reach for Python + Polars when I need more than just SQL, but writing out polars queries instead of SQL is verbose and slow (even using Polars SQL feels clunky as a large python string with no IDE support). Prompting an agent also feels like a waste given 80% of the time, I’m not doing anything mega complex and sometimes can be slower than
-just writing the query myself. 
-
-So: a language concise enough to type quickly without thinking, that is in essence a scripting language but supports SQL as first-class syntax with DuckDB-level query performance. As a bonus, one that LLM agents can drive easily too — and can't
-do much damage with, sandboxed or not.
-
-Ambitious? ..well. 
-
-### Polars
-Writing a DuckDB-grade engine from scratch solo isn't realistic, so I cheated:
-Polars (a dataframe library written in Rust) is the backend. Its API is clean
-enough that the "language" is really just a VM translating instructions into
-Polars queries — which left me free to build whatever front-end I wanted. according to benchmarks easily found online, Polars generally just trails DuckDB in performance so that’s good enough for me.
-
-That front-end was inspired a lot by kdb+/q, a language I'd been lightly exposed to at
-work and wanted an excuse to actually learn, while still getting to write Rust.
-
-Thus: `qpl`.
-
-### Example
-
-Read two parquet files, left-join them, derive a couple of columns, tag every
-row with a conditional, dictionary-encode a key, aggregate, sort, and write the
-result back out.
-
-DuckDB:
+In DuckDB:
 
 ```sql
 CREATE TYPE sym_t AS ENUM (SELECT DISTINCT sym FROM read_parquet('trades.parquet'));
@@ -90,7 +41,7 @@ COPY (
 ) TO 'summary.parquet' (FORMAT PARQUET);
 ```
 
-qpl — the whole thing is one statement:
+In qpl, where the whole thing is one statement:
 
 ```q
 select tot: sum price * size, avg_spread: avg ask - bid, n: count price
@@ -100,21 +51,8 @@ select tot: sum price * size, avg_spread: avg ask - bid, n: count price
     sink "summary.parquet"
 ```
 
-But the same pipeline is more naturally built up **one statement at a time** in
-the REPL — see [Working incrementally](#working-incrementally):
-
-```q
-j: select sym, side, price, size, bid, ask from load "trades.parquet" `sym lj load "quotes.parquet" `sym where price > 0
-j  / check the table so far
-j: update spread: ask - bid, notional: price * size from j
-/ try the next step without committing — don't assign, just look
-update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from j
-/ happy with it — now assign to persist
-j: update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from j
-cols j                                     / check the schema so far
-select tot: sum notional, avg_spread: avg spread, n: count price by csym: `$sym, side, band from j order tot desc
-j sink "summary.parquet"
-```
+No `CREATE TYPE` preamble, no `COPY (...) TO` wrapper to get the output onto
+disk, and the grouping keys named once rather than repeated in a `GROUP BY`.
 
 ## Install
 
@@ -122,828 +60,441 @@ j sink "summary.parquet"
 cargo install --path .
 ```
 
-Or grab a pre-built binary from [Releases](../../releases). Add `--features
-ipc` for the [IPC](#ipc) client/server (`hopen`/`dispatch`/`\port`) — off by
-default, and pulls in no extra dependencies unless enabled.
+Polars is a large crate, so a cold build takes a few minutes. Prebuilt
+binaries for Linux (gnu and musl), Linux ARM64, and macOS on Intel and Apple
+silicon are on the [releases page](../../releases).
+
+Add `--features ipc` for the [client/server][ipc], which is off by default and
+adds no dependencies to a normal build.
 
 ## Quickstart
 
 ```bash
-qpl                 # REPL, with demo tables `trades` and `quotes` preloaded
+qpl --load-demo     # REPL with demo `trades` and `quotes` tables
 qpl script.qpl      # run a script
-qpl -i script.qpl   # run a script, then drop into the REPL
+qpl -i script.qpl   # run a script, then stay in the REPL with its state
 ```
 
 ```q
+qpl) trades                                     / a bare table name prints it
 qpl) select sym, price from trades where price > 200
-qpl) select avg price by sym from trades
+qpl) select avg price by sym from trades        / group-by, key named once
 qpl) t: select from trades where size > 100     / bind a table
-qpl) t sink "big.parquet"                       / write it out
+qpl) t sink "big.parquet"                       / stream it to a file
 ```
 
-Runnable scripts are in [`examples/`](examples/) — e.g.
-`qpl examples/lazy_join_pipeline.qpl`.
+Runnable scripts are in [`examples/`](examples/), and there's a
+[VSCode extension](tools/vscode/) with syntax highlighting and a Ctrl+Enter
+REPL.
 
-Editor support (syntax highlighting + a Ctrl+Enter REPL) is in
-[`tools/vscode/`](tools/vscode/).
+## Why?
+
+I often need to query large parquet files on cloud storage under time
+pressure, or knock out a quick transform job. DuckDB is great at this but
+stops short as soon as I want to do anything scripty around the query. Python
+and Polars handle that part, but turn every query into a verbose block of
+method chaining, and Polars' SQL support means embedding a large string with
+no editor support inside it.
+
+Handing it to an agent is sometimes the right move. But for the eighty
+percent of queries that are genuinely simple, describing what I want in
+English takes longer than writing the query, assuming the language lets me
+write it quickly.
+
+So: something concise enough to type without thinking, that behaves like a
+scripting language, treats queries as first-class syntax rather than strings,
+and runs in the same league as DuckDB. A language like that also turns out to
+be easy for an agent to drive and hard for one to do much damage with.
+
+Writing a DuckDB-grade engine solo isn't realistic, so Polars does that part.
+Its API is clean enough that the language is really a small VM translating
+syntax into Polars operations, which left me free to design the front end.
+That front end borrows from q, which I'd been lightly exposed to at work and
+wanted an excuse to learn properly. [More on the reasoning][why].
 
 ## Working incrementally
 
-This is the part qpl really leans on: **a transformation is a sequence of
-statements, and you build it one statement at a time.**
-
-Every step binds a name; the binding persists, so the next step starts from it.
-There's no re-running a growing query, no stacking CTEs, no scrolling up to edit
-and resubmit a 30-line block — the loop is *type a line, look, type the next*.
+This is the part qpl leans on hardest: **a transformation is a sequence of
+statements, built one at a time.** Each step binds a name, the binding
+persists, and the next step starts from it. There's no growing query to
+re-run and no stack of CTEs.
 
 ```q
-qpl) t: load "trades.parquet"      / bind a table
-qpl) t                              / look at it
-qpl) cols t                         / ...or just its schema
-
-qpl) t: select sym, side, price, size from t where price > 0
+qpl) t: select sym, side, price, size from trades where price > 0
 qpl) t: update notional: price * size from t
 
-qpl) / not sure about the next step? run it WITHOUT assigning — the source is untouched
-qpl) update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from t
-qpl) t: update band: ?[size >= 1000; `large; size >= 250; `mid; `small] from t   / keep it
+qpl) / unsure about the next step? run it WITHOUT assigning — nothing changes
+qpl) update band: ?[size >= 250; `large; size >= 100; `mid; `small] from t
+qpl) t: update band: ?[size >= 250; `large; size >= 100; `mid; `small] from t
 
-qpl) select traded: sum notional by sym, side, band from t order traded desc
+qpl) select traded: sum notional by sym, band from t order traded desc
 qpl) t sink "out.parquet"
 ```
 
-Things that make the loop tight:
-
-- **`t` / `cols t`** — peek at a table or its schema between steps.
-- **Run a statement without assigning it** — you see the result, nothing changes.
-  Assign only once you're happy.
-- **`\d <stmt>`** — show the compiled plan without executing anything.
-- **`lazy`** binds a *plan* rather than a table: nothing touches disk until a
-  `collect` or `sink`, so building a large pipeline is instant and you pay for it
-  once, at the end.
-- In the [VSCode extension](tools/vscode/), **Ctrl+Enter** sends the current line
-  or selection to this same session.
-
-The SQL equivalent is: edit the query, re-run the whole thing, eyeball the
-result, comment a block out to isolate a step, uncomment it, repeat.
+What keeps the loop tight: printing a name or `cols t` to look between steps,
+running a statement unassigned to try it for free, `\d` to see what a
+statement compiles to, and `lazy` to defer the whole pipeline until the end.
+[Full chapter][incremental].
 
 ## Language
 
-### Assignment
+### Assignment · [chapter][assignment]
 
-`:` binds a name. The right-hand side decides what kind of binding it is:
+`:` binds a name, and the right-hand side decides what kind of binding it is.
+Scalars are evaluated in Rust and compiled into later queries as literals, so
+they compose transparently.
 
 ```q
 threshold: 150                                 / scalar
 t: select from trades where size > threshold   / table
-lvl: `low`mid`high                             / symbol vector
-px: trades`price                               / column expression → a list
-top: max trades`price                          / reduction → a scalar
+lvl: `low`mid`high                             / symbol list
+top: max trades`price                          / reduction to a scalar
 ```
 
-Scalar variables are evaluated in Rust and substituted into later queries as
-Polars literals, so they compose transparently with column expressions. See
-[Column expressions & lists](#column-expressions--lists) for `` table`col ``,
-reductions, slicing (`n#`) and indexing.
+### Symbols · [chapter][symbols]
 
-### select / update / delete
-
-```
-select <cols> from <table-expr> [by <keys>] [where <preds>] [order <col> <asc|desc>, ...]
-```
+A backtick makes a **symbol**, an atomic name used for columns and short
+labels. Data in a text column is a string; the *name* of a column is a
+symbol. Symbols written in a run need no separator, and `` `$ `` interns a
+string into one.
 
 ```q
-select from trades
-select sym, price from trades
+`low`mid`high                  / three symbols, not one
+`$"Analytics Engineer"         / a symbol with a space
+```
+
+### select / update / delete · [chapter][select]
+
+```
+<select|update|delete> <cols> from <table-expr> [by <keys>] [where <preds>] [order <col> <asc|desc>, ...]
+```
+
+`select` projects, `update` returns the whole table with columns added or
+replaced, and `delete` removes rows or columns. The clauses work the same way
+in all three.
+
+```q
+select from trades                               / no column list = all of them
 select px: price, qty: size from trades          / aliasing
-select avg price by sym from trades              / group-by aggregation
+select avg price by sym from trades              / group-by
 select total: sum size by sym from trades where side = "buy"
-select from trades where size > 100
-select from trades where size > 100, price < 400  / comma-separated preds = AND
-select from trades where (size > 400) | (side = "buy")   / & / | for and / or
+select from trades where size > 100, price < 400 / commas are AND
+select from trades where (size > 400) | (side = "buy")
 select from trades where 10100000b               / boolean-vector mask
 select from trades order sym asc, price desc
-```
 
-`from` takes any table expression, not just a table name — a nested `select`, a
-`load`, `distinct`, `lazy`, and so on all work, and this composes with the
-table operators below too:
-
-```q
-select from select price from trades where price > 100  / from a nested select
-cols select from trades where size > 100                / cols on a nested select
-select sym, price from load "data/trades.parquet"        / from a load directly
-```
-
-A join's right side (`` `sym lj/ij/rj <table> `sym ``) is a bare table name or
-`load "path"` by default; wrap it in parens to join against any other table
-expression — the parens give the parser an explicit end point, otherwise a
-nested select's own join would swallow the outer `right_on` symbols:
-
-```q
-select price, bid from trades `sym lj quotes `sym                            / bare name
-select price, bid from trades `sym lj (distinct quotes) `sym                 / any table expr, parenthesised
-select price, bid from trades `sym lj (select sym, bid from quotes where bid > 0) `sym
-```
-
-`update` returns the whole table with the named columns replaced or added:
-
-```q
-update price: price * 2 from trades
 update price: price * 2 by sym from trades where size > 100
-update notional: price * size from trades where price > 0   / new column; null where the filter misses
-```
-
-With a `where`, rows that don't match keep the column's old value — or `null` if
-it's a brand-new column.
-
-`delete` removes rows (with `where`) or columns (with a symbol list):
-
-```q
 delete from trades where size < 100
 delete `price`size from trades
 ```
 
-### Column expressions & lists
+`update`'s `where` never drops rows: non-matching rows keep their old value,
+or `null` for a brand-new column.
 
-A **column expression** pulls one column out of a table *without* a surrounding
-`select` statement. It takes one of two forms:
-
-```q
-trades`price                 / backtick a column off a table name
-select price from trades     / a one-column select
-trades`price where size > 100   / a `where` may be attached
-```
-
-Used as a value — assigned to a name, reduced, sliced or indexed — a column
-expression **materialises to a list** (`IntVec` / `FloatVec` / `StrVec` /
-`SymVec` / `BoolVec`, or a typed temporal list such as `TimestampVec` for a
-datetime column; other column dtypes, and columns containing nulls, are an
-error). A bare one-column `select` typed on its own still prints as a table; it
-becomes a list only in a value position.
+`from` takes any table expression rather than just a name, so queries nest
+without special subquery syntax:
 
 ```q
-px: trades`price             / a FloatVec global
-px: select price from trades  / same
+select from select price from trades where price > 100
+select sym, price from load "data/trades.parquet"
 ```
 
-**Reductions** (`sum` `avg`/`mean` `min` `max` `first` `last` `count`
-`std`/`dev` `var` `med`/`median` `mode`/`modal` `skew` `kurt` `any` `all`
-`prod` `argmin` `argmax` `nnull` `distinct`/`n_unique`) collapse a column
-expression to a scalar you can bind:
+Joins are `lj` / `ij` / `rj`, naming the key on each side. The right side is a
+bare table or a `load`; parenthesise anything richer, which tells the parser
+where the inner expression ends.
 
 ```q
-top:  max trades`price
-n:    count select price from trades where size > 100
-select sym, price from trades where price >= top   / the scalar composes into later queries
+select price, bid from trades `sym lj quotes `sym
+select price, bid from trades `sym lj (select sym, bid from quotes where bid > 0) `sym
 ```
 
-Any non-reducing column verb (`cumsum`, `abs`, `2 shift`, `2 round`, …) yields
-another list.
+### Reading & writing files · [chapter][files]
 
-**Slicing** — `n#<expr>` takes the first `n` rows, `-n#<expr>` the last `n`:
+`load` reads parquet or CSV and is eager on its own; `sink` streams a table
+expression out to a file; `cols` shows a schema without reading data.
 
 ```q
-3#trades`price
--3#trades`price
-3#select price from trades
+t: load "data/trades.parquet"
+select sym, price from trades where size > 100 sink "big_trades.parquet"
+cols trades
 ```
 
-`n#<whole table>` (`3#trades`, `3#select sym, price from t`) stays a table — use
-`n limit …` or `n#…` interchangeably there.
-
-**Indexing** — `list[i]` picks one element (an atom); `list[i j k]` gathers a
-sub-list. Works on a list global, a column expression, or a parenthesised
-expression, and chains:
-
-```q
-l: 10 20 30 40 50
-l[0]                         / i64: 10   (an atom)
-l[1 3 4]                     / i64[3]: 20 40 50
-sub: trades`price[2 3]       / a 2-element FloatVec: rows 2 and 3
-one: (trades`sym)[0]
-```
-
-A parenthesised expression may also be followed by a bare int run, q-style:
-`(trades`price) 2 3`.
-
-Once a column expression has been persisted as a list, `where` no longer applies
-to it — filter before materialising.
-
-Bare names in a value position resolve at run time: first a scalar global, then
-a lazy binding, then a table. `t2: trades` copies the table under a new name.
-
-**Vector arithmetic** — every list is backed by a Polars `Series`, so the usual
-operators (arithmetic, comparison) apply elementwise between a list and a
-scalar, or between two lists of the same length (or one of length 1, which
-broadcasts):
-
-```q
-l: 12 34
-l + 2                        / i64[2]: 14 36
-2 * l                        / i64[2]: 24 68
-l > 20                       / bool[2]: 01
-trades`price - trades`price[0]  / list minus a broadcast scalar
-```
-
-Every atomic scalar type has a matching list type (`IntVec` `FloatVec`
-`SymVec` `StrVec` `BoolVec` `DateVec` `MonthVec` `TimeVec` `MinuteVec`
-`SecondVec` `TimestampVec` `TimespanVec`) — a temporal column materialises to
-its typed list rather than a raw integer offset:
-
-```q
-ts: trades`ts                        / a TimestampVec
-ts + 0D00:01:00.000000000            / shift every timestamp forward one minute
-```
-
-**Filtering a list** — `<list-expr> where <predicate>` filters a list
-elementwise; `x` in the predicate refers to the current element (a comma joins
-predicates with AND, same as a table's `where`):
-
-```q
-nums: 10 20 30 40 50
-nums where x > 25              / i64[3]: 30 40 50
-nums where x > 10, x < 50      / i64[3]: 20 30 40
-trades`price where x > 400     / filter an already-materialised list by its own values
-```
-
-This is a different `where` from the one on a `` table`col `` column
-expression (which filters table *rows* by any other column before
-projecting) — the two share the keyword but not a grammar rule, so chaining
-them needs parentheses: `` (trades`price where size>100) where x>400 ``.
-
-**Building lists and tables** — `til` generates a range list; `zip` builds a
-table from a dict of same-length named lists:
-
-```q
-til 5                           / i64[5]: 0 1 2 3 4
-10 til 15                       / i64[5]: 10 11 12 13 14
-
-a: til 20
-b: 2 * til 20
-tbl: zip `cola`colb!a b         / a 2-column table, 20 rows
-```
-
-A dict literal (`` `k1`k2!v1 v2 ``) pairs a symbol (vector) key with one value
-noun per key — a compound value expression needs parens, e.g. `` `a`b!(x+1) y ``.
-
-### Expressions
+### Expressions · [chapter][expressions]
 
 | Kind | |
 |---|---|
-| arithmetic | `+` `-` `*` `%` (`%` is division, q convention) |
+| arithmetic | `+` `-` `*` `%` (`%` is division, since `/` starts a comment) |
 | comparison | `=` `<>` `!=` `<` `<=` `>` `>=` |
-| pattern match | `<str/sym> like <pattern>` — q-style glob, see below |
 | logical | `&` `\|` |
-| conditional | `?[cond; then; cond2; then2; ...; else]` — vectorised, nests for else-if |
-| cast | `type$expr` — see [Casts](#casts) |
-| round | `<precision> round <col>` — round a float column to N places |
-| dyadic verbs | `<param> verb <col>` — `quantile`/`pctl`, `shift`/`lag`, `lead`, `diff`, `pctchange` (and `round`) |
-| window | `<expr> over `p1`p2 [order `k1 asc `k2 desc] [rolling n]` — see [Window functions](#window-functions) |
-
-A leading `-` negates: `-45.3` is a negative literal, `-col` / `-x` folds to
-`0 - …` (works in scalars, column expressions and filters).
+| conditional | `?[cond; then; cond2; then2; ...; else]`, vectorised, nests for else-if |
+| pattern match | `<str/sym> like <pattern>`, q-style glob |
+| cast | `type$expr` |
+| dyadic verbs | `<param> verb <col>`: `quantile`/`pctl`, `shift`/`lag`, `lead`, `diff`, `pctchange`, `round` |
+| window | `` <expr> over `p [order `k asc] [rolling n] `` |
 
 ```q
-l: int$-45.3                                         / scalar: -45
 select price_bin: ?[price>400;`high;price>200;`mid;`low] from trades
-select neg_mv: -market_value from trades
-select mv: 2 round market_value from trades          / round to 2 dp
-select p95: 0.95 quantile price by sym from trades   / 95th percentile
-select sym, price, ret: 1 diff price by sym from trades   / row-over-row change
+select sym from trades where sym like "[AM]*"
+select mv: 2 round market_value from trades          / mode: .qpl.cfg round_type
+select p95: 0.95 quantile price by sym from trades
 ```
 
-`like` tests a string or symbol against a glob pattern, [same as q](https://code.kx.com/q/ref/like/):
-`*` matches any sequence (including empty), `?` matches exactly one character,
-and `[abc]` / `[a-z]` / `[^abc]` are character classes (case-sensitive; no
-pattern characters means an exact match). Escape a pattern character by
-putting it in its own one-character class — `[*]`, `[?]`, `[[]`, `[]]`:
-
-```q
-select sym from trades where sym like "AA*"          / starts with AA
-select sym from trades where sym like "[AM]*"        / starts with A or M
-select sym from trades where sym like "?A?L"         / exactly 4 chars, A then L
-select from trades where not sym like "AAPL"         / negate with `not`
-```
-
-`round` and the other **dyadic verbs** are q-style: the left operand is a
-parameter (a literal), the right is the column. `<p> quantile <col>` takes a
-fraction in `[0,1]`; `<n> shift <col>` (alias `lag`) moves values `n` rows later,
-`lead` `n` rows earlier; `<n> diff <col>` is the difference from `n` rows back;
-`<n> pctchange <col>` the fractional change. `round`'s rounding mode is the
-session config `round_type` (`HALF_TO_EVEN` by default; see [Config](#config)).
+`%` is always true division, even for two ints (`10 % 4` is `2.5`, not `2`) —
+q convention, unlike `+`/`-`/`*` which stay integer when both sides are.
+Evaluation is right to left, so parenthesise when an operator doesn't
+commute: `(int$"42") - 1`.
 
 **Aggregates:** `sum`, `avg`/`mean`, `min`, `max`, `count`, `first`, `last`,
-`std`/`dev`, `var`, `med`/`median`, `mode`/`modal` (modal average — most
-frequent value; ties resolve to the smallest), `skew`, `kurt`/`kurtosis`,
-`any`, `all`, `prod`/`product`, `argmin`, `argmax`, `nnull`/`null_count`,
-`abs`, `neg`, `not`, `string`, `distinct`/`n_unique`.
+`std`/`dev`, `var`, `med`/`median`, `mode`/`modal`, `skew`, `kurt`, `any`,
+`all`, `prod`, `argmin`, `argmax`, `nnull`, `distinct`/`n_unique`, plus
+`abs`, `neg`, `not`, `string`.
 
-**Ordered / cumulative** (most useful with `over` + an `order` sub-clause, which
-sorts each partition before applying): `cumsum`, `cummax`, `cummin`, `cumprod`,
-`cumcount`, `ffill` (forward-fill nulls), `bfill` (backward-fill).
+**Cumulative:** `cumsum`, `cummax`, `cummin`, `cumprod`, `cumcount`, `ffill`,
+`bfill`. Most useful with `over` and an `order`.
 
-### Window functions
+### Column expressions & lists · [chapter][columns]
 
-`<expr> over `key` computes `<expr>` per partition and broadcasts the result
-back to every row (SQL `<expr> OVER (PARTITION BY key)`). Any column expression
-or aggregate works:
+A column expression pulls one column out without a surrounding statement.
+Used as a value it materialises to a **list**; reduce it and you get a scalar
+you can feed straight back into a query.
+
+```q
+px: trades`price                / f64[8]
+top: max trades`price           / f64: 416
+select sym, price from trades where price >= top
+
+l: 10 20 30 40 50
+l[1 3 4]                        / i64[3]: 20 40 50 — index, or gather
+3#trades`price                  / first 3 (-3# for the last 3)
+l + 2                           / elementwise; scalars broadcast
+nums where x > 25               / filter a list by its own values, `x` is the element
+til 5                           / i64[5]: 0 1 2 3 4
+zip `cola`colb!a b              / build a table from named lists
+```
+
+### Casts · [chapter][casts]
+
+`f64`/`float`, `f32`, `i64`/`int`, `i32`, `i16`, `i8`, `u64`, `u32`, `u16`,
+`u8`, `bool`, `str`/`string`. Strings are parsed rather than reinterpreted.
+Integer widths collapse to one 64-bit value in scalar context and only take
+effect once in a column.
+
+```q
+int$45.3                       / 45
+int$"42"                       / 42, parsed
+select s: f64$size, y: str$sym from trades   / name them: unaliased casts both want `x`
+```
+
+### Temporal types · [chapter][temporal]
+
+kdb-style literals, each an integer offset underneath. Adding an integer
+shifts by one unit of that type's own resolution.
+
+| type | literal | counts |
+|---|---|---|
+| date | `2024.03.15` | days since `2000.01.01` |
+| month | `2024.03m` | months since `2000.01` |
+| time | `12:30:00.000` | ms into the day |
+| minute | `12:30` | minutes into the day |
+| second | `12:30:00` | seconds into the day |
+| timestamp | `2024.03.15D12:30:00.000000000` | ns since `2000.01.01` |
+| timespan | `0D12:30:00.000000000` | ns of duration |
+
+```q
+2024.03.15 + 10                     / 2024.03.25
+2024.03.15D09:30:00.0 - 0D00:05:00.000000000
+`date$2024.03.15D12:30:00.0         / 2024.03.15
+"p"$"2024.03.15D12:30:00"           / parse a string
+```
+
+Now-functions, all UTC: `.qpl.d` date, `.qpl.t` time, `.qpl.p` timestamp,
+`.qpl.n` timespan since midnight. Not yet implemented: `xbar`, `within`, unit
+accessors, and column-plus-integer temporal arithmetic.
+
+### Categoricals & enums · [chapter][enums]
+
+`` `$col `` casts a column to a Polars **categorical** (interned strings, fast
+joins and group-bys), with `u8!`/`u16!`/`u32!` choosing the code width. An
+**enum** is the ordered version: declare the order, and it fixes both sorting
+and each value's code.
+
+```q
+select country: u8!`$country from t
+
+lvl: `low`mid`high
+t: update band: lvl::`$?[size >= 250; `high; size >= 100; `mid; `low] from trades
+select from t where band >= `mid     / ordered comparison, not alphabetical
+```
+
+Values absent from an enum become null.
+
+### Window functions · [chapter][window]
+
+`over` computes per partition and broadcasts back to every row. An `order`
+sub-clause sorts the partition first, which is what makes the cumulative and
+row-relative verbs meaningful, and is required by the ranking verbs `rn`
+(`row_number`), `rank` (ties share the lower rank, then a gap) and `drank`
+(no gap).
 
 ```q
 select sym, price, top: max price over `sym from trades
 select sym, gap: (max price over `sym) - price from trades   / `over` binds tighter than `-`
+select sym, run: cumsum price over `sym order `ts asc from trades
+select sym, r: rank over `sym order `price desc from trades
+select sym, ma5: avg price over `sym order `ts asc rolling 5 from trades
 ```
 
-Partition keys are backtick symbols — one (`` `sym ``) or several (`` `sym`day ``).
+Rolling leaves the first `n-1` rows of each partition null. The virtual
+column `i` is the row index, printed as `x`.
 
-An `order` sub-clause (space-separated `` `col asc|desc `` pairs, per-column
-direction) enables the ranking verbs, which stand alone in place of `<expr>`:
-
-| Verb | SQL | Ties |
-|---|---|---|
-| `rn`    | `row_number()` | broken by row order — strict `1..n` |
-| `rank`  | `rank()`       | share the lowest rank, then a gap (`1,1,3`) |
-| `drank` | `dense_rank()` | share a rank, no gap (`1,1,2`) |
-
-```q
-select emp, country, role,
-    seat: rank over `country`role order `desk asc `date desc,
-    seniority: rn over `country order `hired asc
-    from staff
-```
-
-The ranking verbs **require** `order`. Any other aggregate **may** take it: with
-an `order` sub-clause the partition is sorted before the aggregate runs, so
-`cumsum` / `diff` / `ffill` and friends compose in a defined order (a single
-direction applies to every key — mixed asc/desc is ranking-verb only):
-
-```q
-select sym, ts, px,
-    run:  cumsum px over `sym order `ts asc,       / running total in time order
-    prev: lag px    over `sym order `ts asc         / previous row's price
-    from trades
-```
-
-**Rolling windows** — a trailing `rolling <n>` sub-clause turns the aggregate
-into a fixed `n`-row rolling reduction over the ordered partition
-(`sum`/`avg`/`min`/`max`/`std`/`var`/`median`):
-
-```q
-select sym, ts, px, ma5: avg px over `sym order `ts asc rolling 5 from trades
-```
-
-The first `n-1` rows of each partition are `null` (the window isn't full yet).
-
-**Virtual column `i`** is the row index (aliased to `x` in output, per q):
-
-```q
-select i, sym from trades
-select from trades where i < 5
-```
-
-### Functions
-
-q-style lambdas, bound to a name:
-
-```q
-add:   {[x,y] x+y}            / parameter list in [ ], body is ;-separated
-add[2;3]                      / 5   — call with bracketed args
-inc:   {[x] x+1}
-inc 41                        / 42  — a one-arg function also takes `f x`
-inc[41]                      / 42
-
-hypot2: {[a,b] s: (a*a)+(b*b); s}   / earlier statements bind call-local vars;
-hypot2[3;4]                          / the last statement is the return value
-
-fac: {[n] ?[n<2; 1; n*fac[n-1]]}   / `?[..]` works in value context, so
-fac[5]                              / recursion terminates → 120
-```
-
-A function can return a table, and its result composes like any value
-expression:
-
-```q
-bysym: {[s] select sym, price from trades where sym = s}
-bysym[`AAPL]                  / a table
-avgpx: {[s] avg select price from trades where sym = s}
-avgpx[`MSFT]                  / a scalar
-```
-
-The final statement in the body must be an expression (a trailing assignment is
-an error). Parameters and any locals the body assigns are scoped to the call —
-a function cannot mutate outer bindings. Niladic functions are written `{[] ..}`
-or `{ ..}` and called `f[]`. Functions are a named binding kind, not first-class
-values: they cannot be passed as arguments, returned, or used inside a `select`
-projection. See [examples/functions.qpl](examples/functions.qpl).
-
-### Casts
-
-`type$expr` casts a column or scalar:
-
-```q
-select f: f64$size from trades
-select f64$size, str$sym from trades
-
-l: int$45.3                    / scalar: 45
-ok: bool$"true"                / scalar: 1b
-n: 1 + int$"42"                / string parses, then composes: 43
-n:  (int$"42") - 1             / remember right to left evaluation, so parens for subtraction
-```
-
-Types: `f64`/`float`, `f32`, `i64`/`int`, `i32`, `i16`, `i8`, `u64`, `u32`,
-`u16`, `u8`, `bool`, `str`/`string`. In a scalar context every integer width
-folds to a single 64-bit integer and `f32`/`f64` to a single float — the width
-only takes effect once the value lands in a column. A string (or symbol) scalar
-is parsed: `int$"42"`, `f64$"3.5"`, `bool$"false"`.
-
-### Temporal types
-
-kdb+/q-style date & time literals. Each has an underlying integer offset that
-`` `int$ `` / `` `long$ `` exposes.
-
-| type | literal | offset |
-|---|---|---|
-| date | `2024.03.15` | days since `2000.01.01` |
-| month | `2024.03m` | months since `2000.01` |
-| time | `12:30:00.000` | ms of day (stored as ns) |
-| minute | `12:30` | minutes of day |
-| second | `12:30:00` | seconds of day |
-| timestamp | `2024.03.15D12:30:00.000000000` | ns since `2000.01.01` |
-| timespan | `0D12:30:00.000000000` | ns duration |
-
-```q
-d: 2024.03.15
-d + 10                              / 2024.03.25   (days)
-2024.03.20 - 2024.03.15             / 5
-p: 2024.03.15D09:30:00.000000000
-p - 0D00:05:00.000000000            / 2024.03.15D09:25:00.000000000
-p < 2024.03.15D16:00:00.0           / 1b
-```
-
-Adding an integer shifts by one unit of the operand's own resolution — `date`+n
-days, `month`+n months, `time`+n ms, `minute`+n minutes, `second`+n seconds,
-`timestamp`/`timespan`+n ns. Comparison works across variants of the same
-family (`date`↔`timestamp`, `time`↔`minute`↔`second`).
-
-Casts use the backtick form `` `date$x ``, `` `month$x ``, `` `timestamp$x ``,
-or a kdb single-char type code on a string — `"p"$` timestamp, `"d"$` date,
-`"t"$` time, `"m"$` month, `"u"$` minute, `"v"$` second, `"n"$` timespan:
-
-```q
-`date$2024.03.15D12:30:00.0         / 2024.03.15
-`month$2024.03.15                    / 2024.03m
-`timestamp$2024.03.15               / 2024.03.15D00:00:00.000000000
-"p"$"2024.03.15D12:30:00"           / parse a string
-```
-
-In **column** context, a string→temporal cast parses through Polars' string
-parser (`expr.cast(<temporal>)` on a string is deprecated). The format is
-inferred per value — ISO *and* kdb's dotted `2024.03.15` both work:
-
-| cast | parser | result column |
-|---|---|---|
-| `` `date$s `` / `` `month$s `` | `str.to_datetime` → date | `Date` |
-| `` `timestamp$s `` (`"p"$s`) | `str.to_datetime` | `Datetime` (keeps the time part) |
-| `` `time$s `` (`"t"$s`) | `str.to_time` | `Time` |
-
-```q
-select d: `date$date_str from t        / "2024.03.15"          -> 2024-03-15
-select ts: `timestamp$ts_str from t    / "2024-03-15T09:30:00" -> 2024-03-15 09:30:00
-```
-
-A value the inferred format cannot read aborts the query (strict by default).
-
-Now-functions (**UTC** — there is no timezone database): `.qpl.d` today's date,
-`.qpl.t` time, `.qpl.p` timestamp (ns), `.qpl.n` timespan since midnight. They
-are ordinary expressions:
-
-```q
-log .qpl.d
-```
-
-Temporal literals project as Polars-native columns (`Date`, `Datetime[ns]`,
-`Time`, `Duration[ns]`); month maps to `Date` at the 1st. Column output is
-Polars' ISO form, not the kdb form. Not yet in the language: `xbar` bucketing,
-the `within` window operator, `.minute` / `.date` unit accessors, and
-temporal arithmetic on a **column** (`date_col + n` — scalar arithmetic is
-fully supported) — those are planned.
-
-### Symbols, categoricals & enums
-
-Outside a table expression, `` `foo `` is a **symbol** — a distinct value kind
-that names a column. (Tables are named, not symboled: write `trades`,
-not `` `trades ``.) A symbol literal is a bareword (letters, digits, `_` `-`
-`.` `/`) — it can't contain a space. `` `$expr `` interns a *string* into a
-symbol, so a value with spaces or other punctuation goes through a string
-literal instead:
-
-```q
-role: `$"Analytics Engineer"   / a symbol with a space — quote it, then intern it
-```
-
-Inside a table expression, `` `$col `` casts a column to a Polars **Categorical**
-(an interned string pool — fast joins, group-bys and filters), `u32` codes by
-default. `u8!` / `u16!` / `u32!` before `` `$ `` picks the physical width:
-
-```q
-select country: `$country from t
-select country: u8!`$country from t   / u8 codes (<=255 distinct values)
-```
-
-An **enum** is an *ordered* symbol vector — the order fixes sort order and each
-value's code. More performant than categorical and more efficient sorting using the physical representation.
-Define it, then cast with `` name::`$col ``:
-
-```q
-lvl: `low`mid`high
-t: update level: lvl::`$?[price>400;`high;price>100;`mid;`low] from trades
-
-/ as it's a polars enum under the hood, you can sort/compare them too
-select from t where level >= `mid
-```
-
-The cast input may be a string column or an existing categorical/enum (Polars
-re-keys it). Values absent from an enum become null.
-
->See https://docs.pola.rs/user-guide/expressions/categorical-data-and-enums for more on this subject.
-
-### Reading & writing files
-
-`load` reads a parquet or CSV file, taking a string path. On its own it is
-**eager** — `t: load ...` materialises a table straight away. Prefix it with
-[`lazy`](#lazy--collect) to keep it as a deferred scan instead.
-
-```q
-select avg price by sym from load "data/trades.parquet"
-t: load "data/trades.parquet"        / eager — reads the file now, binds a table
-t: lazy load "data/trades.parquet"   / deferred — binds a plan, no IO yet
-select from load "data/quotes.csv"
-```
-
-`sink` streams a **table expression** to a file, also taking a string path — a
-table name, a `select ...`, an `update ...`:
-
-```q
-trades sink "summary.parquet"
-select sym, price from trades where size > 100 sink "big_trades.parquet"
-```
-
-`cols` shows a table's schema (works on lazy bindings too):
-
-```q
-cols trades
-```
-
-### Table operators
+### Table operators · [chapter][tableops]
 
 ```q
 distinct select sym from trades
-
-10 limit select from trades      / first N rows
-10#select from trades            / `#` is the same
-10#trades
-
-`price`size drop select from trades   / drop columns
-`price`size _ trades                  / `_` is the same
-
-`sym`price!01b trades            / sort by a `col!bool` map (0 asc, 1 desc)
-sorted: `sym`price!01b select from trades where size > 100
+10 limit select from trades      / 10#select from trades is the same
+`price`size drop trades          / `price`size _ trades is the same
+`sym`price!01b trades            / sort map: 0 asc, 1 desc
 ```
 
-### lazy / collect
+### lazy / collect · [chapter][lazy]
 
-`lazy` as the first token of a table expression stores the **query plan** under a
-name instead of running it. Nothing touches disk until you `collect` (materialise
-to a DataFrame) or `sink` (stream to a file) — so a whole pipeline can process
-**larger-than-RAM** data in a single pass.
+`lazy` stores the **plan** instead of running it, so nothing touches disk
+until `collect` or `sink`. Extend a plan by re-assigning the binding; the
+whole pipeline then runs as one streaming pass, which is how larger-than-RAM
+data gets processed.
 
 ```q
 t: lazy load "trades.parquet"
-q: lazy select sym, bid, ask from load "quotes.parquet"
-```
-
-Extend a plan by **re-assigning the binding** — each step just adds plan nodes,
-the file is never touched:
-
-```q
 t: select sym, side, price, size from t where size > 100
 t: update notional: price * size from t
-t: update band: ?[notional > 50000; `big; `small] from t
+j: select traded: sum notional by sym, side from t `sym lj q `sym
+j sink "summary.parquet"          / or: tm: collect j
 ```
 
-Reading a lazy binding is contagious — you get another plan, and the REPL prints
-it instead of a table:
+Reading a lazy binding gives another plan, and the REPL prints it, which is a
+good way to see what Polars intends to do before paying for it.
+
+### Functions · [chapter][functions]
+
+q-style lambdas. The last statement is the return value, and locals are
+call-scoped. Functions are a binding kind rather than a value, so they can't
+be passed, returned, or used in a projection.
 
 ```q
-select from t
-/ SELECT [col("sym"), col("side"), col("price"), col("size"), ...]
-/   Parquet SCAN [trades.parquet]
-/   SELECTION: col("size") > 100
+add: {[x,y] x+y}              / add[2;3] -> 5
+inc: {[x] x+1}                / inc 41 or inc[41] -> 42
+fac: {[n] ?[n<2; 1; n*fac[n-1]]}
+bysym: {[s] select sym, price from trades where sym = s}
 ```
 
-Joins, `by` aggregation, `order`, `distinct` and `limit` all compose lazily:
+### Comments, multi-line, logging, config
+
+`/` comments to end of line. In a script, a line indented by a tab or 4+
+spaces continues the one above it; in the REPL, input keeps being read while
+brackets are open or after a trailing comma. [multi-line][multiline]
+
+`log <expr>` prints a scalar raw, concatenating space-separated expressions.
+`\1 <path>` tees all stdout to a file. [logging][logging]
 
 ```q
-j: select sym, side, price, size, bid, ask from t `sym lj q `sym
-j: select traded: sum notional, n: count price by sym, side from j
-```
-
-`collect` runs the plan once and binds a normal table; or skip the table and
-`sink` the plan straight to disk:
-
-```q
-tm: collect j
-j sink "summary.parquet"
-```
-
-[`examples/lazy_join_pipeline.qpl`](examples/lazy_join_pipeline.qpl) is a
-two-input join + aggregate pipeline sunk to parquet without ever being collected.
-
-### Comments
-
-`/` starts a comment that runs to end of line:
-
-```q
-/ full-line comment
-select from trades  / inline comment
-```
-
-### Multi-line statements
-
-In a script, a statement may span several lines: any line indented by a tab or
-4+ spaces continues the one above it; a line starting in column 0 (or a blank
-line) ends it. No continuation character needed.
-
-```q
-t: select
-    tot: sum size,
-    apx: mean price
-    by sym
-    from trades
-    where size > 50
-```
-
-In the REPL the prompt keeps reading while brackets are open, after a trailing
-`,`, or when input was cut off mid-statement; a blank line submits.
-
-### Logging
-
-`log <expr>` (or `1 <expr>`, kdb-style) evaluates a scalar and prints it raw;
-bare `log` / `1` prints a blank line. Space-separated expressions are rendered
-and concatenated:
-
-```q
-log "starting run"
-log "test" str$2*3 " that"       / test6 that
 log "rows > " thr ": " n         / rows > 150: 42
+log (f x) " done"                / juxtaposition separates items, so parenthesise
+log f[x] " done"                 / bracket application isn't ambiguous, no parens needed
 ```
 
-Top-level juxtaposition separates items rather than forming a call — wrap a call
-in parens: `log (f x) " done"`.
+`.qpl.cfg key=value` sets session knobs: `maxcol` and `maxrow` (display
+only), and `round_type` (`HALF_UP` or `HALF_TO_EVEN`, which does change
+answers). A bare `.qpl.cfg` prints the current settings. [config][config]
 
-`\1 <path>` tees all stdout (log lines *and* query output) to a file as well as
-the terminal; bare `\1` detaches it. Works in scripts and the REPL.
+### Namespaces & imports
+
+A namespaced name is any dotted identifier, `.ns.name`, nesting allowed. It's
+an ordinary variable, table or function reference that lives under a prefix
+instead of in the flat session scope. `.qpl` is the one built in, holding the
+now-functions and `.qpl.cfg`.
+
+`\l <path>` loads a script flat into the shared scope. `\i "<path>"` instead
+*imports* it: every table, global and function it newly binds at its top
+level moves under `.<file-stem>.*`, so its pieces don't collide with names
+already in scope. The path is a quoted string because the namespace derives
+from it, which keeps it visually distinct from a namespaced identifier on the
+same line. `\i` behaves the same typed at the prompt or nested inside another
+script.
 
 ```q
-\1 run.log
-select from trades where size > 100
-\1
+\i "lib/utils.qpl"       / defines helper: {[x] x*2}
+.utils.helper 21         / -> 42
 ```
 
-### Config
+A binding the imported script already namespaced itself is left alone rather
+than double-prefixed.
 
-`.qpl.cfg key=value ...` sets session-wide knobs. A bare `.qpl.cfg` prints the
-current settings. Works in scripts and the REPL.
+### IPC · [chapter][ipc]
 
-| Key | Meaning | Default |
-|---|---|---|
-| `maxcol` | max columns physically printed when rendering a table | `8` |
-| `maxrow` | max rows physically printed when rendering a table | `10` |
-| `round_type` | rounding mode for `round`: `HALF_UP` or `HALF_TO_EVEN` | `HALF_TO_EVEN` |
+Optional (`--features ipc`). Lets one qpl process query another over a
+REQ/REP socket pair ([zmq.rs](https://github.com/zeromq/zmq.rs), pure Rust,
+no system libzmq). The point is to load slow tables once in a long-lived
+session and let short-lived clients query it, to let non-qpl callers fetch
+real tables over plain TCP, to fan out across several servers concurrently,
+or to reshape a running session without restarting it.
 
-```q
-.qpl.cfg maxrow=50 maxcol=20
-.qpl.cfg round_type=HALF_UP
-select mv: 2 round market_value from trades
-```
-
-### IPC
-
-Optional feature (`--features ipc`, off by default — see [Install](#install));
-adds no dependencies to a default build. Lets one qpl process act as a client
-to another over a plain REQ/REP socket pair ([`zeromq`](https://github.com/zeromq/zmq.rs),
-pure Rust, no libzmq system dependency).
-
-The problem this solves: a qpl session is normally a single process holding
-its own tables in memory — one script, one address space. IPC lets a second
-process reach into a *running* session instead of re-loading and re-computing
-everything itself, which is the same reason kdb+ shops lean on IPC so heavily.
-Concretely:
-
-- **A shared data process.** Load the big/slow-to-build tables once in a
-  long-lived server session (`qpl -i`), then have any number of short-lived
-  client scripts query it without paying that load cost themselves.
-- **Splitting compute from callers.** A scheduled job, a web backend, or a
-  notebook can `dispatch` a query and get back a real table/scalar, without
-  embedding qpl or re-implementing the query in whatever language it's
-  written in — the wire format is plain TCP, not qpl-specific.
-- **Fan-out across sessions.** A single client can `hopen` several servers
-  (e.g. one per dataset, or one per region) and `async dispatch` to all of
-  them, then `await` each — running independent queries concurrently instead
-  of one after another.
-- **Remote administration of a live session.** `dispatch` treats the request
-  exactly like a typed REPL line, so a client can bind new globals, extend a
-  lazy pipeline, or otherwise reshape the server's session state on the fly —
-  handy for poking at or updating a long-running process without restarting it.
-
-**Server**: `\port <n>` opens a listener; bare `\port` closes it. Only
-available in the interactive REPL (`qpl -i script.qpl`) — a script alone exits
-before anything could connect, so there's a REPL to keep the process alive.
-Once opened, every request is evaluated exactly like a typed REPL line
-(assignments mutate the server's session, `select`/`update`/`delete` all
-work), except the `\`-prefixed system commands (`\d`, `\l`, `\1`, `\port`
-itself), which are local session administration, not part of what a remote
-client dispatches.
-
-```q
-qpl -i --load-demo setup.qpl
-qpl) \port 5001        / start serving
-qpl) \port              / stop
-```
-
-**Client**: `hopen` opens a connection (a plain port number connects to
-`127.0.0.1`; a `"host:port"` string connects elsewhere); `dispatch` sends a
-whole statement to it and blocks for the reply; `async dispatch` returns
-immediately with a pending handle, resolved later by `await`. A table comes
-back as a real table, a scalar as a real scalar — both fully usable locally,
-same as if the query had run in-process.
+`\port <n>` opens a listener and a bare `\port` closes it, in the interactive
+REPL only. Each request is evaluated exactly like a typed line, except for
+the `\`-prefixed system commands.
 
 ```q
 conn: hopen 5001                       / or hopen "db.internal:5001"
 resp: conn dispatch select from trades where price > 100
-resp                                    / a genuine table, queryable further
 
 pending: conn async dispatch select avg price by sym from trades
-/ ... do other things while the server works ...
 result: await pending
 ```
 
-A dispatched assignment (`conn dispatch t: select from u`) has nothing to
-print, same as it would locally — the client gets back a boolean acknowledgment
-rather than a value to bind.
+A bare `hopen` is **read-only**, and the server rejects assignments, `sink`
+and `\1` from it. `` `w!hopen `` opens a write handle. The permission is
+chosen by the client, enforced per request, and never applies to the server
+operator's own input.
 
-**Read vs. write handles**: bare `hopen` opens a **read-only** connection —
-the default. The server rejects anything that writes to its session when
-dispatched from a read handle: an assignment (`x: ...`, `t: select ...`),
-`sink`, and `\1`. Everything else (`select`/`update`/`delete`, building a
-lazy pipeline, etc.) still works. `` `w!hopen `` opens a **write** handle
-instead, with none of those restrictions:
-
-```q
-ro: hopen 5001                          / read-only (default)
-ro dispatch t: select from trades       / rejected by the server
-ro dispatch select from trades          / fine — no write involved
-
-rw: `w!hopen 5001                       / write handle
-rw dispatch t: select from trades       / allowed
-```
-
-The permission is decided by the client at `hopen` time and enforced by the
-server per request — it only ever applies to commands arriving over a
-connection, never to the server operator's own local REPL/script input.
-
-### Operator reference
+### Operator reference · [chapter][operators]
 
 | Operator | Meaning |
 |---|---|
 | `+` `-` `*` | arithmetic |
 | `%` | division (q convention) |
-| `=` `<>` `!=` | equality |
-| `<` `<=` `>` `>=` | comparison |
+| `=` `<>` `!=` `<` `<=` `>` `>=` | comparison |
 | `&` `\|` | logical and / or |
+| `/` | comment to end of line |
+| `:` | bind a name; alias a column |
+| `` `x `` | symbol |
 | `?[...]` | vectorised conditional |
-| `round` | `<precision> round <col>` — round a float column (mode: `.qpl.cfg round_type`) |
-| `over` | window: `<expr> over `p [order `k asc]`; verbs `rn` / `rank` / `drank` |
+| `like` | glob pattern match |
 | `$` | cast (`f64$x`, `` `date$x ``, `"p"$s`); `` `$x `` -> categorical |
-| `.qpl.d` `.qpl.t` `.qpl.p` `.qpl.n` | now: date / time / timestamp / timespan (UTC) |
-| `!` | `col!bool` sort map; `` u8!`$x `` -> categorical physical width; `` `k1`k2!v1 v2 `` -> dict literal |
 | `::` | enum cast (`` lvl::`$x ``) |
-| `#` | limit (`10#t`); take / slice a list (`3#l`, `-3#l`) |
-| `[...]` | positional index into a list (`l[0]`, `l[1 2 3]`) |
+| `!` | dict literal; `` `col!01b `` sort map; `` u8!`$x `` code width |
+| `#` | first n rows of a table; take from a list (`3#l`, `-3#l`) |
+| `[...]` | index a list (`l[0]`, `l[1 2 3]`); call a function |
 | `_` | drop columns (`` `a`b _ t ``) |
-| `hopen` `` `w!hopen `` `dispatch` `async dispatch` `await` | IPC client — see [IPC](#ipc) (`--features ipc`) |
-| `<list> where <pred>` | elementwise filter on a list; `x` is the current element |
+| `where` | filter rows; filter a list elementwise, `x` is the element |
+| `over` | window, with verbs `rn` / `rank` / `drank` |
+| `i` | virtual row-index column, printed as `x` |
 | `til` | `til n` -> `0..n-1`; `lo til hi` -> `lo..hi-1` |
-| `zip` | `zip `k1`k2!v1 v2` — build a table from a dict of named lists |
+| `zip` | build a table from a dict of named lists |
+| `lj` `ij` `rj` | left / inner / right join |
+| `{...}` | lambda |
+| `.qpl.d` `.qpl.t` `.qpl.p` `.qpl.n` | now: date / time / timestamp / timespan (UTC) |
+| `.qpl.cfg` | session config |
+| `hopen` `` `w!hopen `` `dispatch` `async dispatch` `await` | IPC client |
 
 ## REPL
 
 | Command | Action |
 |---|---|
-| `\d <stmt>` | disassemble — show bytecode without executing |
+| `\d <stmt>` | disassemble — show the compiled instructions without executing |
 | `\l <path>` | run a `.qpl` script in the current session |
+| `\i "<path>"` | import a script, namespacing its bindings under `.<file-stem>.*` |
 | `\1 <path>` | tee all stdout to `<path>` (bare `\1` detaches) |
-| `log <expr>` / `1 <expr>` | print a scalar |
+| `\port <n>` | start the IPC listener (bare `\port` stops) |
+| `log <expr>` | print a scalar |
 | `cols <name>` | show a table's schema |
 | Ctrl-C | abandon a partial statement (or exit at an empty prompt) |
 | Ctrl-D | exit |
@@ -954,7 +505,7 @@ qpl) \d select avg price by sym from trades where size > 100
 0001: PUSH_COL_REF size
 0002: PUSH_CONST Int(100)
 0003: BIN_OP >
-0004: FILTER 1
+0004: FRAME_EXPR Filter(1)
 0005: PUSH_COL_REF sym
 0006: ALIAS Some("sym")
 0007: BUILD_KEYS 1
@@ -977,15 +528,44 @@ source -> lexer -> tokens -> parser -> AST -> compiler -> instructions -> VM (Po
 | `lexer` | tokenise source text |
 | `parser` | build the typed AST |
 | `compiler` | emit stack-machine instructions |
-| `vm` | execute instructions, build & collect a `LazyFrame` |
-| `repl` | interactive loop + script runner |
+| `vm` | execute them, building and collecting a `LazyFrame` |
+| `repl` | interactive loop and script runner |
+
+There's no query optimiser, because there doesn't need to be one: the VM's
+job ends at producing a Polars `LazyFrame`, and predicate pushdown and the
+rest happen on the other side of that boundary. [More][architecture].
 
 ## Releases
 
-Binaries build automatically on every version bump (GitHub Actions) for Linux
-(gnu + musl), Linux ARM64, and macOS (x86 + ARM).
+Automated and driven by the version in `Cargo.toml`. A bump landing on `main`
+tags the commit and cross-compiles binaries for Linux (gnu + musl), Linux
+ARM64, and macOS (x86 + ARM).
 
 ## Roadmap
 
-- WASM build, so qpl can run in the browser.
-- More of the language.
+- A WASM build, so qpl can run in the browser.
+- More of the language. Gaps are noted in the [book][book] beside the feature
+  they belong to.
+
+[book]: https://nicelgueta.github.io/qpl
+[why]: https://nicelgueta.github.io/qpl/why.html
+[incremental]: https://nicelgueta.github.io/qpl/working-incrementally.html
+[assignment]: https://nicelgueta.github.io/qpl/language/assignment.html
+[symbols]: https://nicelgueta.github.io/qpl/language/symbols.html
+[select]: https://nicelgueta.github.io/qpl/language/select-update-delete.html
+[files]: https://nicelgueta.github.io/qpl/language/files.html
+[expressions]: https://nicelgueta.github.io/qpl/language/expressions.html
+[columns]: https://nicelgueta.github.io/qpl/language/column-expressions.html
+[casts]: https://nicelgueta.github.io/qpl/language/casts.html
+[temporal]: https://nicelgueta.github.io/qpl/language/temporal-types.html
+[enums]: https://nicelgueta.github.io/qpl/language/categoricals-enums.html
+[tableops]: https://nicelgueta.github.io/qpl/language/table-operators.html
+[window]: https://nicelgueta.github.io/qpl/language/window-functions.html
+[functions]: https://nicelgueta.github.io/qpl/language/functions.html
+[lazy]: https://nicelgueta.github.io/qpl/language/lazy-collect.html
+[multiline]: https://nicelgueta.github.io/qpl/language/multiline.html
+[logging]: https://nicelgueta.github.io/qpl/language/logging.html
+[config]: https://nicelgueta.github.io/qpl/language/config.html
+[ipc]: https://nicelgueta.github.io/qpl/language/ipc.html
+[operators]: https://nicelgueta.github.io/qpl/language/operator-reference.html
+[architecture]: https://nicelgueta.github.io/qpl/architecture.html

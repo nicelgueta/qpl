@@ -1,0 +1,20 @@
+/ ─────────────────────────────────────────────────────────────────────────────
+/ Namespaces & imports: `\i <path>` runs a script like `\l`, then moves every
+/ table/global/function it newly bound at its top level under `.<file-stem>.*`
+/ (the file's stem) — see examples/namespace_lib.qpl and the README's
+/ "Namespaces & imports" section.
+/
+/ Run from the repo root:
+/   cargo run -- --load-demo examples/namespaces.qpl
+/ ─────────────────────────────────────────────────────────────────────────────
+
+\i "examples/namespace_lib.qpl"
+
+log "a function imported under .namespace_lib.* — call it like any other function"
+log .namespace_lib.double[21]        / bracket call — parens only needed for bareword `f x`
+
+log "an imported global"
+log .namespace_lib.greeting
+
+log "an imported table"
+.namespace_lib.lookup

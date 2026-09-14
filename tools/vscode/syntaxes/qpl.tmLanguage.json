@@ -10,6 +10,7 @@
     { "include": "#number" },
     { "include": "#assignment" },
     { "include": "#builtin" },
+    { "include": "#namespace" },
     { "include": "#keyword" },
     { "include": "#cast" },
     { "include": "#aggregate" },
@@ -23,7 +24,7 @@
       "match": "/.*$"
     },
     "repl": {
-      "match": "^\\s*(\\\\(?:[d1l]|port)|log)\\b",
+      "match": "^\\s*(\\\\(?:[d1li]|port)|log)\\b",
       "captures": {
         "1": { "name": "keyword.other.repl.qpl" }
       }
@@ -70,6 +71,11 @@
       "comment": "`.qpl.*` namespaced builtin functions (e.g. `.qpl.cfg`) — coloured like load / sink / cols",
       "name": "keyword.other.qpl",
       "match": "\\.qpl\\.[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*"
+    },
+    "namespace": {
+      "comment": "a user namespace reference (e.g. `.utils.helper`, from `\\i \"utils.qpl\"`) — any other dotted name, coloured like a plain identifier",
+      "name": "variable.other.qpl",
+      "match": "\\.[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)+"
     },
     "keyword": {
       "patterns": [

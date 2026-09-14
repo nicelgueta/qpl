@@ -1,55 +1,195 @@
 # Expressions
 
-| Kind | |
-|---|---|
-| arithmetic | `+` `-` `*` `%` (`%` is division, q convention) |
-| comparison | `=` `<>` `!=` `<` `<=` `>` `>=` |
-| pattern match | `<str/sym> like <pattern>` — q-style glob, see below |
-| logical | `&` `\|` |
-| conditional | `?[cond; then; cond2; then2; ...; else]` — vectorised, nests for else-if |
-| cast | `type$expr` — see [Casts](casts.md) |
-| round | `<precision> round <col>` — round a float column to N places |
-| dyadic verbs | `<param> verb <col>` — `quantile`/`pctl`, `shift`/`lag`, `lead`, `diff`, `pctchange` (and `round`) |
-| window | `<expr> over `p1`p2 [order `k1 asc `k2 desc] [rolling n]` — see [Window functions](window-functions.md) |
+The last few chapters covered the shape of a statement: which clauses exist
+and what each one does with a table. This chapter is about what you can write
+*inside* those clauses.
 
-A leading `-` negates: `-45.3` is a negative literal, `-col` / `-x` folds to
-`0 - …` (works in scalars, column expressions and filters).
+Everything here works in the same places. A projection, a `where` predicate,
+an `update` assignment, the right-hand side of a scalar binding: they all
+accept the same expression language, so anything you learn in one context
+carries to the others.
+
+## Arithmetic and comparison
+
+The arithmetic operators are `+`, `-`, `*` and `%`. As
+[Comments](comments.md) explained, `%` is division, because `/` starts a
+comment.
+
+One wrinkle worth knowing: `%` is always true division, even when both sides
+are integers — unlike `+`, `-` and `*`, which stay integer when both operands
+are.
 
 ```qpl
-l: int$-45.3                                         / scalar: -45
-select price_bin: ?[price>400;`high;price>200;`mid;`low] from trades
-select neg_mv: -market_value from trades
-select mv: 2 round market_value from trades          / round to 2 dp
-select p95: 0.95 quantile price by sym from trades   / 95th percentile
-select sym, price, ret: 1 diff price by sym from trades   / row-over-row change
+qpl) 10 % 4
 ```
 
-`like` tests a string or symbol against a glob pattern, [same as q](https://code.kx.com/q/ref/like/):
-`*` matches any sequence (including empty), `?` matches exactly one character,
-and `[abc]` / `[a-z]` / `[^abc]` are character classes (case-sensitive; no
-pattern characters means an exact match). Escape a pattern character by
-putting it in its own one-character class — `[*]`, `[?]`, `[[]`, `[]]`:
+```
+f64: 2.5
+```
+
+Comparison is `=`, `<>` or `!=` for inequality, and `<`, `<=`, `>`, `>=` as
+usual. Note that equality is a single `=`, not `==`, since there's no
+assignment operator competing for it.
+
+`&` and `|` are logical and and or, which you saw combining predicates in a
+`where` clause.
+
+A leading `-` negates. On a literal it simply makes a negative number, and in
+front of a column or variable it expands to a subtraction from zero, so it
+works the same way in every context:
 
 ```qpl
-select sym from trades where sym like "AA*"          / starts with AA
+select neg_mv: -price from trades
+```
+
+## Conditionals
+
+`?[...]` is the vectorised conditional, and it's the piece of syntax most
+worth getting comfortable with, since it does the work of SQL's `CASE WHEN`
+in a fraction of the space. The contents are a list of condition-then-value
+pairs, with a final fallback:
+
+```qpl
+qpl) select sym, size, band: ?[size >= 250; `large; size >= 100; `mid; `small] from trades
+```
+
+```
+shape: (8, 3)
+┌──────┬──────┬───────┐
+│ sym  ┆ size ┆ band  │
+│ ---  ┆ ---  ┆ ---   │
+│ str  ┆ i64  ┆ str   │
+╞══════╪══════╪═══════╡
+│ AAPL ┆ 100  ┆ mid   │
+│ AAPL ┆ 250  ┆ large │
+│ MSFT ┆ 80   ┆ small │
+│ MSFT ┆ 300  ┆ large │
+│ GOOG ┆ 150  ┆ mid   │
+│ GOOG ┆ 90   ┆ small │
+│ AAPL ┆ 500  ┆ large │
+│ MSFT ┆ 200  ┆ mid   │
+└──────┴──────┴───────┘
+```
+
+Read it as: if `size >= 250` then `` `large ``, otherwise if `size >= 100`
+then `` `mid ``, otherwise `` `small ``. Conditions are tested in order and
+the first match wins, so the ordering of the pairs matters. Add as many pairs
+as you need; the final item with no condition in front of it is the else.
+
+"Vectorised" means this is evaluated once across the whole column rather than
+row by row, which is why it stays fast on large inputs. It's an ordinary
+expression, so it also works outside a query entirely, including in a scalar
+binding or a function body.
+
+## Pattern matching
+
+`like` tests text against a glob pattern, following
+[q's rules](https://code.kx.com/q/ref/like/):
+
+```qpl
+qpl) select sym, price from trades where sym like "A*"
+```
+
+```
+shape: (3, 2)
+┌──────┬───────┐
+│ sym  ┆ price │
+│ ---  ┆ ---   │
+│ str  ┆ f64   │
+╞══════╪═══════╡
+│ AAPL ┆ 182.3 │
+│ AAPL ┆ 183.1 │
+│ AAPL ┆ 184.0 │
+└──────┴───────┘
+```
+
+`*` matches any run of characters including none, `?` matches exactly one,
+and `[abc]`, `[a-z]` and `[^abc]` are character classes. A pattern with none
+of those characters in it is simply an exact match. Matching is
+case-sensitive.
+
+```qpl
 select sym from trades where sym like "[AM]*"        / starts with A or M
-select sym from trades where sym like "?A?L"         / exactly 4 chars, A then L
-select from trades where not sym like "AAPL"         / negate with `not`
+select sym from trades where sym like "?A?L"         / four characters, A then L
+select from trades where not sym like "AAPL"         / negated with `not`
 ```
 
-`round` and the other **dyadic verbs** are q-style: the left operand is a
-parameter (a literal), the right is the column. `<p> quantile <col>` takes a
-fraction in `[0,1]`; `<n> shift <col>` (alias `lag`) moves values `n` rows later,
-`lead` `n` rows earlier; `<n> diff <col>` is the difference from `n` rows back;
-`<n> pctchange <col>` the fractional change. `round`'s rounding mode is the
-session config `round_type` (`HALF_TO_EVEN` by default; see [Config](config.md)).
+To match a literal `*`, `?`, `[` or `]`, put it in a one-character class of
+its own: `[*]`, `[?]`, `[[]`, `[]]`. Glob syntax has no backslash escape.
 
-**Aggregates:** `sum`, `avg`/`mean`, `min`, `max`, `count`, `first`, `last`,
-`std`/`dev`, `var`, `med`/`median`, `mode`/`modal` (modal average — most
-frequent value; ties resolve to the smallest), `skew`, `kurt`/`kurtosis`,
-`any`, `all`, `prod`/`product`, `argmin`, `argmax`, `nnull`/`null_count`,
-`abs`, `neg`, `not`, `string`, `distinct`/`n_unique`.
+## Verbs that take a parameter
 
-**Ordered / cumulative** (most useful with `over` + an `order` sub-clause, which
-sorts each partition before applying): `cumsum`, `cummax`, `cummin`, `cumprod`,
-`cumcount`, `ffill` (forward-fill nulls), `bfill` (backward-fill).
+A family of operations needs a parameter as well as a column. In q these are
+written with the parameter on the *left*, which reads oddly for about five
+minutes and then starts to feel natural:
+
+```qpl
+qpl) select p95: 0.95 quantile price by sym from trades
+```
+
+```
+shape: (3, 2)
+┌──────┬─────────┐
+│ sym  ┆ p95     │
+│ ---  ┆ ---     │
+│ str  ┆ f64     │
+╞══════╪═════════╡
+│ MSFT ┆ 415.92  │
+│ AAPL ┆ 183.91  │
+│ GOOG ┆ 141.165 │
+└──────┴─────────┘
+```
+
+The full set:
+
+| Written | Does |
+|---|---|
+| `<p> quantile <col>` | the `p`th quantile, `p` between 0 and 1 (`pctl` is an alias) |
+| `<n> shift <col>` | move values `n` rows later (`lag` is an alias) |
+| `<n> lead <col>` | move values `n` rows earlier |
+| `<n> diff <col>` | the change from `n` rows back |
+| `<n> pctchange <col>` | the fractional change from `n` rows back |
+| `<n> round <col>` | round to `n` decimal places |
+
+`round` takes its rounding mode from a session setting rather than from the
+expression, since it's the sort of thing you'd want to fix once for a whole
+script. [Config](config.md) covers it.
+
+The row-relative verbs in that table — `shift`, `lead`, `diff`, `pctchange` —
+raise an obvious question: relative to which ordering? On their own they use
+the table's existing row order. To define the ordering explicitly, and to
+compute these things per group, they combine with `over`, which is
+[Window functions](window-functions.md).
+
+## Aggregates
+
+These collapse many values into one. You've already used `avg` and `sum`
+with `by`; they work the same way anywhere an aggregate makes sense.
+
+`sum`, `avg` (or `mean`), `min`, `max`, `count`, `first`, `last`, `std` (or
+`dev`), `var`, `med` (or `median`), `mode` (or `modal`, the most frequent
+value, resolving ties to the smallest), `skew`, `kurt` (or `kurtosis`),
+`any`, `all`, `prod` (or `product`), `argmin`, `argmax`, `nnull` (or
+`null_count`), and `distinct` (or `n_unique`).
+
+A few more verbs transform a column without collapsing it, and are listed
+here for completeness since they appear in the same position: `abs`, `neg`,
+`not`, `string`.
+
+## Cumulative and fill verbs
+
+The last group produces a running result down a column, which means their
+output depends on row order:
+
+`cumsum`, `cummax`, `cummin`, `cumprod`, `cumcount`, plus `ffill` and `bfill`
+for carrying values forward or backward over nulls.
+
+Like the row-relative verbs above, these are at their most useful with `over`
+and an explicit ordering, which the [next chapter but one](window-functions.md)
+covers. On their own they run down the table in its current order.
+
+## Casting
+
+One operator is missing from this chapter deliberately: `$`, which converts
+between types. It comes up often enough to deserve its own short chapter, and
+it's [two chapters ahead](casts.md).

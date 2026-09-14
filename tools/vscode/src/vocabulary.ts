@@ -37,7 +37,7 @@ export const CAST_TYPES = [
   'u64', 'u32', 'u16', 'u8', 'bool', 'str', 'string',
 ];
 
-export const REPL_COMMANDS = ['\\d', '\\1', '\\l', '\\port', 'log'];
+export const REPL_COMMANDS = ['\\d', '\\1', '\\l', '\\i', '\\port', 'log'];
 
 /** Detail strings shown alongside completion items, keyed by identifier. */
 export const AGGREGATE_DETAIL: Record<string, string> = {
@@ -94,6 +94,7 @@ export const KEYWORD_DETAIL: Record<string, string> = {
   hopen: 'hopen <port | "host:port"> — open a read-only IPC connection; `w!hopen` opens a write handle (`ipc` feature)',
   await: 'await <pending> — resolve an `async dispatch` reply (`ipc` feature)',
   '\\port': '\\port <n> — start serving on port n; bare \\port stops (`ipc` feature, REPL only)',
+  '\\i': '\\i "<path>" — run a script, namespacing its new tables/globals/functions under `.<file-stem>.*`',
   til: 'til <n> — list 0..n-1  |  <lo> til <hi> — list lo..hi-1',
   zip: 'zip `k1`k2!v1 v2 — build a table from a dict of named lists',
 };

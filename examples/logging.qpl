@@ -1,7 +1,7 @@
 / ─────────────────────────────────────────────────────────────────────────────
 / Logging to stdout.
 /
-/   log <expr>   /  1 <expr>      print a scalar (raw) to stdout
+/   log <expr>                    print a scalar (raw) to stdout
 /   \1 <path>                     mirror ALL stdout (log lines + query output)
 /                                 to <path>, still printing to the terminal
 /   \1                            detach the log
@@ -16,7 +16,7 @@ log "run started"
 thr: 150
 
 / space-separated expressions are rendered and concatenated
-1 "size threshold: " thr
+log "size threshold: " thr
 log "double is " str$thr*2 " (as text)"
 
 / tee everything below to run.log as well as the terminal

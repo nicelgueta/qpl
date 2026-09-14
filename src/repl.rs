@@ -3,26 +3,117 @@ use crate::compiler::compile;
 use crate::errors::QplError;
 use crate::lexer::tokenise;
 use crate::parser::{parse, parse_expr_seq};
-use crate::tokens::TokenKind;
+use crate::tokens::{Token, TokenKind};
 use crate::temporal;
 use crate::opcodes::disassemble_instructions;
 use crate::vm::{Vm, run_vm, EvalResult};
 use crate::resolve;
 use polars::prelude::*;
 use rustyline::{DefaultEditor, error::ReadlineError};
+use std::collections::HashMap;
 
 /// Run a `.qpl` script file, printing results. Returns Err on the first failure.
 pub fn run_script(path: &str, vm: &mut Vm) -> Result<(), QplError> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| QplError::Runtime(format!("cannot read '{path}': {e}")))?;
     for (lineno, stmt) in logical_statements(&src) {
-        if let Some(result) = system_command(&stmt, vm) {
-            result?;
-            continue;
-        }
-        match_run_vm(&stmt, vm, path, lineno)?;
+        run_line(&stmt, vm, path, lineno)?;
     }
     Ok(())
+}
+
+/// `\d` / `\l` / `\i` / `\1` / an ordinary statement — everything a submitted
+/// line can be *except* `\port`, which needs REPL-loop state (`PortSession`)
+/// this function doesn't have. Shared by the REPL loop (interactive input and,
+/// once a port is open, the polling loop's stdin lines) and [`run_script`], so
+/// `\l`/`\i` also work nested inside a loaded/imported script, not just typed
+/// at the prompt.
+fn run_line(src: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<(), QplError> {
+    if let Some(inner) = src.strip_prefix("\\d").map(str::trim) {
+        println!("{}", disassemble(inner)?);
+        return Ok(());
+    }
+    if let Some(target) = src.strip_prefix("\\l").map(str::trim) {
+        return run_script(target, vm);
+    }
+    if let Some(target) = src.strip_prefix("\\i").map(str::trim) {
+        return run_script_imported(&parse_quoted_path(target)?, vm);
+    }
+    if let Some(result) = system_command(src, vm) {
+        return result;
+    }
+    match_run_vm(src, vm, path, lineno)
+}
+
+/// `\i`'s path argument is a quoted string (`\i "lib/utils.qpl"`), unlike
+/// `\l`'s bare one — the namespace derives from it (see
+/// [`namespace_from_path`]), so writing it as a string keeps that visually
+/// distinct from an ordinary namespaced identifier appearing right after
+/// `\i` on the same line.
+fn parse_quoted_path(rest: &str) -> Result<String, QplError> {
+    match tokenise(rest)?.as_slice() {
+        [Token { kind: TokenKind::Str(s), .. }] => Ok(s.clone()),
+        _ => Err(QplError::Runtime(format!(
+            "\\i expects a quoted path, e.g. \\i \"lib/utils.qpl\", got '{rest}'"
+        ))),
+    }
+}
+
+/// Run a `.qpl` script (`\i <path>`) as a *namespaced import*: every table,
+/// global, and function the script newly binds at its top level — anything
+/// not already present before the run and not already namespaced itself —
+/// is moved under `.<ns>.<name>`, where `<ns>` is derived from the file's
+/// stem (`utils.qpl` -> `.utils`). Bare `\l` keeps loading flat into the
+/// shared session scope; this is the opt-in alternative.
+pub fn run_script_imported(path: &str, vm: &mut Vm) -> Result<(), QplError> {
+    let ns = namespace_from_path(path);
+    let before_tables: std::collections::HashSet<String> = vm.tables.keys().cloned().collect();
+    let before_lazy: std::collections::HashSet<String> = vm.lazy_frames.keys().cloned().collect();
+    let before_globals: std::collections::HashSet<String> = vm.globals.keys().cloned().collect();
+    let before_functions: std::collections::HashSet<String> = vm.functions.keys().cloned().collect();
+
+    run_script(path, vm)?;
+
+    namespace_new_keys(&mut vm.tables, &before_tables, &ns);
+    namespace_new_keys(&mut vm.lazy_frames, &before_lazy, &ns);
+    namespace_new_keys(&mut vm.globals, &before_globals, &ns);
+    namespace_new_keys(&mut vm.functions, &before_functions, &ns);
+    Ok(())
+}
+
+/// Derive a namespace (`.utils`, `.my_lib`) from a `\i`-imported script's
+/// file stem: non-identifier characters become `_`, and a leading digit gets
+/// an `_` prefix so the result always lexes as a valid namespaced name.
+fn namespace_from_path(path: &str) -> String {
+    let stem = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("ns");
+    let mut cleaned: String = stem.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    if cleaned.starts_with(|c: char| c.is_ascii_digit()) {
+        cleaned.insert(0, '_');
+    }
+    format!(".{cleaned}")
+}
+
+/// Move every key in `map` that is new since `before` and not already
+/// namespaced (doesn't start with `.`) under `<ns>.<key>`.
+fn namespace_new_keys<V>(
+    map: &mut HashMap<String, V>,
+    before: &std::collections::HashSet<String>,
+    ns: &str,
+) {
+    let new_keys: Vec<String> = map.keys()
+        .filter(|k| !before.contains(*k) && !k.starts_with('.'))
+        .cloned()
+        .collect();
+    for k in new_keys {
+        let v = map.remove(&k).expect("key just listed from this map");
+        map.insert(format!("{ns}.{k}"), v);
+    }
 }
 
 /// Fold the physical lines of a script into logical statements.
@@ -101,7 +192,7 @@ pub fn start(vm: &mut Vm) {
     let mut rl = DefaultEditor::new().expect("failed to create line editor");
 
     println!(
-        "qpl v{} (Quick Polars Query Language) REPL - \\d disassemble, \\l <path> run a script, \\1 <path> log stdout",
+        "qpl v{} (Quick Polars Query Language) REPL - \\d disassemble, \\l <path> run a script, \\i \"<path>\" import as a namespace, \\1 <path> log stdout",
         env!("CARGO_PKG_VERSION")
     );
 
@@ -174,31 +265,12 @@ pub fn start(vm: &mut Vm) {
     }
 }
 
-/// `\d` / `\l` / `\1` / an ordinary statement — everything a submitted line
-/// can be *except* `\port`, which needs REPL-loop state (`PortSession`) this
-/// function doesn't have. Shared by both the normal (rustyline) input path
-/// and, once a port has been opened, the polling loop's stdin lines.
+/// Everything a submitted REPL line can be *except* `\port`, which needs
+/// REPL-loop state (`PortSession`) this function doesn't have — see
+/// [`run_line`]. Shared by both the normal (rustyline) input path and, once a
+/// port has been opened, the polling loop's stdin lines.
 fn process_submitted(src: &str, vm: &mut Vm) {
-    if let Some(inner) = src.strip_prefix("\\d").map(str::trim) {
-        match disassemble(inner) {
-            Ok(listing) => println!("{listing}"),
-            Err(e) => eprintln!("{}", fmt_repl_error(&e)),
-        }
-        return;
-    }
-    if let Some(path) = src.strip_prefix("\\l").map(str::trim) {
-        if let Err(e) = run_script(path, vm) {
-            eprintln!("{}", fmt_repl_error(&e));
-        }
-        return;
-    }
-    if let Some(result) = system_command(src, vm) {
-        if let Err(e) = result {
-            eprintln!("{}", fmt_repl_error(&e));
-        }
-        return;
-    }
-    if let Err(e) = match_run_vm(src, vm, "<main>", 0) {
+    if let Err(e) = run_line(src, vm, "<main>", 0) {
         eprintln!("{}", fmt_repl_error(&e));
     }
 }
@@ -219,7 +291,7 @@ fn handle_port_directive(rest: &str, session: &mut PortSession) -> Result<(), Qp
 }
 
 /// Evaluate one command received over `\port`, treating it exactly like a
-/// REPL line — `.qpl.cfg` directives, `log`/`1` writes, and ordinary
+/// REPL line — `.qpl.cfg` directives, `log` writes, and ordinary
 /// statements (selects, updates, deletes, assignments, function defs) all
 /// work. `\`-prefixed system commands (`\d`, `\l`, `\1`, `\port` itself)
 /// are deliberately not reachable this way — they're local REPL/session
@@ -230,15 +302,7 @@ fn eval_for_dispatch(line: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
         apply_cfg(args, vm)?;
         return Ok(EvalResult::Stored);
     }
-    // `log_target` also recognises the terse `1 <expr>` stdout-write shorthand
-    // (kdb's `1 x` writes to stdout handle 1) — fine for a human typing at a
-    // local prompt, who'd naturally avoid it when they mean the number 1, but
-    // `command` here is machine-rendered text (`render_tokens`), which cannot
-    // make that same judgement call: `1 + 1` is indistinguishable at the
-    // string level from the `1 <expr>` directive. Dispatch only recognises
-    // the unambiguous `log ` spelling; a literal `1 ...` falls through to
-    // `run_vm` as an ordinary statement instead.
-    if let Some(arg) = log_target(line).filter(|_| !line.trim_start().starts_with(['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'])) {
+    if let Some(arg) = log_target(line) {
         let mut text = String::new();
         for expr in parse_expr_seq(tokenise(arg)?)? {
             let val = match resolve::eval_value(vm, &expr)? {
@@ -426,23 +490,14 @@ fn eval_line(line: &str, vm: &mut Vm) -> Result<(), QplError> {
     Ok(())
 }
 
-/// Recognise the kdb-style stdout write: `log <expr>` or `1 <expr>` (and bare
-/// `log` / `1`, which print a blank line). Returns the argument text to
-/// evaluate as a scalar. `1 limit ...` / `1 # ...` stay ordinary row-count
-/// queries, not writes.
+/// Recognise the stdout write: `log <expr>` (and bare `log`, which prints a
+/// blank line). Returns the argument text to evaluate as a scalar.
 fn log_target(line: &str) -> Option<&str> {
-    if line == "log" || line == "1" {
+    if line == "log" {
         return Some("");
     }
     if let Some(rest) = line.strip_prefix("log ") {
         return Some(rest.trim());
-    }
-    if let Some(rest) = line.strip_prefix("1 ") {
-        let rest = rest.trim();
-        if rest.starts_with("limit") || rest.starts_with('#') {
-            return None;
-        }
-        return Some(rest);
     }
     None
 }
@@ -510,7 +565,7 @@ fn temporal_scalar_of(kind: ast::VecKind, n: i64) -> ast::Value {
 }
 
 /// Space-separated rendering of a vector `Value`'s elements. `quote_str`
-/// selects the pretty (`"a" "b"`) vs. raw (`log`/`1`, `a b`) string form.
+/// selects the pretty (`"a" "b"`) vs. raw (`log`, `a b`) string form.
 fn fmt_vec_elems(kind: ast::VecKind, s: &polars::prelude::Series, quote_str: bool) -> String {
     use ast::VecKind::*;
     let ca_str = || s.str().expect("SymVec/StrVec backed by a string Series");
@@ -540,7 +595,7 @@ fn fmt_vec_elems(kind: ast::VecKind, s: &polars::prelude::Series, quote_str: boo
     }
 }
 
-/// Render a value for `log` / `1`: raw text, no type prefix or quoting.
+/// Render a value for `log`: raw text, no type prefix or quoting.
 fn fmt_log_val(v: &ast::Value) -> String {
     if let Some((kind, s)) = v.as_vec() {
         return fmt_vec_elems(kind, s, false);
@@ -602,6 +657,7 @@ fn disassemble(source: &str) -> Result<String, QplError> {
 #[cfg(test)]
 mod tests {
     use super::{cfg_directive, eval_line, logical_statements, log_target, wants_more};
+    use super::{namespace_from_path, run_line, run_script_imported};
     use crate::vm::Vm;
 
     /// Run `line` through [`eval_line`] and return whatever it wrote via
@@ -614,6 +670,64 @@ mod tests {
         let out = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         out.trim_end().to_string()
+    }
+
+    #[test]
+    fn namespace_from_path_sanitises_the_file_stem() {
+        assert_eq!(namespace_from_path("utils.qpl"), ".utils");
+        assert_eq!(namespace_from_path("lib/my-lib.qpl"), ".my_lib");
+        assert_eq!(namespace_from_path("lib/9lives.qpl"), "._9lives");
+    }
+
+    #[test]
+    fn i_import_namespaces_new_functions_globals_and_tables() {
+        let path = std::env::temp_dir().join(format!("qpl_i_test_{:?}.qpl", std::thread::current().id()));
+        std::fs::write(&path, "greeting: \"hi\"\ndouble: {[x] x*2}\n").unwrap();
+        let mut vm = Vm::new();
+        run_script_imported(path.to_str().unwrap(), &mut vm).expect("run_script_imported");
+        let _ = std::fs::remove_file(&path);
+
+        let ns = namespace_from_path(path.to_str().unwrap());
+        let ns_greeting = format!("{ns}.greeting");
+        let ns_double = format!("{ns}.double");
+        assert!(vm.globals.contains_key(&ns_greeting), "{:?}", vm.globals.keys().collect::<Vec<_>>());
+        assert!(vm.functions.contains_key(&ns_double));
+        assert!(!vm.globals.contains_key("greeting"));
+        assert!(!vm.functions.contains_key("double"));
+    }
+
+    #[test]
+    fn i_import_does_not_double_namespace_an_already_namespaced_binding() {
+        // a script that itself `\i`s another script leaves that nested import's
+        // already-namespaced bindings alone rather than re-prefixing them.
+        let mut vm = Vm::new();
+        vm.globals.insert(".inner.x".into(), crate::ast::Value::Int(1));
+        let path = std::env::temp_dir().join(format!("qpl_i_nested_test_{:?}.qpl", std::thread::current().id()));
+        std::fs::write(&path, "y: 2\n").unwrap();
+        run_script_imported(path.to_str().unwrap(), &mut vm).expect("run_script_imported");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(vm.globals.contains_key(".inner.x"));
+        assert!(!vm.globals.contains_key("y"));
+    }
+
+    #[test]
+    fn i_command_requires_a_quoted_path() {
+        let path = std::env::temp_dir().join(format!("qpl_i_quoted_test_{:?}.qpl", std::thread::current().id()));
+        std::fs::write(&path, "z: 1\n").unwrap();
+        let mut vm = Vm::new();
+
+        // bare/unquoted is rejected with a clear message
+        let err = run_line(&format!("\\i {}", path.to_str().unwrap()), &mut vm, "<main>", 0)
+            .expect_err("bare path should be rejected");
+        assert!(matches!(&err, crate::errors::QplError::Runtime(m) if m.contains("quoted path")), "{err:?}");
+
+        // quoted works, both at the REPL and (via run_script -> run_line) nested in a script
+        run_line(&format!("\\i \"{}\"", path.to_str().unwrap()), &mut vm, "<main>", 0)
+            .expect("quoted path should import");
+        let _ = std::fs::remove_file(&path);
+        let ns = namespace_from_path(path.to_str().unwrap());
+        assert!(vm.globals.contains_key(&format!("{ns}.z")));
     }
 
     #[test]
@@ -631,12 +745,11 @@ mod tests {
 
     #[cfg(feature = "ipc")]
     #[test]
-    fn dispatch_does_not_mistake_an_arithmetic_expression_for_the_1_stdout_shorthand() {
-        // regression: `render_tokens` renders `1+1` as `1 + 1` (the lexer is
-        // whitespace-insensitive, so this is a fine reconstruction on its own),
-        // but `log_target`'s `1 <expr>` shorthand (kdb's stdout handle 1) then
-        // misreads that leading "1 " as the directive, not the literal 1 — so
-        // `eval_for_dispatch` must not apply that shorthand to dispatched text.
+    fn dispatch_evaluates_an_expression_starting_with_a_digit() {
+        // regression: `render_tokens` renders `1+1` as `1 + 1`, which a
+        // stdout-write shorthand keyed on a leading "1 " used to misread as a
+        // directive rather than as the literal 1. `log` is now the only
+        // spelling that writes, so dispatched text like this is unambiguous.
         let mut vm = Vm::new();
         match super::eval_for_dispatch("1 + 1", &mut vm) {
             Ok(crate::vm::EvalResult::Scalar(crate::ast::Value::Int(2))) => {}
@@ -704,20 +817,24 @@ mod tests {
     }
 
     #[test]
-    fn log_target_keyword_and_digit() {
+    fn log_target_keyword() {
         assert_eq!(log_target(r#"log "hi""#), Some(r#""hi""#));
-        assert_eq!(log_target(r#"1 "hi""#), Some(r#""hi""#));
         assert_eq!(log_target("log x + 1"), Some("x + 1"));
     }
 
     #[test]
     fn log_target_bare_is_blank_line() {
         assert_eq!(log_target("log"), Some(""));
-        assert_eq!(log_target("1"), Some(""));
     }
 
+    /// `log` is the only spelling that writes to stdout. A leading digit is
+    /// always an ordinary expression, so arithmetic and row-count queries
+    /// alike reach the VM untouched.
     #[test]
-    fn log_target_leaves_row_count_queries_alone() {
+    fn log_target_ignores_leading_digits() {
+        assert_eq!(log_target("1"), None);
+        assert_eq!(log_target(r#"1 "hi""#), None);
+        assert_eq!(log_target("1 + 1"), None);
         assert_eq!(log_target("1 limit select from trades"), None);
         assert_eq!(log_target("1 # select from trades"), None);
         assert_eq!(log_target("10 limit select from trades"), None);

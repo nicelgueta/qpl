@@ -1,0 +1,10 @@
+/ ─────────────────────────────────────────────────────────────────────────────
+/ A tiny "library" script meant to be imported, not run directly. `\i` (REPL
+/ only — see examples/README.md) runs a script like `\l`, then moves every
+/ table/global/function it newly bound at its top level under `.namespace_lib.*`
+/ (the file's stem), so it doesn't collide with names already in the session.
+/ ─────────────────────────────────────────────────────────────────────────────
+
+double: {[x] x*2}
+greeting: "hello from namespace_lib"
+lookup: select sym, price from trades where price > 100

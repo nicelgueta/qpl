@@ -645,10 +645,14 @@ impl Parser {
     }
 
     /// Like [`Parser::parse_expr`] but without trailing juxtaposition-as-call:
-    /// in a `log` argument list `a b` is two items, not `a(b)`. Binary ops and
-    /// casts still compose; wrap an actual function call in parens.
+    /// in a `log` argument list `a b` is two items, not `a(b)`. Binary ops,
+    /// casts, and noun-level postfixes (`` name`col ``, `f[a;b]` bracket
+    /// application/indexing, `list where pred`, …) still compose — go through
+    /// `parse_noun` rather than `parse_primary` directly, so only bareword
+    /// juxtaposition-as-a-call (`f x`, handled in `parse_expr_inner`) is
+    /// excluded; wrap that form of a call in parens instead.
     fn parse_expr_no_call(&mut self) -> Result<Expr, QplError> {
-        let left = self.parse_primary()?;
+        let left = self.parse_noun()?;
         if let Some(cast) = self.parse_modified_cast(&left, true)? {
             return Ok(cast);
         }
@@ -1022,10 +1026,14 @@ impl Parser {
             TokenKind::Symbol(s)   => Ok(Expr::Sym(s)),
             TokenKind::Temporal(v) => Ok(Expr::Lit(v)),
             TokenKind::Name(n) if n == "i" => Ok(Expr::IColRef),
+            // `.qpl.d` / `.qpl.t` / `.qpl.p` / `.qpl.n` — nullary now-functions,
+            // the only namespaced names that stand for a call with no args of
+            // their own; every other `.ns.name` is an ordinary variable/table
+            // reference (`ColRef`), resolved by lookup like any other name.
+            TokenKind::Name(n) if matches!(n.as_str(), ".qpl.d" | ".qpl.t" | ".qpl.p" | ".qpl.n") =>
+                Ok(Expr::Call { func: n, args: vec![] }),
             TokenKind::Name(n)     => Ok(Expr::ColRef(n)),
             TokenKind::Op(op) if op == "?" => self.parse_case(),
-            // `.qpl.d` / `.qpl.t` / `.qpl.p` / `.qpl.n` — nullary now-functions
-            TokenKind::QplNow(name) => Ok(Expr::Call { func: name, args: vec![] }),
             // leading `-`: a negative literal (`-45.3`) or unary negation of the
             // next primary, lowered to `0 - x` so it composes like any `-`
             TokenKind::Op(op) if op == "-" => {
@@ -1089,7 +1097,7 @@ pub fn parse(tokens: Vec<Token>) -> Result<Stmt, QplError> {
 }
 
 /// Parse one or more juxtaposed expressions (space-separated), consuming every
-/// token. Used by the `log` / `1` stdout-write, which evaluates each as a scalar
+/// token. Used by the `log` stdout-write, which evaluates each as a scalar
 /// and concatenates the rendered values. Top-level juxtaposition separates
 /// items rather than forming a call — see [`Parser::parse_expr_no_call`].
 pub fn parse_expr_seq(tokens: Vec<Token>) -> Result<Vec<Expr>, QplError> {
@@ -1145,7 +1153,6 @@ fn is_noun_start(token: &TokenKind) -> bool {
         | TokenKind::SymbolVec(_)
         | TokenKind::BoolVec(_)
         | TokenKind::Temporal(_)
-        | TokenKind::QplNow(_)
         | TokenKind::LParen
     )
 }
@@ -1210,7 +1217,6 @@ fn render_tokens(tokens: &[Token]) -> String {
             TokenKind::Str(s) => render_str_literal(s),
             TokenKind::Temporal(v) => crate::temporal::format_temporal(v)
                 .unwrap_or_else(|| format!("{v:?}")),
-            TokenKind::QplNow(name) => name.clone(),
             TokenKind::Colon => ":".to_string(),
             TokenKind::ColonColon => "::".to_string(),
             TokenKind::Comma => ",".to_string(),
@@ -1289,6 +1295,18 @@ mod tests {
     fn expr_seq_juxtaposed_names_are_separate_items_not_a_call() {
         let got = seq("a b");
         assert_eq!(got, vec![Expr::ColRef("a".into()), Expr::ColRef("b".into())]);
+    }
+
+    #[test]
+    fn expr_seq_bracket_call_still_applies_without_parens() {
+        // `f[a;b]`/`f[a]` is a noun-level postfix (unlike bareword `f a`
+        // juxtaposition, which `parse_expr_no_call` deliberately treats as two
+        // separate items) — so it applies even inside a `log` arg list.
+        let got = seq("add[2;3]");
+        assert_eq!(got, vec![Expr::Apply {
+            func: Box::new(Expr::ColRef("add".into())),
+            args: vec![Expr::Lit(Value::Int(2)), Expr::Lit(Value::Int(3))],
+        }]);
     }
 
     fn sel(src: &str) -> SelectStmt {
@@ -1838,6 +1856,28 @@ mod tests {
                 expr,
                 Expr::Call { func, args } if func == ".qpl.p" && args.is_empty()
             )),
+            other => panic!("expected scalar assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn namespaced_identifier_parses_as_an_ordinary_variable_reference() {
+        // a general `.ns.name` (not one of the `.qpl.*` now-functions) is just
+        // a `ColRef` — resolved by name lookup like any other identifier,
+        // not a zero-arg call.
+        match p("l: .utils.helper") {
+            Stmt::ScalarAssign { expr, .. } => assert_eq!(expr, Expr::ColRef(".utils.helper".into())),
+            other => panic!("expected scalar assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn namespaced_identifier_composes_with_bareword_call_juxtaposition() {
+        match p("l: .utils.helper 21") {
+            Stmt::ScalarAssign { expr, .. } => assert_eq!(expr, Expr::Call {
+                func: ".utils.helper".into(),
+                args: vec![Expr::Lit(Value::Int(21))],
+            }),
             other => panic!("expected scalar assign, got {other:?}"),
         }
     }

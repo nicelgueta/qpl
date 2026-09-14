@@ -190,22 +190,33 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 i += 1;
             }
             '.' => {
-                // `.qpl.<ident>` — a nullary "now" function (`.qpl.d`, `.qpl.p`,
-                // …) usable anywhere an expression is. Carried as an `Op` so no
-                // new token / AST node is needed; the parser turns it into a
-                // zero-arg `Expr::Call`. (`.qpl.cfg` is handled at the string
-                // level in repl.rs and never reaches here.)
-                if chars[i..].starts_with(&['.', 'q', 'p', 'l', '.']) {
-                    let mut k = i + 5;
+                // a namespaced identifier: `.ns.name` (`.qpl.d`, `.qpl.cfg`,
+                // `.utils.helper` for a `\i`-imported script's bindings, …),
+                // any number of `.segment`s. No new token/AST node — it's a
+                // plain `Name`, so it flows through every existing
+                // identifier path (variable/table lookup, bareword calls,
+                // assignment targets) unchanged. (`.qpl.cfg` as a bare REPL
+                // directive is still handled at the string level in repl.rs
+                // and never reaches here; this only matters when `.qpl.cfg`
+                // appears inside an expression, which it doesn't today.)
+                let mut k = i + 1;
+                if k < n && is_name_start(chars[k]) {
+                    k += 1;
                     while k < n && is_name_char(chars[k]) {
                         k += 1;
                     }
-                    if k > i + 5 {
-                        let name: String = chars[i..k].iter().collect();
-                        tokens.push(Token { kind: TokenKind::QplNow(name), pos: start });
-                        i = k;
-                        continue;
+                    while k < n && chars[k] == '.'
+                        && k + 1 < n && is_name_start(chars[k + 1])
+                    {
+                        k += 1;
+                        while k < n && is_name_char(chars[k]) {
+                            k += 1;
+                        }
                     }
+                    let name: String = chars[i..k].iter().collect();
+                    tokens.push(Token { kind: TokenKind::Name(name), pos: start });
+                    i = k;
+                    continue;
                 }
                 return Err(QplError::Lex(format!("Unexpected character: {c}")));
             }
@@ -427,11 +438,17 @@ mod tests {
 
     #[test]
     fn qpl_now_functions_lex_as_their_own_token() {
-        assert_eq!(kinds(".qpl.d"), vec![TokenKind::QplNow(".qpl.d".into())]);
+        assert_eq!(kinds(".qpl.d"), vec![TokenKind::Name(".qpl.d".into())]);
         assert_eq!(kinds("log .qpl.p"), vec![
             TokenKind::Name("log".into()),
-            TokenKind::QplNow(".qpl.p".into()),
+            TokenKind::Name(".qpl.p".into()),
         ]);
+    }
+
+    #[test]
+    fn namespaced_identifier_lexes_as_a_dotted_name() {
+        assert_eq!(kinds(".utils.helper"), vec![TokenKind::Name(".utils.helper".into())]);
+        assert_eq!(kinds(".utils.sub.thing"), vec![TokenKind::Name(".utils.sub.thing".into())]);
     }
 
     // --- booleans ---

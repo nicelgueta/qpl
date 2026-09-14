@@ -1,122 +1,249 @@
 # Column expressions & lists
 
-A **column expression** pulls one column out of a table *without* a surrounding
-`select` statement. It takes one of two forms:
+Every query so far has returned a table, even when that table had a single
+column and a single row. Often what you actually want is the value itself:
+the highest price, the number of matching rows, the list of prices. This
+chapter is about getting those out.
+
+## Pulling a column out of a table
+
+A **column expression** names one column of one table, without a surrounding
+statement. There are two ways to write it, and they mean the same thing:
 
 ```qpl
-trades`price                 / backtick a column off a table name
+trades`price                 / backtick the column off the table name
 select price from trades     / a one-column select
-trades`price where size > 100   / a `where` may be attached
 ```
 
-Used as a value — assigned to a name, reduced, sliced or indexed — a column
-expression **materialises to a list** (`IntVec` / `FloatVec` / `StrVec` /
-`SymVec` / `BoolVec`, or a typed temporal list such as `TimestampVec` for a
-datetime column; other column dtypes, and columns containing nulls, are an
-error). A bare one-column `select` typed on its own still prints as a table; it
-becomes a list only in a value position.
+The backtick form is the one you'll type day to day. What makes either of
+them interesting is not the syntax but what happens when you *use* the
+result. Typed on its own, a one-column select is still a query, so it prints
+as a table. Put it somewhere a value belongs — bind it to a name, reduce it,
+slice it — and it becomes a **list**:
 
 ```qpl
-px: trades`price             / a FloatVec global
-px: select price from trades  / same
+qpl) px: trades`price
+qpl) px
 ```
 
-**Reductions** (`sum` `avg`/`mean` `min` `max` `first` `last` `count`
-`std`/`dev` `var` `med`/`median` `mode`/`modal` `skew` `kurt` `any` `all`
-`prod` `argmin` `argmax` `nnull` `distinct`/`n_unique`) collapse a column
-expression to a scalar you can bind:
-
-```qpl
-top:  max trades`price
-n:    count select price from trades where size > 100
-select sym, price from trades where price >= top   / the scalar composes into later queries
+```
+f64[8]: 182.3 183.1 415.2 416 140.5 141.2 184 414.8
 ```
 
-Any non-reducing column verb (`cumsum`, `abs`, `2 shift`, `2 round`, …) yields
-another list.
+That's a list of eight floats, displayed with its type and length, rather
+than a table with one column. Lists are a first-class kind of value in qpl,
+and the rest of this chapter is about what you can do with them.
 
-**Slicing** — `n#<expr>` takes the first `n` rows, `-n#<expr>` the last `n`:
+Under the hood a list is a Polars `Series`, and each atomic type has a
+matching list type: `IntVec`, `FloatVec`, `StrVec`, `SymVec`, `BoolVec`, and
+one per temporal type. A column whose type has no list equivalent, or which
+contains nulls, will refuse to materialise rather than quietly losing
+information.
+
+A column expression can carry a `where` of its own, which filters the table's
+rows before the column is extracted:
 
 ```qpl
-3#trades`price
--3#trades`price
-3#select price from trades
+trades`price where size > 100
 ```
 
-`n#<whole table>` (`3#trades`, `3#select sym, price from t`) stays a table — use
-`n limit …` or `n#…` interchangeably there.
+## Reductions turn a list into a scalar
 
-**Indexing** — `list[i]` picks one element (an atom); `list[i j k]` gathers a
-sub-list. Works on a list global, a column expression, or a parenthesised
-expression, and chains:
+Apply an aggregate to a column expression and you get back a single value:
 
 ```qpl
-l: 10 20 30 40 50
-l[0]                         / i64: 10   (an atom)
-l[1 3 4]                     / i64[3]: 20 40 50
-sub: trades`price[2 3]       / a 2-element FloatVec: rows 2 and 3
-one: (trades`sym)[0]
+qpl) top: max trades`price
+qpl) top
 ```
 
-A parenthesised expression may also be followed by a bare int run, q-style:
-`(trades`price) 2 3`.
-
-Once a column expression has been persisted as a list, `where` no longer applies
-to it — filter before materialising.
-
-Bare names in a value position resolve at run time: first a scalar global, then
-a lazy binding, then a table. `t2: trades` copies the table under a new name.
-
-**Vector arithmetic** — every list is backed by a Polars `Series`, so the usual
-operators (arithmetic, comparison) apply elementwise between a list and a
-scalar, or between two lists of the same length (or one of length 1, which
-broadcasts):
-
-```qpl
-l: 12 34
-l + 2                        / i64[2]: 14 36
-2 * l                        / i64[2]: 24 68
-l > 20                       / bool[2]: 01
-trades`price - trades`price[0]  / list minus a broadcast scalar
+```
+f64: 416
 ```
 
-Every atomic scalar type has a matching list type (`IntVec` `FloatVec`
-`SymVec` `StrVec` `BoolVec` `DateVec` `MonthVec` `TimeVec` `MinuteVec`
-`SecondVec` `TimestampVec` `TimespanVec`) — a temporal column materialises to
-its typed list rather than a raw integer offset:
+The aggregates listed in [Expressions](expressions.md) all work here.
+`count`, in particular, is how you answer "how many rows match":
 
 ```qpl
-ts: trades`ts                        / a TimestampVec
-ts + 0D00:01:00.000000000            / shift every timestamp forward one minute
+qpl) n: count select price from trades where size > 100
+qpl) n
 ```
 
-**Filtering a list** — `<list-expr> where <predicate>` filters a list
-elementwise; `x` in the predicate refers to the current element (a comma joins
-predicates with AND, same as a table's `where`):
-
-```qpl
-nums: 10 20 30 40 50
-nums where x > 25              / i64[3]: 30 40 50
-nums where x > 10, x < 50      / i64[3]: 20 30 40
-trades`price where x > 400     / filter an already-materialised list by its own values
+```
+i64: 5
 ```
 
-This is a different `where` from the one on a `` table`col `` column
-expression (which filters table *rows* by any other column before
-projecting) — the two share the keyword but not a grammar rule, so chaining
-them needs parentheses: `` (trades`price where size>100) where x>400 ``.
-
-**Building lists and tables** — `til` generates a range list; `zip` builds a
-table from a dict of same-length named lists:
+Now recall from [Assignment](assignment.md) that a scalar gets compiled into
+later queries as a literal. That's what makes this genuinely useful, because
+it means a value computed from the data can be fed straight back into a query
+over that data:
 
 ```qpl
-til 5                           / i64[5]: 0 1 2 3 4
+qpl) top: max trades`price
+qpl) select sym, price from trades where price >= top
+```
+
+```
+shape: (1, 2)
+┌──────┬───────┐
+│ sym  ┆ price │
+│ ---  ┆ ---   │
+│ str  ┆ f64   │
+╞══════╪═══════╡
+│ MSFT ┆ 416.0 │
+└──────┴───────┘
+```
+
+In SQL that needs a correlated subquery. Here it's two statements, and the
+first one is reusable.
+
+Verbs that don't reduce — `cumsum`, `abs`, and the parameterised ones like
+`2 round` — return another list of the same length instead.
+
+## Taking part of a list
+
+`n#` takes the first `n` elements, and a negative count takes from the end:
+
+```qpl
+qpl) 3#trades`price
+```
+
+```
+f64[3]: 182.3 183.1 415.2
+```
+
+```qpl
+-3#trades`price              / the last three
+```
+
+The same `#` applied to a whole table means "the first n rows" and gives back
+a table, which is covered in [Table operators](table-operators.md). The rule
+is just that a list in gives a list out, and a table in gives a table out.
+
+## Indexing
+
+Square brackets pick elements by position. One index gives a single value; a
+run of indices gives a shorter list:
+
+```qpl
+qpl) l: 10 20 30 40 50
+qpl) l[1 3 4]
+```
+
+```
+i64[3]: 20 40 50
+```
+
+Notice that `10 20 30 40 50` is a list literal: numbers separated by spaces,
+no commas or brackets, in the same spirit as the run-of-symbols form from
+[Symbols](symbols.md).
+
+Indexing works on anything that produces a list, not just a bound name:
+
+```qpl
+sub: trades`price[2 3]       / rows 2 and 3 of the price column
+one: (trades`sym)[0]         / a single symbol
+```
+
+Following q, a parenthesised expression can also be indexed by just putting
+the indices after it: `` (trades`price) 2 3 `` means the same as
+`` (trades`price)[2 3] ``.
+
+One limitation to note: `where` attaches to a column expression *before* it
+becomes a list. Once you've bound a list to a name, that form is no longer
+available, so filter first and materialise second.
+
+## Arithmetic on whole lists
+
+Because a list is a Series, operators apply elementwise. A list against a
+scalar broadcasts the scalar across every element:
+
+```qpl
+qpl) l: 10 20 30 40 50
+qpl) l + 2
+```
+
+```
+i64[5]: 12 22 32 42 52
+```
+
+Two lists of the same length combine pairwise, and a list of length one
+broadcasts against a longer one, which is the same rule NumPy and Polars use.
+Comparison works the same way and gives back a list of booleans.
+
+A neat consequence is that rebasing a series to its first value needs no
+special support:
+
+```qpl
+trades`price - trades`price[0]
+```
+
+The left side is a list of eight, the right side is a single value, so the
+subtraction broadcasts.
+
+## Filtering a list by its own values
+
+Lists have a `where` of their own, in which `x` refers to the element being
+tested:
+
+```qpl
+qpl) nums: 10 20 30 40 50
+qpl) nums where x > 25
+```
+
+```
+i64[3]: 30 40 50
+```
+
+Commas combine predicates with AND, as they do in a query:
+
+```qpl
+nums where x > 10, x < 50
+```
+
+This is a genuinely different operation from the `where` on a column
+expression earlier in the chapter, even though it's the same word. That one
+filters a *table's rows* using any column, before a single column is
+extracted. This one filters a *list* using its own values. They're separate
+rules in the grammar, so combining them needs parentheses to say which is
+which:
+
+```qpl
+(trades`price where size>100) where x>400
+```
+
+Read that as: take the prices of trades bigger than 100 shares, then keep
+only those above 400.
+
+## Building lists and tables from nothing
+
+Two constructors round the chapter off. `til` generates a range, either from
+zero or between two bounds:
+
+```qpl
+qpl) til 5
+```
+
+```
+i64[5]: 0 1 2 3 4
+```
+
+```qpl
 10 til 15                       / i64[5]: 10 11 12 13 14
+```
 
+And `zip` assembles a table from named lists of equal length:
+
+```qpl
 a: til 20
 b: 2 * til 20
 tbl: zip `cola`colb!a b         / a 2-column table, 20 rows
 ```
 
-A dict literal (`` `k1`k2!v1 v2 ``) pairs a symbol (vector) key with one value
-noun per key — a compound value expression needs parens, e.g. `` `a`b!(x+1) y ``.
+The `` `cola`colb!a b `` part is a **dict literal**: a run of symbols, then
+`!`, then one value per symbol. It pairs the first symbol with the first
+value and so on. If a value is itself a compound expression, wrap it in
+parentheses so qpl can tell where one value ends and the next begins, as in
+`` `a`b!(x+1) y ``.
+
+This `!` pairing shows up again as a way of specifying sort order in
+[Table operators](table-operators.md).

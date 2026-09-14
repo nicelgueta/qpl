@@ -1,34 +1,123 @@
 # Functions
 
-q-style lambdas, bound to a name:
+Once you've typed the same query three times with only one value changing,
+it's time to give it a name. qpl has lambdas in the q style, bound with the
+same `:` as everything else.
 
 ```qpl
-add:   {[x,y] x+y}            / parameter list in [ ], body is ;-separated
-add[2;3]                      / 5   — call with bracketed args
-inc:   {[x] x+1}
-inc 41                        / 42  — a one-arg function also takes `f x`
-inc[41]                      / 42
-
-hypot2: {[a,b] s: (a*a)+(b*b); s}   / earlier statements bind call-local vars;
-hypot2[3;4]                          / the last statement is the return value
-
-fac: {[n] ?[n<2; 1; n*fac[n-1]]}   / `?[..]` works in value context, so
-fac[5]                              / recursion terminates → 120
+qpl) add: {[x,y] x+y}
+qpl) add[2;3]
 ```
 
-A function can return a table, and its result composes like any value
-expression:
+```
+i64: 5
+```
+
+The body goes in braces, the parameters in brackets at the front, and
+arguments are passed in brackets separated by semicolons. Semicolons rather
+than commas, because a comma already means something inside a query.
+
+A function of one argument can also be called by just putting the argument
+after it, which reads better for small helpers:
 
 ```qpl
-bysym: {[s] select sym, price from trades where sym = s}
-bysym[`AAPL]                  / a table
-avgpx: {[s] avg select price from trades where sym = s}
-avgpx[`MSFT]                  / a scalar
+qpl) inc: {[x] x+1}
+qpl) inc 41
 ```
 
-The final statement in the body must be an expression (a trailing assignment is
-an error). Parameters and any locals the body assigns are scoped to the call —
-a function cannot mutate outer bindings. Niladic functions are written `{[] ..}`
-or `{ ..}` and called `f[]`. Functions are a named binding kind, not first-class
-values: they cannot be passed as arguments, returned, or used inside a `select`
-projection. See [examples/functions.qpl](https://github.com/nicelgueta/qpl/blob/main/examples/functions.qpl).
+```
+i64: 42
+```
+
+`inc[41]` works too; they're the same call.
+
+## Several statements
+
+A body can hold more than one statement, separated by semicolons. Earlier
+statements bind local names, and the value of the last one is what comes
+back. There's no `return` keyword:
+
+```qpl
+qpl) hypot2: {[a,b] s: (a*a)+(b*b); s}
+qpl) hypot2[3;4]
+```
+
+```
+i64: 25
+```
+
+Because `?[...]` from [Expressions](expressions.md) is an ordinary
+expression rather than statement syntax, it works as a function body, and
+recursion follows without any special support:
+
+```qpl
+qpl) fac: {[n] ?[n<2; 1; n*fac[n-1]]}
+qpl) fac[5]
+```
+
+```
+i64: 120
+```
+
+## Returning tables
+
+Nothing restricts a body to arithmetic. A function can end in a query, in
+which case calling it gives you a table:
+
+```qpl
+qpl) bysym: {[s] select sym, price from trades where sym = s}
+qpl) bysym["AAPL"]
+```
+
+```
+shape: (3, 2)
+┌──────┬───────┐
+│ sym  ┆ price │
+│ ---  ┆ ---   │
+│ str  ┆ f64   │
+╞══════╪═══════╡
+│ AAPL ┆ 182.3 │
+│ AAPL ┆ 183.1 │
+│ AAPL ┆ 184.0 │
+└──────┴───────┘
+```
+
+Or, using a reduction from
+[Column expressions & lists](column-expressions.md), a scalar:
+
+```qpl
+qpl) avgpx: {[s] avg select price from trades where sym = s}
+qpl) avgpx["MSFT"]
+```
+
+```
+f64: 415.3333333333333
+```
+
+Either result composes like any other value of that kind, so a function
+returning a table can be fed straight into another query.
+
+## The rules
+
+A few constraints define what a function is in qpl, and they're worth reading
+once rather than discovering individually:
+
+**The last statement must be an expression.** A trailing assignment is an
+error, since there would be nothing to return.
+
+**Locals are local.** Parameters, and anything the body binds, exist only for
+the duration of the call. A function cannot modify a name outside itself, so
+a call's effect is entirely described by what it returns.
+
+**Niladic functions** take no arguments and are written `{[] ...}` or simply
+`{ ... }`, then called as `f[]`. The empty brackets are what distinguish
+calling it from naming it.
+
+**Functions are not values.** You can bind one and call it, but you cannot
+pass one as an argument, return one from another function, or use one inside
+a `select` projection. If you're reaching for a higher-order function, the
+language will not meet you there; that's a deliberate limit on how much
+machinery the interpreter carries rather than an oversight.
+
+[examples/functions.qpl](https://github.com/nicelgueta/qpl/blob/main/examples/functions.qpl)
+in the repository is a runnable script covering all of the above.

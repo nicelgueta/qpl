@@ -1148,7 +1148,9 @@ fn scalar_binop(l: ast::Value, r: ast::Value, op: &str) -> Result<ast::Value, Qp
         (Int(a),   Int(b),   "+")        => Int(a + b),
         (Int(a),   Int(b),   "-")        => Int(a - b),
         (Int(a),   Int(b),   "*")        => Int(a * b),
-        (Int(a),   Int(b),   "%")        => Int(a / b),
+        // q's `%` is always true (float) division, even for two ints — 10%4 is
+        // 2.5, not 2. Unlike the other int/int arms, this doesn't stay `Int`.
+        (Int(a),   Int(b),   "%")        => Float(a as f64 / b as f64),
         (Int(a),   Int(b),   "=")        => Bool(a == b),
         (Int(a),   Int(b),   "<")        => Bool(a < b),
         (Int(a),   Int(b),   ">")        => Bool(a > b),
@@ -1529,7 +1531,10 @@ fn apply_binop(left: Expr, right: Expr, op: &str) -> Result<Expr, QplError> {
         "+"        => left + right,
         "-"        => left - right,
         "*"        => left * right,
-        "%"        => left / right, // q uses % for division
+        // q's `%` is always true (float) division — Polars' `/` on two integer
+        // columns truncates like Rust's own `/`, so force a float division by
+        // casting both sides first (a no-op for columns already float).
+        "%"        => left.cast(DataType::Float64) / right.cast(DataType::Float64),
         "="        => left.eq(right),
         "!=" | "<>"=> left.neq(right),
         "<"        => left.lt(right),
@@ -2520,9 +2525,10 @@ mod tests {
 
     #[test]
     fn op_div() {
-        // q uses % for division
+        // q uses % for division — always float, even for two ints (10%4 is
+        // 2.5, not 2), unlike +/-/* which stay integer for two ints.
         let df = run(make_vm(), "select h: c2%2 from t");
-        assert_eq!(i64s(&df, "h"), vec![5, 10, 15, 7]);
+        assert_eq!(f64s(&df, "h"), vec![5.0, 10.0, 15.0, 7.5]);
     }
 
     // --- where clause ---
