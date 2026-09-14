@@ -1,7 +1,6 @@
 # qpl — Quick Polars Query Language
 
-An agent-friendly, q/kdb+-inspired programming language that compiles to Polars lazy
-frames. Write concise select statements; Polars runs them fast. Single binary,
+An agent-friendly, q/kdb+-inspired array programming language that uses a polars LazyFrame backend. Select statements are first-class; Polars runs them fast. Single binary,
 zero dependencies — no Python, no Polars install needed.
 
 There's also a [VSCode extension](tools/vscode/) — syntax highlighting plus a
@@ -44,21 +43,21 @@ documentation as a browsable book at
 ## Why?
 
 I often need to query large parquet files on cloud storage under time
-pressure, or knock out a quick transform job. DuckDB is great for this, but I
-always forget the syntax — and prompting an agent for it is often slower than
-just writing the query myself.
+pressure, or knock out a quick transform job. DuckDB is great for this but isn’t great if you want to do scripty things. I usually reach for Python + Polars when I need more than just SQL, but writing out polars queries instead of SQL is verbose and slow (even using Polars SQL feels clunky as a large python string with no IDE support). Prompting an agent also feels like a waste given 80% of the time, I’m not doing anything mega complex and sometimes can be slower than
+just writing the query myself. 
 
-So: a language fast enough to type without thinking, but with DuckDB-level
-performance. As a bonus, one that LLM agents can drive easily too — and can't
+So: a language fast enough to type without thinking, that is in essence a scripting language but supports SQL as first-class syntax with DuckDB-level query performance. As a bonus, one that LLM agents can drive easily too — and can't
 do much damage with, sandboxed or not.
+
+Ambitious? ..well. 
 
 ### Polars
 Writing a DuckDB-grade engine from scratch solo isn't realistic, so I cheated:
 Polars (a dataframe library written in Rust) is the backend. Its API is clean
 enough that the "language" is really just a VM translating instructions into
-Polars queries — which left me free to build whatever front-end I wanted.
+Polars queries — which left me free to build whatever front-end I wanted. according to benchmarks easily found online, Polars generally just trails DuckDB in performance so that’s good enough for me.
 
-That front-end borrows from kdb+/q, a language I'd been lightly exposed to at
+That front-end was inspired a lot by kdb+/q, a language I'd been lightly exposed to at
 work and wanted an excuse to actually learn, while still getting to write Rust.
 
 Thus: `qpl`.
