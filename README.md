@@ -46,7 +46,7 @@ I often need to query large parquet files on cloud storage under time
 pressure, or knock out a quick transform job. DuckDB is great for this but isn’t great if you want to do scripty things. I usually reach for Python + Polars when I need more than just SQL, but writing out polars queries instead of SQL is verbose and slow (even using Polars SQL feels clunky as a large python string with no IDE support). Prompting an agent also feels like a waste given 80% of the time, I’m not doing anything mega complex and sometimes can be slower than
 just writing the query myself. 
 
-So: a language fast enough to type without thinking, that is in essence a scripting language but supports SQL as first-class syntax with DuckDB-level query performance. As a bonus, one that LLM agents can drive easily too — and can't
+So: a language concise enough to type quickly without thinking, that is in essence a scripting language but supports SQL as first-class syntax with DuckDB-level query performance. As a bonus, one that LLM agents can drive easily too — and can't
 do much damage with, sandboxed or not.
 
 Ambitious? ..well. 
