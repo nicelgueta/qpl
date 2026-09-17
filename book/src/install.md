@@ -20,18 +20,17 @@ into a container, a CI job, or a colleague's laptop as easily as `jq`.
 
 ## The IPC feature
 
-There is one build-time decision worth knowing about, though you can safely
-defer it. qpl can optionally act as a client and server, so that one qpl
-process can query the tables held in another running one. That feature is
-switched off by default and adds no dependencies at all to a normal build:
+qpl can act as a client and server, so that one qpl process can query the
+tables held in another running one. That's built in by default. If you don't
+want the two extra dependencies it pulls in (`tokio`, `zeromq`), drop it:
 
 ```bash
-cargo install --path . --features ipc
+cargo install --path . --no-default-features
 ```
 
-Almost nobody needs this on day one, and nothing about a default build is a
-dead end, since you can rebuild with the feature whenever the need shows up.
-[IPC](language/ipc.md) covers what it does, near the end of the book.
+Nothing about that is a dead end, since you can rebuild with the feature
+whenever the need shows up. [IPC](language/ipc.md) covers what it does, near
+the end of the book.
 
 ## Checking it worked
 

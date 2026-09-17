@@ -36,3 +36,8 @@ off mid-expression. A blank line submits what it has.
 In practice this means you can type or paste a multi-line statement at the
 prompt much as you'd write it in a file, and press return on an empty line
 when you're done.
+
+Inside a `{[..] ..}` [function body](functions.md#writing-a-body-across-multiple-lines),
+the same rule applies one indent level in: each line at the body's own
+baseline indent is a separate statement (no `;` needed), and a line indented
+*further* continues the one above, exactly like the script rule above.

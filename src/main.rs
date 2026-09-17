@@ -17,6 +17,10 @@ mod ipc;
 
 use clap::{ArgAction::SetTrue, Parser};
 
+// Matches Polars' own official builds — see the `mimalloc` entry in Cargo.toml.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "qpl", about = "Quick Polars Query Language", version)]
 struct Cli {

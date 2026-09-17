@@ -59,6 +59,31 @@ qpl) fac[5]
 i64: 120
 ```
 
+## Writing a body across multiple lines
+
+Semicolons are only needed to fit more than one statement on the same
+physical line. Written across several lines, a body reads like a script —
+one statement per line, indented under the opening `{[..]`:
+
+```qpl
+summarise: {[min_price]
+    joined: select sym, side, price, size, bid, ask from trades `sym lj quotes `sym
+    priced: select from joined where price > min_price
+    banded: update band: `$?[size >= 300; `large; size >= 150; `mid; `small] from priced
+    select tot: sum price * size, avg_spread: avg ask - bid, n: count price
+        by sym, side, band
+        from banded
+        order tot desc
+    }
+```
+
+The rule is exactly the one from [Multi-line statements](multiline.md), just
+shifted one indent level in: a new line
+indented no further than the body's first statement starts a new one; a line
+indented *more* than that continues the statement above (like the `by`/
+`from`/`order` lines above, which all belong to the final `select`). An
+explicit `;` still works if you'd rather keep two statements on one line.
+
 ## Returning tables
 
 Nothing restricts a body to arithmetic. A function can end in a query, in

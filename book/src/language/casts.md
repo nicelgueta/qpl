@@ -48,6 +48,20 @@ select s: f64$size, y: str$sym from trades
 The available types are `f64` (or `float`), `f32`, `i64` (or `int`), `i32`,
 `i16`, `i8`, `u64`, `u32`, `u16`, `u8`, `bool`, and `str` (or `string`).
 
+## Casting a whole query
+
+The thing on the right of `$` doesn't have to be a bare column reference —
+a whole `select` (or `update`/`collect`/…) works too, and casts its
+one-column result:
+
+```qpl
+qpl) `date$select ts from trades where sym = "AAPL"
+```
+
+```
+date[3]: 2024.03.15 2024.03.15 2024.03.15
+```
+
 ## Width only matters in a column
 
 The narrow integer types are worth a note. In a **scalar** context, every

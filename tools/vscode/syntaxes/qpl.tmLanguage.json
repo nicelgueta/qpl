@@ -48,11 +48,23 @@
       "patterns": [
         {
           "name": "constant.numeric.float.qpl",
+          "match": "\\b\\d+\\.\\d*[eE][+-]?\\d+\\b"
+        },
+        {
+          "name": "constant.numeric.float.qpl",
+          "match": "\\b\\d+[eE]-\\d+\\b"
+        },
+        {
+          "name": "constant.numeric.float.qpl",
           "match": "\\b\\d+\\.\\d*"
         },
         {
           "name": "constant.numeric.bool.qpl",
           "match": "\\b[01]+b\\b"
+        },
+        {
+          "name": "constant.numeric.integer.qpl",
+          "match": "\\b\\d+[eE]\\+?\\d+\\b"
         },
         {
           "name": "constant.numeric.integer.qpl",

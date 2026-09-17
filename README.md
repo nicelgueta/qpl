@@ -64,8 +64,8 @@ Polars is a large crate, so a cold build takes a few minutes. Prebuilt
 binaries for Linux (gnu and musl), Linux ARM64, and macOS on Intel and Apple
 silicon are on the [releases page](../../releases).
 
-Add `--features ipc` for the [client/server][ipc], which is off by default and
-adds no dependencies to a normal build.
+The [client/server][ipc] is built in by default (`ipc` feature); build with
+`--no-default-features` to drop it and its two extra dependencies.
 
 ## Quickstart
 
@@ -283,6 +283,7 @@ effect once in a column.
 int$45.3                       / 45
 int$"42"                       / 42, parsed
 select s: f64$size, y: str$sym from trades   / name them: unaliased casts both want `x`
+`date$select ts from trades where sym = "AAPL"   / casts a whole query's one-column result
 ```
 
 ### Temporal types · [chapter][temporal]
@@ -310,6 +311,21 @@ shifts by one unit of that type's own resolution.
 Now-functions, all UTC: `.qpl.d` date, `.qpl.t` time, `.qpl.p` timestamp,
 `.qpl.n` timespan since midnight. Not yet implemented: `xbar`, `within`, unit
 accessors, and column-plus-integer temporal arithmetic.
+
+A raw integer crossing the `int`/`long` ↔ `timestamp` boundary (`` `timestamp$n ``
+to build one, `` `long$ts `` to unwrap one) is read and written as **ns since
+the Unix epoch (`1970.01.01`)** by default — the same convention a whole-column
+`` `timestamp$col `` cast already uses under Polars, and the one most people
+reach for outside kdb. Set `.qpl.cfg useqepoch=true` to switch that boundary
+back to kdb's native ns-since-`2000.01.01`, matching the type's internal
+representation exactly (only the raw-integer casts move; date literals,
+arithmetic, and display are unaffected either way):
+
+```q
+`timestamp$1700000000000000000     / a Unix-epoch nanosecond timestamp
+.qpl.cfg useqepoch=true
+`timestamp$0                       / now reads as 2000.01.01D00:00:00.0
+```
 
 ### Categoricals & enums · [chapter][enums]
 
@@ -352,8 +368,14 @@ column `i` is the row index, printed as `x`.
 ```q
 distinct select sym from trades
 10 limit select from trades      / 10#select from trades is the same
+-3 limit trades                  / last 3 rows; -3#trades is the same
 `price`size drop trades          / `price`size _ trades is the same
 `sym`price!01b trades            / sort map: 0 asc, 1 desc
+
+n: 10
+n limit trades                   / the count can be any scalar expression, not just a literal
+n#trades
+collect n#(lazy load "trades.parquet")
 ```
 
 ### lazy / collect · [chapter][lazy]
@@ -400,11 +422,15 @@ brackets are open or after a trailing comma. [multi-line][multiline]
 log "rows > " thr ": " n         / rows > 150: 42
 log (f x) " done"                / juxtaposition separates items, so parenthesise
 log f[x] " done"                 / bracket application isn't ambiguous, no parens needed
+info: {[s] log[str$.qpl.p " - INFO " s]}   / log[..] is bracket-scoped, so it works inside a function body
 ```
 
-`.qpl.cfg key=value` sets session knobs: `maxcol` and `maxrow` (display
-only), and `round_type` (`HALF_UP` or `HALF_TO_EVEN`, which does change
-answers). A bare `.qpl.cfg` prints the current settings. [config][config]
+`.qpl.cfg key=value` sets session knobs: `maxcol`, `maxrow`, `tblwidth` (max
+characters wide a printed table may be), and `strlen` (max characters shown
+per cell before truncating with an ellipsis) are display only, `-1` means
+unlimited for `tblwidth`/`strlen`; `round_type` (`HALF_UP` or `HALF_TO_EVEN`)
+and `useqepoch` (`true`/`false`, see Temporal types above) do change answers.
+A bare `.qpl.cfg` prints the current settings. [config][config]
 
 ### Namespaces & imports
 
@@ -427,11 +453,14 @@ script.
 ```
 
 A binding the imported script already namespaced itself is left alone rather
-than double-prefixed.
+than double-prefixed. A function's *body* can still call another top-level
+helper from the same script by its bare, unqualified name (`info` calling
+`_log`, say) — that unqualified call resolves against the importing
+function's own namespace before giving up.
 
 ### IPC · [chapter][ipc]
 
-Optional (`--features ipc`). Lets one qpl process query another over a
+On by default (`ipc` feature; drop with `--no-default-features`). Lets one qpl process query another over a
 REQ/REP socket pair ([zmq.rs](https://github.com/zeromq/zmq.rs), pure Rust,
 no system libzmq). The point is to load slow tables once in a long-lived
 session and let short-lived clients query it, to let non-qpl callers fetch

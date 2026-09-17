@@ -63,6 +63,15 @@ pub struct Scope {
     pub tables: HashMap<String, DataFrame>,
     pub lazy_frames: HashMap<String, LazyFrame>,
     pub functions: HashMap<String, ast::Function>,
+    /// The namespace this call is executing under (e.g. `.logging`), if any —
+    /// set by `apply_function` when the callee resolved to a namespaced name.
+    /// `\i`'s import only renames a script's top-level bindings, it doesn't
+    /// rewrite cross-references *inside* their bodies (`info`'s body still
+    /// calls plain `_log`, not `.logging._log`), so `Vm::lookup` retries an
+    /// unresolved bare name qualified by this before giving up — that's what
+    /// lets a namespaced function call an unqualified sibling from the same
+    /// import.
+    pub current_ns: Option<String>,
 }
 
 /// The kind of binding [`Vm::lookup`] found for a name.
@@ -92,12 +101,31 @@ pub struct VmConfig {
     pub maxrow: usize,
     /// rounding mode used by the `round` column function (`round_type`)
     pub round_type: RoundMode,
+    /// max characters wide a printed table may be, `-1` = unlimited (`tblwidth`)
+    pub tblwidth: i64,
+    /// max characters shown per cell before truncating with an ellipsis,
+    /// `-1` = unlimited (`strlen`)
+    pub strlen: i64,
+    /// when `true`, a raw integer crossing the `Int`/`timestamp` boundary
+    /// (`` `timestamp$n ``, `` `long$ts ``) is read/written as ns since kdb's
+    /// `2000.01.01` epoch, matching the internal [`ast::Value::Timestamp`]
+    /// representation; when `false` (the default) it's ns since the Unix epoch
+    /// (`1970.01.01`), matching what a whole-column `` `timestamp$ `` cast
+    /// already does under Polars and what non-kdb users expect (`useqepoch`)
+    pub useqepoch: bool,
 }
 
 impl Default for VmConfig {
     fn default() -> Self {
         // mirror Polars' own display defaults
-        Self { maxcol: 8, maxrow: 10, round_type: RoundMode::HalfToEven }
+        Self {
+            maxcol: 8,
+            maxrow: 10,
+            round_type: RoundMode::HalfToEven,
+            tblwidth: -1,
+            strlen: 30,
+            useqepoch: false,
+        }
     }
 }
 
@@ -108,14 +136,26 @@ impl VmConfig {
             "maxcol" => self.maxcol = parse_cfg_usize(key, value)?,
             "maxrow" => self.maxrow = parse_cfg_usize(key, value)?,
             "round_type" => self.round_type = parse_round_type(value)?,
+            "tblwidth" => self.tblwidth = parse_cfg_i64(key, value)?,
+            "strlen" => self.strlen = parse_cfg_i64(key, value)?,
+            "useqepoch" => self.useqepoch = parse_cfg_bool(key, value)?,
             _ => return Err(QplError::Runtime(format!(
-                "unknown config '{key}' (known: maxcol, maxrow, round_type)"
+                "unknown config '{key}' (known: maxcol, maxrow, round_type, tblwidth, strlen, useqepoch)"
             ))),
         }
-        // the row/col limits are read by Polars from the environment at render time
+        // the row/col/width/strlen limits are read by Polars from the environment at render time
         match key {
             "maxcol" => unsafe { std::env::set_var("POLARS_FMT_MAX_COLS", self.maxcol.to_string()) },
             "maxrow" => unsafe { std::env::set_var("POLARS_FMT_MAX_ROWS", self.maxrow.to_string()) },
+            "tblwidth" => unsafe { std::env::set_var("POLARS_TABLE_WIDTH", self.tblwidth.to_string()) },
+            // Polars' formatter takes a negative POLARS_FMT_STR_LEN literally as
+            // usize::MAX and then overflows adding padding to it (fmt.rs), unlike
+            // POLARS_TABLE_WIDTH which clamps negatives to u16::MAX itself — so
+            // `-1` (unlimited) is translated to a large-but-safe finite value here.
+            "strlen" => unsafe {
+                let v = if self.strlen < 0 { i32::MAX as i64 } else { self.strlen };
+                std::env::set_var("POLARS_FMT_STR_LEN", v.to_string())
+            },
             _ => {}
         }
         Ok(())
@@ -124,8 +164,9 @@ impl VmConfig {
     /// One `key=value` line per knob — printed by a bare `.qpl.cfg`.
     pub fn describe(&self) -> String {
         format!(
-            "maxcol={}\nmaxrow={}\nround_type={}",
-            self.maxcol, self.maxrow, round_type_name(self.round_type),
+            "maxcol={}\nmaxrow={}\nround_type={}\ntblwidth={}\nstrlen={}\nuseqepoch={}",
+            self.maxcol, self.maxrow, round_type_name(self.round_type), self.tblwidth, self.strlen,
+            self.useqepoch,
         )
     }
 }
@@ -134,6 +175,22 @@ fn parse_cfg_usize(key: &str, value: &str) -> Result<usize, QplError> {
     value.parse().map_err(|_| {
         QplError::Runtime(format!("config '{key}' expects a non-negative integer, got '{value}'"))
     })
+}
+
+fn parse_cfg_i64(key: &str, value: &str) -> Result<i64, QplError> {
+    value.parse().map_err(|_| {
+        QplError::Runtime(format!("config '{key}' expects an integer, got '{value}'"))
+    })
+}
+
+fn parse_cfg_bool(key: &str, value: &str) -> Result<bool, QplError> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(QplError::Runtime(format!(
+            "config '{key}' expects true/false, got '{value}'"
+        ))),
+    }
 }
 
 fn parse_round_type(value: &str) -> Result<RoundMode, QplError> {
@@ -291,7 +348,44 @@ impl Vm {
         if let Some(f) = self.functions.get(name) {
             return Some(Lookup::Function(f));
         }
+        // Unqualified sibling reference from inside a namespaced import's own
+        // function body (see `Scope::current_ns`) — retry once, qualified.
+        if let Some(ns) = self.scopes.last().and_then(|s| s.current_ns.as_ref()) {
+            let qualified = format!("{ns}.{name}");
+            if let Some(v) = self.globals.get(&qualified) {
+                return Some(Lookup::Global(v));
+            }
+            if let Some(lf) = self.lazy_frames.get(&qualified) {
+                return Some(Lookup::LazyFrame(lf));
+            }
+            if let Some(df) = self.tables.get(&qualified) {
+                return Some(Lookup::Table(df));
+            }
+            if let Some(f) = self.functions.get(&qualified) {
+                return Some(Lookup::Function(f));
+            }
+        }
         None
+    }
+
+    /// The namespace a call to `name` should execute under, for propagating
+    /// into the callee's own scope (`Scope::current_ns`) so its body can in
+    /// turn call an unqualified sibling from the same import. `name` already
+    /// qualified (`.logging.info`) uses its own namespace directly; a bare
+    /// name that only resolved via the *current* call's own namespace
+    /// fallback inherits that same namespace, so the chain keeps working
+    /// through more than one level of unqualified sibling calls.
+    pub(crate) fn resolve_function_ns(&self, name: &str) -> Option<String> {
+        if let Some(i) = name.rfind('.') {
+            return Some(name[..i].to_string());
+        }
+        let resolved_directly = self.scopes.last().is_some_and(|s| s.functions.contains_key(name))
+            || self.functions.contains_key(name);
+        if resolved_directly {
+            None
+        } else {
+            self.scopes.last().and_then(|s| s.current_ns.clone())
+        }
     }
 
     /// `lookup`, narrowed to the scalar-global kind.
@@ -433,7 +527,8 @@ impl Vm {
                 temporal::now_value(func)
             }
             ast::Expr::Cast { target, expr } => match target {
-                ast::CastTarget::Prim(dtype) => scalar_cast(self.eval_scalar(expr)?, dtype),
+                ast::CastTarget::Prim(dtype) =>
+                    scalar_cast(self.eval_scalar(expr)?, dtype, self.config.useqepoch),
                 // `` `$expr `` — intern a string into a symbol
                 ast::CastTarget::Sym => match self.eval_scalar(expr)? {
                     ast::Value::Str(s) | ast::Value::Sym(s) => Ok(ast::Value::Sym(s)),
@@ -592,7 +687,13 @@ impl Vm {
                             frame = Some(if needs_i { lf.with_row_index("i", None) } else { lf });
                         }
                         TableSource::Load(path) => {
-                            let lf = rename_columns_snake_case(load_file(&path)?)?;
+                            let path_str = match self.eval_scalar(&path)? {
+                                ast::Value::Str(s) | ast::Value::Sym(s) => s,
+                                other => return Err(QplError::Runtime(format!(
+                                    "expected a string path for load, got {other:?}"
+                                ))),
+                            };
+                            let lf = rename_columns_snake_case(load_file(&path_str)?)?;
                             frame = Some(if needs_i { lf.with_row_index("i", None) } else { lf });
                         }
 
@@ -744,9 +845,19 @@ impl Vm {
                             let lf = require_frame(&mut frame)?;
                             frame = Some(lf.unique_stable(None, UniqueKeepStrategy::First));
                         }
-                        PolarsFrameExpr::Limit(limit) => {
+                        PolarsFrameExpr::Limit => {
+                            let limit = match pop1(&mut stack)?.unwrap_scalar()? {
+                                Value::Int(n) => n,
+                                other => return Err(QplError::Runtime(format!(
+                                    "limit/take count must be an int, got {other:?}"
+                                ))),
+                            };
                             let lf = require_frame(&mut frame)?;
-                            frame = Some(lf.limit(limit as IdxSize));
+                            frame = Some(if limit < 0 {
+                                lf.tail(limit.unsigned_abs() as IdxSize)
+                            } else {
+                                lf.limit(limit as IdxSize)
+                            });
                         }
                         PolarsFrameExpr::Drop(columns) => {
                             let lf = require_frame(&mut frame)?;
@@ -1201,7 +1312,7 @@ fn like_match(text: &str, pattern: &str) -> Result<bool, QplError> {
 /// names [`polars_dtype`] accepts. qpl scalars carry a single integer and a
 /// single float type, so every `iN`/`uN` name folds to `Int` and `f32`/`f64`
 /// to `Float`; the width only matters once the value reaches a column.
-fn scalar_cast(val: ast::Value, dtype: &str) -> Result<ast::Value, QplError> {
+fn scalar_cast(val: ast::Value, dtype: &str, use_qepoch: bool) -> Result<ast::Value, QplError> {
     use ast::Value::*;
     // shared string parse for `Str` / `Sym` sources; accepts an int- or
     // float-looking literal
@@ -1212,7 +1323,7 @@ fn scalar_cast(val: ast::Value, dtype: &str) -> Result<ast::Value, QplError> {
     let bad = |v: &ast::Value| QplError::Runtime(format!("cannot cast {v:?} to '{dtype}'"));
     // temporal targets (`` `date$x ``, `"p"$"…"`, …) have their own path
     if matches!(dtype, "date" | "month" | "time" | "minute" | "second" | "timestamp" | "timespan") {
-        return scalar_temporal_cast(val, dtype);
+        return scalar_temporal_cast(val, dtype, use_qepoch);
     }
     Ok(match dtype {
         "i64" | "int" | "long" | "i32" | "i16" | "i8" | "u64" | "u32" | "u16" | "u8" => match val {
@@ -1221,7 +1332,10 @@ fn scalar_cast(val: ast::Value, dtype: &str) -> Result<ast::Value, QplError> {
             Bool(b)         => Int(b as i64),
             // a temporal scalar unwraps to its kdb integer offset
             Date(n) | Month(n) | Minute(n) | Second(n) => Int(n as i64),
-            Time(n) | Timestamp(n) | Timespan(n)       => Int(n),
+            Time(n) | Timespan(n)                      => Int(n),
+            // `timestamp` -> raw int crosses the epoch boundary: ns since the
+            // Unix epoch by default, ns since kdb's 2000.01.01 with `useqepoch`
+            Timestamp(n) => Int(if use_qepoch { n } else { n + temporal::NS_2000_TO_1970 }),
             Str(ref s) | Sym(ref s) => Int(as_int(s)
                 .ok_or_else(|| QplError::Runtime(format!("cannot parse '{s}' as '{dtype}'")))?),
             ref v           => return Err(bad(v)),
@@ -1263,7 +1377,7 @@ fn scalar_cast(val: ast::Value, dtype: &str) -> Result<ast::Value, QplError> {
 /// string / symbol source is parsed with [`temporal::parse_temporal`]; a
 /// temporal source is converted through its day- or nanosecond-offset; a plain
 /// `Int` is reinterpreted directly as the offset (kdb `` `date$8000 ``).
-fn scalar_temporal_cast(val: ast::Value, target: &str) -> Result<ast::Value, QplError> {
+fn scalar_temporal_cast(val: ast::Value, target: &str, use_qepoch: bool) -> Result<ast::Value, QplError> {
     use ast::Value::*;
 
     // string / symbol → parse, then fall through to the converters below
@@ -1303,8 +1417,10 @@ fn scalar_temporal_cast(val: ast::Value, target: &str) -> Result<ast::Value, Qpl
         },
         "timestamp" => match val {
             Timestamp(_) => val,
-            Int(n)       => Timestamp(n),
-            ref v        => Timestamp(to_days(v).ok_or_else(bad)? as i64 * NS_PER_DAY),
+            // raw int crosses the epoch boundary: read as ns since the Unix
+            // epoch by default, ns since kdb's 2000.01.01 with `useqepoch`
+            Int(n) => Timestamp(if use_qepoch { n } else { n - temporal::NS_2000_TO_1970 }),
+            ref v  => Timestamp(to_days(v).ok_or_else(bad)? as i64 * NS_PER_DAY),
         },
         "time" => match val {
             Time(_)       => val,
@@ -1822,6 +1938,41 @@ mod tests {
     }
 
     #[test]
+    fn load_accepts_a_bound_variable_path() {
+        // regression: `load` only ever accepted a literal string token, so
+        // `p: "x.csv"; load p` (or `f[lazy load p]`) failed to parse.
+        let path = std::env::temp_dir().join("qpl_vm_test_load_variable_path.csv");
+        let path_str = path.to_str().unwrap();
+
+        run_instructions(make_vm(), &format!("t sink \"{path_str}\""));
+
+        let mut vm = Vm::new();
+        run_vm(&format!("p: \"{path_str}\""), &mut vm).unwrap();
+        let df = run(vm, "load p");
+        assert_eq!(df.height(), 4);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn function_call_accepts_a_lazy_load_bracket_argument() {
+        // regression: `analysis[lazy load p]` failed to *parse* at all
+        // ("Unexpected token in primary: Lazy") — a bracket-call argument
+        // didn't know how to start a table expression.
+        let path = std::env::temp_dir().join("qpl_vm_test_lazy_load_bracket_arg.csv");
+        let path_str = path.to_str().unwrap();
+        run_instructions(make_vm(), &format!("t sink \"{path_str}\""));
+
+        let mut vm = Vm::new();
+        run_vm("f: {[t] cols t}", &mut vm).unwrap();
+        run_vm(&format!("p: \"{path_str}\""), &mut vm).unwrap();
+        let df = run(vm, "f[lazy load p]");
+        assert_eq!(df.height(), 3); // c1, c2, c3
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn sink_rejects_a_symbol_path_at_runtime() {
         let mut vm = make_vm();
         let tokens = tokenise("t sink `out.parquet").expect("lex");
@@ -1922,31 +2073,31 @@ mod tests {
     fn scalar_cast_covers_every_family() {
         use ast::Value::*;
         // float -> int truncates; the width name is accepted but folds to i64
-        assert_eq!(scalar_cast(Float(45.3), "int").unwrap(), Int(45));
-        assert_eq!(scalar_cast(Float(45.9), "u32").unwrap(), Int(45));
-        assert_eq!(scalar_cast(Int(300), "i8").unwrap(), Int(300));
+        assert_eq!(scalar_cast(Float(45.3), "int", false).unwrap(), Int(45));
+        assert_eq!(scalar_cast(Float(45.9), "u32", false).unwrap(), Int(45));
+        assert_eq!(scalar_cast(Int(300), "i8", false).unwrap(), Int(300));
         // int/bool -> float
-        assert_eq!(scalar_cast(Int(45), "f64").unwrap(), Float(45.0));
-        assert_eq!(scalar_cast(Bool(true), "f32").unwrap(), Float(1.0));
+        assert_eq!(scalar_cast(Int(45), "f64", false).unwrap(), Float(45.0));
+        assert_eq!(scalar_cast(Bool(true), "f32", false).unwrap(), Float(1.0));
         // -> bool
-        assert_eq!(scalar_cast(Int(0), "bool").unwrap(), Bool(false));
-        assert_eq!(scalar_cast(Float(3.0), "bool").unwrap(), Bool(true));
-        assert_eq!(scalar_cast(Str("true".into()), "bool").unwrap(), Bool(true));
+        assert_eq!(scalar_cast(Int(0), "bool", false).unwrap(), Bool(false));
+        assert_eq!(scalar_cast(Float(3.0), "bool", false).unwrap(), Bool(true));
+        assert_eq!(scalar_cast(Str("true".into()), "bool", false).unwrap(), Bool(true));
         // string parses into a number
-        assert_eq!(scalar_cast(Str("45".into()), "int").unwrap(), Int(45));
-        assert_eq!(scalar_cast(Str("3.9".into()), "int").unwrap(), Int(3));
-        assert_eq!(scalar_cast(Str(" 3.5 ".into()), "f64").unwrap(), Float(3.5));
+        assert_eq!(scalar_cast(Str("45".into()), "int", false).unwrap(), Int(45));
+        assert_eq!(scalar_cast(Str("3.9".into()), "int", false).unwrap(), Int(3));
+        assert_eq!(scalar_cast(Str(" 3.5 ".into()), "f64", false).unwrap(), Float(3.5));
         // -> string
-        assert_eq!(scalar_cast(Int(45), "str").unwrap(), Str("45".into()));
-        assert_eq!(scalar_cast(Bool(true), "string").unwrap(), Str("true".into()));
+        assert_eq!(scalar_cast(Int(45), "str", false).unwrap(), Str("45".into()));
+        assert_eq!(scalar_cast(Bool(true), "string", false).unwrap(), Str("true".into()));
     }
 
     #[test]
     fn scalar_cast_rejects_junk() {
         use ast::Value::*;
-        assert!(scalar_cast(Str("nope".into()), "bool").is_err());
-        assert!(scalar_cast(Str("abc".into()), "int").is_err());
-        assert!(scalar_cast(Int(1), "widget").is_err());
+        assert!(scalar_cast(Str("nope".into()), "bool", false).is_err());
+        assert!(scalar_cast(Str("abc".into()), "int", false).is_err());
+        assert!(scalar_cast(Int(1), "widget", false).is_err());
     }
 
     #[test]
@@ -2055,15 +2206,39 @@ mod tests {
         assert_eq!(scalar_of("l: `month$2024.03.15"), Month(290));
         // date -> timestamp (midnight)
         assert_eq!(scalar_of("l: `timestamp$2000.01.02"), Timestamp(NS_PER_DAY));
-        // temporal -> underlying kdb integer
+        // temporal -> underlying kdb day/month offset (unaffected by `useqepoch`)
         assert_eq!(scalar_of("l: `int$2024.03.15"), Int(8840));
-        assert_eq!(scalar_of("l: `long$2000.01.01D00:00:00.000000001"), Int(1));
+        // `long$`/`timestamp$` cross the Unix-epoch boundary by default
+        assert_eq!(
+            scalar_of("l: `long$2000.01.01D00:00:00.000000001"),
+            Int(temporal::NS_2000_TO_1970 + 1),
+        );
         // string parse via a kdb type code
         assert_eq!(
             scalar_of(r#"l: "p"$"2000.01.01D00:00:00.000000000""#),
             Timestamp(0),
         );
         assert_eq!(scalar_of(r#"l: "d"$"2024.03.15""#), Date(8840));
+    }
+
+    #[test]
+    fn timestamp_int_boundary_defaults_to_unix_epoch() {
+        use ast::Value::*;
+        // a raw long is read/written as ns since 1970.01.01 by default, not
+        // kdb's 2000.01.01 — matches what a whole-column `` `timestamp$ ``
+        // cast already does under Polars
+        let mut vm = make_vm();
+        run_vm("l: `timestamp$1000000000", &mut vm).unwrap();
+        assert_eq!(vm.globals.get("l"), Some(&Timestamp(1_000_000_000 - temporal::NS_2000_TO_1970)));
+        run_vm("l: `long$2000.01.01D00:00:00.0", &mut vm).unwrap();
+        assert_eq!(vm.globals.get("l"), Some(&Int(temporal::NS_2000_TO_1970)));
+
+        // `useqepoch=true` restores the legacy kdb-offset boundary
+        vm.config.useqepoch = true;
+        run_vm("l: `timestamp$1000000000", &mut vm).unwrap();
+        assert_eq!(vm.globals.get("l"), Some(&Timestamp(1_000_000_000)));
+        run_vm("l: `long$2000.01.01D00:00:00.0", &mut vm).unwrap();
+        assert_eq!(vm.globals.get("l"), Some(&Int(0)));
     }
 
     #[test]
@@ -2279,6 +2454,33 @@ mod tests {
             let df = run(make_vm(), source);
             assert_eq!(df.height(), 2, "{source}");
             assert_eq!(strs(&df, "c1"), vec!["a", "b"]);
+        }
+    }
+
+    #[test]
+    fn cast_of_a_select_statement_end_to_end() {
+        // regression: `` `date$select ts from t `` (also `` `date$collect
+        // select … ``) failed to *parse* at all ("Unexpected token in
+        // primary: Select"/"Collect"). This checks the cast actually
+        // executes once parsed, applying to the frame the same way
+        // `` f64$trades`price `` already did.
+        match run_instructions(make_vm(), "int$select c3 from t where c2 > 15") {
+            EvalResult::Scalar(ast::Value::IntVec(s)) => {
+                let got: Vec<i64> = s.i64().unwrap().into_no_null_iter().collect();
+                assert_eq!(got, vec![2, 3]);
+            }
+            other => panic!("expected an int list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_of_a_collect_of_a_select_statement_end_to_end() {
+        match run_instructions(make_vm(), "int$collect select c3 from t where c2 > 15") {
+            EvalResult::Scalar(ast::Value::IntVec(s)) => {
+                let got: Vec<i64> = s.i64().unwrap().into_no_null_iter().collect();
+                assert_eq!(got, vec![2, 3]);
+            }
+            other => panic!("expected an int list, got {other:?}"),
         }
     }
 
@@ -2893,17 +3095,31 @@ mod tests {
     }
 
     #[test]
+    fn negative_limit_takes_last_n_rows() {
+        let df = run(make_vm(), "-2 limit t");
+        assert_eq!(i64s(&df, "c2"), vec![30, 15]);
+    }
+
+    #[test]
     fn config_set_rejects_unknown_key_and_bad_value() {
         let mut cfg = VmConfig::default();
         assert!(cfg.set("nope", "1").is_err());
         assert!(cfg.set("maxrow", "abc").is_err());
         assert!(cfg.set("round_type", "sideways").is_err());
+        assert!(cfg.set("tblwidth", "abc").is_err());
+        assert!(cfg.set("strlen", "abc").is_err());
         cfg.set("maxrow", "42").unwrap();
         cfg.set("maxcol", "7").unwrap();
         cfg.set("round_type", "half_up").unwrap(); // case-insensitive
+        cfg.set("tblwidth", "120").unwrap();
+        cfg.set("strlen", "-1").unwrap();
         assert_eq!(cfg.maxrow, 42);
         assert_eq!(cfg.maxcol, 7);
         assert_eq!(cfg.round_type, RoundMode::HalfAwayFromZero);
+        assert_eq!(cfg.tblwidth, 120);
+        assert_eq!(cfg.strlen, -1);
+        assert_eq!(VmConfig::default().tblwidth, -1);
+        assert_eq!(VmConfig::default().strlen, 30);
     }
 
     // --- window functions ---

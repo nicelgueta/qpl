@@ -1,8 +1,8 @@
 # IPC
 
-*This chapter describes an optional feature. It's compiled in with
-`--features ipc`, as [Install](../install.md) covered, and adds nothing at
-all to a build without it.*
+*This chapter describes the `ipc` feature, on by default (drop it with
+`--no-default-features`, as [Install](../install.md) covered), and adds
+nothing at all to a build without it.*
 
 Every session so far has been a single process with its own tables in its own
 memory. IPC is what you reach for when that stops being enough: it lets one

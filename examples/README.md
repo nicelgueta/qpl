@@ -13,7 +13,7 @@ Runnable `.qpl` scripts. All paths assume you run them from the repo root.
 | [`lazy_join_pipeline.qpl`](lazy_join_pipeline.qpl) | A full pipeline that scans two parquet files, joins, derives + aggregates + sorts, and sinks to parquet **without ever collecting** |
 | [`setup_data.qpl`](setup_data.qpl) | Regenerates the sample parquet inputs (already committed under `data/`) |
 | [`namespaces.qpl`](namespaces.qpl) | `\i "<path>"` imports [`namespace_lib.qpl`](namespace_lib.qpl), namespacing its bindings under `.namespace_lib.*` |
-| [`ipc_server.qpl`](ipc_server.qpl) / [`ipc_client.qpl`](ipc_client.qpl) | `hopen` / `dispatch` / `async dispatch` / `await` / `\port` — requires `--features ipc`, two processes |
+| [`ipc_server.qpl`](ipc_server.qpl) / [`ipc_client.qpl`](ipc_client.qpl) | `hopen` / `dispatch` / `async dispatch` / `await` / `\port` — `ipc` feature (on by default), two processes |
 
 
 ## Sample data
@@ -62,15 +62,17 @@ qpl) log .namespace_lib.greeting
 qpl) .namespace_lib.lookup
 ```
 
-## IPC (optional feature)
+## IPC
 
-`ipc_server.qpl` / `ipc_client.qpl` need two terminals and the `ipc` feature:
+`ipc_server.qpl` / `ipc_client.qpl` need two terminals. The `ipc` feature is
+on by default, so no extra flag is needed unless you built with
+`--no-default-features`:
 
 ```bash
 # terminal 1 — server: runs the script, then drops into the REPL (`-i`)
-cargo run --features ipc -- -i --load-demo examples/ipc_server.qpl
+cargo run -- -i --load-demo examples/ipc_server.qpl
 qpl) \port 5001
 
 # terminal 2 — client
-cargo run --features ipc -- examples/ipc_client.qpl
+cargo run -- examples/ipc_client.qpl
 ```

@@ -64,6 +64,20 @@ qpl) threshold
 i64: 150
 ```
 
+A big round number can be written in scientific notation instead of counting
+zeros: `1e6` and `10e5` both lex as the integer `1000000`. It only folds to an
+`Int` when the mantissa has no decimal point and the exponent isn't negative
+— `1.5e3` and `5e-2` are floats (`1500.0` and `0.05`), same as they'd be
+anywhere else.
+
+```qpl
+qpl) row_cap: 1e6
+```
+
+```
+i64: 1000000
+```
+
 ## Rebinding is the normal thing to do
 
 Names aren't precious, and reassigning one is the ordinary way to move a

@@ -191,8 +191,9 @@ pub enum Expr {
     /// never lowered to stack instructions.
     Table(Box<TableExpr>),
     /// `<n>#<expr>` — take the first `n` rows (`n >= 0`) or the last `-n`
-    /// (`n < 0`) of a frame or list.
-    Take { n: i64, expr: Box<Expr> },
+    /// (`n < 0`) of a frame or list. `n` is any scalar-valued expression
+    /// (a literal, a bound global, …), evaluated at run time.
+    Take { n: Box<Expr>, expr: Box<Expr> },
     /// `(<expr>) <i>` / `(<expr>) <i j k>` — positional index into a list with a
     /// single int or an int run.
     Index { expr: Box<Expr>, idx: Box<Expr> },
@@ -233,7 +234,10 @@ pub struct Alias {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableSource {
     InMem(String),
-    Load(String),
+    /// `load "path.parquet"` / `load path` — a string literal or a bound
+    /// scalar global, resolved to a path at run time (see `vm::run_program`'s
+    /// `TableSource::Load` arm).
+    Load(Box<Expr>),
 }
 
 

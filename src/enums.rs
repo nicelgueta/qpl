@@ -26,7 +26,9 @@ pub enum PolarsFrameExpr {
     Join{ l: usize, r: usize },
     Sort(Vec<(String, bool)>), // col name -> descending
     Distinct,
-    Limit(usize),
+    /// first `n` rows for `n >= 0`, last `|n|` rows (tail) for `n < 0`; `n` is
+    /// popped from the value stack (a preceding `Instruction::Eval` pushes it)
+    Limit,
     Drop(Vec<String>),
     Cols
 }

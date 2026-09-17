@@ -107,6 +107,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 while j < n && chars[j].is_ascii_digit() {
                     j += 1;
                 }
+                let digits_end = j;
                 // bool or bool-vec: all digits 0/1 followed by 'b'
                 if j < n && chars[j] == 'b' && chars[i..j].iter().all(|&c| c == '0' || c == '1') {
                     let bits: Vec<bool> = chars[i..j].iter().map(|&c| c == '1').collect();
@@ -145,17 +146,68 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     }
                 }
                 // float: decimal point after integer digits
+                let mut is_float = false;
                 if j < n && chars[j] == '.' {
+                    is_float = true;
                     j += 1;
                     while j < n && chars[j].is_ascii_digit() {
                         j += 1;
                     }
+                }
+                // scientific-notation suffix: `e5`, `E-2`, `e+3`. A negative
+                // exponent (or a `.` mantissa) makes it a float; a bare
+                // non-negative exponent folds to an `Int` (`10e5` == `1000000`)
+                // so it composes with everything that expects a plain int
+                // literal (e.g. `n limit`) without also having to accept a float.
+                let mut int_exp: Option<u32> = None;
+                if j < n && matches!(chars[j], 'e' | 'E') {
+                    let mut k = j + 1;
+                    let mut exp_negative = false;
+                    if k < n && matches!(chars[k], '+' | '-') {
+                        exp_negative = chars[k] == '-';
+                        k += 1;
+                    }
+                    let exp_digits_start = k;
+                    while k < n && chars[k].is_ascii_digit() {
+                        k += 1;
+                    }
+                    if k > exp_digits_start {
+                        if exp_negative {
+                            is_float = true;
+                        } else {
+                            let exp_str: String = chars[exp_digits_start..k].iter().collect();
+                            int_exp = Some(exp_str.parse().map_err(|_| {
+                                QplError::Lex(format!("invalid exponent in numeric literal '{exp_str}'"))
+                            })?);
+                        }
+                        j = k;
+                    }
+                }
+                if is_float {
                     let float_str: String = chars[i..j].iter().collect();
                     let float_val: f64 = float_str.parse().map_err(|_| {
                         QplError::Lex(format!("Invalid float literal: {}", float_str))
                     })?;
                     tokens.push(Token {
                         kind: TokenKind::Float(float_val),
+                        pos: start,
+                    });
+                    i = j;
+                    continue;
+                }
+                if let Some(exponent) = int_exp {
+                    let literal: String = chars[i..j].iter().collect();
+                    let mantissa: i64 = chars[i..digits_end].iter().collect::<String>().parse().map_err(|_| {
+                        QplError::Lex(format!("Invalid integer literal: {}", literal))
+                    })?;
+                    let scale = 10i64.checked_pow(exponent).ok_or_else(|| {
+                        QplError::Lex(format!("integer literal '{literal}' overflows i64"))
+                    })?;
+                    let int_val = mantissa.checked_mul(scale).ok_or_else(|| {
+                        QplError::Lex(format!("integer literal '{literal}' overflows i64"))
+                    })?;
+                    tokens.push(Token {
+                        kind: TokenKind::Int(int_val),
                         pos: start,
                     });
                     i = j;
@@ -377,6 +429,27 @@ mod tests {
             TokenKind::Int(2),
             TokenKind::Int(3),
         ]);
+    }
+
+    #[test]
+    fn integer_scientific_notation() {
+        assert_eq!(kinds("1e6"), vec![TokenKind::Int(1_000_000)]);
+        assert_eq!(kinds("10e5"), vec![TokenKind::Int(1_000_000)]);
+        assert_eq!(kinds("1E3"), vec![TokenKind::Int(1_000)]);
+        assert_eq!(kinds("3e0"), vec![TokenKind::Int(3)]);
+        assert_eq!(kinds("2e+3"), vec![TokenKind::Int(2_000)]);
+    }
+
+    #[test]
+    fn integer_scientific_notation_overflows() {
+        assert!(tokenise("1e30").is_err());
+    }
+
+    #[test]
+    fn scientific_notation_with_decimal_mantissa_or_negative_exponent_is_a_float() {
+        assert_eq!(kinds("1.5e3"), vec![TokenKind::Float(1500.0)]);
+        assert_eq!(kinds("5e-2"), vec![TokenKind::Float(0.05)]);
+        assert_eq!(kinds("1e-6"), vec![TokenKind::Float(0.000001)]);
     }
 
     // --- floats ---

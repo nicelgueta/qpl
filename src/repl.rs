@@ -1,4 +1,4 @@
-use crate::ast::self;
+use crate::ast::{self, Expr, Stmt};
 use crate::compiler::compile;
 use crate::errors::QplError;
 use crate::lexer::tokenise;
@@ -29,6 +29,7 @@ pub fn run_script(path: &str, vm: &mut Vm) -> Result<(), QplError> {
 /// `\l`/`\i` also work nested inside a loaded/imported script, not just typed
 /// at the prompt.
 fn run_line(src: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<(), QplError> {
+    let src = &normalize_function_body_newlines(src);
     if let Some(inner) = src.strip_prefix("\\d").map(str::trim) {
         println!("{}", disassemble(inner)?);
         return Ok(());
@@ -153,6 +154,63 @@ fn logical_statements(src: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// Inside a `{[..] ..}` function body, let each line stand for one statement —
+/// same rule `logical_statements` already applies at the top level, just
+/// shifted one indent level in: a line indented no deeper than the body's own
+/// first line starts a new statement (an implicit `;` is inserted before it);
+/// a line indented *more* than that continues the statement above, exactly
+/// like a top-level continuation line does. An explicit `;` for several
+/// statements on one physical line still works (and combining it with this —
+/// an already-`;`-terminated line followed by a new baseline-indent line —
+/// just yields a harmless doubled `;`, which the parser tolerates). Blank and
+/// comment-only lines pass through without affecting the baseline; the line
+/// that closes the body (`}` as its first non-space character, at any indent)
+/// is never treated as a new statement.
+///
+/// A no-op whenever `src` has no multi-line `{..}` to fold (single-line
+/// definitions, or text with no `{` at all), so every other statement shape
+/// is completely unaffected.
+fn normalize_function_body_newlines(src: &str) -> String {
+    if !src.contains('\n') || !src.contains('{') {
+        return src.to_string();
+    }
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut baseline: Option<usize> = None;
+
+    for line in src.lines() {
+        let depth_at_start = depth;
+        for ch in line.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth_at_start <= 0 {
+            // not yet inside a function body (the opening line itself, or
+            // anything before/after the whole `{..}` statement)
+            out_lines.push(line.to_string());
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.starts_with('}') {
+            out_lines.push(line.to_string());
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        match baseline {
+            None => {
+                baseline = Some(indent);
+                out_lines.push(line.to_string());
+            }
+            Some(b) if indent <= b => out_lines.push(format!(";{line}")),
+            _ => out_lines.push(line.to_string()),
+        }
+    }
+    out_lines.join("\n")
+}
+
 /// Does `src` look like an unfinished statement that should keep reading?
 /// True while `(`/`[` are unbalanced, on a trailing `,`, on a lex error (e.g. an
 /// unterminated string), or when the parse fails specifically because input ran
@@ -163,6 +221,12 @@ fn wants_more(src: &str) -> bool {
     if trimmed.starts_with('\\') || trimmed.starts_with(".qpl.cfg") {
         return false;
     }
+    // decide completeness against the same text `run_line` will actually
+    // execute (see `normalize_function_body_newlines`) — otherwise a function
+    // body relying on the implicit per-line statement rule looks like a
+    // "complete but wrong" statement (missing `;`) the moment its second line
+    // is typed, and the REPL submits it before the closing `}` even arrives.
+    let src = &normalize_function_body_newlines(src);
     let toks = match tokenise(src) {
         Ok(toks) => toks,
         // an unterminated string may be finished on the next line; every other
@@ -303,19 +367,14 @@ fn eval_for_dispatch(line: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
         return Ok(EvalResult::Stored);
     }
     if let Some(arg) = log_target(line) {
-        let mut text = String::new();
-        for expr in parse_expr_seq(tokenise(arg)?)? {
-            let val = match resolve::eval_value(vm, &expr)? {
-                resolve::EvalValue::Scalar(v) => v,
-                resolve::EvalValue::Frame { .. } => {
-                    return Err(QplError::Runtime(
-                        "log expects a scalar expression, got a table".into(),
-                    ))
-                }
-            };
-            text.push_str(&fmt_log_val(&val));
-        }
-        vm.emit(&text);
+        resolve::eval_log(vm, &parse_expr_seq(tokenise(arg)?)?)?;
+        return Ok(EvalResult::Stored);
+    }
+    if line.trim_start().starts_with("log[")
+        && let Ok(Stmt::SingleVar(Expr::Call { func, args })) = parse(tokenise(line)?)
+        && func == "log"
+    {
+        resolve::eval_log(vm, &args)?;
         return Ok(EvalResult::Stored);
     }
     run_vm(line, vm)
@@ -462,23 +521,24 @@ fn eval_line(line: &str, vm: &mut Vm) -> Result<(), QplError> {
         return apply_cfg(args, vm);
     }
     if let Some(arg) = log_target(line) {
-        // a `log` argument is a list of expressions; render and concatenate each.
-        // Goes through `resolve::eval_value` (not the plain scalar folder) so a
-        // reduction (`log max t`price`) or a cast on a column expression works
-        // the same as it does in any other value position.
-        let mut text = String::new();
-        for expr in parse_expr_seq(tokenise(arg)?)? {
-            let val = match resolve::eval_value(vm, &expr)? {
-                resolve::EvalValue::Scalar(v) => v,
-                resolve::EvalValue::Frame { .. } => {
-                    return Err(QplError::Runtime(
-                        "log expects a scalar expression, got a table".into(),
-                    ))
-                }
-            };
-            text.push_str(&fmt_log_val(&val));
-        }
-        vm.emit(&text);
+        // a `log` argument is a list of expressions; `resolve::eval_log` renders
+        // and concatenates each (via `eval_value`, not the plain scalar folder,
+        // so a reduction like `log max t`price` or a cast on a column expression
+        // works the same as it does in any other value position), then emits
+        // the result. Shared with the bracket-scoped `log[..]` call form.
+        resolve::eval_log(vm, &parse_expr_seq(tokenise(arg)?)?)?;
+        return Ok(());
+    }
+    // `log[..]` typed as a whole top-level statement — unlike every other
+    // function call, suppress the auto-printed return value so it behaves
+    // like the bareword form above (the emit already happened as a side
+    // effect). A `log[..]` embedded in a larger expression (`2 * log[..] + 2`)
+    // is unaffected: this only matches when the *entire* statement is the call.
+    if line.trim_start().starts_with("log[")
+        && let Ok(Stmt::SingleVar(Expr::Call { func, args })) = parse(tokenise(line)?)
+        && func == "log"
+    {
+        resolve::eval_log(vm, &args)?;
         return Ok(());
     }
     match run_vm(line, vm)? {
@@ -595,8 +655,10 @@ fn fmt_vec_elems(kind: ast::VecKind, s: &polars::prelude::Series, quote_str: boo
     }
 }
 
-/// Render a value for `log`: raw text, no type prefix or quoting.
-fn fmt_log_val(v: &ast::Value) -> String {
+/// Render a value for `log`: raw text, no type prefix or quoting. Shared
+/// with `resolve::eval_log`, which does the same rendering for the
+/// bracket-scoped `log[..]` call form.
+pub(crate) fn fmt_log_val(v: &ast::Value) -> String {
     if let Some((kind, s)) = v.as_vec() {
         return fmt_vec_elems(kind, s, false);
     }
@@ -656,9 +718,9 @@ fn disassemble(source: &str) -> Result<String, QplError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cfg_directive, eval_line, logical_statements, log_target, wants_more};
+    use super::{cfg_directive, eval_line, logical_statements, log_target, normalize_function_body_newlines, wants_more};
     use super::{namespace_from_path, run_line, run_script_imported};
-    use crate::vm::Vm;
+    use crate::vm::{Vm, run_vm, EvalResult};
 
     /// Run `line` through [`eval_line`] and return whatever it wrote via
     /// `Vm::emit`, by pointing the stdout-log tee at a scratch file.
@@ -694,6 +756,23 @@ mod tests {
         assert!(vm.functions.contains_key(&ns_double));
         assert!(!vm.globals.contains_key("greeting"));
         assert!(!vm.functions.contains_key("double"));
+    }
+
+    #[test]
+    fn i_import_lets_a_namespaced_function_call_an_unqualified_sibling() {
+        // regression: `\i` renames a script's top-level bindings to `.ns.*`
+        // but doesn't rewrite cross-references *inside* their bodies, so a
+        // function calling another top-level helper by its bare name used to
+        // break after import with "'<helper>' is not a function".
+        let path = std::env::temp_dir().join(format!("qpl_i_sibling_test_{:?}.qpl", std::thread::current().id()));
+        std::fs::write(&path, "_log: {[s] s}\ninfo: {[s] _log[s]}\n").unwrap();
+        let mut vm = Vm::new();
+        run_script_imported(path.to_str().unwrap(), &mut vm).expect("run_script_imported");
+        let _ = std::fs::remove_file(&path);
+
+        let ns = namespace_from_path(path.to_str().unwrap());
+        run_line(&format!("l: {ns}.info \"hi\""), &mut vm, "<main>", 0).expect("call should resolve");
+        assert_eq!(vm.globals.get("l"), Some(&crate::ast::Value::Str("hi".into())));
     }
 
     #[test]
@@ -741,6 +820,35 @@ mod tests {
             polars::df!["price" => [1.0f64, 2.0, 3.0]].unwrap(),
         );
         assert_eq!(logged(&mut vm, "log (max t`price)"), "3");
+    }
+
+    #[test]
+    fn log_bracket_call_concatenates_like_the_bareword_form() {
+        let mut vm = Vm::new();
+        assert_eq!(logged(&mut vm, r#"log["a" "b"]"#), "ab");
+    }
+
+    #[test]
+    fn log_bracket_call_is_usable_inside_a_function_body() {
+        // regression: `log` only ever existed as a whole-line REPL directive
+        // (`repl::log_target`), so it was unreachable from inside a function
+        // body — `{[s] log s}` failed with "unknown function 'log'". `log[..]`
+        // now compiles through the ordinary `Expr::Call` path (`resolve::eval_log`),
+        // so it works there too.
+        let mut vm = Vm::new();
+        eval_line(r#"info: {[s] log[str$"tag" " - " s]}"#, &mut vm).expect("define info");
+        // `info` returns whatever `log` wrote (its only/last statement), so a
+        // bare call at top level also echoes that return value like any other
+        // function call — only a standalone `log[..]` statement suppresses it.
+        assert_eq!(logged(&mut vm, r#"info["hi"]"#), "tag - hi\nstr: \"tag - hi\"");
+    }
+
+    #[test]
+    fn log_bracket_call_as_a_bare_statement_does_not_echo_its_return_value() {
+        // unlike an ordinary function call, a standalone `log[..]` statement
+        // only prints what it logged, matching the bareword `log ..` form.
+        let mut vm = Vm::new();
+        assert_eq!(logged(&mut vm, r#"log["only once"]"#), "only once");
     }
 
     #[cfg(feature = "ipc")]
@@ -910,6 +1018,73 @@ mod tests {
         assert_eq!(got, vec![
             (0, "select a\n    / pick columns\n    from trades".to_string()),
         ]);
+    }
+
+    #[test]
+    fn function_body_newlines_become_implicit_semicolons() {
+        let src = "f: {[x]\n    a: x+1\n    b: a*2\n    b\n    }";
+        assert_eq!(
+            normalize_function_body_newlines(src),
+            "f: {[x]\n    a: x+1\n;    b: a*2\n;    b\n    }"
+        );
+    }
+
+    #[test]
+    fn function_body_deeper_indent_stays_a_continuation() {
+        // `by`/`from`/`order` are more deeply indented than the `select`
+        // above them, so they extend that one statement rather than starting
+        // new ones.
+        let src = "f: {[x]\n    select tot: sum x\n        by sym\n        from t\n    }";
+        assert_eq!(
+            normalize_function_body_newlines(src),
+            "f: {[x]\n    select tot: sum x\n        by sym\n        from t\n    }"
+        );
+    }
+
+    #[test]
+    fn function_body_explicit_semicolon_still_works_and_a_redundant_one_is_harmless() {
+        // an already-`;`-terminated line followed by a new baseline-indent
+        // line just doubles up (`;;`), which the parser tolerates.
+        let src = "f: {[x]\n    a: x+1;\n    a\n    }";
+        assert_eq!(
+            normalize_function_body_newlines(src),
+            "f: {[x]\n    a: x+1;\n;    a\n    }"
+        );
+        let mut vm = Vm::new();
+        run_line(src, &mut vm, "<main>", 0).expect("run_line");
+        match run_vm("f[5]", &mut vm) {
+            Ok(EvalResult::Scalar(v)) => assert_eq!(v, crate::ast::Value::Int(6)),
+            other => panic!("expected Scalar(6), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_line_function_definition_is_untouched() {
+        let src = "add: {[x,y] x+y}";
+        assert_eq!(normalize_function_body_newlines(src), src);
+    }
+
+    #[test]
+    fn blank_and_comment_lines_inside_a_function_body_are_not_new_statements() {
+        let src = "f: {[x]\n    a: x+1\n\n    / a comment\n    a\n    }";
+        assert_eq!(
+            normalize_function_body_newlines(src),
+            "f: {[x]\n    a: x+1\n\n    / a comment\n;    a\n    }"
+        );
+    }
+
+    #[test]
+    fn multiline_function_body_runs_without_explicit_semicolons() {
+        // the original report: a function body written one statement per
+        // line, indented, with no `;` at all — should behave exactly like
+        // the semicolon-separated single-line form.
+        let mut vm = Vm::new();
+        let src = "f: {[x]\n    a: x+1\n    b: a*2\n    b\n    }";
+        run_line(src, &mut vm, "<main>", 0).expect("run_line");
+        match run_vm("f[5]", &mut vm) {
+            Ok(EvalResult::Scalar(v)) => assert_eq!(v, crate::ast::Value::Int(12)),
+            other => panic!("expected Scalar(12), got {other:?}"),
+        }
     }
 }
 

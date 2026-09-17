@@ -8,3 +8,7 @@
 *.vsix
 
 .claude/worktrees/
+__pycache__/
+
+/*.qpl
+/*.py

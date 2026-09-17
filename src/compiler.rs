@@ -80,9 +80,10 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), 
             out.push(Instruction::FrameExpr(PolarsFrameExpr::Distinct));
             Ok(())
         }
-        BuiltIn::Limit(tbl_expr, limit) => {
+        BuiltIn::Limit(tbl_expr, count) => {
             compile_tbl_expr(tbl_expr.as_ref(), out)?;
-            out.push(Instruction::FrameExpr(PolarsFrameExpr::Limit(*limit)));
+            out.push(Instruction::Eval(count.clone()));
+            out.push(Instruction::FrameExpr(PolarsFrameExpr::Limit));
             Ok(())
         }
         BuiltIn::Drop(columns, tbl_expr) => {
@@ -547,7 +548,7 @@ mod tests {
         ]);
         assert_eq!(compile_src("10 limit select from trades"), vec![
             from_table("trades"), BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
-            FrameExpr(PolarsFrameExpr::Limit(10)), Result,
+            Eval(Expr::Lit(Value::Int(10))), FrameExpr(PolarsFrameExpr::Limit), Result,
         ]);
         // `n#…` is a value expression, tree-walked from a single Eval
         assert!(matches!(compile_src("10#select from trades").as_slice(), [Eval(_)]));

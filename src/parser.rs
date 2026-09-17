@@ -102,6 +102,18 @@ impl Parser {
                 TokenKind::Int(_) if self.peek2() == &TokenKind::Limit => {
                     self.assign_from_body(name)
                 }
+                // `-n limit <table-expr>` — same, with a leading unary minus.
+                TokenKind::Op(op)
+                    if op == "-"
+                        && matches!(self.peek2(), TokenKind::Int(_))
+                        && self.peek3() == &TokenKind::Limit =>
+                {
+                    self.assign_from_body(name)
+                }
+                // `<name> limit <table-expr>` — a bound global as the count.
+                TokenKind::Name(_) if self.peek2() == &TokenKind::Limit => {
+                    self.assign_from_body(name)
+                }
                 _ => {
                     let expr = self.parse_expr()?;
                     Ok(Stmt::ScalarAssign { name, expr })
@@ -148,6 +160,13 @@ impl Parser {
         }
         let mut body = Vec::new();
         while self.peek() != &TokenKind::RBrace {
+            // tolerate a stray/extra `;` (an empty statement) between real
+            // ones, rather than trying to parse a statement starting at it
+            // and failing with "Unexpected token in primary: Semicolon".
+            if self.peek() == &TokenKind::Semicolon {
+                self.next();
+                continue;
+            }
             if matches!(self.peek(), TokenKind::Eof) {
                 return Err(QplError::Parse("unterminated function: missing '}'".into()));
             }
@@ -190,13 +209,22 @@ impl Parser {
         // `n#…` is a take/slice value expression handled by `parse_scalar_stmt`.
         let leading_int = matches!(self.peek(), TokenKind::Int(_));
         let int_table = leading_int && self.peek2() == &TokenKind::Limit;
+        // `-n limit <table-expr>` — same, with a leading unary minus (tail).
+        let leading_neg_int =
+            matches!(self.peek(), TokenKind::Op(op) if op == "-") && matches!(self.peek2(), TokenKind::Int(_));
+        let neg_int_table = leading_neg_int && self.peek3() == &TokenKind::Limit;
+        // `<name> limit <table-expr>` — same, with a bound global as the count.
+        let name_table_limit =
+            matches!(self.peek(), TokenKind::Name(_)) && self.peek2() == &TokenKind::Limit;
         // `\`c!01b <tbl>` / `\`a\`b drop <tbl>` — a table op keyed off a leading
         // symbol. A bare `\`x` is a symbol value, not a table.
         let sym_table_op = !self.is_whopen_modifier()
             && matches!(self.peek(), TokenKind::Symbol(_) | TokenKind::SymbolVec(_))
             && (matches!(self.peek2(), TokenKind::Bang | TokenKind::Drop)
                 || matches!(self.peek2(), TokenKind::Name(n) if n == "_"));
-        if (is_table_expr_start(self.peek()) && !leading_int) || int_table || sym_table_op {
+        if (is_table_expr_start(self.peek()) && !leading_int) || int_table || neg_int_table
+            || name_table_limit || sym_table_op
+        {
             let tbl_expr = self.parse_table_expr()?;
             // postfix sink: `<table-expr> sink <path>`
             if matches!(self.peek(), TokenKind::Sink) {
@@ -218,6 +246,14 @@ impl Parser {
     }
 
     fn parse_table_expr(&mut self) -> Result<TableExpr, QplError> {
+        // `<count> limit|# <table-expr>` — first/last `n` rows. `<count>` is
+        // any primary-level scalar expression (a literal, a bound global, a
+        // parenthesised expression, …), speculatively parsed and backtracked
+        // out if no `limit`/`#` follows (so e.g. a bare `select …` or table
+        // name falls through to the match below untouched).
+        if let Some(te) = self.try_parse_table_limit()? {
+            return Ok(te);
+        }
         let peek = self.peek().clone();
         match peek {
             // `(<table-expr>)` — the parens give the parser an explicit end
@@ -242,23 +278,10 @@ impl Parser {
                 self.next();
                 Ok(TableExpr::BuiltIn(BuiltIn::Distinct(Box::new(self.parse_table_expr()?))))
             }
-            TokenKind::Int(n) => {
-                self.next();
-                let operator = self.next();
-                if !matches!(operator, TokenKind::Limit | TokenKind::Hash) {
-                    return Err(QplError::Parse(format!("expected 'limit' or '#' after row count, got {operator:?}")));
-                }
-                let limit = usize::try_from(n)
-                    .map_err(|_| QplError::Parse(format!("limit must be non-negative, got {n}")))?;
-                Ok(TableExpr::BuiltIn(BuiltIn::Limit(Box::new(self.parse_table_expr()?), limit)))
-            }
             TokenKind::Load => {
                 // standalone: load "path" → select all from the file
                 self.next();
-                match self.next() {
-                    TokenKind::Str(path) => Ok(TableExpr::Source(TableSource::Load(path))),
-                    other => Err(QplError::Parse(format!("expected file path string after 'load', got {other:?}"))),
-                }
+                Ok(TableExpr::Source(TableSource::Load(Box::new(self.parse_load_path()?))))
             }
             TokenKind::Cols => {
                 self.next(); // consume 'cols'
@@ -503,7 +526,10 @@ impl Parser {
             if op == "$" {
                 let target = cast_target(&left)?;
                 self.next();
-                let expr = self.parse_expr_inner(windows)?;
+                let expr = match self.try_parse_table_operand()? {
+                    Some(e) => e,
+                    None => self.parse_expr_inner(windows)?,
+                };
                 return Ok(Expr::Cast { target, expr: Box::new(expr) });
             }
             self.next();
@@ -660,7 +686,11 @@ impl Parser {
             if op == "$" {
                 let target = cast_target(&left)?;
                 self.next();
-                return Ok(Expr::Cast { target, expr: Box::new(self.parse_expr_no_call()?) });
+                let expr = match self.try_parse_table_operand()? {
+                    Some(e) => e,
+                    None => self.parse_expr_no_call()?,
+                };
+                return Ok(Expr::Cast { target, expr: Box::new(expr) });
             }
             self.next();
             return Ok(Expr::BinOp {
@@ -722,7 +752,12 @@ impl Parser {
     /// operand of `lazy` / `collect`: either a bare table variable name
     /// (`collect t`) or a full table expression (`lazy load \`x.parquet`).
     fn parse_lazy_operand(&mut self) -> Result<TableExpr, QplError> {
-        if let TokenKind::Name(name) = self.peek().clone() {
+        // a bare name is only a plain table reference when it's not actually
+        // the leading count of `<name>#…` / `<name> limit …` (`parse_table_expr`
+        // handles that generally, via `try_parse_table_limit`).
+        if let TokenKind::Name(name) = self.peek().clone()
+            && !matches!(self.peek2(), TokenKind::Hash | TokenKind::Limit)
+        {
             self.next();
             return Ok(table_ref(name));
         }
@@ -732,11 +767,23 @@ impl Parser {
     fn parse_tbl_src_expr(&mut self) -> Result<TableSource, QplError> {
         match self.next() {
             TokenKind::Name(name) => Ok(TableSource::InMem(name)),
-            TokenKind::Load => match self.next() {
-                TokenKind::Str(path) => Ok(TableSource::Load(path)),
-                other => Err(QplError::Parse(format!("expected file path string after 'load', got {other:?}"))),
-            },
+            TokenKind::Load => Ok(TableSource::Load(Box::new(self.parse_load_path()?))),
             other => Err(QplError::Parse(format!("expected table name or load expression, got {other:?}"))),
+        }
+    }
+
+    /// `load`'s path: a string literal, or a bound scalar global (resolved to
+    /// a path string at run time). Deliberately just one token, not a general
+    /// `parse_expr()` — `parse_tbl_src_expr`'s join-right-hand-side caller
+    /// needs to stop here so a trailing `` `sym `` join key isn't swallowed
+    /// into the path expression.
+    fn parse_load_path(&mut self) -> Result<Expr, QplError> {
+        match self.next() {
+            TokenKind::Str(path) => Ok(Expr::Lit(Value::Str(path))),
+            TokenKind::Name(name) => Ok(Expr::ColRef(name)),
+            other => Err(QplError::Parse(format!(
+                "expected a file path string or variable after 'load', got {other:?}"
+            ))),
         }
     }
 
@@ -882,6 +929,27 @@ impl Parser {
         //                                        bare name (that stays a call site)
         loop {
             if matches!(self.peek(), TokenKind::LBracket) {
+                // `log[...]` — the bracket-scoped spelling of the bareword
+                // `log a b c` stdout-write, so it can be delimited inside a
+                // larger expression or a function body instead of always
+                // running to the end of the line. Parsed like `parse_expr_seq`
+                // (juxtaposed items, each a full `parse_expr_no_call`, `;`
+                // between them optional) rather than the generic `f[a;b]`
+                // call grammar below, which requires a separator and would
+                // reject `log[str$.qpl.p " - INFO " s]` after its first item.
+                if matches!(&e, Expr::ColRef(n) if n == "log") {
+                    self.next(); // `[`
+                    let mut args = Vec::new();
+                    while self.peek() != &TokenKind::RBracket {
+                        args.push(self.parse_expr_no_call()?);
+                        if self.peek() == &TokenKind::Semicolon {
+                            self.next();
+                        }
+                    }
+                    self.eat(&TokenKind::RBracket)?;
+                    e = Expr::Call { func: "log".into(), args };
+                    continue;
+                }
                 self.next(); // `[`
                 // `f[]` / `f[a;b]` → `Expr::Apply`; a single expression with no
                 // `;` stays `Expr::Index` (list index, or a monadic function
@@ -891,12 +959,12 @@ impl Parser {
                     e = Expr::Apply { func: Box::new(e), args: vec![] };
                     continue;
                 }
-                let mut args = vec![self.parse_expr()?];
+                let mut args = vec![self.parse_call_arg()?];
                 let mut multi = false;
                 while self.peek() == &TokenKind::Semicolon {
                     multi = true;
                     self.next();
-                    args.push(self.parse_expr()?);
+                    args.push(self.parse_call_arg()?);
                 }
                 self.eat(&TokenKind::RBracket)?;
                 e = if multi {
@@ -956,29 +1024,77 @@ impl Parser {
         }))))
     }
 
-    /// `[-]<int>#<operand>` — returns `None` when the next tokens are not that shape.
-    fn try_parse_take(&mut self) -> Result<Option<Expr>, QplError> {
-        let n = match (self.peek(), self.peek2()) {
-            (TokenKind::Int(n), TokenKind::Hash) => {
-                let n = *n;
-                self.next();
-                self.next();
-                n
+    /// `<count> limit|# <table-expr>` — returns `None` when this doesn't turn
+    /// out to be that shape (restoring the parser position exactly). See
+    /// [`Parser::try_parse_take`] for the value-context sibling of this.
+    fn try_parse_table_limit(&mut self) -> Result<Option<TableExpr>, QplError> {
+        let checkpoint = self.i;
+        let count = match self.parse_primary() {
+            Ok(count) => count,
+            Err(_) => {
+                self.i = checkpoint;
+                return Ok(None);
             }
-            (TokenKind::Op(m), TokenKind::Int(_))
-                if m == "-" && self.peek3() == &TokenKind::Hash =>
-            {
-                self.next(); // `-`
-                let n = match self.next() {
-                    TokenKind::Int(n) => -n,
-                    _ => unreachable!(),
-                };
-                self.next(); // `#`
-                n
-            }
-            _ => return Ok(None),
         };
-        Ok(Some(Expr::Take { n, expr: Box::new(self.parse_take_operand()?) }))
+        if !matches!(self.peek(), TokenKind::Limit | TokenKind::Hash) {
+            self.i = checkpoint;
+            return Ok(None);
+        }
+        self.next(); // `limit` / `#`
+        Ok(Some(TableExpr::BuiltIn(BuiltIn::Limit(Box::new(self.parse_table_expr()?), count))))
+    }
+
+    /// `<count>#<operand>` — returns `None` when this doesn't turn out to be
+    /// that shape. `<count>` is any primary-level scalar expression (a
+    /// literal, a negative literal, a bound global, a parenthesised
+    /// expression, …), not just a literal int — speculatively parsed and
+    /// backtracked out if no `#` follows.
+    fn try_parse_take(&mut self) -> Result<Option<Expr>, QplError> {
+        let checkpoint = self.i;
+        let n = match self.parse_primary() {
+            Ok(n) => n,
+            Err(_) => {
+                self.i = checkpoint;
+                return Ok(None);
+            }
+        };
+        if self.peek() != &TokenKind::Hash {
+            self.i = checkpoint;
+            return Ok(None);
+        }
+        self.next(); // `#`
+        Ok(Some(Expr::Take { n: Box::new(n), expr: Box::new(self.parse_take_operand()?) }))
+    }
+
+    /// If the next token starts a table expression (`select …`, `collect …`,
+    /// `lazy …`, …), parse the whole thing as one, wrapped in `Expr::Table` —
+    /// `resolve::eval_value` already applies a cast, or hands a frame to a
+    /// called function's parameter, exactly like it does for a bare
+    /// `` trades`price `` or `f[t]` with `t` a table name; the only thing
+    /// missing was a parser path to *reach* those, since none of these
+    /// keywords are a valid `parse_primary`. Used for a cast's RHS
+    /// (`` `date$select ts from t ``) and for a bracket-call argument
+    /// (`f[lazy load "x.csv"]`). Returns `None` for an ordinary scalar/noun
+    /// operand, so the caller falls back to its normal expression parse.
+    fn try_parse_table_operand(&mut self) -> Result<Option<Expr>, QplError> {
+        if matches!(self.peek(),
+            TokenKind::Select | TokenKind::Update | TokenKind::Delete
+            | TokenKind::Distinct | TokenKind::Cols | TokenKind::Load
+            | TokenKind::Lazy | TokenKind::Collect)
+        {
+            return Ok(Some(Expr::Table(Box::new(self.parse_table_expr()?))));
+        }
+        Ok(None)
+    }
+
+    /// One argument inside `f[..]` / `f[a;b;..]`: a table expression when one
+    /// starts here (see `try_parse_table_operand`), otherwise an ordinary
+    /// expression.
+    fn parse_call_arg(&mut self) -> Result<Expr, QplError> {
+        match self.try_parse_table_operand()? {
+            Some(e) => Ok(e),
+            None => self.parse_expr(),
+        }
     }
 
     /// Operand of `<n>#…`: a table expression (`select …`, `` `tbl ``) or a noun
@@ -1309,6 +1425,63 @@ mod tests {
         }]);
     }
 
+    #[test]
+    fn bracket_call_arg_may_be_a_table_expression() {
+        // regression: `f[lazy load out]` failed with "Unexpected token in
+        // primary: Lazy" — a bracket-call argument only ever tried an
+        // ordinary `parse_expr()`, which has no `parse_primary` case for
+        // `select`/`lazy`/`collect`/etc. `resolve::eval_value` already hands
+        // a frame to a called function's parameter fine (it's the same path
+        // `` f[trades] `` uses) — this only needed a parser change.
+        match p("f[lazy load out]") {
+            Stmt::SingleVar(Expr::Index { idx, .. }) => {
+                assert!(matches!(*idx, Expr::Table(_)), "{idx:?}");
+            }
+            other => panic!("expected an Index call, got {other:?}"),
+        }
+        match p("f[lazy load out; 2]") {
+            Stmt::SingleVar(Expr::Apply { args, .. }) => {
+                assert!(matches!(&args[0], Expr::Table(_)), "{:?}", args[0]);
+                assert_eq!(args[1], Expr::Lit(Value::Int(2)));
+            }
+            other => panic!("expected an Apply call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn log_bracket_call_parses_juxtaposed_items_like_a_bareword_log() {
+        // no separator needed — same "space-separated items" grammar as the
+        // bareword `log a b c` form, just delimited by `[..]` instead of
+        // running to the end of the line.
+        assert_eq!(
+            p(r#"log["a" "b"]"#),
+            Stmt::SingleVar(Expr::Call {
+                func: "log".into(),
+                args: vec![Expr::Lit(Value::Str("a".into())), Expr::Lit(Value::Str("b".into()))],
+            })
+        );
+    }
+
+    #[test]
+    fn log_bracket_call_accepts_optional_semicolons() {
+        assert_eq!(
+            p(r#"log["a";"b";"c"]"#),
+            Stmt::SingleVar(Expr::Call {
+                func: "log".into(),
+                args: vec![
+                    Expr::Lit(Value::Str("a".into())),
+                    Expr::Lit(Value::Str("b".into())),
+                    Expr::Lit(Value::Str("c".into())),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn log_bracket_call_empty_is_a_bare_log() {
+        assert_eq!(p("log[]"), Stmt::SingleVar(Expr::Call { func: "log".into(), args: vec![] }));
+    }
+
     fn sel(src: &str) -> SelectStmt {
         match p(src) {
             Stmt::RetTable(tbl_expr) => match tbl_expr {
@@ -1543,7 +1716,35 @@ mod tests {
     fn limit_keyword_is_a_table_op() {
         assert!(matches!(
             p("10 limit select from trades"),
-            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Limit(_, 10)))
+            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Limit(_, Expr::Lit(Value::Int(10)))))
+        ));
+    }
+
+    #[test]
+    fn negative_limit_keyword_is_a_tail_table_op() {
+        for source in ["-10 limit select from trades", "-10 limit trades", "collect -10 limit trades"] {
+            let stmt = p(source);
+            let te = match &stmt {
+                Stmt::RetTable(te) => te,
+                _ => panic!("expected RetTable for '{source}', got {stmt:?}"),
+            };
+            // `collect` wraps the inner table expr; unwrap one level if present.
+            let te = match te {
+                TableExpr::BuiltIn(BuiltIn::Collect(inner)) => inner.as_ref(),
+                other => other,
+            };
+            assert!(
+                matches!(te, TableExpr::BuiltIn(BuiltIn::Limit(_, Expr::Lit(Value::Int(-10))))),
+                "'{source}' -> {te:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_hash_before_limit_in_named_assign() {
+        assert!(matches!(
+            p("t: -5 limit trades"),
+            Stmt::Assign { body, .. } if matches!(*body, Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Limit(_, Expr::Lit(Value::Int(-5))))))
         ));
     }
 
@@ -1552,6 +1753,49 @@ mod tests {
         // `n#…` is always a take/slice; the VM decides frame vs list at run time
         for source in ["10#trades", "10#select from trades", "10#trades`price", "-3#trades`price"] {
             assert!(matches!(p(source), Stmt::SingleVar(Expr::Take { .. })), "{source}");
+        }
+    }
+
+    #[test]
+    fn hash_take_count_need_not_be_a_literal() {
+        // regression: only a literal (or negative-literal) int was accepted
+        // before `#`; a bound global fell through to a parse error.
+        for source in ["k#trades", "-k#trades", "(k+1)#trades"] {
+            assert!(matches!(p(source), Stmt::SingleVar(Expr::Take { .. })), "{source}");
+        }
+    }
+
+    #[test]
+    fn collect_and_lazy_accept_a_variable_hash_count() {
+        // regression: `collect k#t` / `collect (k#t)` errored ("expected
+        // Eof/RParen, got Hash") because `parse_lazy_operand` and
+        // `parse_table_expr` only recognised a *literal* int before `#`.
+        for source in ["collect k#t", "collect (k#t)", "lazy k#t"] {
+            let stmt = p(source);
+            let te = match &stmt {
+                Stmt::RetTable(te) => te,
+                _ => panic!("expected RetTable for '{source}', got {stmt:?}"),
+            };
+            assert!(
+                matches!(te, TableExpr::BuiltIn(BuiltIn::Collect(_)) | TableExpr::BuiltIn(BuiltIn::Lazy(_))),
+                "'{source}' -> {te:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn limit_keyword_accepts_a_variable_count() {
+        for source in ["k limit trades", "sample: k limit trades"] {
+            let stmt = p(source);
+            let te = match &stmt {
+                Stmt::RetTable(te) => te,
+                Stmt::Assign { body, .. } => match body.as_ref() {
+                    Stmt::RetTable(te) => te,
+                    other => panic!("expected RetTable body for '{source}', got {other:?}"),
+                },
+                other => panic!("expected a table statement for '{source}', got {other:?}"),
+            };
+            assert!(matches!(te, TableExpr::BuiltIn(BuiltIn::Limit(_, Expr::ColRef(n))) if n == "k"), "'{source}' -> {te:?}");
         }
     }
 
@@ -1727,7 +1971,7 @@ mod tests {
     fn load_standalone_takes_a_string_path() {
         match p("load \"x.parquet\"") {
             Stmt::RetTable(TableExpr::Source(TableSource::Load(path))) => {
-                assert_eq!(path, "x.parquet");
+                assert_eq!(*path, Expr::Lit(Value::Str("x.parquet".into())));
             }
             other => panic!("expected load, got {other:?}"),
         }
@@ -1741,7 +1985,23 @@ mod tests {
     #[test]
     fn load_as_table_source_takes_a_string_path() {
         let s = sel("select price from load \"x.parquet\"");
-        assert!(matches!(*s.from, TableExpr::Source(TableSource::Load(ref path)) if path == "x.parquet"));
+        assert!(matches!(*s.from, TableExpr::Source(TableSource::Load(ref path))
+            if **path == Expr::Lit(Value::Str("x.parquet".into()))));
+    }
+
+    #[test]
+    fn load_accepts_a_variable_path() {
+        // regression: `load out` (a bound scalar global) failed to parse —
+        // `load` only ever accepted a literal string token.
+        match p("load p") {
+            Stmt::RetTable(TableExpr::Source(TableSource::Load(path))) => {
+                assert_eq!(*path, Expr::ColRef("p".into()));
+            }
+            other => panic!("expected load, got {other:?}"),
+        }
+        let s = sel("select price from load p");
+        assert!(matches!(*s.from, TableExpr::Source(TableSource::Load(ref path))
+            if **path == Expr::ColRef("p".into())));
     }
 
     #[test]
@@ -1933,6 +2193,32 @@ mod tests {
                     if t == "int" && *expr == Expr::Lit(Value::Float(-45.3))
             )),
             other => panic!("expected scalar assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_of_a_select_statement_parses() {
+        // regression: `` `date$select ts from t `` failed with "Unexpected
+        // token in primary: Select" — a cast's RHS didn't know how to start a
+        // table expression, even though `resolve::eval_value`'s `Expr::Cast`
+        // arm already handles a frame/materialised-list operand fine.
+        match p("d: `date$select ts from t where high = 20") {
+            Stmt::ScalarAssign { expr: Expr::Cast { target: CastTarget::Prim(t), expr }, .. } => {
+                assert_eq!(t, "date");
+                assert!(matches!(*expr, Expr::Table(_)));
+            }
+            other => panic!("expected scalar assign with a cast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_of_a_collect_of_a_select_statement_parses() {
+        match p("d: `date$collect select ts from t where high = 20") {
+            Stmt::ScalarAssign { expr: Expr::Cast { target: CastTarget::Prim(t), expr }, .. } => {
+                assert_eq!(t, "date");
+                assert!(matches!(*expr, Expr::Table(_)));
+            }
+            other => panic!("expected scalar assign with a cast, got {other:?}"),
         }
     }
 

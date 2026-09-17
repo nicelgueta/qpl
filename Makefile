@@ -1,4 +1,4 @@
-.PHONY: build release test run bump book book-build book-deploy
+.PHONY: build release test run bump book book-build book-deploy vscode-ext
 
 build:
 	cargo build
@@ -11,6 +11,12 @@ test:
 
 run:
 	cargo run
+
+# Repackage the VSCode extension (tools/vscode) into a .vsix and install it,
+# replacing whatever version is currently loaded. Reload the VSCode window
+# afterwards to pick up the change — grammar/vocabulary edits aren't hot-reloaded.
+vscode-ext:
+	cd tools/vscode && rm -f *.vsix && npx vsce package && code --install-extension "$$(ls *.vsix)"
 
 # Serve the mdbook locally and open it in a browser.
 book:

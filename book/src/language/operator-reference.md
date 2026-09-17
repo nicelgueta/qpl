@@ -35,4 +35,4 @@ explains it.
 | `{...}` | lambda | [Functions](functions.md) |
 | `.qpl.d` `.qpl.t` `.qpl.p` `.qpl.n` | current date / time / timestamp / timespan, UTC | [Temporal types](temporal-types.md) |
 | `.qpl.cfg` | session settings | [Config](config.md) |
-| `hopen` `` `w!hopen `` `dispatch` `async dispatch` `await` | IPC client (`--features ipc`) | [IPC](ipc.md) |
+| `hopen` `` `w!hopen `` `dispatch` `async dispatch` `await` | IPC client (`ipc` feature, on by default) | [IPC](ipc.md) |

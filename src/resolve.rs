@@ -86,7 +86,7 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
         }
         #[cfg(not(feature = "ipc"))]
         Expr::Dispatch { .. } => Err(QplError::Runtime(
-            "dispatch requires qpl to be built with `--features ipc`".into())),
+            "dispatch requires the `ipc` feature (on by default; this build used `--no-default-features`)".into())),
 
         // `f[x]` parsed as an index but `f` names a user function → monadic
         // application. Otherwise falls through to positional indexing below.
@@ -102,19 +102,28 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
             apply_function(vm, &func, args)
         }
 
-        // `<n>#<expr>` — head (`n >= 0`) / tail (`n < 0`) slice
-        Expr::Take { n, expr } => match eval_value(vm, expr)? {
-            EvalValue::Frame { lf, lazy } => {
-                let lf = if *n >= 0 {
-                    lf.limit(*n as IdxSize)
-                } else {
-                    let k = -*n;
-                    lf.slice(-k, k as IdxSize)
-                };
-                Ok(EvalValue::Frame { lf, lazy })
+        // `<n>#<expr>` — head (`n >= 0`) / tail (`n < 0`) slice. `n` is any
+        // scalar expression (a literal, a bound global, …), resolved here.
+        Expr::Take { n, expr } => {
+            let n = match vm.eval_scalar(n)? {
+                Value::Int(n) => n,
+                other => return Err(QplError::Runtime(format!(
+                    "take count must be an int, got {other:?}"
+                ))),
+            };
+            match eval_value(vm, expr)? {
+                EvalValue::Frame { lf, lazy } => {
+                    let lf = if n >= 0 {
+                        lf.limit(n as IdxSize)
+                    } else {
+                        let k = -n;
+                        lf.slice(-k, k as IdxSize)
+                    };
+                    Ok(EvalValue::Frame { lf, lazy })
+                }
+                EvalValue::Scalar(list) => Ok(EvalValue::Scalar(take_list(list, n)?)),
             }
-            EvalValue::Scalar(list) => Ok(EvalValue::Scalar(take_list(list, *n)?)),
-        },
+        }
 
         // `<list>[<i>]` / `<list>[<i j k>]` / `(<expr>) <i j k>` — positional
         // index. A single int picks an atom; an int run picks a sub-list.
@@ -171,8 +180,18 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
         Expr::Call { func, args }
             if (func == "hopen" || func == "whopen" || func == "await") && args.len() == 1 =>
         {
-            Err(QplError::Runtime(format!("'{func}' requires qpl to be built with `--features ipc`")))
+            Err(QplError::Runtime(format!(
+                "'{func}' requires the `ipc` feature (on by default; this build used `--no-default-features`)"
+            )))
         }
+        // `log[a b c]` / `log[a;b;c]` — the bracket-scoped spelling of the
+        // bareword `log a b c` stdout-write (see `Parser::parse_noun`), usable
+        // anywhere an expression is (composed inside a larger expression, or
+        // as a statement in a function body), unlike the bareword form which
+        // `repl::eval_line` only recognises as a whole top-level REPL/script
+        // line. Any argument count, including zero (`log[]`, a blank line).
+        Expr::Call { func, args } if func == "log" => Ok(EvalValue::Scalar(Value::Str(eval_log(vm, args)?))),
+
         // `til 5` / `10 til 15` — a range list constructor, not a reduction
         // over an existing list, so this is intercepted ahead of the generic
         // `eval_call` below (which assumes `args[0]` is already a list/frame).
@@ -333,6 +352,22 @@ fn eval_list_where(vm: &mut Vm, list: &Expr, where_: &[Expr]) -> Result<EvalValu
     Ok(EvalValue::Scalar(result?))
 }
 
+/// Render each of `args` via `fmt_log_val` and concatenate, then write the
+/// result through `Vm::emit` (mirrored to the stdout log). Shared by the
+/// `log[..]` bracket-call arm above and by `repl::eval_line`'s bareword
+/// `log a b c` handling, so both spellings go through one implementation.
+/// Returns the text written, so a bracketed call composes as an ordinary
+/// expression value (mirrors kdb's `1 x` returning what it wrote).
+pub(crate) fn eval_log(vm: &mut Vm, args: &[Expr]) -> Result<String, QplError> {
+    let mut text = String::new();
+    for a in args {
+        let val = expect_scalar(eval_value(vm, a)?)?;
+        text.push_str(&crate::repl::fmt_log_val(&val));
+    }
+    vm.emit(&text);
+    Ok(text)
+}
+
 /// `til n` → `0 .. n-1`; `lo til hi` → `lo .. hi-1`. The dyadic form is parsed
 /// through the shared "param verb value" infix grammar (parser.rs), whose
 /// convention is `args: [value, param]` — so here that's `[hi, lo]`, not
@@ -414,14 +449,34 @@ fn to_list(vm: &mut Vm, expr: &Expr) -> Result<Value, QplError> {
     }
 }
 
+/// Resolve a column verb's source to a lazy frame without forcing an eager
+/// materialise first when it's table-shaped. `eval_table`'s "one-column
+/// select collapses to a list" step exists for genuine value-context list use
+/// (indexing, arithmetic, `where`, …); `eval_call` is about to `.select()`
+/// off it anyway, so materialising first would only buy a redundant collect
+/// and a round trip through an owned buffer — the final `column_to_value` on
+/// the *applied* column below still catches a null result (e.g. `max` of an
+/// all-null column), it just no longer blanket-rejects a source column that
+/// has *some* nulls a reducer would ignore regardless (`max`/`sum`/…, same as
+/// plain Polars).
+fn eval_call_source(vm: &mut Vm, expr: &Expr) -> Result<LazyFrame, QplError> {
+    if let Expr::Table(te) = expr {
+        let mut instrs = Vec::new();
+        crate::compiler::compile_tbl_expr(te, &mut instrs)?;
+        let (lf, _) = vm.eval_frame(instrs)?;
+        return Ok(lf);
+    }
+    match eval_value(vm, expr)? {
+        EvalValue::Frame { lf, .. } => Ok(lf),
+        EvalValue::Scalar(list) => list_to_lazy(list),
+    }
+}
+
 /// Apply a monadic / dyadic column verb to a column expression or list. A
 /// reducing verb on a single argument yields a scalar; anything else yields a
 /// new list.
 fn eval_call(vm: &mut Vm, func: &str, args: &[Expr]) -> Result<EvalValue, QplError> {
-    let lf = match eval_value(vm, &args[0])? {
-        EvalValue::Frame { lf, .. } => lf,
-        EvalValue::Scalar(list) => list_to_lazy(list)?,
-    };
+    let lf = eval_call_source(vm, &args[0])?;
     let name = first_col_name(&lf)?;
     let base = col(name.as_str());
 
@@ -491,11 +546,14 @@ fn apply_function(vm: &mut Vm, func: &Expr, args: &[Expr]) -> Result<EvalValue, 
         .iter()
         .map(|a| eval_value(vm, a))
         .collect::<Result<Vec<_>, _>>()?;
+    // resolved against the *caller's* active scope, before the callee's own is pushed
+    let ns = vm.resolve_function_ns(&name);
 
     // push a fresh call frame; pop it unconditionally on the way out. `lookup`
     // only ever consults the top frame + globals, so the callee cannot see this
     // caller's own locals — lexical, not dynamic, scoping.
     vm.push_scope();
+    vm.scopes.last_mut().expect("just pushed").current_ns = ns;
     let result = run_body(vm, &def, arg_vals);
     vm.pop_scope();
     result
@@ -776,6 +834,18 @@ mod tests {
     }
 
     #[test]
+    fn function_body_tolerates_a_stray_extra_semicolon() {
+        // regression: a doubled `;;` between statements (an easy typo, e.g.
+        // from a trailing `;` left behind after reordering lines) failed with
+        // "Unexpected token in primary: Semicolon" — the parser tried to read
+        // a whole statement starting at the second `;` instead of treating it
+        // as an empty no-op statement.
+        let mut vm = make_vm();
+        run_vm("sq: {[x] tmp: x*x;; tmp}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "sq[9]"), Value::Int(81));
+    }
+
+    #[test]
     fn a_callee_cannot_see_its_caller_s_locals() {
         // lexical, not dynamic, scoping: `callee` has no param/local named `a`,
         // so it must resolve `a` against the true global (99), never against
@@ -923,6 +993,24 @@ mod tests {
     }
 
     #[test]
+    fn reducer_ignores_nulls_in_the_source_column() {
+        // regression: `max t`col` used to force an eager materialise of the
+        // raw source column before applying the reducer, which rejected any
+        // column containing nulls outright ("cannot be materialised into a
+        // list") even though the reducer itself (like plain Polars) would
+        // just skip them. Pushing the reduction into the lazy plan directly
+        // means only the *result* is checked for nulls now.
+        let mut vm = make_vm();
+        let df = df!["n" => [Some(10i64), None, Some(30)]].unwrap();
+        vm.tables.insert("nt".into(), df);
+        assert_eq!(scalar(&mut vm, "max nt`n"), Value::Int(30));
+        // an all-null column still errors: the reduction result is itself null
+        let df_all_null = df!["n" => [None::<i64>, None]].unwrap();
+        vm.tables.insert("allnull".into(), df_all_null);
+        assert!(run_vm("max allnull`n", &mut vm).is_err());
+    }
+
+    #[test]
     fn cast_then_reduce_a_column_expression() {
         // regression: `max f64$t`c2` used to error ("not supported in scalar
         // context") because a cast on a column expression fell into the plain
@@ -943,6 +1031,19 @@ mod tests {
     fn take_head_and_tail() {
         assert_eq!(scalar(&mut make_vm(), "2#t`c2"), ast::int_vec(vec![10, 20]));
         assert_eq!(scalar(&mut make_vm(), "-2#t`c2"), ast::int_vec(vec![30, 15]));
+    }
+
+    #[test]
+    fn take_count_can_be_a_bound_global() {
+        // regression: `k#…` only ever accepted a literal int for `k`; a
+        // variable count fell through to a parse error ("expected Eof/RParen,
+        // got Hash") because the take-count was baked in at parse time.
+        let mut vm = make_vm();
+        run_vm("k: 2", &mut vm).expect("run");
+        assert_eq!(scalar(&mut vm, "k#t`c2"), ast::int_vec(vec![10, 20]));
+        assert_eq!(scalar(&mut vm, "-k#t`c2"), ast::int_vec(vec![30, 15]));
+        assert!(matches!(run_vm("k#t", &mut vm), Ok(EvalResult::Table(_))));
+        assert!(matches!(run_vm("(k+1)#t", &mut vm), Ok(EvalResult::Table(_))));
     }
 
     #[test]

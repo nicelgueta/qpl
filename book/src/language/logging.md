@@ -57,6 +57,27 @@ parentheses to stay a call:
 log (f x) " done"
 ```
 
+## Inside a function body
+
+The bareword form above only works as a whole top-level line — it runs to the
+end of the line, so it has no way to stop early if it's embedded in something
+bigger. `log[...]` is the same thing scoped with brackets instead, which is
+what makes it usable inside a function body or nested in a larger expression:
+
+```qpl
+info: {[s] log[str$.qpl.p " - INFO " s]}
+info["service started"]
+```
+
+```
+2024.03.15D09:30:00.000000000 - INFO service started
+```
+
+Arguments inside the brackets are still space-separated and concatenated
+exactly like the bareword form (a `;` between them is accepted too, but never
+required) — `[...]` only marks where the argument list ends, since a function
+body can't rely on "the rest of the line" the way a REPL line can.
+
 ## Teeing output to a file
 
 `\1 <path>` mirrors everything printed — log lines and query results alike —

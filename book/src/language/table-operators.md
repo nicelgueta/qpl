@@ -60,6 +60,13 @@ This is the same `#` that sliced a list in
 or a limit depends only on whether the thing on its right is a list or a
 table, and in both cases it means "the first n".
 
+A negative count takes from the end instead — the last `n` rows — same as `#`
+on a list:
+
+```qpl
+qpl) -3 limit trades      / identical to -3#trades
+```
+
 ## Dropping columns
 
 Also two spellings, `drop` and `_`, taking a list of column names as symbols:

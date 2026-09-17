@@ -24,9 +24,11 @@ cargo run -- --load-demo    # REPL preloaded with demo `trades` / `quotes` table
 cargo run -- script.qpl     # execute a script
 cargo run -- -i script.qpl  # execute a script, then drop into the REPL
 cargo run -- examples/lazy_join_pipeline.qpl   # run an example
-cargo build --features ipc                      # + hopen/dispatch/await, \port (see Architecture)
-cargo test --features ipc                       # ipc.rs's tests only run with the feature on
+cargo build --no-default-features               # drop `ipc` (hopen/dispatch/await, \port — see Architecture)
 ```
+
+`ipc` is a default feature, so a plain `cargo build`/`cargo test`/`cargo run` already
+includes it; `--no-default-features` is only needed to build/test without it.
 
 There is no separate lint step configured; use `cargo clippy` and `cargo fmt` as normal.
 
@@ -102,8 +104,9 @@ to `x` in output per q convention.
 
 ### IPC (`ipc` feature)
 
-Off by default; `zeromq`/`tokio` are `optional` deps in `Cargo.toml`, pulled in
-only by `ipc = ["dep:tokio", "dep:zeromq"]`. This is the one place the codebase
+On by default (drop it with `--no-default-features`); `zeromq`/`tokio` are
+`optional` deps in `Cargo.toml`, pulled in only by `ipc = ["dep:tokio", "dep:zeromq"]`
+and enabled by default via `default = ["ipc"]`. This is the one place the codebase
 is not fully synchronous, and it's deliberately confined: `Vm` itself is never
 shared across threads (no `Arc`/`Mutex` anywhere in it) — every connection's
 worker thread (client) and the listener thread (server, `\port`) only ever
