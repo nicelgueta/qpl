@@ -61,7 +61,7 @@
       begin: '^\\s*(\\\\(?:[d1l]|port)|log)\\b',
     };
 
-    // `.qpl.cfg`, `.qpl.d`, etc.
+    // `.qpl.cfg`, `.qpl.dt`, etc.
     var NAMESPACED_BUILTIN = {
       className: 'keyword',
       begin: '\\.qpl\\.[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*',

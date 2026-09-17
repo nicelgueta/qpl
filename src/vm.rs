@@ -22,7 +22,7 @@ pub struct Vm {
     /// `tables` / `lazy_frames`, not a first-class value; applied in value
     /// context only (see [`crate::resolve`]).
     pub functions: HashMap<String, ast::Function>,
-    /// Native functions (`.qpl.d`, ...), populated once in [`Vm::new`] and
+    /// Native functions (`.qpl.dt`, ...), populated once in [`Vm::new`] and
     /// never mutated afterwards — a name in here is resolved exactly like a
     /// user [`Lookup::Function`] (see [`Vm::lookup`]) but can never be
     /// reassigned or shadowed (see the `bind_*` guards below). See
@@ -427,7 +427,7 @@ impl Vm {
             ast::Expr::Lit(v) => Ok(v.clone()),
             // outside a table expression `` `foo `` is a symbol (a distinct value kind)
             ast::Expr::Sym(s) => Ok(ast::Value::Sym(s.clone())),
-            // a plain global, or a niladic builtin (e.g. `.qpl.d`) called with
+            // a plain global, or a niladic builtin (e.g. `.qpl.dt`) called with
             // no arguments — resolved like any other bare name, not
             // special-cased by name here. A niladic *user* function isn't
             // supported in this pure/immutable context (it needs a call
@@ -436,7 +436,7 @@ impl Vm {
             ast::Expr::ColRef(name) => match self.lookup_global(name) {
                 Some(v) => Ok(v.clone()),
                 None => match self.lookup(name) {
-                    Some(Lookup::Builtin(b)) if b.arity == 0 => (b.call)(self, &[]),
+                    Some(Lookup::Builtin(b)) if b.arity == 0 => b.call(&[]),
                     _ => Err(QplError::Runtime(format!("undefined variable '{name}'"))),
                 },
             },
@@ -651,7 +651,7 @@ impl Vm {
                     // globals shadow column names, substituting a literal into the lazy plan
                     if let Some(val) = self.lookup_global(&name) {
                         stack.push(StackObj::Expr(ast_val_to_expr(val.clone())?));
-                    // a niladic function/builtin (e.g. `.qpl.d`) reduces to a
+                    // a niladic function/builtin (e.g. `.qpl.dt`) reduces to a
                     // literal the same way — resolved like any other bare
                     // name, not specially recognised here.
                     } else if let Some(v) = resolve::call_niladic(self, &name)? {
@@ -2176,8 +2176,8 @@ mod tests {
 
     #[test]
     fn qpl_now_functions_evaluate_in_scalar_context() {
-        assert!(matches!(scalar_of("l: .qpl.d"), ast::Value::Date(_)));
-        assert!(matches!(scalar_of("l: .qpl.p"), ast::Value::Timestamp(_)));
+        assert!(matches!(scalar_of("l: .qpl.dt"), ast::Value::Date(_)));
+        assert!(matches!(scalar_of("l: .qpl.ts"), ast::Value::Timestamp(_)));
     }
 
     #[test]

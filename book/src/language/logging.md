@@ -65,7 +65,7 @@ bigger. `log[...]` is the same thing scoped with brackets instead, which is
 what makes it usable inside a function body or nested in a larger expression:
 
 ```qpl
-info: {[s] log[str$.qpl.p " - INFO " s]}
+info: {[s] log[str$.qpl.ts " - INFO " s]}
 info["service started"]
 ```
 

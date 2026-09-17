@@ -135,8 +135,21 @@ the duration of the call. A function cannot modify a name outside itself, so
 a call's effect is entirely described by what it returns.
 
 **Niladic functions** take no arguments and are written `{[] ...}` or simply
-`{ ... }`, then called as `f[]`. The empty brackets are what distinguish
-calling it from naming it.
+`{ ... }`. They can be called either with empty brackets, `f[]`, or bare,
+`f`, which reads like a variable that recomputes every time you mention it:
+
+```qpl
+qpl) now: {[] .qpl.ts}
+qpl) now
+qpl) now[]
+```
+
+That's exactly how the `.qpl.dt`/`.qpl.tm`/`.qpl.ts`/`.qpl.dlta` now-functions from
+[Temporal types](temporal-types.md) work — they're built-ins registered in
+the same table user functions live in, not special syntax. A function that
+*does* take parameters has no bare form: naming it without brackets is an
+error telling you to call it with `f[..]`. Built-in names are also reserved:
+binding over one is an error rather than a silent shadow.
 
 **Functions are not values.** You can bind one and call it, but you cannot
 pass one as an argument, return one from another function, or use one inside

@@ -304,8 +304,8 @@ fn resolve_name(vm: &mut Vm, name: &str) -> Result<EvalValue, QplError> {
 pub(crate) fn call_niladic(vm: &mut Vm, name: &str) -> Result<Option<EvalValue>, QplError> {
     match vm.lookup(name) {
         Some(Lookup::Builtin(b)) if b.arity == 0 => {
-            let call = b.call;
-            Ok(Some(EvalValue::Scalar(call(vm, &[])?)))
+            let b = *b; // ends the borrow of `vm`
+            Ok(Some(EvalValue::Scalar(b.call(&[])?)))
         }
         Some(Lookup::Function(f)) if f.params.is_empty() => {
             let def = f.clone();
@@ -569,7 +569,7 @@ fn apply_function(vm: &mut Vm, func: &Expr, args: &[Expr]) -> Result<EvalValue, 
         let arg_vals = args.iter()
             .map(|a| expect_scalar(eval_value(vm, a)?))
             .collect::<Result<Vec<_>, _>>()?;
-        return Ok(EvalValue::Scalar((b.call)(vm, &arg_vals)?));
+        return Ok(EvalValue::Scalar(b.call(&arg_vals)?));
     }
     let def = vm
         .lookup_function(&name)

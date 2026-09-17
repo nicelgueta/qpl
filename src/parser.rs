@@ -936,7 +936,7 @@ impl Parser {
                 // (juxtaposed items, each a full `parse_expr_no_call`, `;`
                 // between them optional) rather than the generic `f[a;b]`
                 // call grammar below, which requires a separator and would
-                // reject `log[str$.qpl.p " - INFO " s]` after its first item.
+                // reject `log[str$.qpl.ts " - INFO " s]` after its first item.
                 if matches!(&e, Expr::ColRef(n) if n == "log") {
                     self.next(); // `[`
                     let mut args = Vec::new();
@@ -1142,7 +1142,7 @@ impl Parser {
             TokenKind::Symbol(s)   => Ok(Expr::Sym(s)),
             TokenKind::Temporal(v) => Ok(Expr::Lit(v)),
             TokenKind::Name(n) if n == "i" => Ok(Expr::IColRef),
-            // Every other bare name — including `.qpl.d`/`.qpl.t`/`.qpl.p`/`.qpl.n`
+            // Every other bare name — including `.qpl.dt`/`.qpl.tm`/`.qpl.ts`/`.qpl.dlta`
             // and any other namespaced name — is an ordinary variable/table/function
             // reference, resolved by lookup (see `Vm::lookup`, `resolve::call_niladic`).
             TokenKind::Name(n)     => Ok(Expr::ColRef(n)),
@@ -2108,11 +2108,11 @@ mod tests {
 
     #[test]
     fn qpl_now_function_parses_as_an_ordinary_variable_reference() {
-        // `.qpl.p` is a builtin (see `Vm::builtins`), but the parser doesn't
+        // `.qpl.ts` is a builtin (see `Vm::builtins`), but the parser doesn't
         // know that — it's a bare `ColRef` like any other name, resolved (and
         // auto-invoked, being niladic) by lookup at run time.
-        match p("l: .qpl.p") {
-            Stmt::ScalarAssign { expr, .. } => assert_eq!(expr, Expr::ColRef(".qpl.p".into())),
+        match p("l: .qpl.ts") {
+            Stmt::ScalarAssign { expr, .. } => assert_eq!(expr, Expr::ColRef(".qpl.ts".into())),
             other => panic!("expected scalar assign, got {other:?}"),
         }
     }

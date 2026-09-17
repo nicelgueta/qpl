@@ -74,18 +74,29 @@ carries across lines because the same `Vm` is reused.
 | `enums` | `PolarsFrameExpr` / `PolarsStackArg` — thin wrappers over Polars ops (join type, filter, sort, distinct, limit, drop) referenced from instructions |
 | `vm` | executes instructions against a `StackObj` stack, building a Polars `LazyFrame`; holds all interpreter state |
 | `repl` | REPL loop, script runner (`logical_statements` folds indented continuation lines into one statement; the interactive loop instead uses `wants_more` — brackets/trailing-comma/parse-cut-off — to decide whether to keep reading), demo tables, result formatting. Also home to the string-level features that never reach the VM: `\` system commands (`\d` disassemble, `\l <path>` run a script, `\1 <path>` stdout log) and the `log` / `1` stdout-write (`parser::parse_expr_seq` parses its space-separated args, each rendered via `eval_scalar` and concatenated). All printing goes through `Vm::emit`, which mirrors to the stdout log |
+| `native` | built-in (native) functions — a `name → Builtin { arity, call }` map built once in `Vm::new`; resolved through `Vm::lookup` exactly like a user function (`Lookup::Builtin`), except the name can never be bound over. Adding one needs no lexer/parser/compiler change |
+| `vm_config` | `VmConfig` — session knobs set by `.qpl.cfg key=value` (`maxcol`, `maxrow`, `tblwidth`, `strlen`, `round_type`, `useqepoch`); a new knob is a field + a `VmConfig::set` arm and nothing else |
 | `errors` | `QplError` (Lex/Parse/Compile/Runtime variants) — the single error type threaded everywhere |
 | `ipc` | `ipc` feature only (`#[cfg(feature = "ipc")]`, `mod ipc;` in `main.rs` is itself gated). Client (`hopen`/`dispatch`/`async dispatch`/`await`) and server (`\port`) over a plain `zeromq` REQ/REP pair — see the IPC subsection below |
 
 ### VM state and evaluation model
 
-`Vm` (in `vm.rs`) holds three maps that persist for the session:
+`Vm` (in `vm.rs`) holds the binding maps that persist for the session:
 
 - `tables: HashMap<String, DataFrame>` — materialised named tables
 - `lazy_frames: HashMap<String, LazyFrame>` — stored **query plans** from `lazy` bindings; nothing runs until `collect` or `sink`
 - `globals: HashMap<String, Value>` — scalar variables
+- `functions: HashMap<String, Function>` — user functions (`name: {[..] ..}`)
+- `builtins: HashMap<String, Builtin>` — native functions from `native.rs`, built once in `Vm::new` and never mutated; a builtin name cannot be bound over
 
-(plus `stdout_log: Option<File>` — the `\1` stdout mirror; not query state.)
+`Vm::lookup` searches all five and returns a `Lookup` discriminating them; a
+zero-param function or builtin resolves *by being called* even when named
+bare (`resolve::call_niladic`), which is all `.qpl.ts` (and any user `{[] ..}`)
+is. `scopes: Vec<Scope>` is the call stack — only the innermost frame is
+searched, so scoping is lexical.
+
+(plus `stdout_log: Option<File>` — the `\1` stdout mirror — and
+`config: VmConfig` — the `.qpl.cfg` knobs; neither is query state.)
 
 The VM executes instructions by pushing/popping a `StackObj` stack (`Expr`,
 `Frame`, `Scalar`, `PolarsArg`). Everything table-shaped is assembled as a

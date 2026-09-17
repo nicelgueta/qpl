@@ -14,6 +14,11 @@ log "`.qpl.cfg key=value ...` sets session-wide knobs; a bare `.qpl.cfg` prints 
 log "maxrow / maxcol only affect how much is *printed* - the query is unchanged"
 select from trades
 
+log "`tblwidth` caps the printed width, `strlen` the characters shown per cell (-1 = unlimited)"
+.qpl.cfg tblwidth=60 strlen=4
+select from trades
+.qpl.cfg tblwidth=-1 strlen=30
+
 log "`round` is dyadic, q-style: <precision> round <column>; mode comes from round_type"
 select sym, spread: 2 round price % size from trades
 

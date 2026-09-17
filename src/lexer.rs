@@ -242,7 +242,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 i += 1;
             }
             '.' => {
-                // a namespaced identifier: `.ns.name` (`.qpl.d`, `.qpl.cfg`,
+                // a namespaced identifier: `.ns.name` (`.qpl.dt`, `.qpl.cfg`,
                 // `.utils.helper` for a `\i`-imported script's bindings, …),
                 // any number of `.segment`s. No new token/AST node — it's a
                 // plain `Name`, so it flows through every existing
@@ -511,10 +511,10 @@ mod tests {
 
     #[test]
     fn qpl_now_functions_lex_as_their_own_token() {
-        assert_eq!(kinds(".qpl.d"), vec![TokenKind::Name(".qpl.d".into())]);
-        assert_eq!(kinds("log .qpl.p"), vec![
+        assert_eq!(kinds(".qpl.dt"), vec![TokenKind::Name(".qpl.dt".into())]);
+        assert_eq!(kinds("log .qpl.ts"), vec![
             TokenKind::Name("log".into()),
-            TokenKind::Name(".qpl.p".into()),
+            TokenKind::Name(".qpl.ts".into()),
         ]);
     }
 

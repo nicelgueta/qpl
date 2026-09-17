@@ -308,8 +308,8 @@ shifts by one unit of that type's own resolution.
 "p"$"2024.03.15D12:30:00"           / parse a string
 ```
 
-Now-functions, all UTC: `.qpl.d` date, `.qpl.t` time, `.qpl.p` timestamp,
-`.qpl.n` timespan since midnight. Not yet implemented: `xbar`, `within`, unit
+Now-functions, all UTC: `.qpl.dt` date, `.qpl.tm` time, `.qpl.ts` timestamp,
+`.qpl.dlta` timespan since midnight. Not yet implemented: `xbar`, `within`, unit
 accessors, and column-plus-integer temporal arithmetic.
 
 A raw integer crossing the `int`/`long` ↔ `timestamp` boundary (`` `timestamp$n ``
@@ -407,12 +407,12 @@ add: {[x,y] x+y}              / add[2;3] -> 5
 inc: {[x] x+1}                / inc 41 or inc[41] -> 42
 fac: {[n] ?[n<2; 1; n*fac[n-1]]}
 bysym: {[s] select sym, price from trades where sym = s}
-now: {[] .qpl.p}               / niladic (no params) -> callable bare, `now`, or bracketed, `now[]`
+now: {[] .qpl.ts}               / niladic (no params) -> callable bare, `now`, or bracketed, `now[]`
 ```
 
 A function taking one or more parameters must be called with `f[..]`; a
 niladic one (no params) can also be called bare, like a variable — that's how
-the `.qpl.d`/`.qpl.t`/`.qpl.p`/`.qpl.n` [now-functions](#temporal-types--chaptertemporal)
+the `.qpl.dt`/`.qpl.tm`/`.qpl.ts`/`.qpl.dlta` [now-functions](#temporal-types--chaptertemporal)
 work: they're ordinary built-ins, not special syntax.
 
 ### Comments, multi-line, logging, config
@@ -428,7 +428,7 @@ brackets are open or after a trailing comma. [multi-line][multiline]
 log "rows > " thr ": " n         / rows > 150: 42
 log (f x) " done"                / juxtaposition separates items, so parenthesise
 log f[x] " done"                 / bracket application isn't ambiguous, no parens needed
-info: {[s] log[str$.qpl.p " - INFO " s]}   / log[..] is bracket-scoped, so it works inside a function body
+info: {[s] log[str$.qpl.ts " - INFO " s]}   / log[..] is bracket-scoped, so it works inside a function body
 ```
 
 `.qpl.cfg key=value` sets session knobs: `maxcol`, `maxrow`, `tblwidth` (max
@@ -516,7 +516,7 @@ operator's own input.
 | `zip` | build a table from a dict of named lists |
 | `lj` `ij` `rj` | left / inner / right join |
 | `{...}` | lambda |
-| `.qpl.d` `.qpl.t` `.qpl.p` `.qpl.n` | now: date / time / timestamp / timespan (UTC) |
+| `.qpl.dt` `.qpl.tm` `.qpl.ts` `.qpl.dlta` | now: date / time / timestamp / timespan (UTC) |
 | `.qpl.cfg` | session config |
 | `hopen` `` `w!hopen `` `dispatch` `async dispatch` `await` | IPC client |
 

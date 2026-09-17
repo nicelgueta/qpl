@@ -7,7 +7,8 @@
 / - written across several lines instead, `;` is optional: one line at the
 /   body's own indent = one statement (like a script), and a further-indented
 /   line continues the statement above it.
-/ - call with brackets: `f[1;2]`, `f[]`, `f[`AAPL]`; or monadically `f 41`.
+/ - call with brackets: `f[1;2]`, `f[]`, `f[`AAPL]`; or monadically `f 41`. A
+/   niladic function may also be called bare, without brackets: `f`.
 / - functions are a named binding kind — they are not first-class values and
 /   cannot appear inside a `select` projection.
 /
@@ -68,8 +69,13 @@ log "two timestamp parameters define a time window"
 between: {[lo,hi] select sym, price, ts from trades where ts >= lo, ts <= hi}
 between[2024.03.15D09:30:00.000; 2024.03.15D09:45:05.000000000]
 
+log "a niladic function (no params) is callable bare, like a variable, or as `f[]`"
+now: {[] .qpl.ts}
+log "bare: " now
+log "bracketed: " now[]
+
 log "temporal arithmetic + a now-function composed inside a function body"
-elapsed: {[t] .qpl.p - t}      / a `timespan` — however long ago `t` was
+elapsed: {[t] .qpl.ts - t}      / a `timespan` — however long ago `t` was
 elapsed[2024.03.15D09:30:00.000000000]
 
 log "a per-symbol lookup returning its latest trade"
