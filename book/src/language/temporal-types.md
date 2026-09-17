@@ -185,16 +185,57 @@ opportunity for a machine's local settings to change a query's meaning.
 
 | | |
 |---|---|
-| `.qpl.d` | today's date |
-| `.qpl.t` | the time |
-| `.qpl.p` | the timestamp, to nanoseconds |
-| `.qpl.n` | timespan since midnight |
+| `.qpl.dt` | today's date |
+| `.qpl.tm` | the time |
+| `.qpl.ts` | the timestamp, to nanoseconds |
+| `.qpl.dlta` | timespan since midnight |
 
-They're ordinary expressions and can be used anywhere one is allowed:
+They're ordinary **niladic built-in functions**, not special syntax: like any
+function taking no parameters they can be called bare, as if they were
+variables, or with empty brackets, and they can be used anywhere an
+expression is allowed:
 
 ```qpl
-log .qpl.d
+log .qpl.dt
+log .qpl.ts[]
 ```
+
+Being built-ins, those four names are reserved — binding over one
+(`.qpl.dt: 3`) is an error rather than a silent shadow. Wrapping one in a
+function of your own is the usual way to give it a shorter name:
+
+```qpl
+now: {[] .qpl.ts}
+log now
+```
+
+## Raw integers and the epoch
+
+A whole-column cast (`` `timestamp$col ``) goes through Polars, which counts
+nanoseconds from the **Unix epoch** (`1970.01.01`). A scalar `` `timestamp$n ``
+or `` `long$ts `` follows that same convention by default, so the two agree
+and a nanosecond count from almost any other tool round-trips as you'd
+expect:
+
+```qpl
+qpl) `timestamp$1700000000000000000
+```
+
+```
+timestamp: 2023.11.14D22:13:20.000000000
+```
+
+If you're coming from kdb and want that boundary to use the type's own
+internal epoch (`2000.01.01`) instead, set the
+[config](config.md) knob `useqepoch`:
+
+```qpl
+.qpl.cfg useqepoch=true
+`timestamp$0                   / now reads as 2000.01.01D00:00:00.000000000
+```
+
+It moves only the raw-integer casts in both directions. Literals, arithmetic
+and display are unaffected either way.
 
 ## Not there yet
 

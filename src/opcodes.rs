@@ -30,9 +30,6 @@ pub enum Instruction {
     Case { branches: usize },
     Alias { name: Option<String> },
     Eval(ast::Expr),
-    /// `name: {[params] body}` — register a user function in `Vm::functions`.
-    /// Leaves the stack untouched (like `Assign`, produces no printable result).
-    DefFunc { name: String, params: Vec<String>, body: Vec<ast::Stmt> },
     Sink,
     /// mark the current statement as lazy: its result is stored/returned as a
     /// LazyFrame plan rather than collected into a DataFrame.
@@ -91,7 +88,6 @@ impl fmt::Display for Instruction {
             Instruction::Result                                     => write!(f, "RESULT"),
             Instruction::Assign(name )                     => write!(f, "ASSIGN {name}"),
             Instruction::Eval(expr)                          => write!(f, "EVAL {expr:?}"),
-            Instruction::DefFunc { name, params, .. }        => write!(f, "DEF_FUNC {name} [{}]", params.join(",")),
             Instruction::Sink                                       => write!(f, "SINK"),
             Instruction::Lazy                                       => write!(f, "LAZY"),
             Instruction::Collect                                    => write!(f, "COLLECT"),
@@ -240,17 +236,6 @@ mod tests {
         assert_eq!(disp(Instruction::Result), "RESULT");
     }
 
-    #[test]
-    fn display_def_func() {
-        assert_eq!(
-            disp(Instruction::DefFunc {
-                name: "f".into(),
-                params: vec!["x".into(), "y".into()],
-                body: vec![],
-            }),
-            "DEF_FUNC f [x,y]",
-        );
-    }
 
     // --- disassemble ---
 

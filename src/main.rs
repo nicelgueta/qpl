@@ -3,6 +3,7 @@ mod builtins;
 mod compiler;
 mod errors;
 mod lexer;
+mod native;
 mod opcodes;
 mod parser;
 mod enums;
@@ -12,6 +13,7 @@ pub mod repl;
 mod temporal;
 mod tokens;
 mod vm;
+mod vm_config;
 #[cfg(feature = "ipc")]
 mod ipc;
 

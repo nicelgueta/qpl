@@ -480,8 +480,8 @@ impl ast::Value {
                 out.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 for b in v.iter().flatten() { out.push(b as u8); }
             }
-            // connection/future handles never need to cross the wire themselves
-            Handle(_) | Future(_) => {
+            // connection/future handles and functions never cross the wire
+            Handle(_) | Future(_) | Closure(_) => {
                 out.push(ValueTag::Str as u8);
                 push_str(out, "<unrepresentable>");
             }

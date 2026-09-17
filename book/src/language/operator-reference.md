@@ -33,6 +33,6 @@ explains it.
 | `zip` | build a table from a dict of named lists | [Column expressions](column-expressions.md) |
 | `lj` `ij` `rj` | left / inner / right join | [select](select-update-delete.md) |
 | `{...}` | lambda | [Functions](functions.md) |
-| `.qpl.d` `.qpl.t` `.qpl.p` `.qpl.n` | current date / time / timestamp / timespan, UTC | [Temporal types](temporal-types.md) |
+| `.qpl.dt` `.qpl.tm` `.qpl.ts` `.qpl.dlta` | current date / time / timestamp / timespan, UTC | [Temporal types](temporal-types.md) |
 | `.qpl.cfg` | session settings | [Config](config.md) |
 | `hopen` `` `w!hopen `` `dispatch` `async dispatch` `await` | IPC client (`ipc` feature, on by default) | [IPC](ipc.md) |

@@ -1,15 +1,16 @@
 use polars::io::utils::sync_on_close::SyncOnCloseType;
 use polars::prelude::*;
-use polars_ops::prelude::RoundMode;
 use crate::ast::{self, TableSource, Value};
 use crate::enums::{PolarsFrameExpr, PolarsStackArg, WindowFn};
 use crate::lexer::tokenise;
 use crate::parser::parse;
 use crate::compiler::compile;
 use crate::errors::QplError;
+use crate::native::Builtin;
 use crate::opcodes::Instruction;
 use crate::resolve;
 use crate::temporal;
+use crate::vm_config::VmConfig;
 use crate::helpers::rename_columns_snake_case;
 use std::collections::HashMap;
 
@@ -17,10 +18,13 @@ pub struct Vm {
     pub tables: HashMap<String, DataFrame>,
     pub lazy_frames: HashMap<String, LazyFrame>,
     pub globals: HashMap<String, ast::Value>,
-    /// User functions bound by `name: {[..] ..}`. A binding kind alongside
-    /// `tables` / `lazy_frames`, not a first-class value; applied in value
-    /// context only (see [`crate::resolve`]).
-    pub functions: HashMap<String, ast::Function>,
+    /// Native functions (`.qpl.dt`, ...), populated once in [`Vm::new`] and
+    /// never mutated afterwards — resolved by [`Vm::lookup`] like any other
+    /// name but never reassignable or shadowable (see the `bind_*` guards
+    /// below). A *user* function isn't a binding kind at all: it's a
+    /// `Value::Closure` living in `globals` like any other value. See
+    /// [`crate::native`].
+    pub builtins: HashMap<String, Builtin>,
     /// The active user-function call stack. Empty at the top level. Only the
     /// *innermost* frame is ever searched (see [`Vm::lookup`]) — a call sees its
     /// own params/locals and the session globals, never an enclosing caller's
@@ -62,7 +66,6 @@ pub struct Scope {
     pub globals: HashMap<String, ast::Value>,
     pub tables: HashMap<String, DataFrame>,
     pub lazy_frames: HashMap<String, LazyFrame>,
-    pub functions: HashMap<String, ast::Function>,
     /// The namespace this call is executing under (e.g. `.logging`), if any —
     /// set by `apply_function` when the callee resolved to a namespaced name.
     /// `\i`'s import only renames a script's top-level bindings, it doesn't
@@ -79,7 +82,7 @@ pub(crate) enum Lookup<'a> {
     Global(&'a ast::Value),
     LazyFrame(&'a LazyFrame),
     Table(&'a DataFrame),
-    Function(&'a ast::Function),
+    Builtin(&'a Builtin),
 }
 
 /// Hard cap on user-function call nesting (a clearer error than a stack
@@ -89,126 +92,6 @@ pub(crate) enum Lookup<'a> {
 /// thread stack the REPL runs on — a much smaller stack (a worker thread, or a
 /// future WASM build) could still overflow before reaching this many levels.
 pub(crate) const MAX_CALL_DEPTH: usize = 128;
-
-/// Interpreter configuration set at run time via `.qpl.cfg`. To add a knob:
-/// give it a field + default here and a match arm in [`VmConfig::set`] — nothing
-/// else in the pipeline needs to change.
-#[derive(Debug, Clone)]
-pub struct VmConfig {
-    /// max columns physically printed when rendering a table (`maxcol`)
-    pub maxcol: usize,
-    /// max rows physically printed when rendering a table (`maxrow`)
-    pub maxrow: usize,
-    /// rounding mode used by the `round` column function (`round_type`)
-    pub round_type: RoundMode,
-    /// max characters wide a printed table may be, `-1` = unlimited (`tblwidth`)
-    pub tblwidth: i64,
-    /// max characters shown per cell before truncating with an ellipsis,
-    /// `-1` = unlimited (`strlen`)
-    pub strlen: i64,
-    /// when `true`, a raw integer crossing the `Int`/`timestamp` boundary
-    /// (`` `timestamp$n ``, `` `long$ts ``) is read/written as ns since kdb's
-    /// `2000.01.01` epoch, matching the internal [`ast::Value::Timestamp`]
-    /// representation; when `false` (the default) it's ns since the Unix epoch
-    /// (`1970.01.01`), matching what a whole-column `` `timestamp$ `` cast
-    /// already does under Polars and what non-kdb users expect (`useqepoch`)
-    pub useqepoch: bool,
-}
-
-impl Default for VmConfig {
-    fn default() -> Self {
-        // mirror Polars' own display defaults
-        Self {
-            maxcol: 8,
-            maxrow: 10,
-            round_type: RoundMode::HalfToEven,
-            tblwidth: -1,
-            strlen: 30,
-            useqepoch: false,
-        }
-    }
-}
-
-impl VmConfig {
-    /// Apply one `key=value` assignment. Unknown keys / bad values are errors.
-    pub fn set(&mut self, key: &str, value: &str) -> Result<(), QplError> {
-        match key {
-            "maxcol" => self.maxcol = parse_cfg_usize(key, value)?,
-            "maxrow" => self.maxrow = parse_cfg_usize(key, value)?,
-            "round_type" => self.round_type = parse_round_type(value)?,
-            "tblwidth" => self.tblwidth = parse_cfg_i64(key, value)?,
-            "strlen" => self.strlen = parse_cfg_i64(key, value)?,
-            "useqepoch" => self.useqepoch = parse_cfg_bool(key, value)?,
-            _ => return Err(QplError::Runtime(format!(
-                "unknown config '{key}' (known: maxcol, maxrow, round_type, tblwidth, strlen, useqepoch)"
-            ))),
-        }
-        // the row/col/width/strlen limits are read by Polars from the environment at render time
-        match key {
-            "maxcol" => unsafe { std::env::set_var("POLARS_FMT_MAX_COLS", self.maxcol.to_string()) },
-            "maxrow" => unsafe { std::env::set_var("POLARS_FMT_MAX_ROWS", self.maxrow.to_string()) },
-            "tblwidth" => unsafe { std::env::set_var("POLARS_TABLE_WIDTH", self.tblwidth.to_string()) },
-            // Polars' formatter takes a negative POLARS_FMT_STR_LEN literally as
-            // usize::MAX and then overflows adding padding to it (fmt.rs), unlike
-            // POLARS_TABLE_WIDTH which clamps negatives to u16::MAX itself — so
-            // `-1` (unlimited) is translated to a large-but-safe finite value here.
-            "strlen" => unsafe {
-                let v = if self.strlen < 0 { i32::MAX as i64 } else { self.strlen };
-                std::env::set_var("POLARS_FMT_STR_LEN", v.to_string())
-            },
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// One `key=value` line per knob — printed by a bare `.qpl.cfg`.
-    pub fn describe(&self) -> String {
-        format!(
-            "maxcol={}\nmaxrow={}\nround_type={}\ntblwidth={}\nstrlen={}\nuseqepoch={}",
-            self.maxcol, self.maxrow, round_type_name(self.round_type), self.tblwidth, self.strlen,
-            self.useqepoch,
-        )
-    }
-}
-
-fn parse_cfg_usize(key: &str, value: &str) -> Result<usize, QplError> {
-    value.parse().map_err(|_| {
-        QplError::Runtime(format!("config '{key}' expects a non-negative integer, got '{value}'"))
-    })
-}
-
-fn parse_cfg_i64(key: &str, value: &str) -> Result<i64, QplError> {
-    value.parse().map_err(|_| {
-        QplError::Runtime(format!("config '{key}' expects an integer, got '{value}'"))
-    })
-}
-
-fn parse_cfg_bool(key: &str, value: &str) -> Result<bool, QplError> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "1" => Ok(true),
-        "false" | "0" => Ok(false),
-        _ => Err(QplError::Runtime(format!(
-            "config '{key}' expects true/false, got '{value}'"
-        ))),
-    }
-}
-
-fn parse_round_type(value: &str) -> Result<RoundMode, QplError> {
-    match value.to_ascii_uppercase().as_str() {
-        "HALF_UP" => Ok(RoundMode::HalfAwayFromZero),
-        "HALF_TO_EVEN" => Ok(RoundMode::HalfToEven),
-        _ => Err(QplError::Runtime(format!(
-            "round_type must be HALF_UP or HALF_TO_EVEN, got '{value}'"
-        ))),
-    }
-}
-
-fn round_type_name(mode: RoundMode) -> &'static str {
-    match mode {
-        RoundMode::HalfAwayFromZero => "HALF_UP",
-        _ => "HALF_TO_EVEN",
-    }
-}
 
 enum StackObj {
     Expr(Expr),
@@ -259,7 +142,7 @@ impl Vm {
             tables: HashMap::new(),
             lazy_frames: HashMap::new(),
             globals: HashMap::new(),
-            functions: HashMap::new(),
+            builtins: crate::native::builtins(),
             scopes: Vec::new(),
             stdout_log: None,
             config: VmConfig::default(),
@@ -322,6 +205,11 @@ impl Vm {
     /// enclosing caller's frame, which is what makes this lexical scoping
     /// rather than "whatever the dynamic call chain happens to have bound".
     pub(crate) fn lookup(&self, name: &str) -> Option<Lookup<'_>> {
+        // checked first and unscoped: a builtin can never be shadowed (see
+        // the `bind_*` guards below), so there's no ambiguity to resolve.
+        if let Some(b) = self.builtins.get(name) {
+            return Some(Lookup::Builtin(b));
+        }
         if let Some(scope) = self.scopes.last() {
             if let Some(v) = scope.globals.get(name) {
                 return Some(Lookup::Global(v));
@@ -332,9 +220,6 @@ impl Vm {
             if let Some(df) = scope.tables.get(name) {
                 return Some(Lookup::Table(df));
             }
-            if let Some(f) = scope.functions.get(name) {
-                return Some(Lookup::Function(f));
-            }
         }
         if let Some(v) = self.globals.get(name) {
             return Some(Lookup::Global(v));
@@ -344,9 +229,6 @@ impl Vm {
         }
         if let Some(df) = self.tables.get(name) {
             return Some(Lookup::Table(df));
-        }
-        if let Some(f) = self.functions.get(name) {
-            return Some(Lookup::Function(f));
         }
         // Unqualified sibling reference from inside a namespaced import's own
         // function body (see `Scope::current_ns`) — retry once, qualified.
@@ -360,9 +242,6 @@ impl Vm {
             }
             if let Some(df) = self.tables.get(&qualified) {
                 return Some(Lookup::Table(df));
-            }
-            if let Some(f) = self.functions.get(&qualified) {
-                return Some(Lookup::Function(f));
             }
         }
         None
@@ -379,8 +258,9 @@ impl Vm {
         if let Some(i) = name.rfind('.') {
             return Some(name[..i].to_string());
         }
-        let resolved_directly = self.scopes.last().is_some_and(|s| s.functions.contains_key(name))
-            || self.functions.contains_key(name);
+        let is_closure = |v: Option<&ast::Value>| matches!(v, Some(ast::Value::Closure(_)));
+        let resolved_directly = self.scopes.last().is_some_and(|s| is_closure(s.globals.get(name)))
+            || is_closure(self.globals.get(name));
         if resolved_directly {
             None
         } else {
@@ -396,17 +276,37 @@ impl Vm {
         }
     }
 
-    /// `lookup`, narrowed to the user-function kind.
-    pub(crate) fn lookup_function(&self, name: &str) -> Option<&ast::Function> {
+    /// `lookup`, narrowed to a global holding a function. Returns the shared
+    /// `Arc` rather than a borrow so the caller can go on using `&mut Vm`.
+    pub(crate) fn lookup_closure(&self, name: &str) -> Option<std::sync::Arc<ast::Function>> {
         match self.lookup(name) {
-            Some(Lookup::Function(f)) => Some(f),
+            Some(Lookup::Global(ast::Value::Closure(f))) => Some(f.clone()),
             _ => None,
         }
     }
 
+    /// Whether `name` can be called (with `[..]` and/or, if niladic, bare) —
+    /// a bound function value or a builtin.
+    pub(crate) fn is_callable(&self, name: &str) -> bool {
+        matches!(
+            self.lookup(name),
+            Some(Lookup::Builtin(_)) | Some(Lookup::Global(ast::Value::Closure(_)))
+        )
+    }
+
+    /// Every `bind_*` below goes through this first: a builtin's name is
+    /// reserved and can never be reassigned or shadowed.
+    fn check_not_builtin(&self, name: &str) -> Result<(), QplError> {
+        if self.builtins.contains_key(name) {
+            return Err(QplError::Runtime(format!("'{name}' is a built-in and cannot be reassigned")));
+        }
+        Ok(())
+    }
+
     /// Bind a scalar to `name` in the active call frame, or the session
     /// globals when there is none.
-    pub(crate) fn bind_global(&mut self, name: String, val: ast::Value) {
+    pub(crate) fn bind_global(&mut self, name: String, val: ast::Value) -> Result<(), QplError> {
+        self.check_not_builtin(&name)?;
         match self.scopes.last_mut() {
             Some(scope) => {
                 scope.globals.insert(name, val);
@@ -415,53 +315,45 @@ impl Vm {
                 self.globals.insert(name, val);
             }
         }
+        Ok(())
     }
 
-    /// Bind an eager table to `name`, scope-aware like `bind_global`.
-    pub(crate) fn bind_table(&mut self, name: String, df: DataFrame) {
+    /// Bind an eager table to `name`, scope-aware like `bind_global`. Also
+    /// drops any scalar of the same name: `globals` is searched first by
+    /// `lookup`, so leaving one behind would hide the new table.
+    pub(crate) fn bind_table(&mut self, name: String, df: DataFrame) -> Result<(), QplError> {
+        self.check_not_builtin(&name)?;
         match self.scopes.last_mut() {
             Some(scope) => {
+                scope.globals.remove(&name);
                 scope.lazy_frames.remove(&name);
                 scope.tables.insert(name, df);
             }
             None => {
+                self.globals.remove(&name);
                 self.lazy_frames.remove(&name);
                 self.tables.insert(name, df);
             }
         }
+        Ok(())
     }
 
-    /// Bind a lazy plan to `name`, scope-aware like `bind_global`.
-    pub(crate) fn bind_lazy(&mut self, name: String, lf: LazyFrame) {
-        match self.scopes.last_mut() {
-            Some(scope) => {
-                scope.tables.remove(&name);
-                scope.lazy_frames.insert(name, lf);
-            }
-            None => {
-                self.tables.remove(&name);
-                self.lazy_frames.insert(name, lf);
-            }
-        }
-    }
-
-    /// Bind a function to `name`, scope-aware like `bind_global` — a function
-    /// defined inside a call is local to that call, same as any other name.
-    pub(crate) fn bind_function(&mut self, name: String, f: ast::Function) {
+    /// Bind a lazy plan to `name`, scope-aware like `bind_table`.
+    pub(crate) fn bind_lazy(&mut self, name: String, lf: LazyFrame) -> Result<(), QplError> {
+        self.check_not_builtin(&name)?;
         match self.scopes.last_mut() {
             Some(scope) => {
                 scope.globals.remove(&name);
                 scope.tables.remove(&name);
-                scope.lazy_frames.remove(&name);
-                scope.functions.insert(name, f);
+                scope.lazy_frames.insert(name, lf);
             }
             None => {
                 self.globals.remove(&name);
                 self.tables.remove(&name);
-                self.lazy_frames.remove(&name);
-                self.functions.insert(name, f);
+                self.lazy_frames.insert(name, lf);
             }
         }
+        Ok(())
     }
 
     /// Point stdout logging at `path` (created / appended). Passing an empty
@@ -510,9 +402,19 @@ impl Vm {
             ast::Expr::Lit(v) => Ok(v.clone()),
             // outside a table expression `` `foo `` is a symbol (a distinct value kind)
             ast::Expr::Sym(s) => Ok(ast::Value::Sym(s.clone())),
-            ast::Expr::ColRef(name) => self.lookup_global(name)
-                .cloned()
-                .ok_or_else(|| QplError::Runtime(format!("undefined variable '{name}'"))),
+            // a plain global, or a niladic builtin (e.g. `.qpl.dt`) called with
+            // no arguments — resolved like any other bare name, not
+            // special-cased by name here. A niladic *user* function isn't
+            // supported in this pure/immutable context (it needs a call
+            // frame — see `resolve::call_niladic`, used by the full
+            // value-context path instead).
+            ast::Expr::ColRef(name) => match self.lookup_global(name) {
+                Some(v) => Ok(v.clone()),
+                None => match self.lookup(name) {
+                    Some(Lookup::Builtin(b)) if b.arity == 0 => b.call(&[]),
+                    _ => Err(QplError::Runtime(format!("undefined variable '{name}'"))),
+                },
+            },
             ast::Expr::BinOp { left, op, right } => {
                 let l = self.eval_scalar(left)?;
                 let r = self.eval_scalar(right)?;
@@ -521,10 +423,6 @@ impl Vm {
                 } else {
                     scalar_binop(l, r, op)
                 }
-            }
-            // `.qpl.d` / `.qpl.t` / `.qpl.p` / `.qpl.n` — nullary now-functions
-            ast::Expr::Call { func, args } if func.starts_with(".qpl.") && args.is_empty() => {
-                temporal::now_value(func)
             }
             ast::Expr::Cast { target, expr } => match target {
                 ast::CastTarget::Prim(dtype) =>
@@ -725,8 +623,21 @@ impl Vm {
                 }
 
                 Instruction::PushColRef(name) => {
+                    // a niladic function/builtin (e.g. `.qpl.dt`) reduces to the
+                    // literal it returns — resolved like any other bare name,
+                    // not specially recognised here. Checked ahead of the global
+                    // shortcut below because a niladic *user* function is itself
+                    // a global (a `Value::Closure`), and the point is to call it.
+                    if let Some(v) = resolve::call_niladic(self, &name)? {
+                        let val = match v {
+                            resolve::EvalValue::Scalar(v) => v,
+                            resolve::EvalValue::Frame { .. } => return Err(QplError::Runtime(format!(
+                                "'{name}' returns a table — it can't be used inside a column expression"
+                            ))),
+                        };
+                        stack.push(StackObj::Expr(ast_val_to_expr(val)?));
                     // globals shadow column names, substituting a literal into the lazy plan
-                    if let Some(val) = self.lookup_global(&name) {
+                    } else if let Some(val) = self.lookup_global(&name) {
                         stack.push(StackObj::Expr(ast_val_to_expr(val.clone())?));
                     } else {
                         stack.push(StackObj::Expr(col(name.as_str())));
@@ -959,10 +870,6 @@ impl Vm {
                     }
                 }
 
-                Instruction::DefFunc { name, params, body } => {
-                    self.bind_function(name, ast::Function { params, body });
-                }
-
                 Instruction::Result => {
                     let lf = require_frame(&mut frame)?;
                     stack.push(StackObj::Frame(lf));
@@ -973,15 +880,15 @@ impl Vm {
                     self.check_write_allowed("assignment")?;
                     match pop1(&mut stack)? {
                         StackObj::Scalar(s) => {
-                            self.bind_global(name, s);
+                            self.bind_global(name, s)?;
                         }
                         StackObj::Frame(lf) => {
                             if lazy_mode {
                                 // keep the plan lazy under this name
-                                self.bind_lazy(name, lf);
+                                self.bind_lazy(name, lf)?;
                             } else {
                                 let df = lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?;
-                                self.bind_table(name, df);
+                                self.bind_table(name, df)?;
                             }
                         }
                         typ => return Err(QplError::Runtime(format!("Cannot assign '{}' to type {}: expected a table or scalar on stack", name, typ.type_name()))),
@@ -1085,6 +992,12 @@ pub(crate) fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
         ast::Value::Timespan(ns) => lit(ns).cast(DataType::Duration(TimeUnit::Nanoseconds)),
         v @ (ast::Value::Handle(_) | ast::Value::Future(_)) => {
             return Err(QplError::Runtime(format!("{v:?} cannot be used in a query expression")))
+        }
+        // a function is a value, but not a *column* value
+        ast::Value::Closure(_) => {
+            return Err(QplError::Runtime(
+                "a function cannot be used in a query expression".into(),
+            ))
         }
         // typed temporal vectors: same offset-rebasing as their scalar
         // counterparts, applied elementwise via Series/Expr arithmetic.
@@ -1724,7 +1637,6 @@ fn like_pattern_to_regex(pattern: &str) -> String {
     out
 }
 
-// fn ap
 
 pub(crate) fn apply_call(func: &str, mut args: Vec<Expr>) -> Result<Expr, QplError> {
     if args.is_empty() {
@@ -2243,8 +2155,8 @@ mod tests {
 
     #[test]
     fn qpl_now_functions_evaluate_in_scalar_context() {
-        assert!(matches!(scalar_of("l: .qpl.d"), ast::Value::Date(_)));
-        assert!(matches!(scalar_of("l: .qpl.p"), ast::Value::Timestamp(_)));
+        assert!(matches!(scalar_of("l: .qpl.dt"), ast::Value::Date(_)));
+        assert!(matches!(scalar_of("l: .qpl.ts"), ast::Value::Timestamp(_)));
     }
 
     #[test]
@@ -3098,28 +3010,6 @@ mod tests {
     fn negative_limit_takes_last_n_rows() {
         let df = run(make_vm(), "-2 limit t");
         assert_eq!(i64s(&df, "c2"), vec![30, 15]);
-    }
-
-    #[test]
-    fn config_set_rejects_unknown_key_and_bad_value() {
-        let mut cfg = VmConfig::default();
-        assert!(cfg.set("nope", "1").is_err());
-        assert!(cfg.set("maxrow", "abc").is_err());
-        assert!(cfg.set("round_type", "sideways").is_err());
-        assert!(cfg.set("tblwidth", "abc").is_err());
-        assert!(cfg.set("strlen", "abc").is_err());
-        cfg.set("maxrow", "42").unwrap();
-        cfg.set("maxcol", "7").unwrap();
-        cfg.set("round_type", "half_up").unwrap(); // case-insensitive
-        cfg.set("tblwidth", "120").unwrap();
-        cfg.set("strlen", "-1").unwrap();
-        assert_eq!(cfg.maxrow, 42);
-        assert_eq!(cfg.maxcol, 7);
-        assert_eq!(cfg.round_type, RoundMode::HalfAwayFromZero);
-        assert_eq!(cfg.tblwidth, 120);
-        assert_eq!(cfg.strlen, -1);
-        assert_eq!(VmConfig::default().tblwidth, -1);
-        assert_eq!(VmConfig::default().strlen, 30);
     }
 
     // --- window functions ---

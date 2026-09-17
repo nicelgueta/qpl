@@ -11,8 +11,8 @@
 /   timestamp  2024.03.15D12:30:00.000000000     (ns)
 /   timespan   0D12:30:00.000000000              (ns duration)
 /
-/   .qpl.d  today's date         .qpl.p  now (timestamp, ns)
-/   .qpl.t  now (time)           .qpl.n  now (timespan since midnight)   -- UTC
+/   .qpl.dt  today's date         .qpl.ts  now (timestamp, ns)
+/   .qpl.tm  now (time)           .qpl.dlta now (timespan since midnight)  -- UTC
 /
 / Run from the repo root:
 /   cargo run -- examples/temporal.qpl
@@ -42,8 +42,13 @@ log "date->ts   " `timestamp$d                / 2024.03.15D00:00:00.000000000
 log "raw days   " `int$d                      / 8840   (days since 2000.01.01)
 log "parsed     " "p"$"2024.06.01D12:00:00"   / 2024.06.01D12:00:00.000000000
 
-/ now-functions work in queries too (here just as scalars)
-log "today      " .qpl.d
+/ now-functions work in queries too (here just as scalars). They're niladic
+/ builtins, so they're callable bare or bracketed - `.qpl.ts` and `.qpl.ts[]`
+/ are the same call.
+log "today      " .qpl.dt
+log "time       " .qpl.tm
+log "now        " .qpl.ts
+log "since 0:00 " .qpl.dlta[]
 
 / temporal literals project as Polars-native typed columns
 trades: load "examples/data/trades.parquet"

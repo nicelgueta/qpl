@@ -69,9 +69,12 @@ impl Parser {
                 unreachable!()
             };
             self.eat(&TokenKind::Colon)?;
-            // `name: {[..] ..}` — a function definition.
+            // `name: {[..] ..}` — binding a function literal. Ordinary scalar
+            // assignment of an ordinary value (see `Value::Closure`); it only
+            // short-circuits `parse_body` here because a leading `{` has no
+            // meaning on the table side.
             if self.peek() == &TokenKind::LBrace {
-                return self.parse_func_def(name);
+                return Ok(Stmt::ScalarAssign { name, expr: self.parse_func_lit()? });
             }
             // query keywords produce a table result; anything else is a scalar
             // expression. `parse_body` decides between a table statement and a
@@ -138,12 +141,12 @@ impl Parser {
         }
     }
 
-    /// `name: {[p1,p2] stmt; stmt; last-expr}` — a function definition. The
-    /// param list is optional (`{[] ..}` / `{ .. }` are niladic). Statements are
-    /// `;`-separated, each a full `parse_stmt` (so locals may be assigned); the
-    /// body must be non-empty, its last statement an expression (checked at
-    /// compile time).
-    fn parse_func_def(&mut self, name: String) -> Result<Stmt, QplError> {
+    /// `{[p1,p2] stmt; stmt; last-expr}` — a function literal, folded straight
+    /// into an `Expr::Lit(Value::Closure(..))`. The param list is optional
+    /// (`{[] ..}` / `{ .. }` are niladic). Statements are `;`-separated, each a
+    /// full `parse_stmt` (so locals may be assigned); the body must be
+    /// non-empty and end in an expression (its return value).
+    fn parse_func_lit(&mut self) -> Result<Expr, QplError> {
         self.eat(&TokenKind::LBrace)?;
         let mut params = Vec::new();
         if self.peek() == &TokenKind::LBracket {
@@ -187,7 +190,12 @@ impl Parser {
         if body.is_empty() {
             return Err(QplError::Parse("function body cannot be empty".into()));
         }
-        Ok(Stmt::FuncDef { name, params, body })
+        if !matches!(body.last(), Some(Stmt::SingleVar(_) | Stmt::RetTable(_))) {
+            return Err(QplError::Parse(
+                "a function body must end with an expression, not an assignment".into(),
+            ));
+        }
+        Ok(Expr::Lit(Value::Closure(std::sync::Arc::new(crate::ast::Function { params, body }))))
     }
 
     fn parse_body(&mut self) -> Result<Stmt, QplError> {
@@ -936,7 +944,7 @@ impl Parser {
                 // (juxtaposed items, each a full `parse_expr_no_call`, `;`
                 // between them optional) rather than the generic `f[a;b]`
                 // call grammar below, which requires a separator and would
-                // reject `log[str$.qpl.p " - INFO " s]` after its first item.
+                // reject `log[str$.qpl.ts " - INFO " s]` after its first item.
                 if matches!(&e, Expr::ColRef(n) if n == "log") {
                     self.next(); // `[`
                     let mut args = Vec::new();
@@ -1128,6 +1136,11 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, QplError> {
+        // `{[..] ..}` anywhere an expression is expected — a function literal,
+        // a first-class value like any other (see `Value::Closure`).
+        if self.peek() == &TokenKind::LBrace {
+            return self.parse_func_lit();
+        }
         // a run of ints juxtaposed with no operator is an int-vector literal
         if matches!(self.peek(), TokenKind::Int(_)) && matches!(self.peek2(), TokenKind::Int(_)) {
             return Ok(self.try_parse_int_run().unwrap());
@@ -1142,12 +1155,9 @@ impl Parser {
             TokenKind::Symbol(s)   => Ok(Expr::Sym(s)),
             TokenKind::Temporal(v) => Ok(Expr::Lit(v)),
             TokenKind::Name(n) if n == "i" => Ok(Expr::IColRef),
-            // `.qpl.d` / `.qpl.t` / `.qpl.p` / `.qpl.n` — nullary now-functions,
-            // the only namespaced names that stand for a call with no args of
-            // their own; every other `.ns.name` is an ordinary variable/table
-            // reference (`ColRef`), resolved by lookup like any other name.
-            TokenKind::Name(n) if matches!(n.as_str(), ".qpl.d" | ".qpl.t" | ".qpl.p" | ".qpl.n") =>
-                Ok(Expr::Call { func: n, args: vec![] }),
+            // Every other bare name — including `.qpl.dt`/`.qpl.tm`/`.qpl.ts`/`.qpl.dlta`
+            // and any other namespaced name — is an ordinary variable/table/function
+            // reference, resolved by lookup (see `Vm::lookup`, `resolve::call_niladic`).
             TokenKind::Name(n)     => Ok(Expr::ColRef(n)),
             TokenKind::Op(op) if op == "?" => self.parse_case(),
             // leading `-`: a negative literal (`-45.3`) or unary negation of the
@@ -1161,11 +1171,7 @@ impl Parser {
                 self.eat(&TokenKind::RParen)?;
                 Ok(expr)
             },
-            // a bare `{ .. }` — anonymous functions are unsupported; a function
-            // must be named (`f: {[..] ..}`).
-            TokenKind::LBrace => Err(QplError::Parse(
-                "anonymous functions are not supported — bind it to a name: `f: {[..] ..}`".into(),
-            )),
+
             other => Err(QplError::Parse(format!("Unexpected token in primary: {:?}", other))),
         }
     }
@@ -1808,28 +1814,55 @@ mod tests {
 
     // --- functions ---
 
+    /// The `Function` behind `p(source)`, which must be `name: {[..] ..}`.
+    fn closure_of(source: &str) -> std::sync::Arc<crate::ast::Function> {
+        match p(source) {
+            Stmt::ScalarAssign { expr: Expr::Lit(Value::Closure(f)), .. } => f,
+            other => panic!("expected a closure assignment, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn func_def_parses_params_and_body() {
+    fn func_def_parses_to_a_closure_assignment() {
         match p("f: {[x,y] t: x*y; t+1}") {
-            Stmt::FuncDef { name, params, body } => {
+            Stmt::ScalarAssign { name, expr: Expr::Lit(Value::Closure(f)) } => {
                 assert_eq!(name, "f");
-                assert_eq!(params, vec!["x".to_string(), "y".to_string()]);
-                assert_eq!(body.len(), 2);
-                assert!(matches!(body[0], Stmt::ScalarAssign { .. }));
-                assert!(matches!(body[1], Stmt::SingleVar(_)));
+                assert_eq!(f.params, vec!["x".to_string(), "y".to_string()]);
+                assert_eq!(f.body.len(), 2);
+                assert!(matches!(f.body[0], Stmt::ScalarAssign { .. }));
+                assert!(matches!(f.body[1], Stmt::SingleVar(_)));
             }
-            other => panic!("expected FuncDef, got {other:?}"),
+            other => panic!("expected a closure assignment, got {other:?}"),
         }
     }
 
     #[test]
     fn niladic_func_def_needs_no_param_list() {
         for source in ["f: {[] 42}", "f: {42}"] {
-            assert!(
-                matches!(p(source), Stmt::FuncDef { ref params, .. } if params.is_empty()),
-                "{source}"
-            );
+            assert!(closure_of(source).params.is_empty(), "{source}");
         }
+    }
+
+    #[test]
+    fn a_func_literal_parses_in_expression_position() {
+        // as a call argument (higher-order use) ...
+        match p("apply[{[y] y*2}; 5]") {
+            Stmt::SingleVar(Expr::Apply { args, .. }) => {
+                assert!(matches!(args[0], Expr::Lit(Value::Closure(_))));
+                assert!(matches!(args[1], Expr::Lit(Value::Int(5))));
+            }
+            other => panic!("expected an Apply, got {other:?}"),
+        }
+        // ... and as a bare expression
+        assert!(matches!(p("{[x] x+1}"), Stmt::SingleVar(Expr::Lit(Value::Closure(_)))));
+    }
+
+    #[test]
+    fn func_body_must_end_in_an_expression() {
+        assert!(matches!(
+            parse(tokenise("f: {[x] y: x+1}").unwrap()),
+            Err(QplError::Parse(_)),
+        ));
     }
 
     #[test]
@@ -1853,9 +1886,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_function_body_and_anonymous_function_are_parse_errors() {
+    fn empty_function_body_is_a_parse_error() {
         assert!(parse(tokenise("f: {[x] }").unwrap()).is_err());
-        assert!(parse(tokenise("{[x] x+1}").unwrap()).is_err());
+        assert!(parse(tokenise("{}").unwrap()).is_err());
     }
 
     #[test]
@@ -2110,21 +2143,20 @@ mod tests {
     }
 
     #[test]
-    fn qpl_now_function_parses_to_a_zero_arg_call() {
-        match p("l: .qpl.p") {
-            Stmt::ScalarAssign { expr, .. } => assert!(matches!(
-                expr,
-                Expr::Call { func, args } if func == ".qpl.p" && args.is_empty()
-            )),
+    fn qpl_now_function_parses_as_an_ordinary_variable_reference() {
+        // `.qpl.ts` is a builtin (see `Vm::builtins`), but the parser doesn't
+        // know that — it's a bare `ColRef` like any other name, resolved (and
+        // auto-invoked, being niladic) by lookup at run time.
+        match p("l: .qpl.ts") {
+            Stmt::ScalarAssign { expr, .. } => assert_eq!(expr, Expr::ColRef(".qpl.ts".into())),
             other => panic!("expected scalar assign, got {other:?}"),
         }
     }
 
     #[test]
     fn namespaced_identifier_parses_as_an_ordinary_variable_reference() {
-        // a general `.ns.name` (not one of the `.qpl.*` now-functions) is just
-        // a `ColRef` — resolved by name lookup like any other identifier,
-        // not a zero-arg call.
+        // a general `.ns.name` is just a `ColRef` — resolved by name lookup
+        // like any other identifier, not a zero-arg call.
         match p("l: .utils.helper") {
             Stmt::ScalarAssign { expr, .. } => assert_eq!(expr, Expr::ColRef(".utils.helper".into())),
             other => panic!("expected scalar assign, got {other:?}"),

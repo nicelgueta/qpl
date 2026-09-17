@@ -1,5 +1,5 @@
 //! kdb+/q-style temporal scalars: parsing literals, formatting them back, and
-//! the `.qpl.d` / `.qpl.t` / `.qpl.p` / `.qpl.n` "now" functions.
+//! the `.qpl.dt` / `.qpl.tm` / `.qpl.ts` / `.qpl.dlta` "now" functions.
 //!
 //! Everything calendar-related lives here so the lexer / vm / repl diffs stay
 //! small. No `chrono` dependency — dates are proleptic-Gregorian day counts
@@ -23,6 +23,14 @@ pub const NS_2000_TO_1970: i64 = 946_684_800_000_000_000;
 
 const NS_PER_DAY: i64 = 86_400_000_000_000;
 const NS_PER_SEC: i64 = 1_000_000_000;
+
+#[derive(Clone, Copy)]
+pub enum TemporalNowFuncType {
+    Date,
+    Time,
+    Timestamp,
+    Timespan
+}
 
 // ── calendar math (Hinnant, epoch 1970-01-01) ──────────────────────────────
 
@@ -214,9 +222,9 @@ fn fmt_tod(ns: i64, frac_digits: usize) -> String {
 
 // ── `.qpl.*` now-functions ────────────────────────────────────────────────
 
-/// Evaluate `.qpl.d` / `.qpl.t` / `.qpl.p` / `.qpl.n`. Times are **UTC** —
+/// Evaluate `.qpl.dt` / `.qpl.tm` / `.qpl.ts` / `.qpl.dlta`. Times are **UTC** —
 /// there is no timezone database without an extra dependency.
-pub fn now_value(func: &str) -> Result<Value, QplError> {
+pub fn now_value(func: TemporalNowFuncType) -> Result<Value, QplError> {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| QplError::Runtime(format!("system clock before 1970: {e}")))?;
@@ -224,11 +232,10 @@ pub fn now_value(func: &str) -> Result<Value, QplError> {
     let sub_ns = dur.subsec_nanos() as i64;
     let ns_of_day = secs.rem_euclid(86_400) * NS_PER_SEC + sub_ns;
     Ok(match func {
-        ".qpl.d" => Value::Date((secs.div_euclid(86_400)) as i32 - DAYS_2000_TO_1970),
-        ".qpl.t" => Value::Time(ns_of_day),
-        ".qpl.p" => Value::Timestamp(secs * NS_PER_SEC + sub_ns - NS_2000_TO_1970),
-        ".qpl.n" => Value::Timespan(ns_of_day),
-        other => return Err(QplError::Runtime(format!("unknown function '{other}'"))),
+        TemporalNowFuncType::Date       => Value::Date((secs.div_euclid(86_400)) as i32 - DAYS_2000_TO_1970),
+        TemporalNowFuncType::Time       => Value::Time(ns_of_day),
+        TemporalNowFuncType::Timestamp  => Value::Timestamp(secs * NS_PER_SEC + sub_ns - NS_2000_TO_1970),
+        TemporalNowFuncType::Timespan   => Value::Timespan(ns_of_day)
     })
 }
 
@@ -320,12 +327,11 @@ mod tests {
 
     #[test]
     fn now_functions_have_the_right_shapes() {
-        assert!(matches!(now_value(".qpl.d"), Ok(Value::Date(_))));
-        assert!(matches!(now_value(".qpl.t"), Ok(Value::Time(_))));
-        assert!(matches!(now_value(".qpl.p"), Ok(Value::Timestamp(_))));
-        assert!(matches!(now_value(".qpl.n"), Ok(Value::Timespan(_))));
-        assert!(now_value(".qpl.x").is_err());
-        if let Ok(Value::Time(ns)) = now_value(".qpl.t") {
+        assert!(matches!(now_value(TemporalNowFuncType::Date), Ok(Value::Date(_))));
+        assert!(matches!(now_value(TemporalNowFuncType::Time), Ok(Value::Time(_))));
+        assert!(matches!(now_value(TemporalNowFuncType::Timestamp), Ok(Value::Timestamp(_))));
+        assert!(matches!(now_value(TemporalNowFuncType::Timespan), Ok(Value::Timespan(_))));
+        if let Ok(Value::Time(ns)) = now_value(TemporalNowFuncType::Time) {
             assert!((0..NS_PER_DAY).contains(&ns));
         }
     }
