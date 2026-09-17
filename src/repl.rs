@@ -60,8 +60,9 @@ fn parse_quoted_path(rest: &str) -> Result<String, QplError> {
     }
 }
 
-/// Run a `.qpl` script (`\i <path>`) as a *namespaced import*: every table,
-/// global, and function the script newly binds at its top level — anything
+/// Run a `.qpl` script (`\i <path>`) as a *namespaced import*: every table and
+/// global the script newly binds at its top level (functions included — a
+/// function is an ordinary global holding a `Value::Closure`) — anything
 /// not already present before the run and not already namespaced itself —
 /// is moved under `.<ns>.<name>`, where `<ns>` is derived from the file's
 /// stem (`utils.qpl` -> `.utils`). Bare `\l` keeps loading flat into the
@@ -71,14 +72,12 @@ pub fn run_script_imported(path: &str, vm: &mut Vm) -> Result<(), QplError> {
     let before_tables: std::collections::HashSet<String> = vm.tables.keys().cloned().collect();
     let before_lazy: std::collections::HashSet<String> = vm.lazy_frames.keys().cloned().collect();
     let before_globals: std::collections::HashSet<String> = vm.globals.keys().cloned().collect();
-    let before_functions: std::collections::HashSet<String> = vm.functions.keys().cloned().collect();
 
     run_script(path, vm)?;
 
     namespace_new_keys(&mut vm.tables, &before_tables, &ns);
     namespace_new_keys(&mut vm.lazy_frames, &before_lazy, &ns);
     namespace_new_keys(&mut vm.globals, &before_globals, &ns);
-    namespace_new_keys(&mut vm.functions, &before_functions, &ns);
     Ok(())
 }
 
@@ -694,6 +693,7 @@ fn fmt_val(v: &ast::Value) -> String {
         ast::Value::Str(s)   => format!("str: \"{s}\""),
         ast::Value::Sym(s)   => format!("sym: `{s}"),
         ast::Value::Bool(b)  => format!("bool: {b}"),
+        ast::Value::Closure(f) => format!("func: {{[{}] ..}}", f.params.join(",")),
         // temporal variants are handled by the early return above; this keeps
         // the match total without a panic path if a new `Value` is added
         other => temporal::format_temporal(other).unwrap_or_else(|| format!("{other:?}")),
@@ -753,9 +753,9 @@ mod tests {
         let ns_greeting = format!("{ns}.greeting");
         let ns_double = format!("{ns}.double");
         assert!(vm.globals.contains_key(&ns_greeting), "{:?}", vm.globals.keys().collect::<Vec<_>>());
-        assert!(vm.functions.contains_key(&ns_double));
+        assert!(matches!(vm.globals.get(&ns_double), Some(crate::ast::Value::Closure(_))));
         assert!(!vm.globals.contains_key("greeting"));
-        assert!(!vm.functions.contains_key("double"));
+        assert!(!vm.globals.contains_key("double"));
     }
 
     #[test]

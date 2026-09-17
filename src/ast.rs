@@ -30,6 +30,12 @@ pub enum Value {
     /// `resp: conn async dispatch ...` — a pending response, resolved by
     /// `await`. `ipc` feature only (see `Handle`).
     Future(i64),
+    /// `f: {[x] x+1}` / a bare `{[x] x+1}` in expression position — a
+    /// function as a first-class value: passable, returnable, storable. There
+    /// is no captured environment (see [`Function`]), so the `Arc` is shared
+    /// purely to keep cloning a binding cheap. Meaningless inside a query
+    /// expression — `vm::ast_val_to_expr` rejects it.
+    Closure(std::sync::Arc<Function>),
     /// Vector variants are all backed by a Polars `Series` so that native
     /// vectorised Polars operations (arithmetic, casts, gather/slice) apply
     /// directly instead of hand-rolled Rust loops. Each carries the same raw
@@ -197,11 +203,11 @@ pub enum Expr {
     /// `(<expr>) <i>` / `(<expr>) <i j k>` — positional index into a list with a
     /// single int or an int run.
     Index { expr: Box<Expr>, idx: Box<Expr> },
-    /// `f[a;b]` / `f[]` — apply a user function (defined with `name: {[..] ..}`)
-    /// to a semicolon-separated argument list. `f[x]` with a single argument and
-    /// no `;` parses as `Index` instead and is resolved to an application at run
-    /// time when `f` names a function. Value context only; `func` is always an
-    /// `Expr::ColRef` (higher-order use is unsupported).
+    /// `f[a;b]` / `f[]` — apply a function to a semicolon-separated argument
+    /// list. `f[x]` with a single argument and no `;` parses as `Index` instead
+    /// and is resolved to an application at run time when `f` names a function.
+    /// Value context only. `func` is usually an `Expr::ColRef`, but any
+    /// expression evaluating to a `Value::Closure` applies.
     Apply { func: Box<Expr>, args: Vec<Expr> },
     /// `<conn> dispatch <rest of statement>` / `<conn> async dispatch <rest>` —
     /// ship `command` (the exact remaining source, reconstructed from tokens
@@ -269,17 +275,28 @@ pub enum Stmt {
     ScalarAssign { name: String, expr: Expr },
     // single var on its own - this just evals and prints in repl
     SingleVar(Expr),
-    /// `name: {[p1,p2] stmt; stmt; last-expr}` — bind a user function. The final
-    /// statement in `body` must be an expression (its value is the return);
-    /// earlier statements run for their (locally scoped) side effects.
-    FuncDef { name: String, params: Vec<String>, body: Vec<Stmt> },
 }
 
-/// A user function bound by `Stmt::FuncDef`. Held in `Vm::functions` — a binding
-/// kind alongside tables / lazy frames, not a first-class `Value`. The body is
-/// kept as AST and recompiled per call (qpl recompiles every line anyway).
-#[derive(Debug, Clone, PartialEq)]
+/// A function literal: `{[p1,p2] stmt; stmt; last-expr}`. Wrapped in a
+/// [`Value::Closure`] the moment it is parsed, so `name: {[..] ..}` is just an
+/// ordinary scalar assignment and a function is an ordinary value. The final
+/// statement in `body` must be an expression (its value is the return); earlier
+/// statements run for their (locally scoped) side effects. Nothing is captured
+/// — a call sees its own params plus the session globals, exactly as a named
+/// function always has (see `Vm::lookup`). The body is kept as AST and
+/// recompiled per call (qpl recompiles every line anyway).
+#[derive(Clone, PartialEq)]
 pub struct Function {
     pub params: Vec<String>,
     pub body: Vec<Stmt>,
+}
+
+/// Prints as the source shape (`{[x,y] ..}`) rather than the whole body AST.
+/// `{v:?}` on a `Value` is user-facing — it's what `\d` disassembles an
+/// `EVAL` to and what runtime errors interpolate — and a dumped body drowns
+/// both.
+impl std::fmt::Debug for Function {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{{[{}] ..}}", self.params.join(","))
+    }
 }

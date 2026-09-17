@@ -18,14 +18,11 @@ pub struct Vm {
     pub tables: HashMap<String, DataFrame>,
     pub lazy_frames: HashMap<String, LazyFrame>,
     pub globals: HashMap<String, ast::Value>,
-    /// User functions bound by `name: {[..] ..}`. A binding kind alongside
-    /// `tables` / `lazy_frames`, not a first-class value; applied in value
-    /// context only (see [`crate::resolve`]).
-    pub functions: HashMap<String, ast::Function>,
     /// Native functions (`.qpl.dt`, ...), populated once in [`Vm::new`] and
-    /// never mutated afterwards — a name in here is resolved exactly like a
-    /// user [`Lookup::Function`] (see [`Vm::lookup`]) but can never be
-    /// reassigned or shadowed (see the `bind_*` guards below). See
+    /// never mutated afterwards — resolved by [`Vm::lookup`] like any other
+    /// name but never reassignable or shadowable (see the `bind_*` guards
+    /// below). A *user* function isn't a binding kind at all: it's a
+    /// `Value::Closure` living in `globals` like any other value. See
     /// [`crate::native`].
     pub builtins: HashMap<String, Builtin>,
     /// The active user-function call stack. Empty at the top level. Only the
@@ -69,7 +66,6 @@ pub struct Scope {
     pub globals: HashMap<String, ast::Value>,
     pub tables: HashMap<String, DataFrame>,
     pub lazy_frames: HashMap<String, LazyFrame>,
-    pub functions: HashMap<String, ast::Function>,
     /// The namespace this call is executing under (e.g. `.logging`), if any —
     /// set by `apply_function` when the callee resolved to a namespaced name.
     /// `\i`'s import only renames a script's top-level bindings, it doesn't
@@ -86,7 +82,6 @@ pub(crate) enum Lookup<'a> {
     Global(&'a ast::Value),
     LazyFrame(&'a LazyFrame),
     Table(&'a DataFrame),
-    Function(&'a ast::Function),
     Builtin(&'a Builtin),
 }
 
@@ -147,7 +142,6 @@ impl Vm {
             tables: HashMap::new(),
             lazy_frames: HashMap::new(),
             globals: HashMap::new(),
-            functions: HashMap::new(),
             builtins: crate::native::builtins(),
             scopes: Vec::new(),
             stdout_log: None,
@@ -226,9 +220,6 @@ impl Vm {
             if let Some(df) = scope.tables.get(name) {
                 return Some(Lookup::Table(df));
             }
-            if let Some(f) = scope.functions.get(name) {
-                return Some(Lookup::Function(f));
-            }
         }
         if let Some(v) = self.globals.get(name) {
             return Some(Lookup::Global(v));
@@ -238,9 +229,6 @@ impl Vm {
         }
         if let Some(df) = self.tables.get(name) {
             return Some(Lookup::Table(df));
-        }
-        if let Some(f) = self.functions.get(name) {
-            return Some(Lookup::Function(f));
         }
         // Unqualified sibling reference from inside a namespaced import's own
         // function body (see `Scope::current_ns`) — retry once, qualified.
@@ -254,9 +242,6 @@ impl Vm {
             }
             if let Some(df) = self.tables.get(&qualified) {
                 return Some(Lookup::Table(df));
-            }
-            if let Some(f) = self.functions.get(&qualified) {
-                return Some(Lookup::Function(f));
             }
         }
         None
@@ -273,8 +258,9 @@ impl Vm {
         if let Some(i) = name.rfind('.') {
             return Some(name[..i].to_string());
         }
-        let resolved_directly = self.scopes.last().is_some_and(|s| s.functions.contains_key(name))
-            || self.functions.contains_key(name);
+        let is_closure = |v: Option<&ast::Value>| matches!(v, Some(ast::Value::Closure(_)));
+        let resolved_directly = self.scopes.last().is_some_and(|s| is_closure(s.globals.get(name)))
+            || is_closure(self.globals.get(name));
         if resolved_directly {
             None
         } else {
@@ -290,18 +276,22 @@ impl Vm {
         }
     }
 
-    /// `lookup`, narrowed to the user-function kind.
-    pub(crate) fn lookup_function(&self, name: &str) -> Option<&ast::Function> {
+    /// `lookup`, narrowed to a global holding a function. Returns the shared
+    /// `Arc` rather than a borrow so the caller can go on using `&mut Vm`.
+    pub(crate) fn lookup_closure(&self, name: &str) -> Option<std::sync::Arc<ast::Function>> {
         match self.lookup(name) {
-            Some(Lookup::Function(f)) => Some(f),
+            Some(Lookup::Global(ast::Value::Closure(f))) => Some(f.clone()),
             _ => None,
         }
     }
 
     /// Whether `name` can be called (with `[..]` and/or, if niladic, bare) —
-    /// a user function or a builtin.
+    /// a bound function value or a builtin.
     pub(crate) fn is_callable(&self, name: &str) -> bool {
-        matches!(self.lookup(name), Some(Lookup::Function(_) | Lookup::Builtin(_)))
+        matches!(
+            self.lookup(name),
+            Some(Lookup::Builtin(_)) | Some(Lookup::Global(ast::Value::Closure(_)))
+        )
     }
 
     /// Every `bind_*` below goes through this first: a builtin's name is
@@ -328,15 +318,19 @@ impl Vm {
         Ok(())
     }
 
-    /// Bind an eager table to `name`, scope-aware like `bind_global`.
+    /// Bind an eager table to `name`, scope-aware like `bind_global`. Also
+    /// drops any scalar of the same name: `globals` is searched first by
+    /// `lookup`, so leaving one behind would hide the new table.
     pub(crate) fn bind_table(&mut self, name: String, df: DataFrame) -> Result<(), QplError> {
         self.check_not_builtin(&name)?;
         match self.scopes.last_mut() {
             Some(scope) => {
+                scope.globals.remove(&name);
                 scope.lazy_frames.remove(&name);
                 scope.tables.insert(name, df);
             }
             None => {
+                self.globals.remove(&name);
                 self.lazy_frames.remove(&name);
                 self.tables.insert(name, df);
             }
@@ -344,38 +338,19 @@ impl Vm {
         Ok(())
     }
 
-    /// Bind a lazy plan to `name`, scope-aware like `bind_global`.
+    /// Bind a lazy plan to `name`, scope-aware like `bind_table`.
     pub(crate) fn bind_lazy(&mut self, name: String, lf: LazyFrame) -> Result<(), QplError> {
-        self.check_not_builtin(&name)?;
-        match self.scopes.last_mut() {
-            Some(scope) => {
-                scope.tables.remove(&name);
-                scope.lazy_frames.insert(name, lf);
-            }
-            None => {
-                self.tables.remove(&name);
-                self.lazy_frames.insert(name, lf);
-            }
-        }
-        Ok(())
-    }
-
-    /// Bind a function to `name`, scope-aware like `bind_global` — a function
-    /// defined inside a call is local to that call, same as any other name.
-    pub(crate) fn bind_function(&mut self, name: String, f: ast::Function) -> Result<(), QplError> {
         self.check_not_builtin(&name)?;
         match self.scopes.last_mut() {
             Some(scope) => {
                 scope.globals.remove(&name);
                 scope.tables.remove(&name);
-                scope.lazy_frames.remove(&name);
-                scope.functions.insert(name, f);
+                scope.lazy_frames.insert(name, lf);
             }
             None => {
                 self.globals.remove(&name);
                 self.tables.remove(&name);
-                self.lazy_frames.remove(&name);
-                self.functions.insert(name, f);
+                self.lazy_frames.insert(name, lf);
             }
         }
         Ok(())
@@ -648,13 +623,12 @@ impl Vm {
                 }
 
                 Instruction::PushColRef(name) => {
-                    // globals shadow column names, substituting a literal into the lazy plan
-                    if let Some(val) = self.lookup_global(&name) {
-                        stack.push(StackObj::Expr(ast_val_to_expr(val.clone())?));
-                    // a niladic function/builtin (e.g. `.qpl.dt`) reduces to a
-                    // literal the same way — resolved like any other bare
-                    // name, not specially recognised here.
-                    } else if let Some(v) = resolve::call_niladic(self, &name)? {
+                    // a niladic function/builtin (e.g. `.qpl.dt`) reduces to the
+                    // literal it returns — resolved like any other bare name,
+                    // not specially recognised here. Checked ahead of the global
+                    // shortcut below because a niladic *user* function is itself
+                    // a global (a `Value::Closure`), and the point is to call it.
+                    if let Some(v) = resolve::call_niladic(self, &name)? {
                         let val = match v {
                             resolve::EvalValue::Scalar(v) => v,
                             resolve::EvalValue::Frame { .. } => return Err(QplError::Runtime(format!(
@@ -662,6 +636,9 @@ impl Vm {
                             ))),
                         };
                         stack.push(StackObj::Expr(ast_val_to_expr(val)?));
+                    // globals shadow column names, substituting a literal into the lazy plan
+                    } else if let Some(val) = self.lookup_global(&name) {
+                        stack.push(StackObj::Expr(ast_val_to_expr(val.clone())?));
                     } else {
                         stack.push(StackObj::Expr(col(name.as_str())));
                     }
@@ -893,10 +870,6 @@ impl Vm {
                     }
                 }
 
-                Instruction::DefFunc { name, params, body } => {
-                    self.bind_function(name, ast::Function { params, body })?;
-                }
-
                 Instruction::Result => {
                     let lf = require_frame(&mut frame)?;
                     stack.push(StackObj::Frame(lf));
@@ -1019,6 +992,12 @@ pub(crate) fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
         ast::Value::Timespan(ns) => lit(ns).cast(DataType::Duration(TimeUnit::Nanoseconds)),
         v @ (ast::Value::Handle(_) | ast::Value::Future(_)) => {
             return Err(QplError::Runtime(format!("{v:?} cannot be used in a query expression")))
+        }
+        // a function is a value, but not a *column* value
+        ast::Value::Closure(_) => {
+            return Err(QplError::Runtime(
+                "a function cannot be used in a query expression".into(),
+            ))
         }
         // typed temporal vectors: same offset-rebasing as their scalar
         // counterparts, applied elementwise via Series/Expr arithmetic.

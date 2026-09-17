@@ -15,8 +15,24 @@ builtin functions (`.qpl.cfg`), aggregates (`sum`, `avg`, `count`, `round`, ...)
 cast types (`f64$x`), the operator functions `?` `$` `::` `!` `#`, join
 operators (`lj`, `ij`, `rj`), the `like` glob-match operator, the IPC client
 (`hopen`, `await`, `dispatch`/`async dispatch` — `ipc` feature), assignments,
+function literals (`{[x,y] ..}` — braces and parameter names),
 `\d` / `\l` / `\1` / `\port` REPL lines, and the virtual `i` column. Plus line
-comments, bracket matching and auto-closing pairs.
+comments, bracket matching and auto-closing pairs for `{}`, `[]`, `()` and `"`.
+
+### Braces and indentation
+
+Braces are matched, auto-closed and surroundable like brackets, but they
+indent differently, because qpl's own continuation rule decides where a
+function body ends: a line indented by a tab or 4+ spaces continues the
+statement above it, so a function's closing `}` has to stay *inside* the body
+indent. Outdenting it to the opening line's column — what an editor normally
+does with `}` — makes the function unterminated and the script fails to parse.
+
+So the closing brace is never auto-outdented: pressing Enter inside `{ }`
+indents the body and leaves `}` at that indent, and typing `}` on an indented
+line leaves it where it is. The extension also pins `editor.tabSize` to 4 with
+spaces for `.qpl` files, since a 2-space indent is below what the interpreter
+counts as a continuation.
 
 ### Completion & snippets
 
@@ -29,7 +45,7 @@ comments, bracket matching and auto-closing pairs.
   `qpl.demoTables` (default `trades`, `quotes`).
 - Variables assigned in the open document (`name: ...`).
 - Snippets: `sel`, `selby`, `upd`, `del`, `delcols`, `join`, `lazyp`, `cond`,
-  `over`.
+  `over`, `fn`, `lambda`.
 
 ### Interactive REPL
 

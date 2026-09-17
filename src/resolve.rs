@@ -88,11 +88,15 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
         Expr::Dispatch { .. } => Err(QplError::Runtime(
             "dispatch requires the `ipc` feature (on by default; this build used `--no-default-features`)".into())),
 
-        // `f[x]` parsed as an index but `f` names a user function or builtin
-        // → monadic application. Otherwise falls through to positional
-        // indexing below.
+        // `f[x]` parsed as an index but `f` names a user function or builtin,
+        // or is a function literal applied in place (`{[y] y*2}[5]`) →
+        // monadic application. Otherwise falls through to positional indexing
+        // below. Deliberately only these two shapes: any *other* expression
+        // here is a list being indexed, and probing it for a function would
+        // mean evaluating it twice.
         Expr::Index { expr, idx }
-            if matches!(expr.as_ref(), Expr::ColRef(n) if vm.is_callable(n)) =>
+            if matches!(expr.as_ref(), Expr::ColRef(n) if vm.is_callable(n))
+                || matches!(expr.as_ref(), Expr::Lit(Value::Closure(_))) =>
         {
             apply_function(vm, expr, std::slice::from_ref(idx))
         }
@@ -283,9 +287,11 @@ fn resolve_name(vm: &mut Vm, name: &str) -> Result<EvalValue, QplError> {
         Some(Lookup::Table(df)) => {
             return Ok(EvalValue::Frame { lf: df.clone().lazy(), lazy: false });
         }
-        Some(Lookup::Function(_)) | Some(Lookup::Builtin(_)) => {
+        // a user function *is* a value and falls out of `Lookup::Global` above;
+        // a builtin is not, so naming one bare (and not niladic) is an error.
+        Some(Lookup::Builtin(_)) => {
             return Err(QplError::Runtime(format!(
-                "'{name}' is a function — call it with '{name}[..]'"
+                "'{name}' is a built-in function — call it with '{name}[..]'"
             )));
         }
         None => {}
@@ -295,7 +301,7 @@ fn resolve_name(vm: &mut Vm, name: &str) -> Result<EvalValue, QplError> {
     )))
 }
 
-/// Resolves `name` when it names a niladic (zero-parameter) user function or
+/// Resolves `name` when it names a niladic (zero-parameter) function value or
 /// builtin, calling it with no arguments. Returns `Ok(None)` when `name`
 /// resolves to anything else (a variable, table, or a function/builtin that
 /// still takes parameters) so the caller falls back to its own handling —
@@ -307,7 +313,7 @@ pub(crate) fn call_niladic(vm: &mut Vm, name: &str) -> Result<Option<EvalValue>,
             let b = *b; // ends the borrow of `vm`
             Ok(Some(EvalValue::Scalar(b.call(&[])?)))
         }
-        Some(Lookup::Function(f)) if f.params.is_empty() => {
+        Some(Lookup::Global(Value::Closure(f))) if f.params.is_empty() => {
             let def = f.clone();
             if vm.scopes.len() >= crate::vm::MAX_CALL_DEPTH {
                 return Err(QplError::Runtime(format!(
@@ -544,23 +550,30 @@ fn eval_call(vm: &mut Vm, func: &str, args: &[Expr]) -> Result<EvalValue, QplErr
     }
 }
 
-/// Apply a user function (`name: {[..] ..}`) or a builtin to `args`.
+/// Apply a function or a builtin to `args`.
+///
+/// `func` is any expression that evaluates to a `Value::Closure` — usually a
+/// bare name, but equally a parameter holding a function, a literal
+/// `{[..] ..}`, or the result of another call, which is what makes higher-order
+/// use (`apply: {[f;x] f[x]}`) work. A bare name is resolved directly rather
+/// than evaluated, so a *niladic* function named as the call target isn't
+/// invoked twice (`resolve_name` would have called it on sight).
 ///
 /// Arguments are evaluated in the *caller* scope, then bound to the parameter
 /// names in a child scope that shadows the session: params and any locals the
 /// body assigns are discarded on return, so a function cannot mutate outer
-/// bindings. The body's leading statements run for their side effects; its final
-/// statement (an expression, guaranteed by the compiler) supplies the return.
+/// bindings. Nothing is captured from the defining scope. The body's leading
+/// statements run for their side effects; its final statement (an expression,
+/// guaranteed by the parser) supplies the return.
 fn apply_function(vm: &mut Vm, func: &Expr, args: &[Expr]) -> Result<EvalValue, QplError> {
+    // `Some` only for a bare-name target — what error messages and namespace
+    // resolution key off. An anonymous target has neither.
     let name = match func {
-        Expr::ColRef(n) => n.clone(),
-        _ => {
-            return Err(QplError::Runtime(
-                "only a named function can be applied (higher-order use is unsupported)".into(),
-            ))
-        }
+        Expr::ColRef(n) => Some(n.clone()),
+        _ => None,
     };
-    if let Some(b) = vm.builtins.get(&name).copied() {
+    if let Some(b) = name.as_ref().and_then(|n| vm.builtins.get(n).copied()) {
+        let name = name.expect("builtin was looked up by name");
         if args.len() != b.arity {
             return Err(QplError::Runtime(format!(
                 "'{name}' takes {} argument(s), got {}", b.arity, args.len()
@@ -571,13 +584,23 @@ fn apply_function(vm: &mut Vm, func: &Expr, args: &[Expr]) -> Result<EvalValue, 
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(EvalValue::Scalar(b.call(&arg_vals)?));
     }
-    let def = vm
-        .lookup_function(&name)
-        .cloned()
-        .ok_or_else(|| QplError::Runtime(format!("'{name}' is not a function")))?;
+    let def = match &name {
+        Some(n) => vm
+            .lookup_closure(n)
+            .ok_or_else(|| QplError::Runtime(format!("'{n}' is not a function")))?,
+        None => match expect_scalar(eval_value(vm, func)?)? {
+            Value::Closure(f) => f,
+            other => {
+                return Err(QplError::Runtime(format!(
+                    "cannot apply {other:?} — not a function"
+                )))
+            }
+        },
+    };
+    let label = name.clone().unwrap_or_else(|| "{[..] ..}".to_string());
     if args.len() != def.params.len() {
         return Err(QplError::Runtime(format!(
-            "function '{name}' takes {} argument(s), got {}",
+            "function '{label}' takes {} argument(s), got {}",
             def.params.len(),
             args.len()
         )));
@@ -595,7 +618,7 @@ fn apply_function(vm: &mut Vm, func: &Expr, args: &[Expr]) -> Result<EvalValue, 
         .map(|a| eval_value(vm, a))
         .collect::<Result<Vec<_>, _>>()?;
     // resolved against the *caller's* active scope, before the callee's own is pushed
-    let ns = vm.resolve_function_ns(&name);
+    let ns = name.as_deref().and_then(|n| vm.resolve_function_ns(n));
 
     // push a fresh call frame; pop it unconditionally on the way out. `lookup`
     // only ever consults the top frame + globals, so the callee cannot see this
@@ -967,14 +990,82 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_function_name_is_a_helpful_error() {
+    fn a_function_literal_applies_in_place() {
+        assert_eq!(scalar(&mut make_vm(), "{[y] y*2}[5]"), Value::Int(10));
+    }
+
+    #[test]
+    fn a_function_passed_as_an_argument_is_applied_by_the_callee() {
+        let mut vm = make_vm();
+        run_vm("apply: {[f,x] f[x]}", &mut vm).unwrap();
+        // an anonymous literal ...
+        assert_eq!(scalar(&mut vm, "apply[{[y] y*2}; 5]"), Value::Int(10));
+        // ... and a bound name, which now resolves through `globals` like any value
+        run_vm("double: {[y] y*2}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "apply[double; 21]"), Value::Int(42));
+        // the parameter is callable more than once, and nests
+        run_vm("twice: {[f,x] f[f[x]]}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "twice[{[y] y+3}; 1]"), Value::Int(7));
+    }
+
+    #[test]
+    fn a_function_can_be_returned_stored_and_rebound() {
+        let mut vm = make_vm();
+        run_vm("mk: {[n] {[y] y+1}}", &mut vm).unwrap();
+        run_vm("g: mk[0]", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "g[41]"), Value::Int(42));
+        run_vm("h: g", &mut vm).unwrap(); // plain aliasing
+        assert_eq!(scalar(&mut vm, "h[41]"), Value::Int(42));
+    }
+
+    #[test]
+    fn a_returned_niladic_function_still_auto_invokes_on_a_bare_reference() {
+        let mut vm = make_vm();
+        run_vm("mk: {[n] {[] 99}}", &mut vm).unwrap();
+        run_vm("g: mk[0]", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "g"), Value::Int(99));
+        assert_eq!(scalar(&mut vm, "g[]"), Value::Int(99));
+    }
+
+    #[test]
+    fn a_function_body_sees_no_caller_locals_even_when_passed_in() {
+        // the non-capturing invariant: `f`'s body resolves `n` against the
+        // session globals, never against `outer`'s frame.
+        let mut vm = make_vm();
+        run_vm("outer: {[n] apply[{[y] y+n}; 1]}", &mut vm).unwrap();
+        run_vm("apply: {[f,x] f[x]}", &mut vm).unwrap();
+        assert!(run_vm("outer[10]", &mut vm).is_err());
+        assert!(vm.scopes.is_empty());
+    }
+
+    #[test]
+    fn applying_a_non_function_value_is_an_error() {
+        let mut vm = make_vm();
+        run_vm("notafn: 3", &mut vm).unwrap();
+        assert!(run_vm("notafn[1]", &mut vm).is_err());
+        assert!(run_vm("apply: {[f,x] f[x]}", &mut vm).is_ok());
+        assert!(run_vm("apply[3; 1]", &mut vm).is_err());
+        assert!(vm.scopes.is_empty());
+    }
+
+    #[test]
+    fn a_function_value_cannot_be_used_as_a_column() {
+        let mut vm = make_vm();
+        run_vm("myfn: {[x] x+1}", &mut vm).unwrap();
+        let err = run_vm("select a: myfn from t", &mut vm).unwrap_err();
+        assert!(format!("{err:?}").contains("cannot be used in a query expression"), "{err:?}");
+    }
+
+    #[test]
+    fn a_bare_function_name_is_the_function_value_itself() {
         let mut vm = make_vm();
         run_vm("f: {[x] x}", &mut vm).unwrap();
-        let err = match run_vm("f", &mut vm) {
-            Err(e) => e,
-            Ok(_) => panic!("expected an error"),
-        };
-        assert!(format!("{err:?}").contains("is a function"));
+        match run_vm("f", &mut vm) {
+            Ok(crate::vm::EvalResult::Scalar(Value::Closure(f))) => {
+                assert_eq!(f.params, vec!["x".to_string()]);
+            }
+            other => panic!("expected a closure, got {other:?}"),
+        }
     }
 
     #[test]

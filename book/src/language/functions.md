@@ -145,17 +145,64 @@ qpl) now[]
 ```
 
 That's exactly how the `.qpl.dt`/`.qpl.tm`/`.qpl.ts`/`.qpl.dlta` now-functions from
-[Temporal types](temporal-types.md) work — they're built-ins registered in
-the same table user functions live in, not special syntax. A function that
-*does* take parameters has no bare form: naming it without brackets is an
-error telling you to call it with `f[..]`. Built-in names are also reserved:
-binding over one is an error rather than a silent shadow.
+[Temporal types](temporal-types.md) work — they're built-ins resolved by the
+same name lookup user functions go through, not special syntax. A function
+that *does* take parameters has no bare form: naming it gives you the function
+itself rather than calling it. Built-in names are reserved: binding over one
+is an error rather than a silent shadow.
 
-**Functions are not values.** You can bind one and call it, but you cannot
-pass one as an argument, return one from another function, or use one inside
-a `select` projection. If you're reaching for a higher-order function, the
-language will not meet you there; that's a deliberate limit on how much
-machinery the interpreter carries rather than an oversight.
+**A function is not a column value.** `select px: inc from trades` is an
+error. Everywhere else, a function is an ordinary value — see below.
+
+## Functions as values
+
+A function is a value like an int or a list. It can be passed to another
+function, returned from one, and stored in a variable, and a `{[..] ..}`
+literal is legal anywhere an expression is:
+
+```qpl
+qpl) apply: {[f,x] f[x]}
+qpl) apply[{[y] y*2}; 5]
+```
+
+```
+i64: 10
+```
+
+The parameter `f` holds a function, so `f[x]` inside the body calls it. A
+function bound by name works the same way, since the name is just where the
+value happens to live:
+
+```qpl
+qpl) apply[inc; 41]
+```
+
+```
+i64: 42
+```
+
+A literal can also be applied on the spot, without being bound first, and a
+body can end in one — which is how a function returns a function:
+
+```qpl
+qpl) {[y] y*2}[21]
+qpl) adder: {[n] {[y] y+1}}
+qpl) plus1: adder[0]
+qpl) plus1[41]
+```
+
+```
+i64: 42
+i64: 42
+```
+
+**There is no lexical capture.** A body sees its own parameters plus the
+session globals, and nothing else — not the locals of whoever called it, and
+not the locals of wherever the literal was written. So in `adder` above, the
+inner `{[y] y+1}` cannot refer to `n`; writing `{[y] y+n}` there gives you an
+undefined-name error when it runs. That's the same rule named functions have
+always followed, and it's why a function value needs to carry nothing but its
+parameters and its body.
 
 [examples/functions.qpl](https://github.com/nicelgueta/qpl/blob/main/examples/functions.qpl)
 in the repository is a runnable script covering all of the above.

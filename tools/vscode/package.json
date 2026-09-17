@@ -80,6 +80,12 @@
         }
       ]
     },
+    "configurationDefaults": {
+      "[qpl]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true
+      }
+    },
     "configuration": {
       "title": "qpl",
       "properties": {

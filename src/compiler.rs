@@ -28,21 +28,6 @@ fn compile_stmt(stmt: &Stmt, out: &mut Vec<Instruction>) -> Result<(), QplError>
         // scalar assigns are evaluated by the REPL before reaching the compiler
         Stmt::ScalarAssign { name, expr } => { out.push(Instruction::Eval(expr.clone())); out.push(Instruction::Assign(name.clone())); Ok(()) },
         Stmt::SingleVar(expr) => { out.push(Instruction::Eval(expr.clone())); Ok(())}
-        // `name: {[..] ..}` — register a user function. The body must end in an
-        // expression (its return value); a trailing assignment is rejected here.
-        Stmt::FuncDef { name, params, body } => {
-            if !matches!(body.last(), Some(Stmt::SingleVar(_) | Stmt::RetTable(_))) {
-                return Err(QplError::Compile(
-                    "a function body must end with an expression, not an assignment".into(),
-                ));
-            }
-            out.push(Instruction::DefFunc {
-                name: name.clone(),
-                params: params.clone(),
-                body: body.clone(),
-            });
-            Ok(())
-        }
     }
 }
 
@@ -587,23 +572,28 @@ mod tests {
     }
 
     #[test]
-    fn func_def_compiles_to_a_single_def_func() {
-        use crate::ast::{Expr, Stmt};
-        assert_eq!(compile_src("f: {[x,y] x+y}"), vec![DefFunc {
-            name: "f".into(),
+    fn func_def_compiles_to_an_ordinary_scalar_assign() {
+        use crate::ast::{Expr, Function, Stmt, Value};
+        let closure = Value::Closure(std::sync::Arc::new(Function {
             params: vec!["x".into(), "y".into()],
             body: vec![Stmt::SingleVar(Expr::BinOp {
                 left: Box::new(Expr::ColRef("x".into())),
                 op: "+".into(),
                 right: Box::new(Expr::ColRef("y".into())),
             })],
-        }]);
+        }));
+        assert_eq!(
+            compile_src("f: {[x,y] x+y}"),
+            vec![Eval(Expr::Lit(closure)), Assign("f".into())],
+        );
     }
 
     #[test]
-    fn func_body_ending_in_an_assignment_is_a_compile_error() {
-        let stmt = parse(tokenise("f: {[x] y: x+1}").unwrap()).unwrap();
-        assert!(matches!(compile(&stmt), Err(QplError::Compile(_))));
+    fn func_body_ending_in_an_assignment_is_rejected() {
+        assert!(matches!(
+            parse(tokenise("f: {[x] y: x+1}").unwrap()),
+            Err(QplError::Parse(_)),
+        ));
     }
 
     #[test]

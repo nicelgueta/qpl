@@ -54,6 +54,16 @@
     "body": "?[${1:pred1}; ${2:val1}; ${3:pred2}; ${4:val2}; ${5:default}]",
     "description": "?[cond; then; cond; then; ...; else] conditional expression"
   },
+  "function": {
+    "prefix": "fn",
+    "body": "${1:name}: {[${2:x}] ${3:x+1}}",
+    "description": "bind a function: name: {[params] stmt; stmt; last-expr}"
+  },
+  "lambda": {
+    "prefix": "lambda",
+    "body": "{[${1:x}] ${2:x+1}}",
+    "description": "an anonymous function literal - a value, so it can be passed, returned or applied in place"
+  },
   "window over": {
     "prefix": "over",
     "body": "select ${1:col}, ${2:rn}: rn over ${3:keys} from ${4:table}",

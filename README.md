@@ -399,8 +399,7 @@ good way to see what Polars intends to do before paying for it.
 ### Functions · [chapter][functions]
 
 q-style lambdas. The last statement is the return value, and locals are
-call-scoped. Functions are a binding kind rather than a value, so they can't
-be passed, returned, or used in a projection.
+call-scoped.
 
 ```q
 add: {[x,y] x+y}              / add[2;3] -> 5
@@ -414,6 +413,23 @@ A function taking one or more parameters must be called with `f[..]`; a
 niladic one (no params) can also be called bare, like a variable — that's how
 the `.qpl.dt`/`.qpl.tm`/`.qpl.ts`/`.qpl.dlta` [now-functions](#temporal-types--chaptertemporal)
 work: they're ordinary built-ins, not special syntax.
+
+Functions are first-class, so they can be passed, returned and stored, and a
+`{[..] ..}` literal works anywhere an expression does:
+
+```q
+apply: {[f,x] f[x]}
+apply[{[y] y*2}; 5]           / -> 10
+apply[inc; 41]                / -> 42
+{[y] y*2}[21]                 / applied on the spot -> 42
+adder: {[n] {[y] y+1}}
+plus1: adder[0]               / returned, stored, called later -> plus1[41] = 42
+```
+
+There is no lexical capture: a body sees its own params plus the session
+globals, never the caller's locals — the same rule named functions have always
+followed. A function isn't a *column* value either, so `select px: inc from
+trades` is an error.
 
 ### Comments, multi-line, logging, config
 

@@ -9,6 +9,7 @@
     { "include": "#symbol" },
     { "include": "#number" },
     { "include": "#assignment" },
+    { "include": "#function" },
     { "include": "#builtin" },
     { "include": "#namespace" },
     { "include": "#keyword" },
@@ -78,6 +79,24 @@
         "1": { "name": "variable.other.qpl" },
         "2": { "name": "keyword.operator.assignment.qpl" }
       }
+    },
+    "function": {
+      "comment": "a function literal `{[x,y] ..}` / `{ ..}` — its braces and its optional parameter list",
+      "patterns": [
+        {
+          "match": "(\\{)\\s*(?:(\\[)\\s*([A-Za-z_]\\w*(?:\\s*,\\s*[A-Za-z_]\\w*)*)?\\s*(\\]))?",
+          "captures": {
+            "1": { "name": "punctuation.definition.function.begin.qpl" },
+            "2": { "name": "punctuation.definition.parameters.begin.qpl" },
+            "3": { "name": "variable.parameter.qpl" },
+            "4": { "name": "punctuation.definition.parameters.end.qpl" }
+          }
+        },
+        {
+          "name": "punctuation.definition.function.end.qpl",
+          "match": "\\}"
+        }
+      ]
     },
     "builtin": {
       "comment": "`.qpl.*` namespaced builtin functions (e.g. `.qpl.cfg`) — coloured like load / sink / cols",

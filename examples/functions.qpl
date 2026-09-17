@@ -9,8 +9,12 @@
 /   line continues the statement above it.
 / - call with brackets: `f[1;2]`, `f[]`, `f[`AAPL]`; or monadically `f 41`. A
 /   niladic function may also be called bare, without brackets: `f`.
-/ - functions are a named binding kind — they are not first-class values and
-/   cannot appear inside a `select` projection.
+/ - functions are ordinary values: pass one to another function, return one,
+/   store one in a variable, or apply a `{[..] ..}` literal on the spot. There
+/   is no lexical capture — a body sees its own params plus the session
+/   globals, never the caller's locals.
+/ - a function still isn't a *column* value, so it can't appear inside a
+/   `select` projection.
 /
 / Run from the repo root:
 /   cargo run -- --load-demo examples/functions.qpl
@@ -81,3 +85,19 @@ elapsed[2024.03.15D09:30:00.000000000]
 log "a per-symbol lookup returning its latest trade"
 latest: {[s] select lts: max ts from trades where sym = s}
 latest[`AAPL]
+
+log "functions are values: pass one in (higher-order use)"
+apply: {[f,x] f[x]}
+apply[{[y] y*2}; 5]             / an anonymous literal, applied by the callee
+apply[inc; 41]                  / ... or a function bound by name
+
+log "apply a literal on the spot, without binding it first"
+{[y] y*2}[21]
+
+log "return a function, store it, call it later"
+adder: {[n] {[y] y+1}}
+plus1: adder[0]
+plus1[41]
+
+log "a function value is not a column value, so this is an error:"
+log "  select px: inc from trades"

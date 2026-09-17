@@ -1,5 +1,5 @@
 //! Built-in (native) functions — resolved through [`crate::vm::Vm::builtins`]
-//! exactly like a user function (`Lookup::Builtin` alongside `Lookup::Function`
+//! exactly like a user function value (`Lookup::Builtin` alongside a `Value::Closure`
 //! in [`crate::vm::Lookup`]), the one difference being that a name in this map
 //! can never be bound over (see the `bind_*` guards in `vm.rs`).
 //!
