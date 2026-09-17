@@ -407,7 +407,13 @@ add: {[x,y] x+y}              / add[2;3] -> 5
 inc: {[x] x+1}                / inc 41 or inc[41] -> 42
 fac: {[n] ?[n<2; 1; n*fac[n-1]]}
 bysym: {[s] select sym, price from trades where sym = s}
+now: {[] .qpl.p}               / niladic (no params) -> callable bare, `now`, or bracketed, `now[]`
 ```
+
+A function taking one or more parameters must be called with `f[..]`; a
+niladic one (no params) can also be called bare, like a variable — that's how
+the `.qpl.d`/`.qpl.t`/`.qpl.p`/`.qpl.n` [now-functions](#temporal-types--chaptertemporal)
+work: they're ordinary built-ins, not special syntax.
 
 ### Comments, multi-line, logging, config
 

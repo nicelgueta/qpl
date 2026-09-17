@@ -1142,12 +1142,9 @@ impl Parser {
             TokenKind::Symbol(s)   => Ok(Expr::Sym(s)),
             TokenKind::Temporal(v) => Ok(Expr::Lit(v)),
             TokenKind::Name(n) if n == "i" => Ok(Expr::IColRef),
-            // `.qpl.d` / `.qpl.t` / `.qpl.p` / `.qpl.n` — nullary now-functions,
-            // the only namespaced names that stand for a call with no args of
-            // their own; every other `.ns.name` is an ordinary variable/table
-            // reference (`ColRef`), resolved by lookup like any other name.
-            TokenKind::Name(n) if matches!(n.as_str(), ".qpl.d" | ".qpl.t" | ".qpl.p" | ".qpl.n") =>
-                Ok(Expr::Call { func: n, args: vec![] }),
+            // Every other bare name — including `.qpl.d`/`.qpl.t`/`.qpl.p`/`.qpl.n`
+            // and any other namespaced name — is an ordinary variable/table/function
+            // reference, resolved by lookup (see `Vm::lookup`, `resolve::call_niladic`).
             TokenKind::Name(n)     => Ok(Expr::ColRef(n)),
             TokenKind::Op(op) if op == "?" => self.parse_case(),
             // leading `-`: a negative literal (`-45.3`) or unary negation of the
@@ -2110,21 +2107,20 @@ mod tests {
     }
 
     #[test]
-    fn qpl_now_function_parses_to_a_zero_arg_call() {
+    fn qpl_now_function_parses_as_an_ordinary_variable_reference() {
+        // `.qpl.p` is a builtin (see `Vm::builtins`), but the parser doesn't
+        // know that — it's a bare `ColRef` like any other name, resolved (and
+        // auto-invoked, being niladic) by lookup at run time.
         match p("l: .qpl.p") {
-            Stmt::ScalarAssign { expr, .. } => assert!(matches!(
-                expr,
-                Expr::Call { func, args } if func == ".qpl.p" && args.is_empty()
-            )),
+            Stmt::ScalarAssign { expr, .. } => assert_eq!(expr, Expr::ColRef(".qpl.p".into())),
             other => panic!("expected scalar assign, got {other:?}"),
         }
     }
 
     #[test]
     fn namespaced_identifier_parses_as_an_ordinary_variable_reference() {
-        // a general `.ns.name` (not one of the `.qpl.*` now-functions) is just
-        // a `ColRef` — resolved by name lookup like any other identifier,
-        // not a zero-arg call.
+        // a general `.ns.name` is just a `ColRef` — resolved by name lookup
+        // like any other identifier, not a zero-arg call.
         match p("l: .utils.helper") {
             Stmt::ScalarAssign { expr, .. } => assert_eq!(expr, Expr::ColRef(".utils.helper".into())),
             other => panic!("expected scalar assign, got {other:?}"),

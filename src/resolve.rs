@@ -88,16 +88,17 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
         Expr::Dispatch { .. } => Err(QplError::Runtime(
             "dispatch requires the `ipc` feature (on by default; this build used `--no-default-features`)".into())),
 
-        // `f[x]` parsed as an index but `f` names a user function → monadic
-        // application. Otherwise falls through to positional indexing below.
+        // `f[x]` parsed as an index but `f` names a user function or builtin
+        // → monadic application. Otherwise falls through to positional
+        // indexing below.
         Expr::Index { expr, idx }
-            if matches!(expr.as_ref(), Expr::ColRef(n) if vm.lookup_function(n).is_some()) =>
+            if matches!(expr.as_ref(), Expr::ColRef(n) if vm.is_callable(n)) =>
         {
             apply_function(vm, expr, std::slice::from_ref(idx))
         }
 
-        // `f x` — monadic user-function application (juxtaposition).
-        Expr::Call { func, args } if vm.lookup_function(func).is_some() => {
+        // `f x` — monadic user-function/builtin application (juxtaposition).
+        Expr::Call { func, args } if vm.is_callable(func) => {
             let func = Expr::ColRef(func.clone());
             apply_function(vm, &func, args)
         }
@@ -268,7 +269,12 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
     }
 }
 
-fn resolve_name(vm: &Vm, name: &str) -> Result<EvalValue, QplError> {
+fn resolve_name(vm: &mut Vm, name: &str) -> Result<EvalValue, QplError> {
+    // a niladic function/builtin resolves like any other bare name — called
+    // with no arguments; anything with params still needs `name[..]`.
+    if let Some(v) = call_niladic(vm, name)? {
+        return Ok(v);
+    }
     match vm.lookup(name) {
         Some(Lookup::Global(v)) => return Ok(EvalValue::Scalar(v.clone())),
         Some(Lookup::LazyFrame(lf)) => {
@@ -277,7 +283,7 @@ fn resolve_name(vm: &Vm, name: &str) -> Result<EvalValue, QplError> {
         Some(Lookup::Table(df)) => {
             return Ok(EvalValue::Frame { lf: df.clone().lazy(), lazy: false });
         }
-        Some(Lookup::Function(_)) => {
+        Some(Lookup::Function(_)) | Some(Lookup::Builtin(_)) => {
             return Err(QplError::Runtime(format!(
                 "'{name}' is a function — call it with '{name}[..]'"
             )));
@@ -287,6 +293,37 @@ fn resolve_name(vm: &Vm, name: &str) -> Result<EvalValue, QplError> {
     Err(QplError::Runtime(format!(
         "undefined name '{name}' (not a variable, table or lazy frame)"
     )))
+}
+
+/// Resolves `name` when it names a niladic (zero-parameter) user function or
+/// builtin, calling it with no arguments. Returns `Ok(None)` when `name`
+/// resolves to anything else (a variable, table, or a function/builtin that
+/// still takes parameters) so the caller falls back to its own handling —
+/// used both by [`resolve_name`] (bare-name value context) and by
+/// [`crate::vm::Vm`]'s `PushColRef` (bare name inside a column expression).
+pub(crate) fn call_niladic(vm: &mut Vm, name: &str) -> Result<Option<EvalValue>, QplError> {
+    match vm.lookup(name) {
+        Some(Lookup::Builtin(b)) if b.arity == 0 => {
+            let call = b.call;
+            Ok(Some(EvalValue::Scalar(call(vm, &[])?)))
+        }
+        Some(Lookup::Function(f)) if f.params.is_empty() => {
+            let def = f.clone();
+            if vm.scopes.len() >= crate::vm::MAX_CALL_DEPTH {
+                return Err(QplError::Runtime(format!(
+                    "function recursion too deep (limit {})",
+                    crate::vm::MAX_CALL_DEPTH
+                )));
+            }
+            let ns = vm.resolve_function_ns(name);
+            vm.push_scope();
+            vm.scopes.last_mut().expect("just pushed").current_ns = ns;
+            let result = run_body(vm, &def, vec![]);
+            vm.pop_scope();
+            Ok(Some(result?))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn eval_table(vm: &mut Vm, te: &TableExpr) -> Result<EvalValue, QplError> {
@@ -507,7 +544,7 @@ fn eval_call(vm: &mut Vm, func: &str, args: &[Expr]) -> Result<EvalValue, QplErr
     }
 }
 
-/// Apply a user function (`name: {[..] ..}`) to `args`.
+/// Apply a user function (`name: {[..] ..}`) or a builtin to `args`.
 ///
 /// Arguments are evaluated in the *caller* scope, then bound to the parameter
 /// names in a child scope that shadows the session: params and any locals the
@@ -523,6 +560,17 @@ fn apply_function(vm: &mut Vm, func: &Expr, args: &[Expr]) -> Result<EvalValue, 
             ))
         }
     };
+    if let Some(b) = vm.builtins.get(&name).copied() {
+        if args.len() != b.arity {
+            return Err(QplError::Runtime(format!(
+                "'{name}' takes {} argument(s), got {}", b.arity, args.len()
+            )));
+        }
+        let arg_vals = args.iter()
+            .map(|a| expect_scalar(eval_value(vm, a)?))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(EvalValue::Scalar((b.call)(vm, &arg_vals)?));
+    }
     let def = vm
         .lookup_function(&name)
         .cloned()
@@ -569,11 +617,11 @@ fn run_body(
 ) -> Result<EvalValue, QplError> {
     for (p, v) in def.params.iter().zip(arg_vals) {
         match v {
-            EvalValue::Scalar(s) => vm.bind_global(p.clone(), s),
-            EvalValue::Frame { lf, lazy } if lazy => vm.bind_lazy(p.clone(), lf),
+            EvalValue::Scalar(s) => vm.bind_global(p.clone(), s)?,
+            EvalValue::Frame { lf, lazy } if lazy => vm.bind_lazy(p.clone(), lf)?,
             EvalValue::Frame { lf, .. } => {
                 let df = lf.collect().map_err(rt)?;
-                vm.bind_table(p.clone(), df);
+                vm.bind_table(p.clone(), df)?;
             }
         }
     }

@@ -268,12 +268,6 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
             compile_expr(value, out)?;
             out.push(Instruction::Round { decimals });
         }
-        // `.qpl.d` / `.qpl.t` / `.qpl.p` / `.qpl.n` — nullary now-functions,
-        // folded to a constant here (qpl recompiles every line, so compile time
-        // is effectively evaluation time).
-        Expr::Call { func, args } if func.starts_with(".qpl.") && args.is_empty() => {
-            out.push(Instruction::PushConst(crate::temporal::now_value(func)?));
-        }
         Expr::Call { func, args } => {
             for arg in args {
                 compile_expr(arg, out)?;
