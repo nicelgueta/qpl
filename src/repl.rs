@@ -9,6 +9,7 @@ use crate::opcodes::disassemble_instructions;
 use crate::vm::{Vm, run_vm, EvalResult};
 use crate::resolve;
 use polars::prelude::*;
+#[cfg(feature = "cli")]
 use rustyline::{DefaultEditor, error::ReadlineError};
 use std::collections::HashMap;
 
@@ -31,7 +32,8 @@ pub fn run_script(path: &str, vm: &mut Vm) -> Result<(), QplError> {
 fn run_line(src: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<(), QplError> {
     let src = &normalize_function_body_newlines(src);
     if let Some(inner) = src.strip_prefix("\\d").map(str::trim) {
-        println!("{}", disassemble(inner)?);
+        let listing = disassemble(inner)?;
+        vm.emit(&listing);
         return Ok(());
     }
     if let Some(target) = src.strip_prefix("\\l").map(str::trim) {
@@ -215,7 +217,7 @@ fn normalize_function_body_newlines(src: &str) -> String {
 /// unterminated string), or when the parse fails specifically because input ran
 /// out (so a genuine syntax error still surfaces immediately). `\` commands are
 /// always single-line.
-fn wants_more(src: &str) -> bool {
+pub fn wants_more(src: &str) -> bool {
     let trimmed = src.trim_start();
     if trimmed.starts_with('\\') || trimmed.starts_with(".qpl.cfg") {
         return false;
@@ -251,6 +253,7 @@ fn wants_more(src: &str) -> bool {
     }
 }
 
+#[cfg(feature = "cli")]
 pub fn start(vm: &mut Vm) {
     let mut rl = DefaultEditor::new().expect("failed to create line editor");
 
@@ -332,17 +335,30 @@ pub fn start(vm: &mut Vm) {
 /// REPL-loop state (`PortSession`) this function doesn't have — see
 /// [`run_line`]. Shared by both the normal (rustyline) input path and, once a
 /// port has been opened, the polling loop's stdin lines.
+#[cfg(feature = "cli")]
 fn process_submitted(src: &str, vm: &mut Vm) {
     if let Err(e) = run_line(src, vm, "<main>", 0) {
         eprintln!("{}", fmt_repl_error(&e));
     }
 }
 
+/// Evaluate one submitted line with its output captured instead of printed —
+/// the non-terminal equivalent of [`process_submitted`], used by the wasm REPL.
+/// Returns `(output, error)`: `output` is exactly what the CLI would have
+/// printed to stdout (including anything emitted before a failure), and `error`
+/// is the message the CLI would have put on stderr, if the line failed.
+pub fn eval_capture(src: &str, vm: &mut Vm) -> (String, Option<String>) {
+    let outer = vm.capture.replace(String::new());
+    let err = run_line(src, vm, "<main>", 0).err().map(|e| fmt_repl_error(&e));
+    let out = std::mem::replace(&mut vm.capture, outer).unwrap_or_default();
+    (out, err)
+}
+
 /// `\port <n>` opens a listener (closing any previously open one first);
 /// bare `\port` closes it. Only reachable from `start()` — `\port` doesn't
 /// exist for script mode (`run_script` never calls this), per its being
 /// meaningless outside a long-lived interactive session.
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", feature = "cli"))]
 fn handle_port_directive(rest: &str, session: &mut PortSession) -> Result<(), QplError> {
     session.close_port();
     if rest.is_empty() {
@@ -359,7 +375,7 @@ fn handle_port_directive(rest: &str, session: &mut PortSession) -> Result<(), Qp
 /// work. `\`-prefixed system commands (`\d`, `\l`, `\1`, `\port` itself)
 /// are deliberately not reachable this way — they're local REPL/session
 /// administration, not part of the query language a remote client dispatches.
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", feature = "cli"))]
 fn eval_for_dispatch(line: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
     if let Some(args) = cfg_directive(line) {
         apply_cfg(args, vm)?;
@@ -382,20 +398,20 @@ fn eval_for_dispatch(line: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
 /// REPL-loop-side state for `\port`: a stdin-reader thread (spawned once, the
 /// first time `\port` is used) feeding lines to the polling loop in `start()`,
 /// plus whichever listener is currently open, if any.
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", feature = "cli"))]
 struct PortSession {
     stdin_rx: std::sync::mpsc::Receiver<String>,
     port: Option<(crate::ipc::ServerHandle, std::sync::mpsc::Receiver<crate::ipc::PortRequest>)>,
 }
 
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", feature = "cli"))]
 enum PortEvent {
     Line(String),
     Request(crate::ipc::HandleMode, String, std::sync::mpsc::Sender<Vec<u8>>),
     StdinClosed,
 }
 
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", feature = "cli"))]
 impl PortSession {
     fn new() -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -719,7 +735,7 @@ fn disassemble(source: &str) -> Result<String, QplError> {
 #[cfg(test)]
 mod tests {
     use super::{cfg_directive, eval_line, logical_statements, log_target, normalize_function_body_newlines, wants_more};
-    use super::{namespace_from_path, run_line, run_script_imported};
+    use super::{eval_capture, namespace_from_path, run_line, run_script_imported};
     use crate::vm::{Vm, run_vm, EvalResult};
 
     /// Run `line` through [`eval_line`] and return whatever it wrote via
@@ -1086,5 +1102,30 @@ mod tests {
             other => panic!("expected Scalar(12), got {other:?}"),
         }
     }
-}
 
+    /// `eval_capture` must return exactly what the CLI would have printed —
+    /// including output emitted *before* a statement failed — and must leave
+    /// the VM's capture state as it found it.
+    #[test]
+    fn eval_capture_returns_output_and_error_separately() {
+        let mut vm = Vm::new();
+        assert_eq!(eval_capture("x: 41", &mut vm), (String::new(), None));
+        assert_eq!(eval_capture("x + 1", &mut vm), ("i64: 42\n".to_string(), None));
+
+        let (out, err) = eval_capture("nosuchtable", &mut vm);
+        assert!(out.is_empty(), "failed statement emitted {out:?}");
+        assert!(err.is_some_and(|e| e.contains("nosuchtable")));
+        assert!(vm.capture.is_none(), "capture buffer outlived the call");
+    }
+
+    /// A `log` write happens before the statement's own failure, so it has to
+    /// survive in the captured output rather than being discarded with it.
+    #[test]
+    fn eval_capture_keeps_output_emitted_before_a_failure() {
+        let mut vm = Vm::new();
+        eval_capture("f: {[] log[\"before\"]; nosuchtable}", &mut vm);
+        let (out, err) = eval_capture("f[]", &mut vm);
+        assert_eq!(out, "before\n");
+        assert!(err.is_some());
+    }
+}

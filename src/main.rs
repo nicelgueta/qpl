@@ -1,23 +1,5 @@
-mod ast;
-mod builtins;
-mod compiler;
-mod errors;
-mod lexer;
-mod native;
-mod opcodes;
-mod parser;
-mod enums;
-mod resolve;
-mod helpers;
-pub mod repl;
-mod temporal;
-mod tokens;
-mod vm;
-mod vm_config;
-#[cfg(feature = "ipc")]
-mod ipc;
-
 use clap::{ArgAction::SetTrue, Parser};
+use qpl::{repl, vm};
 
 // Matches Polars' own official builds — see the `mimalloc` entry in Cargo.toml.
 #[global_allocator]

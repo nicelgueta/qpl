@@ -582,6 +582,10 @@ source -> lexer -> tokens -> parser -> AST -> compiler -> instructions -> VM (Po
 | `vm` | execute them, building and collecting a `LazyFrame` |
 | `repl` | interactive loop and script runner |
 
+The interpreter is a library (`src/lib.rs`); the `qpl` binary (`cli` feature,
+on by default) and the browser bindings (`wasm` feature) are both thin
+front-ends over it.
+
 There's no query optimiser, because there doesn't need to be one: the VM's
 job ends at producing a Polars `LazyFrame`, and predicate pushdown and the
 rest happen on the other side of that boundary. [More][architecture].
@@ -592,9 +596,25 @@ Automated and driven by the version in `Cargo.toml`. A bump landing on `main`
 tags the commit and cross-compiles binaries for Linux (gnu + musl), Linux
 ARM64, and macOS (x86 + ARM).
 
+## In the browser
+
+A `wasm` feature exposes the same interpreter to JavaScript — a `Repl` object
+with an `eval(line)` method that behaves like a CLI line, plus a
+`qplLangConfig()` that hands an online editor (Monaco and friends) the
+tokenizer, language configuration and completions the [VS Code
+extension](tools/vscode/) uses.
+
+It builds: `wasm-pack` produces a working `pkg/`. The catch is that stock
+Polars doesn't compile for `wasm32-unknown-unknown` (its only supported wasm
+target is `wasm32-unknown-emscripten`, for Pyodide), so the build needs a
+four-change patch to Polars, kept in
+[`tools/wasm/patches/`](tools/wasm/patches/) and applied for you by `make
+wasm`. [The full story](tools/wasm/README.md).
+
 ## Roadmap
 
-- A WASM build, so qpl can run in the browser.
+- Drop the Polars patch from the WASM build, once upstream builds for
+  `wasm32-unknown-unknown` unaided.
 - More of the language. Gaps are noted in the [book][book] beside the feature
   they belong to.
 

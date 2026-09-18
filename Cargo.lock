@@ -2320,12 +2320,15 @@ name = "qpl"
 version = "0.1.26"
 dependencies = [
  "clap",
+ "js-sys",
  "mimalloc",
  "polars",
  "polars-ops",
  "regex",
  "rustyline",
+ "serde_json",
  "tokio",
+ "wasm-bindgen",
  "zeromq",
 ]
 

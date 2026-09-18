@@ -13,3 +13,4 @@ __pycache__/
 /*.qpl
 /*.py
 /*.sql
+tools/wasm/pkg/

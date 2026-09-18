@@ -1,0 +1,150 @@
+diff --git a/crates/polars-async/Cargo.toml b/crates/polars-async/Cargo.toml
+index 8a94fbecd0..4eed8ea0c2 100644
+--- a/crates/polars-async/Cargo.toml
++++ b/crates/polars-async/Cargo.toml
+@@ -17,12 +17,17 @@ parking_lot = { workspace = true }
+ pin-project-lite = { workspace = true }
+ rand = { workspace = true }
+ slotmap = { workspace = true }
+-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "net", "time"] }
++tokio = { workspace = true, features = ["rt", "sync", "time"] }
+ 
+ polars-config = { workspace = true }
+ polars-error = { workspace = true }
+ polars-utils = { workspace = true }
+ 
++[target.'cfg(not(target_family = "wasm"))'.dependencies]
++# wasm has no threads, so the runtime below is single-threaded there; `net` is
++# unsupported by tokio on wasm and pulls `mio`, which does not build for it.
++tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
++
+ [features]
+ default = []
+ 
+diff --git a/crates/polars-async/src/lib.rs b/crates/polars-async/src/lib.rs
+index 9dae5ef001..62932b02cb 100644
+--- a/crates/polars-async/src/lib.rs
++++ b/crates/polars-async/src/lib.rs
+@@ -32,7 +32,22 @@ impl RuntimeManager {
+         let warned = RelaxedCell::new_bool(false);
+         let tokio_thread_count_start = Arc::new(RelaxedCell::new_i64(0));
+         let tokio_thread_count_stop = tokio_thread_count_start.clone();
++        // all of the above only feed the multi-threaded builder below
++        #[cfg(target_family = "wasm")]
++        let _ = (
++            n_threads,
++            max_blocking,
++            max_total_threads,
++            &warned,
++            &tokio_thread_count_start,
++            &tokio_thread_count_stop,
++        );
+ 
++        // wasm is single-threaded: no worker or blocking threads to spawn, and
++        // no `enable_io` (tokio's `net` feature does not exist there).
++        #[cfg(target_family = "wasm")]
++        let rt = Builder::new_current_thread().enable_time().build().unwrap();
++        #[cfg(not(target_family = "wasm"))]
+         let rt = Builder::new_multi_thread()
+             .worker_threads(n_threads)
+             .max_blocking_threads(max_blocking)
+@@ -59,6 +74,11 @@ impl RuntimeManager {
+         if THREAD_SPAWNED_BY_POLARS_EXECUTOR.get() {
+             executor::block_in_place(f)
+         } else {
++            // `block_in_place` needs a multi-threaded runtime to hand this
++            // thread's work to; on wasm there is nothing to hand it to.
++            #[cfg(target_family = "wasm")]
++            return f();
++            #[cfg(not(target_family = "wasm"))]
+             tokio::task::block_in_place(f)
+         }
+     }
+@@ -78,6 +98,10 @@ impl RuntimeManager {
+         if THREAD_SPAWNED_BY_POLARS_EXECUTOR.get() {
+             executor::block_in_place(|| self.rt.block_on(future))
+         } else {
++            // see `block_in_place` above
++            #[cfg(target_family = "wasm")]
++            return self.rt.block_on(future);
++            #[cfg(not(target_family = "wasm"))]
+             tokio::task::block_in_place(|| self.rt.block_on(future))
+         }
+     }
+diff --git a/crates/polars-core/Cargo.toml b/crates/polars-core/Cargo.toml
+index 54b39b7c3a..9bb8988e89 100644
+--- a/crates/polars-core/Cargo.toml
++++ b/crates/polars-core/Cargo.toml
+@@ -44,12 +44,21 @@ schemars = { workspace = true, optional = true, features = ["uuid1"] }
+ serde = { workspace = true, optional = true }
+ serde_json = { workspace = true, optional = true }
+ strum_macros = { workspace = true }
+-tokio = { workspace = true, features = ["fs", "net", "rt-multi-thread", "time", "sync"] }
+ uuid = { workspace = true }
+ xxhash-rust = { workspace = true }
+ 
++[target.'cfg(not(target_family = "wasm"))'.dependencies]
++# Not used by polars-core itself: this exists so that Cargo feature unification
++# hands `polars-io` (which declares `tokio` with no features of its own) the
++# `fs`/`net`/`sync`/`time` it needs. tokio rejects `fs` and `net` on wasm, and
++# `net` pulls `mio`, which has no wasm32-unknown-unknown backend at all.
++tokio = { workspace = true, features = ["fs", "net", "rt-multi-thread", "time", "sync"] }
++
+ [target.'cfg(target_family = "wasm")'.dependencies]
+ uuid = { workspace = true, features = ["js"] }
++# wasm gets only the subset tokio supports there; the `tokio::fs` call sites in
++# polars-io are `cfg`-ed to `std::fs` to match.
++tokio = { workspace = true, features = ["sync", "time"] }
+ 
+ [dev-dependencies]
+ bincode = { workspace = true }
+diff --git a/crates/polars-core/src/runtime.rs b/crates/polars-core/src/runtime.rs
+index ca8d9217dc..35e9fc452f 100644
+--- a/crates/polars-core/src/runtime.rs
++++ b/crates/polars-core/src/runtime.rs
+@@ -202,7 +202,9 @@ pub static THREAD_POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
+         .expect("could not spawn threads")
+ });
+ 
+-#[cfg(all(target_os = "emscripten", target_family = "wasm"))] // Use 1 rayon thread on emscripten
++// Use 1 rayon thread on every wasm target: `use_current_thread` means the pool
++// is built without spawning, which is the only thing that works in a browser.
++#[cfg(target_family = "wasm")]
+ pub static THREAD_POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
+     ThreadPoolBuilder::new()
+         .num_threads(1)
+diff --git a/crates/polars-io/src/utils/byte_source.rs b/crates/polars-io/src/utils/byte_source.rs
+index c94008bdad..e37113c140 100644
+--- a/crates/polars-io/src/utils/byte_source.rs
++++ b/crates/polars-io/src/utils/byte_source.rs
+@@ -38,6 +38,11 @@ impl BufferByteSource {
+         path: &Path,
+         _cloud_options: Option<&CloudOptions>,
+     ) -> PolarsResult<Self> {
++        // see the note in `utils/mkdir.rs` — no `tokio::fs` on wasm
++        #[cfg(target_family = "wasm")]
++        let file =
++            Arc::new(std::fs::File::open(path).map_err(|err| _limit_path_len_io_err(path, err))?);
++        #[cfg(not(target_family = "wasm"))]
+         let file = Arc::new(
+             tokio::fs::File::open(path)
+                 .await
+diff --git a/crates/polars-io/src/utils/mkdir.rs b/crates/polars-io/src/utils/mkdir.rs
+index f4ff2839dc..8110255ae7 100644
+--- a/crates/polars-io/src/utils/mkdir.rs
++++ b/crates/polars-io/src/utils/mkdir.rs
+@@ -15,6 +15,14 @@ pub fn mkdir_recursive(path: &PlRefPath) -> io::Result<()> {
+ 
+ pub async fn tokio_mkdir_recursive(path: &PlRefPath) -> io::Result<()> {
+     if !path.has_scheme() {
++        // `tokio::fs` does not exist on wasm (the `fs` feature is unsupported
++        // there); the blocking equivalent is correct in a single-threaded runtime.
++        #[cfg(target_family = "wasm")]
++        std::fs::DirBuilder::new().recursive(true).create(
++            path.parent()
++                .ok_or(io::Error::other("path is not a file"))?,
++        )?;
++        #[cfg(not(target_family = "wasm"))]
+         tokio::fs::DirBuilder::new()
+             .recursive(true)
+             .create(

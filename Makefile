@@ -1,4 +1,4 @@
-.PHONY: build release test run bump book book-build book-deploy vscode-ext
+.PHONY: build release test run wasm bump book book-build book-deploy vscode-ext
 
 build:
 	cargo build
@@ -11,6 +11,13 @@ test:
 
 run:
 	cargo run
+
+# Build the browser bundle into tools/wasm/pkg. Prepares a patched Polars
+# checkout first (stock Polars doesn't compile for wasm32-unknown-unknown --
+# see tools/wasm/README.md) and points cargo at it for the duration of the
+# build. Slow on a cold cache: the whole Polars tree, for a new target.
+wasm:
+	@./scripts/build-wasm.sh
 
 # Repackage the VSCode extension (tools/vscode) into a .vsix and install it,
 # replacing whatever version is currently loaded. Reload the VSCode window

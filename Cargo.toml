@@ -3,22 +3,40 @@ name = "qpl"
 version = "0.1.26"
 edition = "2024"
 
+# The interpreter lives in a library so it can be driven by something other than
+# the terminal REPL — `cdylib` is what `wasm-pack` links for the `wasm` feature,
+# `rlib` is what the `qpl` binary (and the tests) link against.
+[lib]
+name = "qpl"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+# `cli` is a default feature, so a plain `cargo build` still produces the binary;
+# the wasm build (`--no-default-features --features wasm`) drops it, along with
+# the terminal-only deps (clap/rustyline/mimalloc) that don't exist in a browser.
+[[bin]]
+name = "qpl"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [dependencies]
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.6", features = ["derive"], optional = true }
 # `default-features = false` drops polars' `docs` / `zip_with` / `dtype-slim` defaults.
-# `fmt` is required by repl.rs (`df.to_string()`); `temporal` is NOT a qpl language
+# `temporal` is NOT a qpl language
 # feature but cannot be dropped -- polars-expr's `strings` dispatch does
 # `use polars_time::prelude::StringMethods`, and polars_time is only linked via
 # `temporal`, so `strings` without `temporal` fails to compile (upstream, 0.55.2).
 # `temporal` links `polars-time` (needed by `strings`, see above) but does NOT
 # enable the temporal dtypes -- the `dtype-date` / `-datetime` / `-time` /
 # `-duration` features are separate and power qpl's date/time literals & casts.
-polars = { version = "0.55.2", default-features = false, features = ["fmt", "temporal", "lazy", "parquet", "csv", "strings", "is_in", "abs", "dtype-categorical", "dtype-date", "dtype-datetime", "dtype-time", "dtype-duration", "round_series", "rank", "mode", "moment", "diff",
+# The feature list is split per target (see the two `[target...dependencies.polars]`
+# blocks below `[features]`): `fmt` and `parquet`/`csv` cannot be used on wasm.
+polars = { version = "0.55.2", default-features = false, features = ["temporal", "lazy", "strings", "is_in", "abs", "dtype-categorical", "dtype-date", "dtype-datetime", "dtype-time", "dtype-duration", "round_series", "rank", "mode", "moment", "diff",
     "pct_change", "cum_agg", "rolling_window", "product", "regex"] }
 # pulled in only to name `RoundMode` (the `polars` facade re-exports it crate-privately);
 # already compiled as a transitive dep, same version.
 polars-ops = { version = "0.55.2", features = ["round_series"] }
-rustyline = "18.0.1"
+rustyline = { version = "18.0.1", optional = true }
 # `like`'s q-glob pattern is translated to an anchored regex, then matched with
 # this directly for scalars; polars' own (already-linked, transitive) regex
 # engine handles the column-expression case via `.str().contains(...)`.
@@ -33,11 +51,51 @@ zeromq = { version = "0.5", optional = true }
 # the default system allocator is measurably slower for its allocation-heavy
 # workloads (CSV parsing, hash tables for group-by, ...). Cut a real script's
 # wall time by ~25% in testing, on top of `opt-level = 3` below.
-mimalloc = "0.1.52"
+mimalloc = { version = "0.1.52", optional = true }
+# `wasm` feature only — the browser bindings in `src/wasm.rs`. `js-sys` is what
+# builds the `qplLangConfig()` object (and the `{output, error}` eval result)
+# without pulling in serde.
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+# `wasm` feature only — assembles `qplLangConfig()` from the JSON that the
+# VS Code extension already uses as its vocabulary (see `src/wasm.rs`).
+serde_json = { version = "1", optional = true }
 
 [features]
-default = ["ipc"]
+default = ["cli", "ipc"]
+cli = ["dep:clap", "dep:rustyline", "dep:mimalloc"]
 ipc = ["dep:tokio", "dep:zeromq"]
+# Browser target: `wasm-pack build --target web --no-default-features --features wasm`.
+# Mutually exclusive with `ipc` (no sockets) and `cli` (no terminal).
+wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde_json"]
+
+# `fmt` pulls `comfy-table/tty` -> `crossterm`, which has no wasm backend; polars'
+# own `make check-wasm` excludes it for exactly this reason. `fmt_no_tty` is the
+# same `DataFrame: Display` without the terminal-width probing, which is all
+# repl.rs's `df.to_string()` needs.
+#
+# `parquet`/`csv` force polars' `streaming` feature, which drags in polars-stream
+# -> polars-io/file_cache -> cloud -> object_store/hyper/reqwest/ring, none of
+# which build for wasm. A browser has no filesystem to `load`/`sink` against
+# anyway, so those two builtins are `cfg`-ed out there (see `vm::load_file`).
+[target.'cfg(not(target_family = "wasm"))'.dependencies.polars]
+version = "0.55.2"
+default-features = false
+features = ["fmt", "parquet", "csv"]
+
+[target.'cfg(target_family = "wasm")'.dependencies.polars]
+version = "0.55.2"
+default-features = false
+features = ["fmt_no_tty"]
+
+# Off by default for two reasons: wasm-pack's bundled `wasm-opt` predates
+# bulk-memory being on by default and rejects the `memory.copy` rustc emits
+# (hence the explicit feature flags), and `-O` over a Polars-sized module takes
+# far longer than the compile itself. Swap `false` for the flag list below when
+# you actually want the size win.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+# wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
 
 [profile.release]
 opt-level = 3

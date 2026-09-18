@@ -25,10 +25,16 @@ cargo run -- script.qpl     # execute a script
 cargo run -- -i script.qpl  # execute a script, then drop into the REPL
 cargo run -- examples/lazy_join_pipeline.qpl   # run an example
 cargo build --no-default-features               # drop `ipc` (hopen/dispatch/await, \port — see Architecture)
+cargo test --no-default-features --features wasm   # browser bindings, host-side tests
+make wasm                   # browser bundle -> tools/wasm/pkg (patches polars first,
+                            # see scripts/build-wasm.sh and tools/wasm/README.md)
 ```
 
-`ipc` is a default feature, so a plain `cargo build`/`cargo test`/`cargo run` already
-includes it; `--no-default-features` is only needed to build/test without it.
+`cli` and `ipc` are default features, so a plain `cargo build`/`cargo test`/`cargo run`
+already includes both; `--no-default-features` is only needed to build/test without
+them. `cli` gates the binary itself (`[[bin]] required-features`) along with
+clap/rustyline/mimalloc; the interpreter lives in `src/lib.rs` so that the binary
+and the `wasm` bindings are both thin front-ends over the same library.
 
 There is no separate lint step configured; use `cargo clippy` and `cargo fmt` as normal.
 
@@ -77,6 +83,7 @@ carries across lines because the same `Vm` is reused.
 | `native` | built-in (native) functions — a `name → Builtin { arity, call }` map built once in `Vm::new`; resolved through `Vm::lookup` exactly like a user function (`Lookup::Builtin`), except the name can never be bound over. Adding one needs no lexer/parser/compiler change |
 | `vm_config` | `VmConfig` — session knobs set by `.qpl.cfg key=value` (`maxcol`, `maxrow`, `tblwidth`, `strlen`, `round_type`, `useqepoch`); a new knob is a field + a `VmConfig::set` arm and nothing else |
 | `errors` | `QplError` (Lex/Parse/Compile/Runtime variants) — the single error type threaded everywhere |
+| `wasm` | `wasm` feature only (`#[cfg(feature = "wasm")] mod wasm;` in `lib.rs`). `Repl` (a `Vm` behind `eval(line)`, driven by `repl::eval_capture` — same `run_line` the terminal REPL uses, with output captured instead of printed) and `qplLangConfig()` (Monaco tokenizer/config/completions, built at compile time from `tools/vscode/`'s JSON). Builds only against a patched Polars (stock 0.55.2 doesn't compile for `wasm32-unknown-unknown`) — [`tools/wasm/README.md`](tools/wasm/README.md) has the build steps and the patch |
 | `ipc` | `ipc` feature only (`#[cfg(feature = "ipc")]`, `mod ipc;` in `main.rs` is itself gated). Client (`hopen`/`dispatch`/`async dispatch`/`await`) and server (`\port`) over a plain `zeromq` REQ/REP pair — see the IPC subsection below |
 
 ### VM state and evaluation model
@@ -95,8 +102,10 @@ bare (`resolve::call_niladic`), which is all `.qpl.ts` (and any user `{[] ..}`)
 is. `scopes: Vec<Scope>` is the call stack — only the innermost frame is
 searched, so scoping is lexical.
 
-(plus `stdout_log: Option<File>` — the `\1` stdout mirror — and
-`config: VmConfig` — the `.qpl.cfg` knobs; neither is query state.)
+(plus `stdout_log: Option<File>` — the `\1` stdout mirror —
+`capture: Option<String>` — when set, `Vm::emit` appends here instead of
+writing to stdout, which is how the wasm `Repl` collects a statement's output —
+and `config: VmConfig`, the `.qpl.cfg` knobs; none of the three is query state.)
 
 The VM executes instructions by pushing/popping a `StackObj` stack (`Expr`,
 `Frame`, `Scalar`, `PolarsArg`). Everything table-shaped is assembled as a
@@ -165,9 +174,12 @@ feature, a runnable snippet under `examples/` and a note in `README.md`.
 **Every user-visible language change (new keyword, operator, or builtin) must
 also update [`tools/vscode/`](tools/vscode/)** — this is not optional cleanup,
 do it in the same change:
-- `src/vocabulary.ts` — add the keyword/operator to the relevant list
-  (`STATEMENT_KEYWORDS`, `BUILTIN_KEYWORDS`, `JOIN_OPERATORS`, `WORD_OPERATORS`,
-  `AGGREGATES`) and give it an entry in `KEYWORD_DETAIL`/`AGGREGATE_DETAIL`.
+- `src/vocabulary.json` — the single source of truth for the vocabulary: add the
+  keyword/operator to the relevant list (`statementKeywords`, `builtinKeywords`,
+  `joinOperators`, `wordOperators`, `aggregates`) and give it an entry in
+  `keywordDetail`/`aggregateDetail`. `src/vocabulary.ts` is a typed re-export of
+  this file and needs no edit; the crate `include_str!`s the same file for
+  `qplLangConfig()` (`wasm` feature), so both editors stay in sync automatically.
 - `syntaxes/qpl.tmLanguage.json` — add it to the matching grammar rule so it
   highlights (validate with `python3 -c "import json; json.load(open(...))"`).
 - `src/extension.ts` — only if the new vocabulary list isn't already wired

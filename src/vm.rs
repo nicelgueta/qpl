@@ -1,3 +1,4 @@
+#[cfg(not(target_family = "wasm"))]
 use polars::io::utils::sync_on_close::SyncOnCloseType;
 use polars::prelude::*;
 use crate::ast::{self, TableSource, Value};
@@ -33,6 +34,10 @@ pub struct Vm {
     /// When set (via the `\1 <path>` command), every line printed through
     /// [`Vm::emit`] is also appended here — kdb-style stdout redirection.
     pub stdout_log: Option<std::fs::File>,
+    /// When set, [`Vm::emit`] appends to this buffer instead of writing to
+    /// stdout — how a non-terminal front-end (the wasm REPL) collects a
+    /// statement's output. See [`crate::repl::eval_capture`].
+    pub capture: Option<String>,
     /// Session-wide knobs set from `.qpl.cfg key=value ...`.
     pub config: VmConfig,
     /// Open `hopen` connections, keyed by the `Value::Handle` id returned to
@@ -145,6 +150,7 @@ impl Vm {
             builtins: crate::native::builtins(),
             scopes: Vec::new(),
             stdout_log: None,
+            capture: None,
             config: VmConfig::default(),
             #[cfg(feature = "ipc")]
             connections: HashMap::new(),
@@ -373,9 +379,16 @@ impl Vm {
         Ok(())
     }
 
-    /// Print `text` to stdout, mirroring it to the stdout log if one is set.
+    /// Print `text` to stdout (or to the capture buffer, when one is active),
+    /// mirroring it to the stdout log if one is set.
     pub fn emit(&mut self, text: &str) {
-        println!("{text}");
+        match self.capture.as_mut() {
+            Some(buf) => {
+                buf.push_str(text);
+                buf.push('\n');
+            }
+            None => println!("{text}"),
+        }
         if let Some(file) = self.stdout_log.as_mut() {
             use std::io::Write;
             let _ = writeln!(file, "{text}");
@@ -1396,6 +1409,19 @@ fn polars_dtype(name: &str) -> Result<DataType, QplError> {
     })
 }
 
+/// `load <path>`. Unavailable on wasm: a browser has no filesystem, and the
+/// Polars features that provide the readers (`parquet`/`csv`) can't be built
+/// for that target at all — see the `[target...dependencies.polars]` blocks in
+/// `Cargo.toml`. It stays a runtime error rather than a missing builtin so the
+/// grammar, the compiler and every error message are identical everywhere.
+#[cfg(target_family = "wasm")]
+fn load_file(path: &str) -> Result<LazyFrame, QplError> {
+    Err(QplError::Runtime(format!(
+        "cannot load '{path}': file I/O is not available in this build"
+    )))
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn load_file(path: &str) -> Result<LazyFrame, QplError> {
     let ext = std::path::Path::new(path)
         .extension()
@@ -1411,6 +1437,15 @@ fn load_file(path: &str) -> Result<LazyFrame, QplError> {
     }
 }
 
+/// `<table> sink <path>`. Unavailable on wasm — see [`load_file`].
+#[cfg(target_family = "wasm")]
+fn sink_file(_lf: LazyFrame, path: &str) -> Result<(), QplError> {
+    Err(QplError::Runtime(format!(
+        "cannot sink to '{path}': file I/O is not available in this build"
+    )))
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn sink_file(lf: LazyFrame, path: &str) -> Result<(), QplError> {
     let ext = std::path::Path::new(path)
         .extension()
@@ -1837,6 +1872,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_family = "wasm"))]
     fn sink_and_load_round_trip_with_a_string_path() {
         let path = std::env::temp_dir().join("qpl_vm_test_sink_round_trip.csv");
         let path_str = path.to_str().unwrap();
@@ -1850,6 +1886,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_family = "wasm"))]
     fn load_accepts_a_bound_variable_path() {
         // regression: `load` only ever accepted a literal string token, so
         // `p: "x.csv"; load p` (or `f[lazy load p]`) failed to parse.
@@ -1867,6 +1904,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_family = "wasm"))]
     fn function_call_accepts_a_lazy_load_bracket_argument() {
         // regression: `analysis[lazy load p]` failed to *parse* at all
         // ("Unexpected token in primary: Lazy") — a bracket-call argument
