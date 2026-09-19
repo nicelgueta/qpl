@@ -38,6 +38,16 @@ pub struct Vm {
     /// stdout — how a non-terminal front-end (the wasm REPL) collects a
     /// statement's output. See [`crate::repl::eval_capture`].
     pub capture: Option<String>,
+    /// When set, a statement that yields a table stores it in [`Vm::last_table`]
+    /// instead of pretty-printing it — how the wasm front-end gets a result as
+    /// data rather than as (truncated) text. See [`crate::repl::eval_capture_table`].
+    /// `wasm` feature only.
+    #[cfg(feature = "wasm")]
+    pub capture_table: bool,
+    /// The table produced by the last statement run under [`Vm::capture_table`].
+    /// `wasm` feature only.
+    #[cfg(feature = "wasm")]
+    pub last_table: Option<DataFrame>,
     /// Session-wide knobs set from `.qpl.cfg key=value ...`.
     pub config: VmConfig,
     /// Open `hopen` connections, keyed by the `Value::Handle` id returned to
@@ -151,6 +161,10 @@ impl Vm {
             scopes: Vec::new(),
             stdout_log: None,
             capture: None,
+            #[cfg(feature = "wasm")]
+            capture_table: false,
+            #[cfg(feature = "wasm")]
+            last_table: None,
             config: VmConfig::default(),
             #[cfg(feature = "ipc")]
             connections: HashMap::new(),

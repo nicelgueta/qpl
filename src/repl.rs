@@ -354,6 +354,28 @@ pub fn eval_capture(src: &str, vm: &mut Vm) -> (String, Option<String>) {
     (out, err)
 }
 
+/// What [`eval_capture_table`] returns: the text output and error exactly as
+/// [`eval_capture`] would give them, plus the result table itself when the
+/// statement produced one (in which case it is *not* also in `output`).
+#[cfg(feature = "wasm")]
+pub struct TableEval {
+    pub output: String,
+    pub error: Option<String>,
+    pub table: Option<polars::prelude::DataFrame>,
+}
+
+/// Like [`eval_capture`], but a table result comes back as a `DataFrame` —
+/// untruncated, with its types — rather than as display text. Non-table results
+/// (scalars, lists, plans) still land in `output`.
+#[cfg(feature = "wasm")]
+pub fn eval_capture_table(src: &str, vm: &mut Vm) -> TableEval {
+    let outer_table = std::mem::replace(&mut vm.capture_table, true);
+    vm.last_table = None;
+    let (output, error) = eval_capture(src, vm);
+    vm.capture_table = outer_table;
+    TableEval { output, error, table: vm.last_table.take() }
+}
+
 /// `\port <n>` opens a listener (closing any previously open one first);
 /// bare `\port` closes it. Only reachable from `start()` — `\port` doesn't
 /// exist for script mode (`run_script` never calls this), per its being
@@ -557,6 +579,8 @@ fn eval_line(line: &str, vm: &mut Vm) -> Result<(), QplError> {
         return Ok(());
     }
     match run_vm(line, vm)? {
+        #[cfg(feature = "wasm")]
+        EvalResult::Table(df) if vm.capture_table => vm.last_table = Some(df),
         EvalResult::Table(df)   => vm.emit(&df.to_string()),
         EvalResult::Stored      => {}
         EvalResult::Scalar(val) => vm.emit(&fmt_val(&val)),

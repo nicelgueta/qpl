@@ -22,10 +22,10 @@ index 8a94fbecd0..4eed8ea0c2 100644
  default = []
  
 diff --git a/crates/polars-async/src/lib.rs b/crates/polars-async/src/lib.rs
-index 9dae5ef001..62932b02cb 100644
+index 9dae5ef001..0977cab064 100644
 --- a/crates/polars-async/src/lib.rs
 +++ b/crates/polars-async/src/lib.rs
-@@ -32,7 +32,22 @@ impl RuntimeManager {
+@@ -32,7 +32,26 @@ impl RuntimeManager {
          let warned = RelaxedCell::new_bool(false);
          let tokio_thread_count_start = Arc::new(RelaxedCell::new_i64(0));
          let tokio_thread_count_stop = tokio_thread_count_start.clone();
@@ -40,15 +40,19 @@ index 9dae5ef001..62932b02cb 100644
 +            &tokio_thread_count_stop,
 +        );
  
-+        // wasm is single-threaded: no worker or blocking threads to spawn, and
-+        // no `enable_io` (tokio's `net` feature does not exist there).
++        // wasm is single-threaded: no worker or blocking threads to spawn, no
++        // `enable_io` (tokio's `net` feature does not exist there) and no
++        // `enable_time`: tokio's time driver reads `std::time::Instant::now()`
++        // as it is built, which panics on wasm32-unknown-unknown ("time not
++        // implemented on this platform"). Nothing on the in-memory path waits
++        // on a tokio timer.
 +        #[cfg(target_family = "wasm")]
-+        let rt = Builder::new_current_thread().enable_time().build().unwrap();
++        let rt = Builder::new_current_thread().build().unwrap();
 +        #[cfg(not(target_family = "wasm"))]
          let rt = Builder::new_multi_thread()
              .worker_threads(n_threads)
              .max_blocking_threads(max_blocking)
-@@ -59,6 +74,11 @@ impl RuntimeManager {
+@@ -59,6 +78,11 @@ impl RuntimeManager {
          if THREAD_SPAWNED_BY_POLARS_EXECUTOR.get() {
              executor::block_in_place(f)
          } else {
@@ -60,7 +64,7 @@ index 9dae5ef001..62932b02cb 100644
              tokio::task::block_in_place(f)
          }
      }
-@@ -78,6 +98,10 @@ impl RuntimeManager {
+@@ -78,6 +102,10 @@ impl RuntimeManager {
          if THREAD_SPAWNED_BY_POLARS_EXECUTOR.get() {
              executor::block_in_place(|| self.rt.block_on(future))
          } else {

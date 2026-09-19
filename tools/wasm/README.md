@@ -18,10 +18,37 @@ reimplementation: `Repl.eval` calls `repl::eval_capture`, which wraps the same
 |--------|-------|
 | `new Repl()` | one long-lived `Vm`; state carries across `eval` calls exactly as it does across REPL lines |
 | `repl.eval(line)` | `{ output, error }` — `output` is what the CLI would print to stdout, `error` is `null` or the message it would print to stderr |
+| `repl.registerTable(name, ipc)` | bind `name` to the table in `ipc`, an uncompressed Arrow IPC **stream**; replaces an existing binding. Throws on a bad name (plain identifiers only) or payload. This is how a host gets data in, since `load` needs a filesystem |
+| `repl.rowCount(name)` | rows in the table bound to `name`, for paging. The language's `count` counts non-null values in a table's first column, so it can't be used for this |
+| `repl.evalArrow(line)` | like `eval`, but a table result comes back as data: `{ output, error, ipc }` where `ipc` is a `Uint8Array` Arrow IPC stream of the whole, untruncated result (`output` is then empty), or `null` for a scalar / list / assignment |
 | `repl.wantsMore(src)` | the CLI's `qpl) ` vs `  ...  ` rule: is this statement unfinished? |
 | `repl.loadDemo()` | binds the demo `trades` / `quotes` tables (`--load-demo`) |
 | `repl.version()` | interpreter version, for a banner |
 | `qplLangConfig()` | editor configuration — see below |
+
+### Getting data in and out as Arrow
+
+The `Repl` has no filesystem, so tables reach it as Arrow IPC bytes and results
+leave the same way, instead of as the text `eval` prints (which is truncated by
+`maxrow` / `maxcol` / `strlen` and has no types).
+
+```js
+import * as arrow from 'apache-arrow';
+
+repl.registerTable('trades', arrow.tableToIPC(myArrowTable, 'stream'));
+
+const { ipc, output, error } = repl.evalArrow('select avg price by sym from trades');
+if (error) throw new Error(error);
+const result = ipc ? arrow.tableFromIPC(ipc) : null;   // else `output` holds the text
+```
+
+Text columns are written as `LargeUtf8` (not the newer `Utf8View`, which most
+Arrow readers can't read yet) and categoricals as dictionaries. Compressed IPC
+bodies are not supported in either direction: Polars' IPC compression needs the
+C `lz4` / `zstd` builds, which don't target wasm. `apache-arrow` doesn't
+compress by default, so this only matters for a producer that opts in. The
+implementation is `src/arrow_io.rs`, on `polars-arrow`'s `io_ipc` rather than
+Polars' `ipc` feature (which forces `streaming`).
 
 `ipc` is off in this build, so `hopen` / `dispatch` / `await` / `\port` don't
 exist. Anything that touches the filesystem (`load`, `sink`, `\l`, `\i`, `\1`)

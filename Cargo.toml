@@ -36,6 +36,11 @@ polars = { version = "0.55.2", default-features = false, features = ["temporal",
 # pulled in only to name `RoundMode` (the `polars` facade re-exports it crate-privately);
 # already compiled as a transitive dep, same version.
 polars-ops = { version = "0.55.2", features = ["round_series"] }
+# `wasm` feature only — `df <-> Arrow IPC` (see `arrow_io.rs`) goes through polars-arrow's
+# `io_ipc` directly, NOT polars' `ipc`/`ipc_streaming` features, which force `streaming` /
+# enable the C lz4+zstd builds and so don't compile for wasm. Already compiled as a
+# transitive dep.
+polars-arrow = { version = "0.55.2", default-features = false, features = ["io_ipc"], optional = true }
 rustyline = { version = "18.0.1", optional = true }
 # `like`'s q-glob pattern is translated to an anchored regex, then matched with
 # this directly for scalars; polars' own (already-linked, transitive) regex
@@ -59,7 +64,10 @@ wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
 # `wasm` feature only — assembles `qplLangConfig()` from the JSON that the
 # VS Code extension already uses as its vocabulary (see `src/wasm.rs`).
-serde_json = { version = "1", optional = true }
+# `preserve_order`: Monarch takes the first matching entry of a `cases` block *in key order*,
+# and `@default` must come last. serde_json's default map sorts keys, which put it in the
+# middle and made every keyword after it (`select`, `from`, `like`, ...) unreachable.
+serde_json = { version = "1", optional = true, features = ["preserve_order"] }
 
 [features]
 default = ["cli", "ipc"]
@@ -67,7 +75,7 @@ cli = ["dep:clap", "dep:rustyline", "dep:mimalloc"]
 ipc = ["dep:tokio", "dep:zeromq"]
 # Browser target: `wasm-pack build --target web --no-default-features --features wasm`.
 # Mutually exclusive with `ipc` (no sockets) and `cli` (no terminal).
-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde_json"]
+wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde_json", "dep:polars-arrow"]
 
 # `fmt` pulls `comfy-table/tty` -> `crossterm`, which has no wasm backend; polars'
 # own `make check-wasm` excludes it for exactly this reason. `fmt_no_tty` is the

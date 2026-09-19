@@ -4,6 +4,8 @@
 //! The `qpl` binary (`main.rs`, `cli` feature) and the browser bindings
 //! (`wasm.rs`, `wasm` feature) are both thin front-ends over this.
 
+#[cfg(feature = "wasm")]
+pub mod arrow_io;
 pub mod ast;
 pub mod builtins;
 pub mod compiler;

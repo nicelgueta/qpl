@@ -16,9 +16,10 @@
 //!   `tools/vscode/src/vocabulary.json` the VS Code extension reads, so a
 //!   browser editor and the extension cannot drift apart.
 
+use crate::arrow_io;
 use crate::repl;
 use crate::vm::Vm;
-use js_sys::{Object, Reflect};
+use js_sys::{Object, Reflect, Uint8Array};
 use serde_json::{Value as Json, json};
 use wasm_bindgen::prelude::*;
 
@@ -31,6 +32,20 @@ const LANG_CONFIG: &str = include_str!("../tools/vscode/language-configuration.j
 /// `tools/vscode/snippets/qpl.json` — VS Code snippet definitions, re-shaped
 /// into Monaco completion items below.
 const SNIPPETS: &str = include_str!("../tools/vscode/snippets/qpl.json");
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = error)]
+    fn console_error(msg: &str);
+}
+
+/// Runs once when the module is instantiated. The release profile is
+/// `panic = "abort"`, so a panic otherwise surfaces in JS as a bare
+/// `RuntimeError: unreachable` with no message; this logs the real one first.
+#[wasm_bindgen(start)]
+fn start() {
+    std::panic::set_hook(Box::new(|info| console_error(&format!("qpl panic: {info}"))));
+}
 
 /// A qpl session: one [`Vm`], fed one line at a time.
 ///
@@ -62,6 +77,51 @@ impl Repl {
         match error {
             Some(msg) => set(&obj, "error", &JsValue::from_str(&msg)),
             None => set(&obj, "error", &JsValue::NULL),
+        }
+        obj.into()
+    }
+
+    /// Bind `name` to the table in `ipc`, an Arrow IPC **stream** (what
+    /// `apache-arrow`'s `tableToIPC(t, 'stream')` writes; uncompressed). An
+    /// existing binding of that name is replaced. Throws on a bad name or
+    /// payload. This is how a browser host gets data in, since `load` needs a
+    /// filesystem.
+    #[wasm_bindgen(js_name = registerTable)]
+    pub fn register_table(&mut self, name: &str, ipc: &[u8]) -> Result<(), JsError> {
+        arrow_io::register_table(&mut self.vm, name, ipc).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Rows in the table bound to `name`, for paging. The language's `count`
+    /// counts non-null values in a table's first column, so it can't be used for
+    /// this. Throws if `name` isn't a table.
+    #[wasm_bindgen(js_name = rowCount)]
+    pub fn row_count(&self, name: &str) -> Result<f64, JsError> {
+        arrow_io::row_count(&self.vm, name).map(|n| n as f64).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Like [`eval`](Self::eval), but a table result comes back as data.
+    /// Returns `{ output, error, ipc }`: `ipc` is a `Uint8Array` holding the
+    /// whole, untruncated result as an Arrow IPC stream when the statement
+    /// produced a table (and `output` is then empty), else `null` — a scalar or
+    /// list still goes to `output` as text, an assignment to neither.
+    #[wasm_bindgen(js_name = evalArrow)]
+    pub fn eval_arrow(&mut self, line: &str) -> JsValue {
+        let r = repl::eval_capture_table(line, &mut self.vm);
+        // A table that fails to serialise is reported like any other error.
+        let (ipc, ser_err) = match r.table.as_ref().map(arrow_io::df_to_ipc) {
+            Some(Ok(bytes)) => (Some(bytes), None),
+            Some(Err(e)) => (None, Some(e.to_string())),
+            None => (None, None),
+        };
+        let obj = Object::new();
+        set(&obj, "output", &JsValue::from_str(&r.output));
+        match r.error.or(ser_err) {
+            Some(msg) => set(&obj, "error", &JsValue::from_str(&msg)),
+            None => set(&obj, "error", &JsValue::NULL),
+        }
+        match ipc {
+            Some(bytes) => set(&obj, "ipc", &Uint8Array::from(bytes.as_slice())),
+            None => set(&obj, "ipc", &JsValue::NULL),
         }
         obj.into()
     }
@@ -325,6 +385,22 @@ mod tests {
             let attr = name.trim_start_matches('@');
             assert!(m[attr].is_array(), "monarch is missing the `{attr}` list");
         }
+    }
+
+    /// Monarch takes the first matching entry of a `cases` block in key order,
+    /// and `@default` matches everything, so any entry after it is unreachable.
+    /// (Serialised with sorted keys it landed mid-block and no keyword highlighted.)
+    /// Checked on the string that actually crosses to JS, not just the in-memory value.
+    #[test]
+    fn default_is_the_last_case_so_keywords_are_reachable() {
+        let vocab: Json = serde_json::from_str(VOCABULARY).unwrap();
+        let wire = monarch(&vocab).to_string();
+        let parsed: Json = serde_json::from_str(&wire).unwrap();
+        let cases = parsed["tokenizer"]["root"].as_array().unwrap().iter()
+            .find_map(|rule| rule.get(1).and_then(|a| a.get("cases")))
+            .unwrap().as_object().unwrap();
+        let keys: Vec<&String> = cases.keys().collect();
+        assert_eq!(keys.last().map(|k| k.as_str()), Some("@default"), "{keys:?}");
     }
 
     #[test]
