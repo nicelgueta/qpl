@@ -313,12 +313,12 @@ impl Parser {
                         "reference tables by name, not by symbol: write '{s}', not '`{s}'"
                     ))),
                     TokenKind::Bang => {
-                        // single symbol with a bang should actually 
+                        // single symbol with a bang should actually
                         // be a symvec with a single element
                         self.next(); // consume '!'
                         // TODO also make the use of a dict generic not just to sort
                         // so a sort in the compiler is pushing the map onto the stack
-                        // and calling sort 
+                        // and calling sort
                         let peek = self.peek().clone();
                         match peek {
                             TokenKind::BoolVec(b) => {
@@ -1007,7 +1007,6 @@ impl Parser {
             let where_ = self.parse_where()?.expect("parse_where always returns Some");
             e = Expr::ListWhere { list: Box::new(e), where_ };
         }
-
         Ok(e)
     }
 
