@@ -1,7 +1,7 @@
 / A random table with a column of (nearly) every data type, built from `?`
 / (roll) and string vectors. Values change on every run.
 / Each `zip` value is one noun, so a compound expression goes in parens.
-n: 8
+n: 5000
 
 / `zip` builds i64 / f64 / bool / str columns; the temporal and narrower types
 / are then cast onto the raw values (ns since midnight / the epoch, days, ...)

@@ -55,7 +55,20 @@ impl VmConfig {
                 "unknown config '{key}' (known: maxcol, maxrow, round_type, tblwidth, strlen, useqepoch)"
             ))),
         }
-        // the row/col/width/strlen limits are read by Polars from the environment at render time
+        self.export_render_limits(key);
+        Ok(())
+    }
+
+    /// The row/col/width/strlen limits are read by Polars from the environment
+    /// at render time, so mirror the just-set knob into it.
+    ///
+    /// Not on wasm: a browser has no process environment (`std::env::set_var`
+    /// panics there), and Polars has nothing to read the limits from — the knob
+    /// is still stored (and shown by a bare `.qpl.cfg`) but the text `eval`
+    /// prints stays at Polars' defaults. `evalArrow` returns the whole table,
+    /// so a wasm host does its own truncation.
+    #[cfg(not(target_family = "wasm"))]
+    fn export_render_limits(&self, key: &str) {
         match key {
             "maxcol" => unsafe { std::env::set_var("POLARS_FMT_MAX_COLS", self.maxcol.to_string()) },
             "maxrow" => unsafe { std::env::set_var("POLARS_FMT_MAX_ROWS", self.maxrow.to_string()) },
@@ -70,8 +83,10 @@ impl VmConfig {
             },
             _ => {}
         }
-        Ok(())
     }
+
+    #[cfg(target_family = "wasm")]
+    fn export_render_limits(&self, _key: &str) {}
 
     /// One `key=value` line per knob — printed by a bare `.qpl.cfg`.
     pub fn describe(&self) -> String {

@@ -218,6 +218,12 @@ fn normalize_function_body_newlines(src: &str) -> String {
 /// out (so a genuine syntax error still surfaces immediately). `\` commands are
 /// always single-line.
 pub fn wants_more(src: &str) -> bool {
+    // nothing but blank / comment lines is a complete no-op (see `eval_capture`),
+    // not an unfinished statement — otherwise a host that feeds a script line
+    // by line glues a leading comment onto the statement after it
+    if src.lines().all(|l| l.trim().is_empty() || l.trim_start().starts_with('/')) {
+        return false;
+    }
     let trimmed = src.trim_start();
     if trimmed.starts_with('\\') || trimmed.starts_with(".qpl.cfg") {
         return false;
@@ -248,7 +254,10 @@ pub fn wants_more(src: &str) -> bool {
     }
     match parse(toks) {
         Ok(_) => false,
-        Err(QplError::Parse(msg)) => msg.contains("got Eof"),
+        // input ran out mid-expression: either a specific token was expected
+        // ("expected RParen, got Eof") or any primary was ("Unexpected token in
+        // primary: Eof", e.g. a trailing operator or a dict literal missing values)
+        Err(QplError::Parse(msg)) => msg.contains("got Eof") || msg.ends_with("primary: Eof"),
         Err(_) => false,
     }
 }
@@ -348,6 +357,12 @@ fn process_submitted(src: &str, vm: &mut Vm) {
 /// printed to stdout (including anything emitted before a failure), and `error`
 /// is the message the CLI would have put on stderr, if the line failed.
 pub fn eval_capture(src: &str, vm: &mut Vm) -> (String, Option<String>) {
+    // the terminal REPL drops blank and comment-only lines before they reach
+    // `run_line` (they tokenise to nothing, which doesn't parse); a host that
+    // submits a script line by line gets the same treatment here
+    if src.lines().all(|l| l.trim().is_empty() || l.trim_start().starts_with('/')) {
+        return (String::new(), None);
+    }
     let outer = vm.capture.replace(String::new());
     let err = run_line(src, vm, "<main>", 0).err().map(|e| fmt_repl_error(&e));
     let out = std::mem::replace(&mut vm.capture, outer).unwrap_or_default();
@@ -944,8 +959,16 @@ mod tests {
         assert!(wants_more("select price from"));
         // unterminated string
         assert!(wants_more("log \"oops"));
+        // a trailing operator / a dict literal still missing values: parse ran out in a primary
+        assert!(wants_more("x: 1 +"));
+        assert!(wants_more("zip `a`b!"));
+        assert!(wants_more("zip `a`b!(1 2 3)"));
+        assert!(!wants_more("zip `a`b!(1 2 3) (4 5 6)"));
         // a real syntax error is NOT "more" — surface it now
         assert!(!wants_more("selct from trades"));
+        // blank / comment-only input is finished (a no-op), not unfinished
+        assert!(!wants_more("/ just a comment"));
+        assert!(!wants_more(""));
         // a terminal lex error must not hang the prompt waiting for input
         assert!(!wants_more("select from t where a = 1 @"));
         // `\` commands are always single-line
@@ -1142,6 +1165,37 @@ mod tests {
         assert!(vm.capture.is_none(), "capture buffer outlived the call");
     }
 
+    /// Blank and comment-only submissions are no-ops, as at the terminal REPL —
+    /// a host feeding a script line by line submits them too. A comment above
+    /// code in the same submission still runs the code.
+    #[test]
+    fn eval_capture_ignores_blank_and_comment_only_input() {
+        let mut vm = Vm::new();
+        for src in ["", "   ", "\n", "/ just a note", "  / indented\n/ two lines"] {
+            assert_eq!(eval_capture(src, &mut vm), (String::new(), None), "{src:?}");
+        }
+        assert_eq!(eval_capture("/ note\nx: 5", &mut vm), (String::new(), None));
+        assert_eq!(eval_capture("x", &mut vm), ("i64: 5\n".to_string(), None));
+    }
+
+    /// The example script, fed the way the terminal REPL feeds it (line by
+    /// line, accumulating while `wants_more`, blank/comment lines included)
+    /// — what a wasm host driving `eval`/`wantsMore` does.
+    #[test]
+    fn a_multiline_script_runs_when_fed_line_by_line_with_wants_more() {
+        let src = "n: 3\n\n/ note\nt: zip `a`b!\n    (til n)\n    (n ? 5)\n\nt\n";
+        let mut vm = Vm::new();
+        let mut buf = String::new();
+        for line in src.lines() {
+            buf = if buf.is_empty() { line.to_string() } else { format!("{buf}\n{line}") };
+            if wants_more(&buf) { continue; }
+            let (_, err) = eval_capture(&buf, &mut vm);
+            assert!(err.is_none(), "{buf:?}: {err:?}");
+            buf.clear();
+        }
+        assert_eq!(vm.tables["t"].shape(), (3, 2));
+    }
+
     /// A `log` write happens before the statement's own failure, so it has to
     /// survive in the captured output rather than being discarded with it.
     #[test]
@@ -1151,25 +1205,5 @@ mod tests {
         let (out, err) = eval_capture("f[]", &mut vm);
         assert_eq!(out, "before\n");
         assert!(err.is_some());
-    }
-}
-#[cfg(test)]
-mod tmp_probe {
-    use super::*;
-    #[test]
-    fn probe() {
-        let src = std::fs::read_to_string("examples/random_table.qpl").unwrap();
-        let mut vm = Vm::new();
-        println!("WHOLE FILE: {:?}", eval_capture(&src, &mut vm).1);
-        let mut vm = Vm::new();
-        for (i, l) in src.lines().enumerate() {
-            let (_, e) = eval_capture(l, &mut vm);
-            if let Some(e) = e { println!("line {}: {:?} -> {e}", i + 1, l); }
-        }
-        let mut vm = Vm::new();
-        for (i, (_, s)) in logical_statements(&src).iter().enumerate() {
-            let (_, e) = eval_capture(s, &mut vm);
-            println!("stmt {i}: {:?}", e);
-        }
     }
 }
