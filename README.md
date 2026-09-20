@@ -269,6 +269,11 @@ l[1 3 4]                        / i64[3]: 20 40 50 — index, or gather
 l + 2                           / elementwise; scalars broadcast
 nums where x > 25               / filter a list by its own values, `x` is the element
 til 5                           / i64[5]: 0 1 2 3 4
+("ab" "cd" "ef")                / str[3] — space-separated strings; parens keep it apart from other values
+enlist 23                       / i64[1]: 23 — one-element list of any atom (`enlist "a"` is a str[1])
+3?6                             / i64[3]: 3 random ints in 0..5, drawn with replacement
+2 ? 10 20 30 40                 / 2 random picks from the list (any list: ints, syms, strings, a column)
+5?2.5                           / f64[5]: uniform in [0, 2.5)
 zip `cola`colb!a b              / build a table from named lists
 ```
 
@@ -529,6 +534,8 @@ operator's own input.
 | `over` | window, with verbs `rn` / `rank` / `drank` |
 | `i` | virtual row-index column, printed as `x` |
 | `til` | `til n` -> `0..n-1`; `lo til hi` -> `lo..hi-1` |
+| `enlist` | `enlist x` -> the one-element list of the atom `x` (a string is one atom) |
+| `?` | roll: `n?6` -> `n` random ints below 6; `n?list` -> `n` random elements, with replacement. (Prefix `?[c;a;b]` is the conditional) |
 | `zip` | build a table from a dict of named lists |
 | `lj` `ij` `rj` | left / inner / right join |
 | `{...}` | lambda |

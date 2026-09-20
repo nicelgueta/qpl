@@ -1153,3 +1153,23 @@ mod tests {
         assert!(err.is_some());
     }
 }
+#[cfg(test)]
+mod tmp_probe {
+    use super::*;
+    #[test]
+    fn probe() {
+        let src = std::fs::read_to_string("examples/random_table.qpl").unwrap();
+        let mut vm = Vm::new();
+        println!("WHOLE FILE: {:?}", eval_capture(&src, &mut vm).1);
+        let mut vm = Vm::new();
+        for (i, l) in src.lines().enumerate() {
+            let (_, e) = eval_capture(l, &mut vm);
+            if let Some(e) = e { println!("line {}: {:?} -> {e}", i + 1, l); }
+        }
+        let mut vm = Vm::new();
+        for (i, (_, s)) in logical_statements(&src).iter().enumerate() {
+            let (_, e) = eval_capture(s, &mut vm);
+            println!("stmt {i}: {:?}", e);
+        }
+    }
+}

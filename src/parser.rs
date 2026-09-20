@@ -8,6 +8,11 @@ use crate::tokens::{Token, TokenKind};
 pub struct Parser {
     tokens: Vec<Token>,
     i: usize,
+    /// Do juxtaposed string literals (`"a" "b"`) fold into one `StrVec`? On
+    /// everywhere except the top level of a `log` argument list, where
+    /// juxtaposition already means "separate items to concatenate" — there a
+    /// string vector needs parens (`log ("a" "b")`). See [`Parser::with_str_runs`].
+    str_runs: bool,
 }
 
 impl Parser {
@@ -542,11 +547,7 @@ impl Parser {
             }
             self.next();
             let right = self.parse_expr_inner(windows)?;
-            return Ok(Expr::BinOp {
-                left: Box::new(left),
-                op,
-                right: Box::new(right),
-            });
+            return Ok(binop(left, op, right));
         }
         // `like`: q-glob match, a real binary operator like `=`/`<>` — just
         // spelled as a bareword rather than an `Op` token.
@@ -621,7 +622,7 @@ impl Parser {
         {
             self.next();
             let right = self.parse_expr_inner(true)?;
-            return Ok(Expr::BinOp { left: Box::new(win), op, right: Box::new(right) });
+            return Ok(binop(win, op, right));
         }
         Ok(win)
     }
@@ -701,11 +702,8 @@ impl Parser {
                 return Ok(Expr::Cast { target, expr: Box::new(expr) });
             }
             self.next();
-            return Ok(Expr::BinOp {
-                left: Box::new(left),
-                op,
-                right: Box::new(self.parse_expr_no_call()?),
-            });
+            let right = self.parse_expr_no_call()?;
+            return Ok(binop(left, op, right));
         }
         Ok(left)
     }
@@ -949,7 +947,7 @@ impl Parser {
                     self.next(); // `[`
                     let mut args = Vec::new();
                     while self.peek() != &TokenKind::RBracket {
-                        args.push(self.parse_expr_no_call()?);
+                        args.push(self.with_str_runs(false, |p| p.parse_expr_no_call())?);
                         if self.peek() == &TokenKind::Semicolon {
                             self.next();
                         }
@@ -1098,10 +1096,21 @@ impl Parser {
     /// starts here (see `try_parse_table_operand`), otherwise an ordinary
     /// expression.
     fn parse_call_arg(&mut self) -> Result<Expr, QplError> {
-        match self.try_parse_table_operand()? {
+        self.with_str_runs(true, |p| match p.try_parse_table_operand()? {
             Some(e) => Ok(e),
-            None => self.parse_expr(),
-        }
+            None => p.parse_expr(),
+        })
+    }
+
+    /// Runs `f` with string-run folding set to `on`, restoring the previous
+    /// setting afterwards (also on error) — a bracket or paren group is its
+    /// own context, so `log ("a" "b")` / `log[f["a" "b"]]` fold even though the
+    /// enclosing `log` argument list doesn't.
+    fn with_str_runs<T>(&mut self, on: bool, f: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = std::mem::replace(&mut self.str_runs, on);
+        let out = f(self);
+        self.str_runs = outer;
+        out
     }
 
     /// Operand of `<n>#…`: a table expression (`select …`, `` `tbl ``) or a noun
@@ -1147,6 +1156,15 @@ impl Parser {
         match self.next() {
             TokenKind::Int(n)      => Ok(Expr::Lit(Value::Int(n))),
             TokenKind::Float(n)    => Ok(Expr::Lit(Value::Float(n))),
+            // a run of juxtaposed strings is a string-vector literal: `"a" "b"`
+            TokenKind::Str(s) if self.str_runs && matches!(self.peek(), TokenKind::Str(_)) => {
+                let mut v = vec![s];
+                while let TokenKind::Str(next) = self.peek() {
+                    v.push(next.clone());
+                    self.next();
+                }
+                Ok(Expr::Lit(crate::ast::str_vec(v)))
+            }
             TokenKind::Str(s)      => Ok(Expr::Lit(Value::Str(s))),
             TokenKind::Bool(b)     => Ok(Expr::Lit(Value::Bool(b))),
             TokenKind::BoolVec(v)  => Ok(Expr::Lit(crate::ast::bool_vec(v))),
@@ -1154,6 +1172,9 @@ impl Parser {
             TokenKind::Symbol(s)   => Ok(Expr::Sym(s)),
             TokenKind::Temporal(v) => Ok(Expr::Lit(v)),
             TokenKind::Name(n) if n == "i" => Ok(Expr::IColRef),
+            // `enlist <value>` — the one-element list of an atom. A literal
+            // folds here; anything else is applied at run time (`resolve::eval_value`).
+            TokenKind::Name(n) if n == "enlist" => Ok(enlist(self.parse_value()?)),
             // Every other bare name — including `.qpl.dt`/`.qpl.tm`/`.qpl.ts`/`.qpl.dlta`
             // and any other namespaced name — is an ordinary variable/table/function
             // reference, resolved by lookup (see `Vm::lookup`, `resolve::call_niladic`).
@@ -1166,13 +1187,38 @@ impl Parser {
                 Ok(negate(rhs))
             }
             TokenKind::LParen      => {
-                let expr = self.parse_expr()?;
+                let expr = self.with_str_runs(true, |p| p.parse_expr())?;
                 self.eat(&TokenKind::RParen)?;
                 Ok(expr)
             },
 
             other => Err(QplError::Parse(format!("Unexpected token in primary: {:?}", other))),
         }
+    }
+}
+
+/// `<left> <op> <right>`. `?` (roll: `3?6`, `2?10 20 30`) isn't a scalar
+/// operator, so it lowers to `Call { func: "?", args: [right, left] }` —
+/// value context only, evaluated by `resolve::eval_value` like `til`.
+fn binop(left: Expr, op: String, right: Expr) -> Expr {
+    if op == "?" {
+        return Expr::Call { func: op, args: vec![right, left] };
+    }
+    Expr::BinOp { left: Box::new(left), op, right: Box::new(right) }
+}
+
+/// `enlist <operand>`: a literal atom folds to the one-element vector
+/// straight away (so it works anywhere a literal does, e.g. in a `where`);
+/// anything else defers to run time as `Call { func: "enlist", .. }`.
+fn enlist(operand: Expr) -> Expr {
+    let folded = match &operand {
+        Expr::Lit(v) => v.enlist(),
+        Expr::Sym(s) => Some(crate::ast::sym_vec(vec![s.clone()])),
+        _ => None,
+    };
+    match folded {
+        Some(v) => Expr::Lit(v),
+        None => Expr::Call { func: "enlist".into(), args: vec![operand] },
     }
 }
 
@@ -1211,7 +1257,7 @@ fn is_column_expr(te: &TableExpr) -> bool {
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Stmt, QplError> {
-    let mut parser = Parser { tokens, i: 0 };
+    let mut parser = Parser { tokens, i: 0, str_runs: true };
     let stmt = parser.parse_stmt()?;
     parser.eat(&TokenKind::Eof)?;
     Ok(stmt)
@@ -1222,7 +1268,7 @@ pub fn parse(tokens: Vec<Token>) -> Result<Stmt, QplError> {
 /// and concatenates the rendered values. Top-level juxtaposition separates
 /// items rather than forming a call — see [`Parser::parse_expr_no_call`].
 pub fn parse_expr_seq(tokens: Vec<Token>) -> Result<Vec<Expr>, QplError> {
-    let mut parser = Parser { tokens, i: 0 };
+    let mut parser = Parser { tokens, i: 0, str_runs: false };
     let mut exprs = Vec::new();
     while !matches!(parser.peek(), TokenKind::Eof) {
         exprs.push(parser.parse_expr_no_call()?);
@@ -1400,6 +1446,54 @@ mod tests {
             Expr::Lit(Value::Str("test".into())),
             Expr::Lit(Value::Str("me".into())),
         ]);
+    }
+
+    #[test]
+    fn expr_seq_str_run_needs_parens_to_be_a_vector() {
+        // top level of a `log` argument list: juxtaposition means separate items
+        assert_eq!(seq("\"a\" \"b\" \"c\"").len(), 3);
+        // parenthesised: one string vector
+        assert_eq!(seq("(\"a\" \"b\") \"c\""), vec![
+            Expr::Lit(crate::ast::str_vec(vec!["a".into(), "b".into()])),
+            Expr::Lit(Value::Str("c".into())),
+        ]);
+    }
+
+    #[test]
+    fn str_run_outside_log_is_a_str_vec() {
+        assert_eq!(p("x: \"a\" \"b\""), Stmt::ScalarAssign {
+            name: "x".into(),
+            expr: Expr::Lit(crate::ast::str_vec(vec!["a".into(), "b".into()])),
+        });
+        assert_eq!(p("(\"a\" \"b\")"), Stmt::SingleVar(
+            Expr::Lit(crate::ast::str_vec(vec!["a".into(), "b".into()]))));
+    }
+
+    #[test]
+    fn enlist_literal_folds_to_a_vector_literal() {
+        assert_eq!(p("enlist 23"), Stmt::SingleVar(Expr::Lit(crate::ast::int_vec(vec![23]))));
+        assert_eq!(p("enlist \"s\""), Stmt::SingleVar(Expr::Lit(crate::ast::str_vec(vec!["s".into()]))));
+        assert_eq!(p("enlist `s"), Stmt::SingleVar(Expr::Lit(crate::ast::sym_vec(vec!["s".into()]))));
+    }
+
+    #[test]
+    fn enlist_of_a_name_defers_to_a_call() {
+        assert_eq!(p("enlist n"), Stmt::SingleVar(Expr::Call {
+            func: "enlist".into(),
+            args: vec![Expr::ColRef("n".into())],
+        }));
+    }
+
+    #[test]
+    fn question_mark_infix_is_a_roll_call_with_the_list_first() {
+        assert_eq!(p("3?6"), Stmt::SingleVar(Expr::Call {
+            func: "?".into(),
+            args: vec![Expr::Lit(Value::Int(6)), Expr::Lit(Value::Int(3))],
+        }));
+        assert_eq!(p("2 ? 10 20"), Stmt::SingleVar(Expr::Call {
+            func: "?".into(),
+            args: vec![Expr::Lit(crate::ast::int_vec(vec![10, 20])), Expr::Lit(Value::Int(2))],
+        }));
     }
 
     #[test]

@@ -102,6 +102,27 @@ impl Value {
         }
     }
 
+    /// The one-element vector of an atomic scalar (`enlist`); `None` for
+    /// anything that has no vector counterpart (a vector already, a handle, a closure).
+    pub fn enlist(&self) -> Option<Value> {
+        use Value::*;
+        Some(match self {
+            Int(n) => int_vec(vec![*n]),
+            Float(f) => float_vec(vec![*f]),
+            Bool(b) => bool_vec(vec![*b]),
+            Str(s) => str_vec(vec![s.clone()]),
+            Sym(s) => sym_vec(vec![s.clone()]),
+            Date(d) => date_vec(vec![*d]),
+            Month(m) => month_vec(vec![*m]),
+            Time(t) => time_vec(vec![*t]),
+            Minute(m) => minute_vec(vec![*m]),
+            Second(s) => second_vec(vec![*s]),
+            Timestamp(t) => timestamp_vec(vec![*t]),
+            Timespan(t) => timespan_vec(vec![*t]),
+            _ => return None,
+        })
+    }
+
     /// Build a vector `Value` of the given kind from a backing `Series`.
     pub fn from_vec(kind: VecKind, s: Series) -> Value {
         match kind {
@@ -129,16 +150,13 @@ pub fn str_vec(v: Vec<String>) -> Value { Value::StrVec(str_series(v)) }
 pub fn date_vec(v: Vec<i32>) -> Value { Value::DateVec(Series::new("".into(), v)) }
 // `month` / `minute` / `second` have no native Polars dtype (only `date` /
 // `time` / `datetime` / `duration` do), so — matching `CastTarget::Prim`,
-// which only ever resolves those three for a *scalar* cast — nothing yet
-// materialises a `MonthVec`/`MinuteVec`/`SecondVec` from a real column.
-// These constructors exist so the type itself has full parity with every
-// other atomic scalar (see `VecKind`), ready for a future producer.
-#[allow(dead_code)]
+// which only ever resolves those three for a *scalar* cast — nothing
+// materialises a `MonthVec`/`MinuteVec`/`SecondVec` from a real column; only
+// `enlist` produces them. The type has full parity with every other atomic
+// scalar (see `VecKind`), ready for a real producer.
 pub fn month_vec(v: Vec<i32>) -> Value { Value::MonthVec(Series::new("".into(), v)) }
 pub fn time_vec(v: Vec<i64>) -> Value { Value::TimeVec(Series::new("".into(), v)) }
-#[allow(dead_code)]
 pub fn minute_vec(v: Vec<i32>) -> Value { Value::MinuteVec(Series::new("".into(), v)) }
-#[allow(dead_code)]
 pub fn second_vec(v: Vec<i32>) -> Value { Value::SecondVec(Series::new("".into(), v)) }
 pub fn timestamp_vec(v: Vec<i64>) -> Value { Value::TimestampVec(Series::new("".into(), v)) }
 pub fn timespan_vec(v: Vec<i64>) -> Value { Value::TimespanVec(Series::new("".into(), v)) }

@@ -22,6 +22,7 @@ reimplementation: `Repl.eval` calls `repl::eval_capture`, which wraps the same
 | `repl.rowCount(name)` | rows in the table bound to `name`, for paging. The language's `count` counts non-null values in a table's first column, so it can't be used for this |
 | `repl.evalArrow(line)` | like `eval`, but a table result comes back as data: `{ output, error, ipc }` where `ipc` is a `Uint8Array` Arrow IPC stream of the whole, untruncated result (`output` is then empty), or `null` for a scalar / list / assignment |
 | `repl.wantsMore(src)` | the CLI's `qpl) ` vs `  ...  ` rule: is this statement unfinished? |
+| `repl.symbols()` | what is bound right now, for completion: `{ tables: [{ name, columns?, rows? }], variables: [name], functions: [name] }`, sorted by name. Lazy plans are listed as tables without `columns`/`rows` |
 | `repl.loadDemo()` | binds the demo `trades` / `quotes` tables (`--load-demo`) |
 | `repl.version()` | interpreter version, for a banner |
 | `qplLangConfig()` | editor configuration — see below |

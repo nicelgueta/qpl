@@ -10,6 +10,7 @@
 use polars::prelude::*;
 use crate::ast::{self, Alias, Expr, SelectStmt, TableExpr, TableSource, Value};
 use crate::errors::QplError;
+use crate::helpers;
 use crate::vm::{Lookup, Vm};
 #[cfg(feature = "ipc")]
 use crate::vm::EvalResult;
@@ -99,6 +100,19 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
         {
             apply_function(vm, expr, std::slice::from_ref(idx))
         }
+
+        // `enlist <value>` (non-literal operand; a literal is folded by the
+        // parser) — the one-element list of an atom. Ahead of the generic
+        // call below so nothing can shadow the keyword.
+        Expr::Call { func, args } if func == "enlist" && args.len() == 1 => {
+            let v = expect_scalar(eval_value(vm, &args[0])?)?;
+            v.enlist().map(EvalValue::Scalar).ok_or_else(|| {
+                QplError::Runtime("'enlist' expects a single atom, not a list or function".into())
+            })
+        }
+
+        // `3?6` / `2?10 20 30` — roll (`Parser::binop` lowers `?` to this).
+        Expr::Call { func, args } if func == "?" && args.len() == 2 => eval_roll(vm, args),
 
         // `f x` — monadic user-function/builtin application (juxtaposition).
         Expr::Call { func, args } if vm.is_callable(func) => {
@@ -432,6 +446,39 @@ fn eval_til(vm: &mut Vm, args: &[Expr]) -> Result<EvalValue, QplError> {
         )));
     }
     Ok(EvalValue::Scalar(ast::int_vec((lo..hi).collect())))
+}
+
+/// `<n>?<x>` — `n` random items drawn with replacement. `args` is `[x, n]`
+/// (right operand first, like `til`'s). `x` is an int `hi` (ints in `0..hi`),
+/// a float `hi` (floats in `[0, hi)`) or a list of any kind (random elements).
+fn eval_roll(vm: &mut Vm, args: &[Expr]) -> Result<EvalValue, QplError> {
+    let n = match expect_scalar(eval_value(vm, &args[1])?)? {
+        Value::Int(n) if n >= 0 => n as usize,
+        other => return Err(QplError::Runtime(format!(
+            "'?' expects a non-negative int count on the left, got {other:?}"
+        ))),
+    };
+    let rolled = match to_list(vm, &args[0])? {
+        Value::Int(hi) if hi > 0 => {
+            ast::int_vec((0..n).map(|_| helpers::rand_below(hi as u64) as i64).collect())
+        }
+        Value::Int(hi) => return Err(QplError::Runtime(format!(
+            "'?' needs a positive upper bound to roll ints in, got {hi}"
+        ))),
+        Value::Float(hi) => ast::float_vec((0..n).map(|_| hi * helpers::rand_unit()).collect()),
+        list if is_list_value(&list) => {
+            let len = list.as_vec().expect("checked by is_list_value").1.len();
+            if len == 0 && n > 0 {
+                return Err(QplError::Runtime("'?' cannot roll from an empty list".into()));
+            }
+            let idx: Vec<i64> = (0..n).map(|_| helpers::rand_below(len as u64) as i64).collect();
+            index_list(list, &idx)?
+        }
+        other => return Err(QplError::Runtime(format!(
+            "'?' expects an int, float or list on the right, got {other:?}"
+        ))),
+    };
+    Ok(EvalValue::Scalar(rolled))
 }
 
 /// `zip `k1`k2!v1 v2` — evaluate each dict value to a list and assemble them,
@@ -874,6 +921,115 @@ mod tests {
             EvalResult::Stored => "stored",
             EvalResult::Scalar(_) => "scalar",
             EvalResult::Lazy(_) => "lazy",
+        }
+    }
+
+    fn strs(v: &Value) -> Vec<String> {
+        v.vec_strings().expect("a string/symbol list")
+    }
+
+    #[test]
+    fn juxtaposed_strings_are_a_str_vec() {
+        let mut vm = make_vm();
+        assert_eq!(scalar(&mut vm, r#"("string1" "string2")"#), ast::str_vec(vec!["string1".into(), "string2".into()]));
+        assert_eq!(scalar(&mut vm, r#""a" "b" "c""#), ast::str_vec(vec!["a".into(), "b".into(), "c".into()]));
+        // a string vector composes as a value: bindable, indexable
+        scalar_or_stored(&mut vm, r#"v: ("a" "b" "c")"#);
+        assert_eq!(scalar(&mut vm, "v[1]"), Value::Str("b".into()));
+    }
+
+    fn scalar_or_stored(vm: &mut Vm, src: &str) {
+        run_vm(src, vm).expect("run");
+    }
+
+    #[test]
+    fn enlist_makes_a_one_element_vector_of_any_atom() {
+        let mut vm = make_vm();
+        assert_eq!(scalar(&mut vm, "enlist 23"), ast::int_vec(vec![23]));
+        assert_eq!(scalar(&mut vm, "enlist 1.5"), ast::float_vec(vec![1.5]));
+        assert_eq!(scalar(&mut vm, "enlist 1b"), ast::bool_vec(vec![true]));
+        assert_eq!(scalar(&mut vm, "enlist `a"), ast::sym_vec(vec!["a".into()]));
+        // a string is one atom, not a list of characters
+        assert_eq!(scalar(&mut vm, r#"enlist "hello""#), ast::str_vec(vec!["hello".into()]));
+        assert_eq!(scalar(&mut vm, "enlist 2024.03.15"), ast::date_vec(vec![8840]));
+    }
+
+    #[test]
+    fn enlist_of_a_variable_or_expression_is_evaluated_at_run_time() {
+        let mut vm = make_vm();
+        scalar_or_stored(&mut vm, "n: 5");
+        assert_eq!(scalar(&mut vm, "enlist n"), ast::int_vec(vec![5]));
+        assert_eq!(scalar(&mut vm, "enlist n + 1"), ast::int_vec(vec![6]));
+        assert_eq!(scalar(&mut vm, "enlist first t`c2"), ast::int_vec(vec![10]));
+    }
+
+    #[test]
+    fn enlist_rejects_a_list() {
+        assert!(run_vm("enlist 1 2 3", &mut make_vm()).is_err());
+    }
+
+    #[test]
+    fn roll_ints_draws_n_values_below_the_bound() {
+        let mut vm = make_vm();
+        for _ in 0..20 {
+            let v = scalar(&mut vm, "50?6");
+            let got: Vec<i64> = v.as_vec().unwrap().1.i64().unwrap().into_no_null_iter().collect();
+            assert_eq!(got.len(), 50);
+            assert!(got.iter().all(|n| (0..6).contains(n)), "{got:?}");
+        }
+    }
+
+    #[test]
+    fn roll_actually_varies() {
+        let mut vm = make_vm();
+        let v = scalar(&mut vm, "200?1000000");
+        let got: Vec<i64> = v.as_vec().unwrap().1.i64().unwrap().into_no_null_iter().collect();
+        let distinct: std::collections::HashSet<_> = got.iter().collect();
+        assert!(distinct.len() > 150, "200 draws from 1e6 had only {} distinct values", distinct.len());
+    }
+
+    #[test]
+    fn roll_from_a_list_picks_its_elements_with_replacement() {
+        let mut vm = make_vm();
+        let v = scalar(&mut vm, "2 ? 10 20 30 40");
+        assert_eq!(v.as_vec().unwrap().1.len(), 2);
+        let v = scalar(&mut vm, "30 ? 10 20");
+        let got: Vec<i64> = v.as_vec().unwrap().1.i64().unwrap().into_no_null_iter().collect();
+        assert_eq!(got.len(), 30, "more draws than elements: replacement");
+        assert!(got.iter().all(|n| *n == 10 || *n == 20));
+        // works for any list kind, and for a column
+        let v = scalar(&mut vm, "20 ? `a`b`c");
+        assert!(matches!(v, Value::SymVec(_)) && strs(&v).iter().all(|s| ["a", "b", "c"].contains(&s.as_str())));
+        let v = scalar(&mut vm, r#"20 ? ("x" "y")"#);
+        assert!(matches!(v, Value::StrVec(_)) && strs(&v).iter().all(|s| s == "x" || s == "y"));
+        let v = scalar(&mut vm, "20 ? t`c2");
+        assert!(v.as_vec().unwrap().1.i64().unwrap().into_no_null_iter().all(|n| [10, 20, 30, 15].contains(&n)));
+    }
+
+    #[test]
+    fn roll_floats_and_zero_count() {
+        let mut vm = make_vm();
+        let v = scalar(&mut vm, "50?2.5");
+        let got: Vec<f64> = v.as_vec().unwrap().1.f64().unwrap().into_no_null_iter().collect();
+        assert_eq!(got.len(), 50);
+        assert!(got.iter().all(|f| (0.0..2.5).contains(f)));
+        assert_eq!(scalar(&mut vm, "0?5").as_vec().unwrap().1.len(), 0);
+    }
+
+    #[test]
+    fn roll_composes_with_other_expressions() {
+        let mut vm = make_vm();
+        scalar_or_stored(&mut vm, "n: 4");
+        assert_eq!(scalar(&mut vm, "count n?100"), Value::Int(4));
+        let v = scalar(&mut vm, "100 + 3?1");
+        assert_eq!(v, ast::int_vec(vec![100, 100, 100]));
+    }
+
+    #[test]
+    fn roll_rejects_bad_operands() {
+        let mut vm = make_vm();
+        for bad in ["-1?5", "3?0", "3?`a", "1.5?5"] {
+            assert!(run_vm(bad, &mut vm).is_err(), "{bad} should be an error");
         }
     }
 

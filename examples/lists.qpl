@@ -1,0 +1,19 @@
+/ String vectors: space-separated strings. Parens keep one apart from
+/ neighbouring values (and `log` treats bare juxtaposition as separate items).
+names: ("ann" "bob" "cy")
+names
+log ("ann" "bob") " and " "cy"
+
+/ enlist: the one-element list of an atom
+enlist 23
+enlist "solo"
+enlist `sym
+
+/ ? (roll): random draws with replacement
+3?6                       / 3 ints in 0..5
+2 ? 10 20 30 40           / 2 picks from a list
+5 ? names                 / picks from a string vector
+4 ? `buy`sell             / picks from a symbol vector
+3?1.0                     / 3 floats in [0, 1)
+picks: 4 ? trades`price   / from a table column
+picks

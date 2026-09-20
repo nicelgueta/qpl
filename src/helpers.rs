@@ -181,3 +181,38 @@ mod tests {
         Ok(())
     }
 }
+/// Next value of a thread-local splitmix64 stream, seeded once per thread from
+/// OS randomness (the browser's `Math.random` on wasm, where std has none).
+/// Not cryptographic — it backs the `?` roll operator only.
+pub fn rand_u64() -> u64 {
+    use std::cell::Cell;
+    thread_local!(static STATE: Cell<u64> = Cell::new(seed()));
+    STATE.with(|s| {
+        let x = s.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+        s.set(x);
+        let z = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        let z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    })
+}
+
+#[cfg(all(feature = "wasm", target_family = "wasm"))]
+fn seed() -> u64 {
+    (js_sys::Math::random() * 9_007_199_254_740_992.0) as u64
+}
+
+#[cfg(not(all(feature = "wasm", target_family = "wasm")))]
+fn seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new().build_hasher().finish()
+}
+
+/// Uniform in `0..n` (`n > 0`).
+pub fn rand_below(n: u64) -> u64 {
+    ((rand_u64() as u128 * n as u128) >> 64) as u64
+}
+
+/// Uniform in `[0, 1)`.
+pub fn rand_unit() -> f64 {
+    (rand_u64() >> 11) as f64 / (1u64 << 53) as f64
+}

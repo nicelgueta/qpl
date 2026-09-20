@@ -135,6 +135,14 @@ impl Repl {
         repl::wants_more(src)
     }
 
+    /// What the session has bound right now, for editor completion:
+    /// `{ tables: [{ name, columns, rows? }], variables: [name], functions: [name] }`.
+    /// Lazy plans count as tables (no `columns`/`rows`: resolving a plan's
+    /// schema can be expensive). Sorted by name.
+    pub fn symbols(&self) -> JsValue {
+        js_sys::JSON::parse(&symbols_json(&self.vm).to_string()).expect("serde_json output is valid JSON")
+    }
+
     /// Bind the demo `trades` / `quotes` tables — the `--load-demo` flag.
     #[wasm_bindgen(js_name = loadDemo)]
     pub fn load_demo(&mut self) {
@@ -344,6 +352,34 @@ fn to_regex(obj: &JsValue, key: &str) {
     set(obj, key, &js_sys::RegExp::new(&pattern, "").into());
 }
 
+/// The session's top-level bindings as JSON (see [`Repl::symbols`]).
+fn symbols_json(vm: &Vm) -> Json {
+    use crate::ast::Value;
+    let mut tables: Vec<Json> = vm
+        .tables
+        .iter()
+        .map(|(name, df)| {
+            let columns: Vec<String> = df.get_column_names().iter().map(|c| c.to_string()).collect();
+            json!({ "name": name, "columns": columns, "rows": df.height() })
+        })
+        .chain(vm.lazy_frames.keys().map(|name| json!({ "name": name })))
+        .collect();
+    tables.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+
+    let mut variables = Vec::new();
+    let mut functions = Vec::new();
+    for (name, v) in &vm.globals {
+        if matches!(v, Value::Closure(_)) {
+            functions.push(name.clone());
+        } else {
+            variables.push(name.clone());
+        }
+    }
+    variables.sort();
+    functions.sort();
+    json!({ "tables": tables, "variables": variables, "functions": functions })
+}
+
 fn set(obj: &JsValue, key: &str, value: &JsValue) {
     let _ = Reflect::set(obj, &key.into(), value);
 }
@@ -401,6 +437,19 @@ mod tests {
             .unwrap().as_object().unwrap();
         let keys: Vec<&String> = cases.keys().collect();
         assert_eq!(keys.last().map(|k| k.as_str()), Some("@default"), "{keys:?}");
+    }
+
+    #[test]
+    fn symbols_lists_tables_variables_and_functions() {
+        let mut vm = Vm::new();
+        repl::load_demo_tables(&mut vm);
+        repl::eval_capture("n: 3", &mut vm);
+        repl::eval_capture("f: {[x] x + 1}", &mut vm);
+        let s = symbols_json(&vm);
+        let trades = s["tables"].as_array().unwrap().iter().find(|t| t["name"] == "trades").unwrap();
+        assert!(trades["columns"].as_array().unwrap().iter().any(|c| c == "price"));
+        assert_eq!(s["variables"], json!(["n"]));
+        assert_eq!(s["functions"], json!(["f"]));
     }
 
     #[test]

@@ -6,6 +6,8 @@ Runnable `.qpl` scripts. All paths assume you run them from the repo root.
 |--------|---------------|
 | [`basics.qpl`](basics.qpl) | Core language: projection, aliases, scalar vars, `where`, `by` aggregation, `?[...]` conditional, `order`, casts |
 | [`config_and_round.qpl`](config_and_round.qpl) | `.qpl.cfg` session knobs (`maxrow`/`maxcol`/`tblwidth`/`strlen`/`round_type`) and the `round` column function |
+| [`lists.qpl`](lists.qpl) | Building lists: string vectors (`("a" "b")`), `enlist`, and `?` (roll) for random draws |
+| [`random_table.qpl`](random_table.qpl) | A random table with a column of nearly every data type, built from `zip`, `?` (roll) and casts |
 | [`window_functions.qpl`](window_functions.qpl) | `<expr> over `key`, and the ranking verbs `rn` / `rank` / `drank` with an `order` sub-clause |
 | [`multiline.qpl`](multiline.qpl) | Statements spanning multiple lines via tab / 4-space indentation |
 | [`logging.qpl`](logging.qpl) | `log` / `1` stdout writes and `\1 <path>` stdout mirroring |
