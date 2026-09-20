@@ -8,7 +8,6 @@
 //! column to a scalar, and slices / indexes lists.
 
 use polars::prelude::*;
-
 use crate::ast::{self, Alias, Expr, SelectStmt, TableExpr, TableSource, Value};
 use crate::errors::QplError;
 use crate::vm::{Lookup, Vm};
