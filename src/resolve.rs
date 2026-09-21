@@ -481,6 +481,39 @@ fn eval_roll(vm: &mut Vm, args: &[Expr]) -> Result<EvalValue, QplError> {
     Ok(EvalValue::Scalar(rolled))
 }
 
+/// One `zip` column: the dict value evaluated to a list, as a `Series` with
+/// the dtype the table column should have.
+fn zip_column(vm: &mut Vm, name: &str, expr: &Expr) -> Result<Series, QplError> {
+    // A cast at the top of the value (`i8$n ? 100`, `` `$syms ``, `f32$xs`) is
+    // applied to the column directly: a list `Value` only holds i64 / f64 /
+    // str / bool / temporal, so going through one would lose the narrower
+    // integer / float widths and the categorical.
+    if let Expr::Cast { target, expr: inner } = expr {
+        let list = to_list(vm, inner)?;
+        if !is_list_value(&list) {
+            return Err(QplError::Runtime(format!("'zip' column '{name}' is not a list: {list:?}")));
+        }
+        let lf = list_to_lazy(list)?;
+        let casted = vm.build_cast_expr(target, col("x"), Some(&lf))?;
+        let df = lf.select([casted.alias("x")]).collect().map_err(rt)?;
+        return Ok(df.column("x").map_err(rt)?.as_materialized_series().clone());
+    }
+    let list_val = expect_scalar(eval_value(vm, expr)?)?;
+    let (kind, s) = list_val.as_vec().ok_or_else(|| {
+        QplError::Runtime(format!("'zip' column '{name}' is not a list: {list_val:?}"))
+    })?;
+    // a temporal list holds kdb offsets (days / ns since 2000); the column
+    // must carry the native Polars dtype, so give it the same conversion a
+    // literal gets in any query (`ast_val_to_expr`)
+    if matches!(kind, ast::VecKind::Date | ast::VecKind::Month | ast::VecKind::Time
+        | ast::VecKind::Minute | ast::VecKind::Second | ast::VecKind::Timestamp | ast::VecKind::Timespan)
+    {
+        let df = list_to_lazy(list_val.clone())?.collect().map_err(rt)?;
+        return Ok(df.column("x").map_err(rt)?.as_materialized_series().clone());
+    }
+    Ok(s.clone())
+}
+
 /// `zip `k1`k2!v1 v2` — evaluate each dict value to a list and assemble them,
 /// in order, into a table (kdb's `flip` of a column dict, under a friendlier
 /// name). Every value must be list-shaped and the same length.
@@ -499,10 +532,7 @@ fn eval_zip(vm: &mut Vm, dict_expr: &Expr) -> Result<EvalValue, QplError> {
     let mut len = None;
     let mut columns = Vec::with_capacity(pairs.len());
     for (name, expr) in pairs {
-        let list_val = expect_scalar(eval_value(vm, expr)?)?;
-        let (_, s) = list_val.as_vec().ok_or_else(|| {
-            QplError::Runtime(format!("'zip' column '{name}' is not a list: {list_val:?}"))
-        })?;
+        let s = &zip_column(vm, name, expr)?;
         match len {
             None => len = Some(s.len()),
             Some(l) if l != s.len() => {
@@ -1031,6 +1061,31 @@ mod tests {
         for bad in ["-1?5", "3?0", "3?`a", "1.5?5"] {
             assert!(run_vm(bad, &mut vm).is_err(), "{bad} should be an error");
         }
+    }
+
+    #[test]
+    fn zip_gives_temporal_lists_their_native_dtype() {
+        let mut vm = make_vm();
+        scalar_or_stored(&mut vm, "ts: `timestamp$1700000000000000000 1700086400123456789");
+        scalar_or_stored(&mut vm, "t2: zip `ts`day`tm`span!(ts) (`date$ts) (`time$ts) (`timespan$5 6)");
+        let df = &vm.tables["t2"];
+        let dtypes: Vec<_> = df.dtypes().iter().map(|d| d.to_string()).collect();
+        assert_eq!(dtypes, ["datetime[ns]", "date", "time", "duration[ns]"]);
+        assert_eq!(df.null_count().sum_horizontal(NullStrategy::Ignore).unwrap().unwrap().u32().unwrap().get(0), Some(0));
+        // and the values survive the round trip through the column
+        assert_eq!(scalar(&mut vm, "t2`day"), scalar(&mut vm, "`date$ts"));
+    }
+
+    #[test]
+    fn zip_applies_a_top_level_cast_to_the_column_keeping_its_dtype() {
+        let mut vm = make_vm();
+        scalar_or_stored(&mut vm, "t3: zip `a`b`c`d`e!(i8$10 20 30) (i32$1 2 3) (f32$3 ? 1.0) (`$`x`y`x) (`timestamp$1700000000000000000 1700000000000000001 1700000000000000002)");
+        let dtypes: Vec<_> = vm.tables["t3"].dtypes().iter().map(|d| d.to_string()).collect();
+        assert_eq!(dtypes, ["i8", "i32", "f32", "cat", "datetime[ns]"]);
+        // an operand may itself be a roll
+        scalar_or_stored(&mut vm, "t4: zip `a!(i8$5 ? 100)");
+        assert_eq!(vm.tables["t4"].dtypes()[0].to_string(), "i8");
+        assert_eq!(vm.tables["t4"].height(), 5);
     }
 
     #[test]
