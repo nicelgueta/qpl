@@ -2317,7 +2317,7 @@ dependencies = [
 
 [[package]]
 name = "qpl"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "clap",
  "js-sys",
