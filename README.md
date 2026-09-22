@@ -67,6 +67,23 @@ silicon are on the [releases page](../../releases).
 The [client/server][ipc] is built in by default (`ipc` feature); build with
 `--no-default-features` to drop it and its two extra dependencies.
 
+### Editor support
+
+The [VSCode extension](tools/vscode/) adds syntax highlighting, autocomplete,
+and a Ctrl+Enter REPL — install it straight from the Marketplace as
+[`nicelgueta.qpl`](https://marketplace.visualstudio.com/items?itemName=nicelgueta.qpl).
+
+### Try it in a browser, no install
+
+qpl also compiles to WebAssembly, running free in your browser at
+[FastBoard](https://nicelgueta.github.io/fastboard/board/). Add a **Code
+Editor** widget there and set its language to `qpl` — it's a Monaco editor,
+the same one VSCode is built on, so it gets the same syntax highlighting and
+autocomplete as the extension. 
+You can also add a **Data Table** widget too, upload a CSV
+or Parquet file, and link the editor to it to route query results into the
+table instead of the CLI output. It all runs client-side as compiled wasm in a Web Worker — there's no backend, so nothing you upload ever leaves the browser tab. Check the network tab under dev tools if you don't believe me. 
+
 ## Quickstart
 
 ```bash
@@ -83,10 +100,7 @@ qpl) t: select from trades where size > 100     / bind a table
 qpl) t sink "big.parquet"                       / stream it to a file
 ```
 
-Runnable scripts are in [`examples/`](examples/), and there's a
-[VSCode extension](tools/vscode/) with syntax highlighting, autocomplete, and
-a Ctrl+Enter REPL — install it straight from the Marketplace as
-[`nicelgueta.qpl`](https://marketplace.visualstudio.com/items?itemName=nicelgueta.qpl).
+Runnable scripts are in [`examples/`](examples/).
 
 ## Why?
 

@@ -41,7 +41,9 @@ qpl --version
 Once that responds, [Quickstart](quickstart.md) has you querying data within
 a couple of lines.
 
-## Editor support - VSCode users
+## Editor support
+
+### VSCode extension
 
 The [VSCode extension](https://marketplace.visualstudio.com/items?itemName=nicelgueta.qpl)
 (`nicelgueta.qpl` on the Marketplace) adds syntax highlighting, autocomplete
@@ -49,3 +51,19 @@ for keywords/builtins/table and column names, and a Ctrl+Enter binding that
 sends the current line or selection to a REPL running alongside the editor —
 install it and go straight to editing `.qpl` files with the interpreter one
 keystroke away.
+
+### Try it in a browser, no install
+
+qpl also compiles to WebAssembly, and that build is running live at
+[FastBoard](https://nicelgueta.github.io/fastboard/board/) — free to try with
+nothing to install. Open the board, add a **Code Editor** widget, and set its
+language to `qpl`. The editor is Monaco, the same editor VSCode is built on,
+so it comes with the same syntax highlighting and autocomplete as the
+extension above, straight from the wasm-compiled interpreter.
+
+You can also add a **Data Table** widget alongside it, upload your own CSV or Parquet, and link the Code Editor's target table to it to route query results straight
+into the table — a way to poke at qpl against real data without leaving the
+browser tab. Because the interpreter is compiled to wasm and runs entirely
+client-side, in a Web Worker, nothing you upload is ever sent to a server —
+there isn't one for this to talk to. Query it, chart it, close the tab, and
+none of it left your machine. Check the network tab under dev tools if you don't believe me. 
