@@ -1,4 +1,4 @@
-# qpl — Quick Polars Query Language
+# qpl — Quick Polars Language
 
 qpl is a query language with two rather different parents. The syntax comes
 from kdb+/q, so it's terse to the point of looking cryptic until it suddenly

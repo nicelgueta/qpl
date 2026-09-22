@@ -94,7 +94,14 @@ shape: (1, 2)
 ```
 
 In SQL that needs a correlated subquery. Here it's two statements, and the
-first one is reusable.
+first one is reusable — handy when several later queries need the same
+`top`. When you don't need to reuse it, skip the intermediate name and write
+the reduction straight into the `where`, wrapped in parentheses so qpl can
+tell it's a single value and not a column reference:
+
+```qpl
+select sym, price from trades where price >= (max price)
+```
 
 Verbs that don't reduce — `cumsum`, `abs`, and the parameterised ones like
 `2 round` — return another list of the same length instead.
@@ -148,14 +155,20 @@ Following q, a parenthesised expression can also be indexed by just putting
 the indices after it: `` (trades`price) 2 3 `` means the same as
 `` (trades`price)[2 3] ``.
 
-One limitation to note: `where` attaches to a column expression *before* it
-becomes a list. Once you've bound a list to a name, that form is no longer
-available, so filter first and materialise second.
+One limitation to note: the `where` in `trades\`price where size > 100` filters
+the *table's* rows by any of its columns, before the one column is extracted.
+Once a list is bound to a name, that particular form is gone — a bound list
+has no other columns left to filter by, so `size` is no longer in scope. (A
+list still has a `where` of its own after that point, just a different one —
+filtering by the list's *own* values, covered later in this chapter — so
+don't read "no longer available" as "lists can't be filtered.")
 
 ## Arithmetic on whole lists
 
-Because a list is a Series, operators apply elementwise. A list against a
-scalar broadcasts the scalar across every element:
+Like in **array programming** languages: operators work on whole lists at once instead
+of looping over elements, the same style kdb+/q and NumPy use. Because a list
+is a Series, operators apply elementwise. A list against a scalar broadcasts
+the scalar across every element:
 
 ```qpl
 qpl) l: 10 20 30 40 50

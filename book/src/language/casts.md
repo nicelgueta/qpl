@@ -51,8 +51,7 @@ The available types are `f64` (or `float`), `f32`, `i64` (or `int`), `i32`,
 ## Casting a whole query
 
 The thing on the right of `$` doesn't have to be a bare column reference —
-a whole `select` (or `update`/`collect`/…) works too, and casts its
-one-column result:
+a whole `select` (or `update`/`collect`/…) works too:
 
 ```qpl
 qpl) `date$select ts from trades where sym = "AAPL"
@@ -61,6 +60,13 @@ qpl) `date$select ts from trades where sym = "AAPL"
 ```
 date[3]: 2024.03.15 2024.03.15 2024.03.15
 ```
+
+This only makes sense for a **single-column** query — the cast applies to
+one column and returns a list, not a table. If the query returns more than
+one column, the cast doesn't error; it silently casts the *first* column
+and drops the rest, so `` `date$select ts, sym from trades `` gives back the
+dates only, with `sym` discarded. Keep the query to the one column you
+actually want cast.
 
 ## Width only matters in a column
 
@@ -106,12 +112,11 @@ qpl) 1 + int$"42"
 i64: 43
 ```
 
-## A word about evaluation order
+## Evaluation order bites here first
 
-That last example is a convenient place to mention something that applies to
-the whole language rather than just to casts. qpl evaluates right to left,
-following q. With `+` it makes no visible difference, but with an operator
-that doesn't commute it very much does.
+[Expressions](expressions.md) already introduced qpl's right-to-left
+evaluation order, but a cast is usually where it's first felt in practice,
+because a cast tends to be the innermost thing in an expression.
 
 Writing `int$"42" - 1` doesn't subtract one from forty-two. Reading right to
 left, the `-` is applied first, so qpl tries to cast the result of

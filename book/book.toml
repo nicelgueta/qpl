@@ -2,7 +2,7 @@
 title = "qpl"
 authors = ["Nick Elgueta"]
 language = "en"
-description = "Quick Polars Query Language — a kdb+/q-inspired CLI query language that compiles to Polars lazy frames."
+description = "Quick Polars Language — a kdb+/q-inspired CLI query language that compiles to Polars lazy frames."
 src = "src"
 
 [output.html]

@@ -6,7 +6,7 @@ use qpl::{repl, vm};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
-#[command(name = "qpl", about = "Quick Polars Query Language", version)]
+#[command(name = "qpl", about = "Quick Polars Language", version)]
 struct Cli {
     /// Script file to execute (.qpl)
     file: Option<String>,

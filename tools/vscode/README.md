@@ -1,6 +1,6 @@
 # qpl for VSCode
 
-Editor support for [`qpl`](../../README.md) — the Quick Polars Query Language.
+Editor support for [`qpl`](../../README.md) — the Quick Polars Language.
 
 ## Features
 

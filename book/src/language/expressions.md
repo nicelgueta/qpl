@@ -42,6 +42,21 @@ works the same way in every context:
 select neg_mv: -price from trades
 ```
 
+## A word about evaluation order
+
+This is worth internalising early, because it applies to every expression in
+the language, not just the operators above: qpl evaluates right to left,
+following q, rather than the left-to-right order most languages use. With `+`
+or `*` that's invisible, but with anything that doesn't commute it changes the
+answer.
+
+`10 - 3 - 2` doesn't give `5`; reading right to left, `3 - 2` happens first,
+then `10 - 1`, giving `9`. Parentheses make the order explicit whenever it
+matters: `(10 - 3) - 2` is the `5` a left-to-right reader would expect.
+[Casts](casts.md) is where this most often catches people out, because a cast
+tends to sit innermost in an expression — but the rule is general, so keep it
+in mind anywhere you chain non-commutative operators.
+
 ## Conditionals
 
 `?[...]` is the vectorised conditional, and it's the piece of syntax most

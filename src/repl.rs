@@ -267,7 +267,7 @@ pub fn start(vm: &mut Vm) {
     let mut rl = DefaultEditor::new().expect("failed to create line editor");
 
     println!(
-        "qpl v{} (Quick Polars Query Language) REPL - \\d disassemble, \\l <path> run a script, \\i \"<path>\" import as a namespace, \\1 <path> log stdout",
+        "qpl v{} (Quick Polars Language) REPL - \\d disassemble, \\l <path> run a script, \\i \"<path>\" import as a namespace, \\1 <path> log stdout",
         env!("CARGO_PKG_VERSION")
     );
 
