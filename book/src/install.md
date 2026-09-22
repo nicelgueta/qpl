@@ -40,3 +40,12 @@ qpl --version
 
 Once that responds, [Quickstart](quickstart.md) has you querying data within
 a couple of lines.
+
+## Editor support - VSCode users
+
+The [VSCode extension](https://marketplace.visualstudio.com/items?itemName=nicelgueta.qpl)
+(`nicelgueta.qpl` on the Marketplace) adds syntax highlighting, autocomplete
+for keywords/builtins/table and column names, and a Ctrl+Enter binding that
+sends the current line or selection to a REPL running alongside the editor —
+install it and go straight to editing `.qpl` files with the interpreter one
+keystroke away.

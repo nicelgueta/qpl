@@ -84,8 +84,9 @@ qpl) t sink "big.parquet"                       / stream it to a file
 ```
 
 Runnable scripts are in [`examples/`](examples/), and there's a
-[VSCode extension](tools/vscode/) with syntax highlighting and a Ctrl+Enter
-REPL.
+[VSCode extension](tools/vscode/) with syntax highlighting, autocomplete, and
+a Ctrl+Enter REPL — install it straight from the Marketplace as
+[`nicelgueta.qpl`](https://marketplace.visualstudio.com/items?itemName=nicelgueta.qpl).
 
 ## Why?
 
