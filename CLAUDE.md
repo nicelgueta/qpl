@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `qpl` (Quick Polars Language) is a CLI interpreter for a kdb+/q-inspired
-query language that compiles to Polars **lazy** frames. It is a single Rust
+language that compiles to Polars **lazy** frames. It is a single Rust
 binary with no runtime dependencies (no Python). The language surface, examples,
 and rationale are documented in [README.md](README.md) and [examples/](examples/) —
 read those for language semantics; this file covers build/dev workflow and

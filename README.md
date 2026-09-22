@@ -1,6 +1,6 @@
 # qpl — Quick Polars Language
 
-qpl is a query language with two rather different parents. The syntax comes
+qpl is a language with two rather different parents. The syntax comes
 from kdb+/q, so it's terse to the point of looking cryptic until it suddenly
 doesn't. The engine underneath is [Polars](https://pola.rs), so the queries
 run at a speed competitive with DuckDB. Nothing else is involved: qpl is a

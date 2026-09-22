@@ -1,6 +1,6 @@
 # qpl VSCode Extension — Plan
 
-Syntax highlighting + autocomplete for the `qpl` query language.
+Syntax highlighting + autocomplete for the `qpl` language.
 
 ## Approach
 
