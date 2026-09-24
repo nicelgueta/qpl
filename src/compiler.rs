@@ -336,6 +336,8 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
             "`dispatch` is only valid outside a select projection".into())),
         Expr::ListWhere { .. } => return Err(QplError::Compile(
             "a list `where` is only valid outside a select projection".into())),
+        Expr::While { .. } | Expr::Noop => return Err(QplError::Compile(
+            "`while` / `noop` are only valid outside a select projection".into())),
     }
     Ok(())
 }
@@ -783,5 +785,14 @@ mod tests {
             col("c3"), int(2), op("*"), alias("dbl"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
             SelectBy, Result,
         ]);
+    }
+
+    #[test]
+    fn while_and_noop_are_rejected_inside_a_select() {
+        for src in ["select noop from t", "select a: while[1b; 2] from t"] {
+            let stmt = parse(tokenise(src).expect("lex error")).expect("parse error");
+            let err = compile(&stmt).expect_err("value-context only");
+            assert!(err.to_string().contains("only valid outside a select"), "{err}");
+        }
     }
 }

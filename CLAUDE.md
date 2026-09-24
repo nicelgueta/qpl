@@ -84,6 +84,7 @@ carries across lines because the same `Vm` is reused.
 | `vm_config` | `VmConfig` — session knobs set by `.qpl.cfg key=value` (`maxcol`, `maxrow`, `tblwidth`, `strlen`, `round_type`, `useqepoch`); a new knob is a field + a `VmConfig::set` arm and nothing else |
 | `errors` | `QplError` (Lex/Parse/Compile/Runtime variants) — the single error type threaded everywhere |
 | `wasm` | `wasm` feature only (`#[cfg(feature = "wasm")] mod wasm;` in `lib.rs`). `Repl` (a `Vm` behind `eval(line)`, driven by `repl::eval_capture` — same `run_line` the terminal REPL uses, with output captured instead of printed) and `qplLangConfig()` (Monaco tokenizer/config/completions, built at compile time from `tools/vscode/`'s JSON). Builds only against a patched Polars (stock 0.55.2 doesn't compile for `wasm32-unknown-unknown`) — [`tools/wasm/README.md`](tools/wasm/README.md) has the build steps and the patch |
+| `interrupt` | Ctrl-C flag (`Interrupt`, an `Arc` of two atomics on `Vm`). The `cli` handler in `main.rs` sets it; the interpreter polls `vm.interrupt.check()` (each `while` iteration, function entry, `exec_stmt`, around Polars `collect`s, IPC waits) and returns `QplError::Interrupted`. Each top-level statement runs under `interrupt.statement()` (in `repl::run_line`) |
 | `ipc` | `ipc` feature only (`#[cfg(feature = "ipc")]`, `mod ipc;` in `main.rs` is itself gated). Client (`hopen`/`dispatch`/`async dispatch`/`await`) and server (`\port`) over a plain `zeromq` REQ/REP pair — see the IPC subsection below |
 
 ### VM state and evaluation model
@@ -114,6 +115,15 @@ lazy. `run_vm` returns an `EvalResult`: `Table(DataFrame)`, `Scalar(Value)`,
 `Lazy(String)` (an explained plan, printed instead of a table), or `Stored`
 (an assignment — nothing to print).
 
+`while[..]` and `noop` are value-context `Expr` variants tree-walked in
+`resolve::eval_value` like `Case` (no instruction, no compiler lowering);
+`EvalValue::Noop` is what they yield, and `Instruction::Eval` pushes nothing for
+it, which is why `x: noop` fails at `Assign` (empty stack) with "cannot assign a
+no-op expression.". `exec_stmt` runs one statement in the current scope and is
+shared by function bodies and `while` bodies. `while` and `noop` are reserved
+words (`parser::RESERVED`); the conditional stays `?[..]` (atom condition: short-circuit; boolean-vector condition: `resolve::eval_case_vector`, elementwise via a Polars `when/then` with a length check), and functions stay
+pure (only plain assignment or a `while` body changes outer state).
+
 **Scalars are evaluated in Rust, not Polars.** `Vm::eval_scalar` folds
 literal/global-only expressions to a `Value`; at query time those values are
 injected as Polars `lit(...)` so `threshold: 150` composes with column
@@ -128,7 +138,7 @@ On by default (drop it with `--no-default-features`); `zeromq`/`tokio` are
 `optional` deps in `Cargo.toml`, pulled in only by `ipc = ["dep:tokio", "dep:zeromq"]`
 and enabled by default via `default = ["ipc"]`. This is the one place the codebase
 is not fully synchronous, and it's deliberately confined: `Vm` itself is never
-shared across threads (no `Arc`/`Mutex` anywhere in it) — every connection's
+shared across threads (the one exception is `interrupt`, an `Arc` of atomics that only the Ctrl-C handler touches; no `Mutex` anywhere) — every connection's
 worker thread (client) and the listener thread (server, `\port`) only ever
 exchange owned `String`/`Vec<u8>` values over `std::sync::mpsc`, and the *only*
 thread that ever calls into `resolve::eval_value`/`vm::run_vm` is the main

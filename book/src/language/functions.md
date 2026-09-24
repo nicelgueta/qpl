@@ -59,6 +59,22 @@ qpl) fac[5]
 i64: 120
 ```
 
+With an atom condition only the taken branch is evaluated, which is what stops
+the recursion. Pass a boolean *vector* instead and `?[...]` is elementwise, so
+the same expression works on a whole list at once (see
+[Expressions](expressions.md#outside-a-query)):
+
+```qpl
+qpl) pick: {[m] ?[m; 1; 0]}
+qpl) pick[1011b]
+```
+
+```
+i64[4]: 1 0 1 1
+```
+
+See [Control flow](control-flow.md) for `while` loops and `noop`.
+
 ## Writing a body across multiple lines
 
 Semicolons are only needed to fit more than one statement on the same

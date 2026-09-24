@@ -112,11 +112,11 @@
       "patterns": [
         {
           "name": "keyword.control.qpl",
-          "match": "\\b(select|by|from|where|over|order|asc|desc|distinct|limit|drop|update|delete|lj|ij|rj|like|dispatch)\\b"
+          "match": "\\b(select|by|from|where|over|order|asc|desc|distinct|limit|drop|update|delete|while|lj|ij|rj|like|dispatch)\\b"
         },
         {
           "name": "keyword.other.qpl",
-          "match": "\\b(load|sink|cols|lazy|collect|til|enlist|zip|hopen|await|async)\\b"
+          "match": "\\b(load|sink|cols|lazy|collect|til|enlist|noop|zip|hopen|await|async)\\b"
         }
       ]
     },

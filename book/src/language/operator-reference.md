@@ -14,7 +14,9 @@ explains it.
 | `/` | comment to end of line | [Comments](comments.md) |
 | `:` | bind a name; also alias a column in a query | [Assignment](assignment.md) |
 | `` `x `` | a symbol | [Symbols](symbols.md) |
-| `?[...]` | vectorised conditional | [Expressions](expressions.md) |
+| `?[...]` | conditional: vectorised in a select; outside one an atom picks a branch, a vector gives an elementwise result of the same length | [Expressions](expressions.md) |
+| `while[test; s1; ...]` | loop: run statements in the current scope while `test` holds | [Control flow](control-flow.md) |
+| `noop` | nothing: prints nothing, can't be assigned or used as a value | [Control flow](control-flow.md) |
 | `like` | glob pattern match | [Expressions](expressions.md) |
 | `round` | `<n> round <col>`, mode from `.qpl.cfg round_type` | [Expressions](expressions.md) |
 | `quantile` `shift` `lag` `lead` `diff` `pctchange` | parameter-on-the-left verbs | [Expressions](expressions.md) |

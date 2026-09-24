@@ -50,6 +50,9 @@ pub struct Vm {
     pub last_table: Option<DataFrame>,
     /// Session-wide knobs set from `.qpl.cfg key=value ...`.
     pub config: VmConfig,
+    /// Ctrl-C flag, set by the `cli` signal handler and polled at check points
+    /// (see [`crate::interrupt`]).
+    pub interrupt: crate::interrupt::Interrupt,
     /// Open `hopen` connections, keyed by the `Value::Handle` id returned to
     /// the caller. `ipc` feature only.
     #[cfg(feature = "ipc")]
@@ -166,6 +169,7 @@ impl Vm {
             #[cfg(feature = "wasm")]
             last_table: None,
             config: VmConfig::default(),
+            interrupt: crate::interrupt::Interrupt::default(),
             #[cfg(feature = "ipc")]
             connections: HashMap::new(),
             #[cfg(feature = "ipc")]
@@ -551,14 +555,18 @@ impl Vm {
     /// [`EvalResult`]. The instruction loop itself lives in [`Vm::run_program`]
     /// so it can be reused by [`Vm::eval_frame`].
     pub fn eval(&mut self, program: Vec<Instruction>) -> Result<EvalResult, QplError> {
+        self.interrupt.check()?;
         let (mut stack, lazy_mode) = self.run_program(program)?;
+        self.interrupt.check()?;
         if let Some(last_item) = stack.pop() {
             match last_item {
                 StackObj::Frame(lf) => {
                     if lazy_mode {
                         return Ok(EvalResult::Lazy(explain_plan(&lf)));
                     }
-                    Ok(EvalResult::Table(lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?))
+                    let df = lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?;
+                    self.interrupt.check()?;
+                    Ok(EvalResult::Table(df))
                 }
                 StackObj::Scalar(s) => Ok(EvalResult::Scalar(s)),
                 typ => Err(QplError::Runtime(format!("Unexpected type on stack: {}", typ.type_name()))),
@@ -572,6 +580,7 @@ impl Vm {
     /// whether it should stay lazy. Used by `resolve::eval_value` to compose a
     /// column expression with reductions / slices without collecting early.
     pub(crate) fn eval_frame(&mut self, mut program: Vec<Instruction>) -> Result<(LazyFrame, bool), QplError> {
+        self.interrupt.check()?;
         program.push(Instruction::Result);
         let (mut stack, lazy_mode) = self.run_program(program)?;
         match stack.pop() {
@@ -660,6 +669,9 @@ impl Vm {
                             resolve::EvalValue::Scalar(v) => v,
                             resolve::EvalValue::Frame { .. } => return Err(QplError::Runtime(format!(
                                 "'{name}' returns a table — it can't be used inside a column expression"
+                            ))),
+                            resolve::EvalValue::Noop => return Err(QplError::Runtime(format!(
+                                "'{name}' returns nothing — it can't be used inside a column expression"
                             ))),
                         };
                         stack.push(StackObj::Expr(ast_val_to_expr(val)?));
@@ -894,6 +906,8 @@ impl Vm {
                             }
                             stack.push(StackObj::Frame(lf));
                         }
+                        // nothing to push: `eval` then reports `Stored`
+                        resolve::EvalValue::Noop => {}
                     }
                 }
 
@@ -905,7 +919,10 @@ impl Vm {
 
                 Instruction::Assign(name) => {
                     self.check_write_allowed("assignment")?;
-                    match pop1(&mut stack)? {
+                    let value = stack.pop().ok_or_else(|| {
+                        QplError::Runtime("cannot assign a no-op expression.".into())
+                    })?;
+                    match value {
                         StackObj::Scalar(s) => {
                             self.bind_global(name, s)?;
                         }

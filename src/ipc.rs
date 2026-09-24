@@ -25,6 +25,7 @@ use polars::prelude::*;
 
 use crate::ast;
 use crate::errors::QplError;
+use crate::interrupt::Interrupt;
 use crate::vm::EvalResult;
 
 fn rt<E: std::fmt::Display>(e: E) -> QplError {
@@ -39,6 +40,7 @@ fn rt<E: std::fmt::Display>(e: E) -> QplError {
 fn error_message(e: &QplError) -> String {
     match e {
         QplError::Lex(m) | QplError::Parse(m) | QplError::Compile(m) | QplError::Runtime(m) => m.clone(),
+        QplError::Interrupted => "interrupted".to_string(),
     }
 }
 
@@ -179,16 +181,36 @@ pub fn enqueue(conn: &ClientConn, command: String) -> Result<ReplyRx, QplError> 
     Ok(reply_rx)
 }
 
+/// Wait for a reply, waking every 50 ms to honour Ctrl-C. On interrupt the
+/// receiver is simply dropped by a sync caller: the connection worker ignores
+/// the failed `send`, having already finished the REQ/REP round trip, so the
+/// handle stays usable.
+fn recv_interruptible(rx: &ReplyRx, interrupt: &Interrupt) -> Result<EvalResult, QplError> {
+    loop {
+        interrupt.check()?;
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(reply) => return reply,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(QplError::Runtime("connection closed before replying".into()))
+            }
+        }
+    }
+}
+
 /// Blocking `dispatch`: enqueue and wait for the reply inline.
-pub fn dispatch_blocking(conn: &ClientConn, command: String) -> Result<EvalResult, QplError> {
-    enqueue(conn, command)?
-        .recv()
-        .map_err(|_| QplError::Runtime("connection closed before replying".into()))?
+pub fn dispatch_blocking(
+    conn: &ClientConn,
+    command: String,
+    interrupt: &Interrupt,
+) -> Result<EvalResult, QplError> {
+    recv_interruptible(&enqueue(conn, command)?, interrupt)
 }
 
 /// `await`: block on a reply channel previously stashed by an async dispatch.
-pub fn await_reply(rx: ReplyRx) -> Result<EvalResult, QplError> {
-    rx.recv().map_err(|_| QplError::Runtime("connection closed before replying".into()))?
+/// Borrows the receiver so an interrupted wait can be retried.
+pub fn await_reply(rx: &ReplyRx, interrupt: &Interrupt) -> Result<EvalResult, QplError> {
+    recv_interruptible(rx, interrupt)
 }
 
 // ---------------------------------------------------------------------------
@@ -674,7 +696,7 @@ mod tests {
             Ok(EvalResult::Scalar(ast::Value::Int(2)))
         });
         let conn = hopen("28901", HandleMode::Read).expect("hopen");
-        match dispatch_blocking(&conn, "1+1".into()) {
+        match dispatch_blocking(&conn, "1+1".into(), &Interrupt::default()) {
             Ok(EvalResult::Scalar(ast::Value::Int(2))) => {}
             other => panic!("expected Scalar(2), got {other:?}"),
         }
@@ -687,7 +709,7 @@ mod tests {
             Ok(EvalResult::Table(df!["a" => [1i64, 2]].unwrap()))
         });
         let conn = hopen("28902", HandleMode::Read).expect("hopen");
-        match dispatch_blocking(&conn, "select from t".into()) {
+        match dispatch_blocking(&conn, "select from t".into(), &Interrupt::default()) {
             Ok(EvalResult::Table(df)) => assert_eq!(df, df!["a" => [1i64, 2]].unwrap()),
             other => panic!("expected a table, got {other:?}"),
         }
@@ -698,7 +720,7 @@ mod tests {
     fn dispatch_surfaces_a_remote_error_locally() {
         let server = spawn_stub_server(28903, |_cmd| Err(QplError::Runtime("nope".into())));
         let conn = hopen("28903", HandleMode::Read).expect("hopen");
-        let err = dispatch_blocking(&conn, "bad".into()).expect_err("expected an error");
+        let err = dispatch_blocking(&conn, "bad".into(), &Interrupt::default()).expect_err("expected an error");
         assert_eq!(err.to_string(), QplError::Runtime("nope".into()).to_string());
         server.close();
     }
@@ -709,7 +731,7 @@ mod tests {
         let conn = hopen("28904", HandleMode::Read).expect("hopen");
         let rx = enqueue(&conn, "slow query".into()).expect("enqueue");
         // the request is already in flight; await just waits for it
-        match await_reply(rx) {
+        match await_reply(&rx, &Interrupt::default()) {
             Ok(EvalResult::Scalar(ast::Value::Int(99))) => {}
             other => panic!("expected Scalar(99), got {other:?}"),
         }
@@ -721,11 +743,11 @@ mod tests {
         let server = spawn_stub_server(28905, |cmd| Ok(EvalResult::Scalar(ast::Value::Str(cmd.to_string()))));
         let a = hopen("28905", HandleMode::Read).expect("hopen a");
         let b = hopen("28905", HandleMode::Write).expect("hopen b");
-        match dispatch_blocking(&a, "from-a".into()) {
+        match dispatch_blocking(&a, "from-a".into(), &Interrupt::default()) {
             Ok(EvalResult::Scalar(ast::Value::Str(s))) => assert_eq!(s, "from-a"),
             other => panic!("unexpected: {other:?}"),
         }
-        match dispatch_blocking(&b, "from-b".into()) {
+        match dispatch_blocking(&b, "from-b".into(), &Interrupt::default()) {
             Ok(EvalResult::Scalar(ast::Value::Str(s))) => assert_eq!(s, "from-b"),
             other => panic!("unexpected: {other:?}"),
         }
@@ -749,17 +771,89 @@ mod tests {
         });
 
         let read_conn = hopen("28907", HandleMode::Read).expect("hopen read");
-        match dispatch_blocking(&read_conn, "cmd".into()) {
+        match dispatch_blocking(&read_conn, "cmd".into(), &Interrupt::default()) {
             Ok(EvalResult::Scalar(ast::Value::Str(s))) => assert_eq!(s, "Read:cmd"),
             other => panic!("unexpected: {other:?}"),
         }
 
         let write_conn = hopen("28907", HandleMode::Write).expect("hopen write");
-        match dispatch_blocking(&write_conn, "cmd".into()) {
+        match dispatch_blocking(&write_conn, "cmd".into(), &Interrupt::default()) {
             Ok(EvalResult::Scalar(ast::Value::Str(s))) => assert_eq!(s, "Write:cmd"),
             other => panic!("unexpected: {other:?}"),
         }
 
+        server.close();
+    }
+
+    /// A server that answers `"slow"` after `delay`, everything else at once.
+    fn spawn_slow_server(port: u16, delay: std::time::Duration) -> ServerHandle {
+        spawn_stub_server(port, move |cmd| {
+            if cmd == "slow" {
+                thread::sleep(delay);
+            }
+            Ok(EvalResult::Scalar(ast::Value::Str(cmd.to_string())))
+        })
+    }
+
+    fn interrupt_after(ms: u64) -> (Interrupt, thread::JoinHandle<()>) {
+        let interrupt = Interrupt::default();
+        let i2 = interrupt.clone();
+        let t = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(ms));
+            i2.request();
+        });
+        (interrupt, t)
+    }
+
+    #[test]
+    fn an_interrupted_dispatch_leaves_the_connection_usable() {
+        let server = spawn_slow_server(28910, std::time::Duration::from_millis(400));
+        let conn = hopen("28910", HandleMode::Read).expect("hopen");
+        let (interrupt, t) = interrupt_after(50);
+        let started = std::time::Instant::now();
+        let err = dispatch_blocking(&conn, "slow".into(), &interrupt).expect_err("interrupted");
+        t.join().unwrap();
+        assert!(matches!(err, QplError::Interrupted), "{err:?}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(350), "returned before the server replied");
+        // the abandoned reply is drained by the worker; the next round trip is in step
+        match dispatch_blocking(&conn, "fast".into(), &Interrupt::default()) {
+            Ok(EvalResult::Scalar(ast::Value::Str(s))) => assert_eq!(s, "fast"),
+            other => panic!("expected the reply to `fast`, got {other:?}"),
+        }
+        server.close();
+    }
+
+    #[test]
+    fn an_interrupted_await_can_be_awaited_again() {
+        let server = spawn_slow_server(28911, std::time::Duration::from_millis(300));
+        let conn = hopen("28911", HandleMode::Read).expect("hopen");
+        let rx = enqueue(&conn, "slow".into()).expect("enqueue");
+        let (interrupt, t) = interrupt_after(50);
+        assert!(matches!(await_reply(&rx, &interrupt), Err(QplError::Interrupted)));
+        t.join().unwrap();
+        match await_reply(&rx, &Interrupt::default()) {
+            Ok(EvalResult::Scalar(ast::Value::Str(s))) => assert_eq!(s, "slow"),
+            other => panic!("expected the original reply, got {other:?}"),
+        }
+        server.close();
+    }
+
+    #[test]
+    fn an_interrupt_requested_up_front_never_blocks() {
+        let server = spawn_slow_server(28912, std::time::Duration::from_millis(300));
+        let conn = hopen("28912", HandleMode::Read).expect("hopen");
+        let interrupt = Interrupt::default();
+        interrupt.request();
+        assert!(matches!(dispatch_blocking(&conn, "slow".into(), &interrupt), Err(QplError::Interrupted)));
+        server.close();
+    }
+
+    #[test]
+    fn an_interrupted_error_crosses_the_wire_as_a_plain_error() {
+        let server = spawn_stub_server(28913, |_cmd| Err(QplError::Interrupted));
+        let conn = hopen("28913", HandleMode::Read).expect("hopen");
+        let err = dispatch_blocking(&conn, "x".into(), &Interrupt::default()).expect_err("error");
+        assert_eq!(err.to_string(), "'interrupted");
         server.close();
     }
 }

@@ -1,0 +1,57 @@
+/ ─────────────────────────────────────────────────────────────────────────────
+/ Control flow: `?[..]` for conditions, `while[..]` for loops, `noop`.
+/
+/ - `?[c1; v1; c2; v2; else]` is the conditional. Outside a select, boolean
+/   *atoms* evaluate only the branch taken, so a branch can be a function call
+/   and recursion works; a boolean *vector* is elementwise (same-length result). Functions stay pure: a call can
+/   `log`, but never assigns outer state.
+/ - `while[test; s1; s2; ..]` runs its statements in order, in the *current*
+/   scope, while `test` (a boolean atom) holds. At the top level it binds
+/   globals; inside a function it binds that function's locals.
+/ - `noop` is "nothing": it prints nothing and can't be assigned or used as
+/   a value. It's what `while` yields, and a `?[..]` branch can be `noop`.
+/ - `while` and `noop` are reserved words.
+/ - Ctrl-C stops a running loop (`'interrupted`); assignments made by earlier
+/   iterations stay.
+/
+/ Run from the repo root:
+/   cargo run -- examples/control_flow.qpl
+/ ─────────────────────────────────────────────────────────────────────────────
+
+log "a countdown"
+n: 3
+while[n>0; log[n]; n: n-1]
+
+log "accumulate: 1 + 2 + ... + 10"
+k: 1
+total: 0
+while[k<=10;
+    total: total+k;
+    k: k+1]
+total
+
+log "a while inside a function binds locals only"
+sumto: {[m] s: 0; while[m>0; s: s+m; m: m-1]; s}
+sumto[100]
+
+log "a conditional with function branches (pure, and only one is called)"
+shout: {[msg] log[msg]}
+n: 5
+?[n>3; shout["big"]; shout["small"]]
+
+log "a vector condition is elementwise; a vector branch must match its length"
+?[1011b; 1; 0]
+?[1011b; 10 20 30 40; 0]
+/ ?[1011b; 1 2 3; 0]        / 'branch has length 3, expected 4
+
+log "recursion through ?[..]"
+fac: {[x] ?[x<2; 1; x*fac[x-1]]}
+fac[5]
+
+log "noop: a branch that does nothing prints nothing"
+?[n>3; noop; shout["never printed"]]
+
+log "using a noop as a value is an error (uncomment to see it)"
+/ y: noop                     / 'cannot assign a no-op expression.
+/ y: while[0b; 1]             / 'cannot assign a no-op expression.
+/ 1 + noop                    / 'cannot use a no-op expression as a value

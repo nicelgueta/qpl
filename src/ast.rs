@@ -236,6 +236,16 @@ pub enum Expr {
     /// context only, tree-walked by `resolve::eval_value` like `Table` above —
     /// there's nothing here for the compiler to lower.
     Dispatch { conn: Box<Expr>, command: String, is_async: bool },
+    /// `while[test; s1; ...; sn]` — while `test` (a boolean atom) is true, run
+    /// the statements in order in the *current* scope (so assignments bind
+    /// whatever scope the loop sits in: globals at the top level, locals inside
+    /// a function). Yields noop. Value context only, tree-walked by
+    /// `resolve::eval_value` like `Case` — nothing for the compiler to lower.
+    While { cond: Box<Expr>, body: Vec<Stmt> },
+    /// `noop` — evaluates to nothing: prints nothing, and can be neither
+    /// assigned nor used as an operand (`resolve::EvalValue::Noop`). Value
+    /// context only.
+    Noop,
     /// `<expr> where <predicate>[, <predicate>...]` where `<expr>` is a *list*
     /// value (not a table-column expression, which has its own `where` sugar
     /// via `TableExpr::Select`'s `where_`) — filters the list elementwise.

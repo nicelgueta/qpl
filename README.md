@@ -451,6 +451,24 @@ globals, never the caller's locals — the same rule named functions have always
 followed. A function isn't a *column* value either, so `select px: inc from
 trades` is an error.
 
+### Control flow · [chapter][controlflow]
+
+`?[..]` is the conditional — with an atom condition it is lazy in its branches
+(so recursion works), with a vector condition it is elementwise and every branch
+must match its length — and functions stay pure. `while[test; s1; s2; ..]` runs statements in order in the
+current scope while a boolean test holds; `noop` is "nothing" — it prints
+nothing and can't be assigned or used as a value. `while` and `noop` are
+reserved words. Ctrl-C stops a running statement (`'interrupted`).
+
+```q
+n: 3
+while[n>0; log[n]; n: n-1]              / 3 2 1
+sumto: {[m] s: 0; while[m>0; s: s+m; m: m-1]; s}
+sumto[100]                              / 5050 — the loop binds function locals
+?[n>3; noop; log["small"]]              / a branch that does nothing
+?[1011b; 1; 0]                          / vector condition: i64[4]: 1 0 1 1
+```
+
 ### Comments, multi-line, logging, config
 
 `/` comments to end of line. In a script, a line indented by a tab or 4+
@@ -537,7 +555,9 @@ operator's own input.
 | `/` | comment to end of line |
 | `:` | bind a name; alias a column |
 | `` `x `` | symbol |
-| `?[...]` | vectorised conditional |
+| `?[...]` | conditional: vectorised in a select; outside one an atom picks a branch, a vector gives an elementwise result of the same length |
+| `while[test; s1; ...]` | loop: run statements in the current scope while `test` holds |
+| `noop` | nothing: prints nothing, can't be assigned or used as a value |
 | `like` | glob pattern match |
 | `$` | cast (`f64$x`, `` `date$x ``, `"p"$s`); `` `$x `` -> categorical |
 | `::` | enum cast (`` lvl::`$x ``) |
@@ -655,6 +675,7 @@ wasm`. [The full story](tools/wasm/README.md).
 [tableops]: https://nicelgueta.github.io/qpl/language/table-operators.html
 [window]: https://nicelgueta.github.io/qpl/language/window-functions.html
 [functions]: https://nicelgueta.github.io/qpl/language/functions.html
+[controlflow]: https://nicelgueta.github.io/qpl/language/control-flow.html
 [lazy]: https://nicelgueta.github.io/qpl/language/lazy-collect.html
 [multiline]: https://nicelgueta.github.io/qpl/language/multiline.html
 [logging]: https://nicelgueta.github.io/qpl/language/logging.html

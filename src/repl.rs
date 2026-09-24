@@ -30,6 +30,8 @@ pub fn run_script(path: &str, vm: &mut Vm) -> Result<(), QplError> {
 /// `\l`/`\i` also work nested inside a loaded/imported script, not just typed
 /// at the prompt.
 fn run_line(src: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<(), QplError> {
+    // every top-level statement — typed, or a script line — is interruptible
+    let _running = vm.interrupt.statement();
     let src = &normalize_function_body_newlines(src);
     if let Some(inner) = src.strip_prefix("\\d").map(str::trim) {
         let listing = disassemble(inner)?;
@@ -288,6 +290,7 @@ pub fn start(vm: &mut Vm) {
             match session.poll() {
                 PortEvent::Line(line) => process_submitted(&line, vm),
                 PortEvent::Request(mode, command, reply_tx) => {
+                    let _running = vm.interrupt.statement();
                     let result = vm.with_request_permission(mode, |vm| eval_for_dispatch(&command, vm));
                     let _ = reply_tx.send(crate::ipc::encode_result(&result));
                 }
@@ -561,7 +564,7 @@ pub fn load_demo_tables(vm: &mut Vm) {
 fn match_run_vm(line: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<(), QplError> {
     match eval_line(line, vm) {
         Ok(())                       => Ok(()),
-        Err(e) if path == "<main>"   => Err(e),
+        Err(e) if path == "<main>" || matches!(e, QplError::Interrupted) => Err(e),
         Err(e) => Err(QplError::Runtime(format!("{}:{}: {e}", path, lineno + 1))),
     }
 }
@@ -761,6 +764,7 @@ fn fmt_repl_error(error: &QplError) -> String {
         | QplError::Parse(message)
         | QplError::Compile(message)
         | QplError::Runtime(message) => format!("'{message}"),
+        QplError::Interrupted => "'interrupted".to_string(),
     }
 }
 
@@ -1205,5 +1209,116 @@ mod tests {
         let (out, err) = eval_capture("f[]", &mut vm);
         assert_eq!(out, "before\n");
         assert!(err.is_some());
+    }
+
+    #[test]
+    fn while_may_span_lines_in_a_script_and_in_the_repl() {
+        // script: indented continuation lines fold into the one statement
+        let stmts = logical_statements("while[k<3;\n    log k;\n    k: k+1]\nx: 1\n");
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].1.contains("k: k+1]"));
+        // REPL: an open bracket keeps reading
+        assert!(wants_more("while[k<3;"));
+        assert!(wants_more("while[k<3;\n  k: k+1"));
+        assert!(!wants_more("while[k<3;\n  k: k+1]"));
+
+        let mut vm = Vm::new();
+        run_line("k: 0", &mut vm, "<main>", 0).unwrap();
+        let (out, err) = eval_capture("while[k<3;\n    log[k];\n    k: k+1]", &mut vm);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(out, "0\n1\n2\n");
+    }
+
+    #[test]
+    fn run_script_stops_at_an_interrupted_statement() {
+        let path = std::env::temp_dir().join(format!("qpl_interrupt_test_{:?}.qpl", std::thread::current().id()));
+        std::fs::write(&path, "before: 1\nwhile[1b; noop]\nafter: 1\n").unwrap();
+        let mut vm = Vm::new();
+        let interrupt = vm.interrupt.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            interrupt.request();
+        });
+        let err = super::run_script(path.to_str().unwrap(), &mut vm).expect_err("interrupted");
+        t.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(err, crate::errors::QplError::Interrupted), "{err:?}");
+        assert!(vm.globals.contains_key("before"));
+        assert!(!vm.globals.contains_key("after"), "later lines must not run");
+    }
+
+    #[test]
+    fn while_and_noop_print_nothing() {
+        let mut vm = Vm::new();
+        let (out, err) = eval_capture("n: 0", &mut vm);
+        assert_eq!((out.as_str(), err), ("", None));
+        let (out, err) = eval_capture("while[n<3; n: n+1]", &mut vm);
+        assert_eq!((out.as_str(), err), ("", None));
+        let (out, err) = eval_capture("noop", &mut vm);
+        assert_eq!((out.as_str(), err), ("", None));
+    }
+
+    #[test]
+    fn a_noop_assignment_reports_the_error_and_the_session_continues() {
+        let mut vm = Vm::new();
+        let (out, err) = eval_capture("x: noop", &mut vm);
+        assert_eq!(out, "");
+        assert_eq!(err.as_deref(), Some("'cannot assign a no-op expression."));
+        let (out, err) = eval_capture("1+1", &mut vm);
+        assert_eq!((out.as_str(), err), ("i64: 2\n", None));
+    }
+
+    #[test]
+    fn an_interrupted_statement_reports_interrupted_and_the_session_continues() {
+        let mut vm = Vm::new();
+        let interrupt = vm.interrupt.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            interrupt.request();
+        });
+        let (out, err) = eval_capture("while[1b; noop]", &mut vm);
+        t.join().unwrap();
+        assert_eq!(out, "");
+        assert_eq!(err.as_deref(), Some("'interrupted"));
+        let (out, err) = eval_capture("1+1", &mut vm);
+        assert_eq!((out.as_str(), err), ("i64: 2\n", None));
+    }
+
+    #[test]
+    fn an_interrupt_in_a_loaded_script_keeps_its_variant() {
+        // `\l` runs the script under its own path, which normally wraps a
+        // failure as `path:line: ..` text — an interrupt must stay an interrupt.
+        let path = std::env::temp_dir().join(format!("qpl_interrupt_nested_{:?}.qpl", std::thread::current().id()));
+        std::fs::write(&path, "while[1b; noop]\n").unwrap();
+        let mut vm = Vm::new();
+        let interrupt = vm.interrupt.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            interrupt.request();
+        });
+        let err = run_line(&format!("\\l {}", path.to_str().unwrap()), &mut vm, "<main>", 0)
+            .expect_err("interrupted");
+        t.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(err, crate::errors::QplError::Interrupted), "{err:?}");
+        // and the outer statement's guard has been released
+        assert!(vm.interrupt.check().is_ok());
+    }
+
+    #[test]
+    fn a_script_error_in_a_while_body_names_the_script_line() {
+        let path = std::env::temp_dir().join(format!("qpl_while_err_{:?}.qpl", std::thread::current().id()));
+        std::fs::write(&path, "ok: 1\nwhile[1b; nosuch[1]]\n").unwrap();
+        let mut vm = Vm::new();
+        let err = super::run_script(path.to_str().unwrap(), &mut vm).expect_err("should fail");
+        let _ = std::fs::remove_file(&path);
+        assert!(err.to_string().contains(":2:"), "{err}");
+    }
+
+    #[test]
+    fn a_while_with_a_trailing_comment_and_blank_continuation_folds_into_one_statement() {
+        let stmts = logical_statements("while[k<2;   / loop\n    k: k+1]\n\nafter: 1\n");
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].1.contains("k: k+1]"));
     }
 }

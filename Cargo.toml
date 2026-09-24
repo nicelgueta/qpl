@@ -68,10 +68,13 @@ js-sys = { version = "0.3", optional = true }
 # and `@default` must come last. serde_json's default map sorts keys, which put it in the
 # middle and made every keyword after it (`select`, `from`, `like`, ...) unreachable.
 serde_json = { version = "1", optional = true, features = ["preserve_order"] }
+# `cli` only — turns Ctrl-C during a running statement into a cooperative
+# interrupt (see `interrupt.rs` / `main.rs`) instead of killing the session.
+ctrlc = { version = "3.5.2", optional = true }
 
 [features]
 default = ["cli", "ipc"]
-cli = ["dep:clap", "dep:rustyline", "dep:mimalloc"]
+cli = ["dep:clap", "dep:rustyline", "dep:mimalloc", "dep:ctrlc"]
 ipc = ["dep:tokio", "dep:zeromq"]
 # Browser target: `wasm-pack build --target web --no-default-features --features wasm`.
 # Mutually exclusive with `ipc` (no sockets) and `cli` (no terminal).

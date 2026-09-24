@@ -9,6 +9,7 @@ Runnable `.qpl` scripts. All paths assume you run them from the repo root.
 | [`lists.qpl`](lists.qpl) | Building lists: string vectors (`("a" "b")`), `enlist`, and `?` (roll) for random draws |
 | [`random_table.qpl`](random_table.qpl) | A random table with a column of nearly every data type, built from `zip`, `?` (roll) and casts |
 | [`window_functions.qpl`](window_functions.qpl) | `<expr> over `key`, and the ranking verbs `rn` / `rank` / `drank` with an `order` sub-clause |
+| [`control_flow.qpl`](control_flow.qpl) | `while[..]` loops, `noop`, and `?[..]` with function branches |
 | [`multiline.qpl`](multiline.qpl) | Statements spanning multiple lines via tab / 4-space indentation |
 | [`logging.qpl`](logging.qpl) | `log` / `1` stdout writes and `\1 <path>` stdout mirroring |
 | [`lazy_and_collect.qpl`](lazy_and_collect.qpl) | `lazy` to keep a query plan, extend it by re-assignment, print the plan, `collect` to a table |

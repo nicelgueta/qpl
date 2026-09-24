@@ -68,5 +68,10 @@
     "prefix": "over",
     "body": "select ${1:col}, ${2:rn}: rn over ${3:keys} from ${4:table}",
     "description": "window function (rn/rank/drank/shift/lag/lead) partitioned by `over`"
+  },
+  "while": {
+    "prefix": "while",
+    "body": "while[${1:test}; ${2:statement}]",
+    "description": "while[test; s1; s2; ...] \u2014 loop while the boolean test holds"
   }
 }

@@ -5,6 +5,18 @@ use crate::builtins::BuiltIn;
 use crate::errors::QplError;
 use crate::tokens::{Token, TokenKind};
 
+/// Words that can't be bound as a variable or parameter name: `while[..]` and
+/// `noop` are parsed straight off the token stream (see `parse_primary`), so a
+/// same-named binding would be unreachable.
+const RESERVED: &[&str] = &["while", "noop"];
+
+fn check_not_reserved(name: &str) -> Result<(), QplError> {
+    if RESERVED.contains(&name) {
+        return Err(QplError::Parse(format!("'{name}' is a reserved word")));
+    }
+    Ok(())
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     i: usize,
@@ -74,6 +86,7 @@ impl Parser {
                 unreachable!()
             };
             self.eat(&TokenKind::Colon)?;
+            check_not_reserved(&name)?;
             // `name: {[..] ..}` — binding a function literal. Ordinary scalar
             // assignment of an ordinary value (see `Value::Closure`); it only
             // short-circuits `parse_body` here because a leading `{` has no
@@ -158,6 +171,7 @@ impl Parser {
             self.next();
             while let TokenKind::Name(p) = self.peek().clone() {
                 self.next();
+                check_not_reserved(&p)?;
                 params.push(p);
                 if self.peek() != &TokenKind::Comma {
                     break;
@@ -737,6 +751,34 @@ impl Parser {
         Ok(Some(Expr::Cast { target, expr: Box::new(expr) }))
     }
 
+    /// `while[test; s1; ...; sn]` (the `while` already consumed, sat on `[`).
+    /// Every slot is a full statement, so the body may assign; the test must be
+    /// an expression.
+    fn parse_while(&mut self) -> Result<Expr, QplError> {
+        self.eat(&TokenKind::LBracket)?;
+        let mut slots = Vec::new();
+        loop {
+            if matches!(self.peek(), TokenKind::Semicolon | TokenKind::RBracket) {
+                return Err(QplError::Parse("empty slot in `while[..]` — use noop".into()));
+            }
+            slots.push(self.parse_stmt()?);
+            if self.peek() != &TokenKind::Semicolon {
+                break;
+            }
+            self.next();
+        }
+        self.eat(&TokenKind::RBracket)?;
+        if slots.len() < 2 {
+            return Err(QplError::Parse("`while[..]` requires a test and at least one statement".into()));
+        }
+        let mut slots = slots.into_iter();
+        let cond = match slots.next() {
+            Some(Stmt::SingleVar(e)) => Box::new(e),
+            _ => return Err(QplError::Parse("a `while` test must be an expression, not an assignment or table statement".into())),
+        };
+        Ok(Expr::While { cond, body: slots.collect() })
+    }
+
     fn parse_case(&mut self) -> Result<Expr, QplError> {
         self.eat(&TokenKind::LBracket)?;
         let mut terms = vec![self.parse_expr()?];
@@ -1175,6 +1217,9 @@ impl Parser {
             // `enlist <value>` — the one-element list of an atom. A literal
             // folds here; anything else is applied at run time (`resolve::eval_value`).
             TokenKind::Name(n) if n == "enlist" => Ok(enlist(self.parse_value()?)),
+            TokenKind::Name(n) if n == "noop" => Ok(Expr::Noop),
+            TokenKind::Name(n) if n == "while" && self.peek() == &TokenKind::LBracket => self.parse_while(),
+            TokenKind::Name(n) if n == "while" => Err(QplError::Parse("'while' is a reserved word".into())),
             // Every other bare name — including `.qpl.dt`/`.qpl.tm`/`.qpl.ts`/`.qpl.dlta`
             // and any other namespaced name — is an ordinary variable/table/function
             // reference, resolved by lookup (see `Vm::lookup`, `resolve::call_niladic`).
@@ -2538,6 +2583,94 @@ mod tests {
         let tokens = tokenise("`w!1+1").expect("lex error");
         assert!(parse(tokens).is_err());
     }
+
+    fn parse_err(src: &str) -> String {
+        match parse(tokenise(src).expect("lex error")) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected a parse error for {src:?}"),
+        }
+    }
+
+    #[test]
+    fn while_parses_a_test_and_a_body() {
+        match p("while[x>0; log x; x: x-1]") {
+            Stmt::SingleVar(Expr::While { body, .. }) => {
+                assert_eq!(body.len(), 2);
+                assert!(matches!(body[1], Stmt::ScalarAssign { .. }));
+            }
+            other => panic!("expected a while, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn while_needs_a_test_and_a_statement() {
+        assert!(parse_err("while[1b]").contains("at least one statement"));
+        assert!(parse_err("while[x: 1; 2]").contains("not an assignment"));
+        assert!(parse_err("while[1b;;2]").contains("empty slot"));
+    }
+
+    #[test]
+    fn noop_parses_as_a_keyword() {
+        assert_eq!(p("noop"), Stmt::SingleVar(Expr::Noop));
+    }
+
+    #[test]
+    fn while_and_noop_are_reserved() {
+        assert!(parse_err("while: 1").contains("reserved word"));
+        assert!(parse_err("noop: 1").contains("reserved word"));
+        assert!(parse_err("{[noop] 1}").contains("reserved word"));
+        assert!(parse_err("while").contains("reserved word"));
+    }
+
+    #[test]
+    fn while_and_noop_may_end_a_function_body() {
+        p("f: {[n] while[n>0; n: n-1]}");
+        p("f: {[] noop}");
+    }
+
+    #[test]
+    fn while_test_must_be_an_expression_not_a_statement() {
+        assert!(parse_err("while[select from t; 1]").contains("must be an expression"));
+        assert!(parse_err("while[x: 1b; 1]").contains("must be an expression"));
+    }
+
+    #[test]
+    fn a_trailing_or_doubled_semicolon_is_an_empty_slot() {
+        assert!(parse_err("while[1b; 2;]").contains("empty slot"));
+        assert!(parse_err("while[;1]").contains("empty slot"));
+        assert!(parse_err("while[]").contains("empty slot"));
+    }
+
+    #[test]
+    fn while_nests_and_may_sit_in_a_conditional_branch() {
+        match p("while[a<3; while[b<2; b: b+1]; a: a+1]") {
+            Stmt::SingleVar(Expr::While { body, .. }) => {
+                assert!(matches!(&body[0], Stmt::SingleVar(Expr::While { .. })));
+            }
+            other => panic!("{other:?}"),
+        }
+        match p("?[c; while[d; 1]; noop]") {
+            Stmt::SingleVar(Expr::Case { branches, default }) => {
+                assert!(matches!(branches[0].1, Expr::While { .. }));
+                assert_eq!(*default, Expr::Noop);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn reserved_words_are_rejected_everywhere_a_name_is_bound() {
+        assert!(parse_err("{[x,while] 1}").contains("reserved word"));
+        assert!(parse_err("select while from t").contains("reserved word"));
+        // a bare `while` without brackets is never a variable reference
+        assert!(parse_err("1 + while").contains("reserved word"));
+    }
+
+    #[test]
+    fn identifiers_that_merely_contain_the_words_are_fine() {
+        p("whiled: 1");
+        p("noop2: 1");
+        p("nooper[1]");
+        p(".ns.while: 1");
+    }
 }
-
-

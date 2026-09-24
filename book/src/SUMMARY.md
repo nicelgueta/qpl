@@ -20,6 +20,7 @@
   - [Table operators](language/table-operators.md)
   - [Window functions](language/window-functions.md)
   - [Functions](language/functions.md)
+  - [Control flow](language/control-flow.md)
   - [lazy / collect](language/lazy-collect.md)
   - [Multi-line statements](language/multiline.md)
   - [Logging](language/logging.md)

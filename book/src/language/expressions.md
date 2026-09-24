@@ -96,6 +96,49 @@ row by row, which is why it stays fast on large inputs. It's an ordinary
 expression, so it also works outside a query entirely, including in a scalar
 binding or a function body.
 
+### Outside a query
+
+Outside a `select` the condition can be a boolean **atom** or a boolean
+**vector**.
+
+With an atom, only the branch that is taken is evaluated, and the result is
+whatever that branch is. That is what makes conditional recursion work
+(`fac: {[n] ?[n<2; 1; n*fac[n-1]]}`) and lets a branch be a function call.
+
+With a vector, the result is elementwise and as long as the condition. Atoms
+broadcast; a vector branch must be exactly as long as the condition, and it is
+a runtime error if not:
+
+```qpl
+qpl) ?[1011b; 1; 0]
+```
+
+```
+i64[4]: 1 0 1 1
+```
+
+```qpl
+qpl) x: 5 6 7 8
+qpl) ?[x>6; x; 0]
+```
+
+```
+i64[4]: 0 0 7 8
+```
+
+```qpl
+qpl) ?[1011b; 1 2 3; 0]
+'`?[..]` branch has length 3, expected 4 (the length of the condition)
+```
+
+With several pairs the first true condition wins per element, and every
+condition after the first must be boolean and either an atom or the same
+length. A vector conditional has no short-circuit: every branch is evaluated,
+since each element picks its own. Its branches must all be text or all be
+non-text (`?[m; 1; "a"]` is an error rather than turning the numbers into
+strings), and an all-symbol result stays a symbol vector. `while` is different:
+its test is always a single boolean atom.
+
 ## Pattern matching
 
 `like` tests text against a glob pattern, following

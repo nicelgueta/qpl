@@ -21,6 +21,9 @@ use crate::vm::EvalResult;
 pub enum EvalValue {
     Scalar(ast::Value),
     Frame { lf: LazyFrame, lazy: bool },
+    /// Nothing: what `noop` and `while` evaluate to. Prints nothing; `x: <noop>`
+    /// and any use as an operand are runtime errors.
+    Noop,
 }
 
 fn rt<E: std::fmt::Display>(e: E) -> QplError {
@@ -34,6 +37,21 @@ fn expect_scalar(v: EvalValue) -> Result<ast::Value, QplError> {
         EvalValue::Frame { .. } => {
             Err(QplError::Runtime("expected a scalar here, got a table".into()))
         }
+        EvalValue::Noop => Err(no_value()),
+    }
+}
+
+fn no_value() -> QplError {
+    QplError::Runtime("cannot use a no-op expression as a value".into())
+}
+
+/// Evaluate a `?[..]` / `while[..]` test, which must be a boolean atom.
+fn eval_test(vm: &mut Vm, test: &Expr, what: &str) -> Result<bool, QplError> {
+    match eval_value(vm, test)? {
+        EvalValue::Scalar(Value::Bool(b)) => Ok(b),
+        _ => Err(QplError::Runtime(format!(
+            "a `{what}` condition must be a boolean scalar in value context"
+        ))),
     }
 }
 
@@ -81,7 +99,8 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
                 vm.pending.insert(id, rx);
                 Ok(EvalValue::Scalar(Value::Future(id)))
             } else {
-                eval_result_to_value(crate::ipc::dispatch_blocking(client, command.clone())?)
+                let intr = vm.interrupt.clone();
+                eval_result_to_value(crate::ipc::dispatch_blocking(client, command.clone(), &intr)?)
             }
         }
         #[cfg(not(feature = "ipc"))]
@@ -140,6 +159,7 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
                     Ok(EvalValue::Frame { lf, lazy })
                 }
                 EvalValue::Scalar(list) => Ok(EvalValue::Scalar(take_list(list, n)?)),
+                EvalValue::Noop => Err(no_value()),
             }
         }
 
@@ -190,9 +210,15 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
                 other => return Err(QplError::Runtime(format!(
                     "await expects a pending response (from async dispatch), got {other:?}"))),
             };
-            let rx = vm.pending.remove(&id).ok_or_else(|| QplError::Runtime(
+            let intr = vm.interrupt.clone();
+            let rx = vm.pending.get(&id).ok_or_else(|| QplError::Runtime(
                 "await: no such pending response (already awaited?)".into()))?;
-            eval_result_to_value(crate::ipc::await_reply(rx)?)
+            let reply = crate::ipc::await_reply(rx, &intr);
+            // an interrupted await leaves the future pending, so it can be awaited again
+            if !matches!(reply, Err(QplError::Interrupted)) {
+                vm.pending.remove(&id);
+            }
+            eval_result_to_value(reply?)
         }
         #[cfg(not(feature = "ipc"))]
         Expr::Call { func, args }
@@ -245,6 +271,7 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
                 target: target.clone(),
                 expr: Box::new(Expr::Lit(v)),
             })?)),
+            EvalValue::Noop => Err(no_value()),
         },
 
         // a binary op whose operands may themselves be function calls
@@ -263,17 +290,21 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
         // `<list-expr> where <predicate>...` — elementwise filter on a list.
         Expr::ListWhere { list, where_ } => eval_list_where(vm, list, where_),
 
-        // `?[c1;v1;c2;v2;default]` in value context — a scalar conditional,
-        // tree-walked so it short-circuits (needed for conditional recursion in
-        // function bodies).
+        // `?[c1;v1;c2;v2;default]` in value context. A boolean *atom* condition
+        // is tree-walked so only the taken branch runs (needed for conditional
+        // recursion in function bodies). A boolean *vector* condition switches
+        // to the elementwise form — see `eval_case_vector`.
         Expr::Case { branches, default } => {
-            for (cond, val) in branches {
+            for (k, (cond, val)) in branches.iter().enumerate() {
                 match eval_value(vm, cond)? {
                     EvalValue::Scalar(Value::Bool(true)) => return eval_value(vm, val),
                     EvalValue::Scalar(Value::Bool(false)) => {}
+                    EvalValue::Scalar(mask @ Value::BoolVec(_)) => {
+                        return eval_case_vector(vm, mask, &branches[k..], default);
+                    }
                     _ => {
                         return Err(QplError::Runtime(
-                            "a `?[..]` condition must be a boolean scalar in value context".into(),
+                            "a `?[..]` condition must be a boolean scalar or vector in value context".into(),
                         ))
                     }
                 }
@@ -281,9 +312,96 @@ pub fn eval_value(vm: &mut Vm, expr: &Expr) -> Result<EvalValue, QplError> {
             eval_value(vm, default)
         }
 
+        // `noop` — nothing; `while[test; s1; ..; sn]` — run the statements in
+        // the current scope (no frame is pushed) while `test` holds. Its
+        // result is always noop.
+        Expr::Noop => Ok(EvalValue::Noop),
+        Expr::While { cond, body } => {
+            while eval_test(vm, cond, "while")? {
+                vm.interrupt.check()?;
+                for st in body {
+                    exec_stmt(vm, st)?;
+                }
+            }
+            Ok(EvalValue::Noop)
+        }
+
         // everything else is a pure scalar fold (literals, symbols, binops, casts)
         other => Ok(EvalValue::Scalar(vm.eval_scalar(other)?)),
     }
+}
+
+/// The elementwise form of `?[..]` outside a select: `first` is the boolean
+/// vector condition of `branches[0]`, and every other condition, branch and the
+/// default is evaluated (there is no short-circuit — each element picks its own
+/// branch). An atom operand broadcasts; a vector operand must be exactly as long
+/// as the condition, else it is a runtime error. The first true condition wins
+/// per element, like the atom form; the result has the condition's length.
+fn eval_case_vector(
+    vm: &mut Vm,
+    first: Value,
+    branches: &[(Expr, Expr)],
+    default: &Expr,
+) -> Result<EvalValue, QplError> {
+    let n = first.as_vec().map(|(_, s)| s.len()).expect("a BoolVec");
+    // (is text, is symbol) per value operand, to reject a text/non-text mix
+    // (Polars would silently stringify the numbers) and to keep an all-symbol
+    // result a symbol vector rather than strings.
+    let mut kinds: Vec<(bool, bool)> = Vec::new();
+    let mut operand = |vm: &mut Vm, e: &Expr, what: &str, bool_only: bool| -> Result<polars::prelude::Expr, QplError> {
+        let v = expect_scalar(eval_value(vm, e)?)?;
+        if bool_only && !matches!(v, Value::Bool(_) | Value::BoolVec(_)) {
+            return Err(QplError::Runtime(
+                "a `?[..]` condition must be a boolean scalar or vector in value context".into(),
+            ));
+        }
+        if let Some((_, s)) = v.as_vec()
+            && s.len() != n
+        {
+            return Err(QplError::Runtime(format!(
+                "`?[..]` {what} has length {}, expected {n} (the length of the condition)",
+                s.len()
+            )));
+        }
+        if !bool_only {
+            kinds.push((
+                matches!(v, Value::Str(_) | Value::Sym(_) | Value::StrVec(_) | Value::SymVec(_)),
+                matches!(v, Value::Sym(_) | Value::SymVec(_)),
+            ));
+        }
+        crate::vm::ast_val_to_expr(v)
+    };
+
+    let mut arms = Vec::with_capacity(branches.len());
+    for (k, (cond, val)) in branches.iter().enumerate() {
+        let c = if k == 0 {
+            crate::vm::ast_val_to_expr(first.clone())?
+        } else {
+            operand(vm, cond, "condition", true)?
+        };
+        arms.push((c, operand(vm, val, "branch", false)?));
+    }
+    let mut acc = operand(vm, default, "default", false)?;
+    for (c, v) in arms.into_iter().rev() {
+        acc = when(c).then(v).otherwise(acc);
+    }
+    if kinds.iter().any(|k| k.0) && !kinds.iter().all(|k| k.0) {
+        return Err(QplError::Runtime(
+            "`?[..]` branches mix text and non-text values".into(),
+        ));
+    }
+    let all_sym = kinds.iter().all(|k| k.1);
+    let df = df!("_" => [0i64]).map_err(rt)?.lazy().select([acc.alias("r")]).collect().map_err(rt)?;
+    if df.height() != n {
+        return Err(QplError::Runtime(format!(
+            "`?[..]` produced {} value(s), expected {n} (the length of the condition)", df.height()
+        )));
+    }
+    let out = column_to_value(df.column("r").map_err(rt)?)?;
+    Ok(EvalValue::Scalar(match out {
+        Value::StrVec(s) if all_sym => Value::SymVec(s),
+        other => other,
+    }))
 }
 
 fn resolve_name(vm: &mut Vm, name: &str) -> Result<EvalValue, QplError> {
@@ -328,6 +446,7 @@ pub(crate) fn call_niladic(vm: &mut Vm, name: &str) -> Result<Option<EvalValue>,
         }
         Some(Lookup::Global(Value::Closure(f))) if f.params.is_empty() => {
             let def = f.clone();
+            vm.interrupt.check()?;
             if vm.scopes.len() >= crate::vm::MAX_CALL_DEPTH {
                 return Err(QplError::Runtime(format!(
                     "function recursion too deep (limit {})",
@@ -351,6 +470,7 @@ fn eval_table(vm: &mut Vm, te: &TableExpr) -> Result<EvalValue, QplError> {
     let (lf, lazy) = vm.eval_frame(instrs)?;
     if is_column_select(te) {
         let df = lf.collect().map_err(rt)?;
+        vm.interrupt.check()?;
         let col = df
             .select_at_idx(0)
             .ok_or_else(|| QplError::Runtime("empty column expression".into()))?;
@@ -555,6 +675,7 @@ fn eval_zip(vm: &mut Vm, dict_expr: &Expr) -> Result<EvalValue, QplError> {
 /// frame, reject a multi-column one.
 fn to_list(vm: &mut Vm, expr: &Expr) -> Result<Value, QplError> {
     match eval_value(vm, expr)? {
+        EvalValue::Noop => Err(no_value()),
         EvalValue::Scalar(v) => Ok(v),
         EvalValue::Frame { lf, .. } => {
             let df = lf.collect().map_err(rt)?;
@@ -588,6 +709,7 @@ fn eval_call_source(vm: &mut Vm, expr: &Expr) -> Result<LazyFrame, QplError> {
     match eval_value(vm, expr)? {
         EvalValue::Frame { lf, .. } => Ok(lf),
         EvalValue::Scalar(list) => list_to_lazy(list),
+        EvalValue::Noop => Err(no_value()),
     }
 }
 
@@ -681,6 +803,7 @@ fn apply_function(vm: &mut Vm, func: &Expr, args: &[Expr]) -> Result<EvalValue, 
             args.len()
         )));
     }
+    vm.interrupt.check()?;
     if vm.scopes.len() >= crate::vm::MAX_CALL_DEPTH {
         return Err(QplError::Runtime(format!(
             "function recursion too deep (limit {})",
@@ -722,14 +845,26 @@ fn run_body(
                 let df = lf.collect().map_err(rt)?;
                 vm.bind_table(p.clone(), df)?;
             }
+            EvalValue::Noop => return Err(no_value()),
         }
     }
     let (last, head) = def.body.split_last().expect("non-empty function body");
     for st in head {
-        let prog = crate::compiler::compile(st)?;
-        vm.eval(prog)?;
+        exec_stmt(vm, st)?;
     }
     match last {
+        ast::Stmt::SingleVar(_) | ast::Stmt::RetTable(_) => exec_stmt(vm, last),
+        _ => Err(QplError::Runtime(
+            "a function body must end with an expression".into(),
+        )),
+    }
+}
+
+/// Run one statement in the *current* scope: an expression yields its value
+/// (a table statement its frame); an assignment binds and yields `Noop`.
+fn exec_stmt(vm: &mut Vm, st: &ast::Stmt) -> Result<EvalValue, QplError> {
+    vm.interrupt.check()?;
+    match st {
         ast::Stmt::SingleVar(e) => eval_value(vm, e),
         ast::Stmt::RetTable(te) => {
             let mut instrs = Vec::new();
@@ -737,9 +872,10 @@ fn run_body(
             let (lf, lazy) = vm.eval_frame(instrs)?;
             Ok(EvalValue::Frame { lf, lazy })
         }
-        _ => Err(QplError::Runtime(
-            "a function body must end with an expression".into(),
-        )),
+        other => {
+            vm.eval(crate::compiler::compile(other)?)?;
+            Ok(EvalValue::Noop)
+        }
     }
 }
 
@@ -1439,5 +1575,379 @@ mod tests {
         let s = Series::new("x".into(), &[Some(1i64), None, Some(3)]);
         let col = Column::from(s);
         assert!(column_to_value(&col).is_err());
+    }
+
+    fn run_err(vm: &mut Vm, src: &str) -> String {
+        match run_vm(src, vm) {
+            Err(e) => e.to_string(),
+            Ok(r) => panic!("expected an error for {src:?}, got a {} result", kind(&r)),
+        }
+    }
+
+    fn run_stored(vm: &mut Vm, src: &str) {
+        match run_vm(src, vm) {
+            Ok(EvalResult::Stored) => {}
+            Ok(r) => panic!("{src:?}: expected nothing, got a {} result", kind(&r)),
+            Err(e) => panic!("{src:?}: {e}"),
+        }
+    }
+
+    #[test]
+    fn while_counts_down_in_the_current_scope() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "x: 5");
+        run_stored(&mut vm, "while[x>2; x: x-1]");
+        assert_eq!(scalar(&mut vm, "x"), Value::Int(2));
+    }
+
+    #[test]
+    fn while_runs_its_statements_in_order_and_may_not_run_at_all() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "n: 0");
+        run_stored(&mut vm, "acc: 0");
+        // `(acc*10)+n` is order-sensitive: appending 0,1,2 gives 12
+        run_stored(&mut vm, "while[n<3; acc: (acc*10)+n; n: n+1]");
+        assert_eq!(scalar(&mut vm, "acc"), Value::Int(12));
+        run_stored(&mut vm, "while[0b; acc: 99]");
+        assert_eq!(scalar(&mut vm, "acc"), Value::Int(12));
+    }
+
+    #[test]
+    fn while_body_may_run_table_statements() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "k: 0");
+        run_stored(&mut vm, "while[k<2; t: select from t where c2 > 10; k: k+1]");
+        assert_eq!(vm.tables["t"].height(), 3);
+    }
+
+    #[test]
+    fn while_inside_a_function_binds_locals_only() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "s: 100");
+        run_stored(&mut vm, "g: {[n] s: 0; while[n>0; s: s+n; n: n-1]; s}");
+        assert_eq!(scalar(&mut vm, "g[4]"), Value::Int(10));
+        assert_eq!(scalar(&mut vm, "s"), Value::Int(100), "the global is untouched");
+    }
+
+    #[test]
+    fn a_function_still_cannot_assign_a_global() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "x: 1");
+        run_stored(&mut vm, "bump: {[] x: x+1; x}");
+        assert_eq!(scalar(&mut vm, "bump[]"), Value::Int(2));
+        assert_eq!(scalar(&mut vm, "x"), Value::Int(1));
+    }
+
+    #[test]
+    fn a_non_boolean_test_is_an_error() {
+        let mut vm = make_vm();
+        assert!(run_err(&mut vm, "while[1; 2]").contains("boolean scalar"));
+        assert!(run_err(&mut vm, "while[1 2 3; 2]").contains("boolean scalar"));
+    }
+
+    #[test]
+    fn noop_prints_nothing() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "noop");
+        run_stored(&mut vm, "f: {[] noop}");
+        run_stored(&mut vm, "f[]");
+        run_stored(&mut vm, "?[0b; 1; noop]");
+        run_stored(&mut vm, "while[0b; 1]");
+    }
+
+    #[test]
+    fn a_noop_cannot_be_assigned() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "f: {[] noop}");
+        for src in ["x: noop", "x: f[]", "x: while[0b; 1]", "x: ?[1b; noop; 1]"] {
+            assert_eq!(run_err(&mut vm, src), "'cannot assign a no-op expression.", "{src}");
+        }
+        assert!(vm.globals.get("x").is_none());
+    }
+
+    #[test]
+    fn a_noop_cannot_be_an_operand() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "g: {[a] a}");
+        run_stored(&mut vm, "f: {[] noop}");
+        for src in ["1 + noop", "g[noop]", "sum f[]"] {
+            assert!(run_err(&mut vm, src).contains("no-op expression as a value"), "{src}");
+        }
+    }
+
+    #[test]
+    fn ctrl_c_stops_an_infinite_while_and_the_session_carries_on() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "x: 0");
+        let interrupt = vm.interrupt.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            interrupt.request();
+        });
+        {
+            let _running = vm.interrupt.statement();
+            let err = run_vm("while[1b; x: x+1]", &mut vm).err().expect("should be interrupted");
+            assert!(matches!(err, QplError::Interrupted), "{err}");
+        }
+        t.join().unwrap();
+        // bindings made before the interrupt stay; the next statement runs normally
+        match scalar(&mut vm, "x") {
+            Value::Int(n) => assert!(n > 0),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_c_stops_runaway_recursion() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "f: {[n] f[n+1]}");
+        vm.interrupt.request();
+        assert!(matches!(run_vm("f[0]", &mut vm), Err(QplError::Interrupted)));
+        let _running = vm.interrupt.statement(); // a new statement clears the stale request
+        assert_eq!(scalar(&mut vm, "1+1"), Value::Int(2));
+    }
+
+    #[test]
+    fn nested_whiles_reset_their_inner_counter() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "a: 0");
+        run_stored(&mut vm, "n: 0");
+        run_stored(&mut vm, "while[a<3; b: 0; while[b<2; b: b+1; n: n+1]; a: a+1]");
+        assert_eq!(scalar(&mut vm, "a"), Value::Int(3));
+        assert_eq!(scalar(&mut vm, "b"), Value::Int(2));
+        assert_eq!(scalar(&mut vm, "n"), Value::Int(6), "inner body ran 3 x 2 times");
+    }
+
+    #[test]
+    fn the_test_is_re_evaluated_each_iteration_and_may_call_a_function() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "ok: {[v] v<3}");
+        run_stored(&mut vm, "c: 0");
+        run_stored(&mut vm, "while[ok[c]; c: c+1]");
+        assert_eq!(scalar(&mut vm, "c"), Value::Int(3));
+    }
+
+    #[test]
+    fn a_body_may_call_a_recursive_function_and_use_a_conditional() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "tri: {[n] ?[n<1; 0; n + tri[n-1]]}");
+        run_stored(&mut vm, "c: 0");
+        run_stored(&mut vm, "tot: 0");
+        run_stored(&mut vm, "while[c<4; c: c+1; tot: tot + ?[c>2; tri[c]; 0]]");
+        assert_eq!(scalar(&mut vm, "tot"), Value::Int(6 + 10));
+    }
+
+    #[test]
+    fn while_in_a_conditional_branch_only_runs_when_taken() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "c: 0");
+        run_stored(&mut vm, "?[0b; while[c<3; c: c+1]; noop]");
+        assert_eq!(scalar(&mut vm, "c"), Value::Int(0));
+        run_stored(&mut vm, "?[1b; while[c<3; c: c+1]; noop]");
+        assert_eq!(scalar(&mut vm, "c"), Value::Int(3));
+    }
+
+    #[test]
+    fn nothing_untaken_is_evaluated() {
+        let mut vm = make_vm();
+        // a body that would error is never reached when the test starts false
+        run_stored(&mut vm, "while[0b; undefined_fn[1]]");
+        // ... nor an untaken conditional branch
+        run_stored(&mut vm, "?[1b; noop; undefined_fn[1]]");
+    }
+
+    #[test]
+    fn an_error_in_the_body_stops_the_loop_and_keeps_earlier_bindings() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "c: 0");
+        assert!(run_err(&mut vm, "while[c<5; c: c+1; boom[]; c: 100]").contains("boom"));
+        assert_eq!(scalar(&mut vm, "c"), Value::Int(1), "the first iteration got as far as `boom[]`");
+    }
+
+    #[test]
+    fn a_noop_or_table_test_is_not_a_boolean() {
+        let mut vm = make_vm();
+        assert!(run_err(&mut vm, "while[noop; 1]").contains("boolean scalar"));
+        assert!(run_err(&mut vm, "while[t; 1]").contains("boolean scalar"));
+        assert!(run_err(&mut vm, "?[noop; 1; 2]").contains("boolean scalar"));
+    }
+
+    #[test]
+    fn a_function_may_run_a_while_and_a_noop_before_its_return() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "f: {[] while[0b; 1]; noop; 7}");
+        assert_eq!(scalar(&mut vm, "f[]"), Value::Int(7));
+    }
+
+    #[test]
+    fn a_function_body_that_ends_in_while_returns_nothing() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "f: {[n] while[n>0; n: n-1]}");
+        run_stored(&mut vm, "f[3]");
+        assert_eq!(run_err(&mut vm, "y: f[3]"), "'cannot assign a no-op expression.");
+    }
+
+    #[test]
+    fn a_while_in_a_function_reads_globals_but_leaves_them_alone() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "lim: 3");
+        run_stored(&mut vm, "f: {[] c: 0; while[c<lim; c: c+1]; c}");
+        assert_eq!(scalar(&mut vm, "f[]"), Value::Int(3), "the test reads the global");
+        // assigning the same name in the body binds a *local* that then shadows it
+        run_stored(&mut vm, "g: {[] c: 0; while[c<lim; c: c+1; lim: 5]; c}");
+        assert_eq!(scalar(&mut vm, "g[]"), Value::Int(5));
+        assert_eq!(scalar(&mut vm, "lim"), Value::Int(3), "the global is untouched");
+    }
+
+    #[test]
+    fn a_noop_argument_to_a_call_is_an_error_for_every_kind_of_callee() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "id: {[a] a}");
+        run_stored(&mut vm, "nil: {[] noop}");
+        for src in ["id[noop]", "id[nil[]]", "sum noop", "count noop", "{[a] a}[noop]"] {
+            assert!(run_err(&mut vm, src).contains("no-op expression"), "{src}");
+        }
+    }
+
+    #[test]
+    fn a_noop_cannot_index_take_or_cast() {
+        let mut vm = make_vm();
+        for src in ["3#noop", "f64$noop", "noop[0]"] {
+            let err = run_err(&mut vm, src);
+            assert!(err.contains("no-op") || err.contains("noop"), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_failed_noop_assignment_keeps_the_previous_binding() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "x: 5");
+        assert!(run_err(&mut vm, "x: noop").contains("cannot assign a no-op"));
+        assert_eq!(scalar(&mut vm, "x"), Value::Int(5));
+    }
+
+    #[test]
+    fn an_interrupt_before_a_query_stops_it_and_binds_nothing() {
+        let mut vm = make_vm();
+        vm.interrupt.request();
+        assert!(matches!(run_vm("select from t", &mut vm), Err(QplError::Interrupted)));
+        assert!(matches!(run_vm("x: 1", &mut vm), Err(QplError::Interrupted)));
+        assert!(!vm.globals.contains_key("x"));
+        let _running = vm.interrupt.statement();
+        assert_eq!(scalar(&mut vm, "1"), Value::Int(1));
+    }
+
+    #[test]
+    fn an_interrupt_inside_a_nested_call_unwinds_the_scopes() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "f: {[n] while[1b; n: n+1]; n}");
+        run_stored(&mut vm, "g: {[n] f[n]}");
+        let interrupt = vm.interrupt.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            interrupt.request();
+        });
+        {
+            let _running = vm.interrupt.statement();
+            assert!(matches!(run_vm("g[0]", &mut vm), Err(QplError::Interrupted)));
+        }
+        t.join().unwrap();
+        assert!(vm.scopes.is_empty(), "every call frame was popped on the way out");
+        assert_eq!(scalar(&mut vm, "1+1"), Value::Int(2));
+    }
+
+    #[test]
+    fn a_stale_interrupt_does_not_abort_the_next_statement() {
+        let mut vm = make_vm();
+        {
+            let _running = vm.interrupt.statement();
+            vm.interrupt.request(); // arrives after the last check point
+        }
+        assert_eq!(scalar(&mut vm, "1+1"), Value::Int(2));
+    }
+
+    #[test]
+    fn a_vector_condition_gives_an_elementwise_result() {
+        let mut vm = make_vm();
+        assert_eq!(scalar(&mut vm, "?[1011b; 1; 0]"), ast::int_vec(vec![1, 0, 1, 1]));
+        assert_eq!(scalar(&mut vm, "?[1011b; 1 2 3 4; 5 6 7 8]"), ast::int_vec(vec![1, 6, 3, 4]));
+        assert_eq!(
+            scalar(&mut vm, r#"?[1011b; "yes"; "no"]"#),
+            ast::str_vec(vec!["yes".into(), "no".into(), "yes".into(), "yes".into()])
+        );
+    }
+
+    #[test]
+    fn a_vector_condition_may_come_from_a_variable_or_a_comparison() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "x: 5 6 7 8");
+        assert_eq!(scalar(&mut vm, "?[x>6; x; 0]"), ast::int_vec(vec![0, 0, 7, 8]));
+        run_stored(&mut vm, "f: {[m] ?[m; 1; 0]}");
+        assert_eq!(scalar(&mut vm, "f[10b]"), ast::int_vec(vec![1, 0]));
+    }
+
+    #[test]
+    fn a_vector_branch_must_match_the_condition_length() {
+        let mut vm = make_vm();
+        for src in ["?[1011b; 1 2 3; 0]", "?[1011b; 1; 5 6 7 8 9]", "?[10b; 1 2 3 4; 0]"] {
+            let err = run_err(&mut vm, src);
+            assert!(err.contains("has length") && err.contains("length of the condition"), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_chained_vector_conditional_takes_the_first_true_condition_per_element() {
+        let mut vm = make_vm();
+        assert_eq!(scalar(&mut vm, "?[1011b; 1; 0110b; 2; 3]"), ast::int_vec(vec![1, 2, 1, 1]));
+        assert_eq!(scalar(&mut vm, "?[0110b; 1; 0011b; 2; 3]"), ast::int_vec(vec![3, 1, 1, 2]));
+        // every later condition must be boolean and as long as the first
+        assert!(run_err(&mut vm, "?[1011b; 1; 01b; 2; 3]").contains("condition has length 2"));
+        assert!(run_err(&mut vm, "?[1011b; 1; 1; 2; 3]").contains("boolean scalar or vector"));
+    }
+
+    #[test]
+    fn an_atom_condition_after_a_vector_one_is_broadcast() {
+        let mut vm = make_vm();
+        assert_eq!(scalar(&mut vm, "?[1011b; 1; 1b; 2; 3]"), ast::int_vec(vec![1, 2, 1, 1]));
+        assert_eq!(scalar(&mut vm, "?[1011b; 1; 0b; 2; 3]"), ast::int_vec(vec![1, 3, 1, 1]));
+    }
+
+    #[test]
+    fn atom_conditions_before_a_vector_one_still_short_circuit() {
+        let mut vm = make_vm();
+        assert_eq!(scalar(&mut vm, "?[0b; undefined_fn[1]; 1011b; 5; 6]"), ast::int_vec(vec![5, 6, 5, 5]));
+        // a true atom returns its branch as-is, whatever its length
+        assert_eq!(scalar(&mut vm, "?[1b; 1 2 3; 1011b; 5; 6]"), ast::int_vec(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn a_vector_conditional_keeps_symbols_symbols_and_rejects_a_text_number_mix() {
+        let mut vm = make_vm();
+        assert_eq!(scalar(&mut vm, "?[1011b; `a`b`c`d; `z]"), ast::sym_vec(vec!["a".into(), "z".into(), "c".into(), "d".into()]));
+        assert!(run_err(&mut vm, r#"?[1011b; 1; "a"]"#).contains("mix text and non-text"));
+        assert_eq!(scalar(&mut vm, "?[1011b; 1; 2.5]"), ast::float_vec(vec![1.0, 2.5, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn a_vector_conditional_on_an_empty_condition_is_empty() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "e: til 0");
+        match scalar(&mut vm, "?[e>0; 1; 2]") {
+            v @ Value::IntVec(_) => assert_eq!(v.as_vec().unwrap().1.len(), 0),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_noop_or_table_branch_of_a_vector_conditional_is_an_error() {
+        let mut vm = make_vm();
+        assert!(run_err(&mut vm, "?[1011b; noop; 1]").contains("no-op"));
+        assert!(run_err(&mut vm, "?[1011b; t; 1]").contains("expected a scalar"));
+    }
+
+    #[test]
+    fn while_still_needs_a_boolean_atom() {
+        let mut vm = make_vm();
+        assert!(run_err(&mut vm, "while[10b; 1]").contains("boolean scalar"));
     }
 }

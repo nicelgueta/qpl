@@ -12,7 +12,9 @@
     "limit",
     "drop",
     "update",
-    "delete"
+    "delete",
+    "while",
+    "noop"
   ],
   "builtinKeywords": [
     "load",
@@ -169,6 +171,8 @@
     "\\i": "\\i \"<path>\" \u2014 run a script, namespacing its new tables/globals/functions under `.<file-stem>.*`",
     "til": "til <n> \u2014 list 0..n-1  |  <lo> til <hi> \u2014 list lo..hi-1",
     "enlist": "enlist <atom> \u2014 the one-element list of a value (`enlist 23` is an int vector, `enlist \"a\"` a string vector)",
-    "zip": "zip `k1`k2!v1 v2 \u2014 build a table from a dict of named lists"
+    "zip": "zip `k1`k2!v1 v2 \u2014 build a table from a dict of named lists",
+    "while": "while[test; s1; s2; ...] \u2014 run the statements in order, in the current scope, while the boolean test holds. Yields noop",
+    "noop": "noop \u2014 evaluates to nothing: prints nothing, and cannot be assigned or used as a value"
   }
 }

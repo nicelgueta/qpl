@@ -8,6 +8,9 @@ pub enum QplError {
     Parse(String),
     Compile(String),
     Runtime(String),
+    /// Ctrl-C stopped the running statement. Its own variant (not a `Runtime`
+    /// string) so the script runner / REPL can tell it apart.
+    Interrupted,
 }
 
 impl fmt::Display for QplError {
@@ -17,6 +20,7 @@ impl fmt::Display for QplError {
             QplError::Parse(msg) => write!(f, "ParseError: {msg}"),
             QplError::Compile(msg) => write!(f, "CompileError: {msg}"),
             QplError::Runtime(msg) => write!(f, "'{msg}"),
+            QplError::Interrupted => write!(f, "'interrupted"),
         }
     }
 }

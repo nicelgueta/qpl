@@ -12,6 +12,7 @@ pub mod compiler;
 pub mod enums;
 pub mod errors;
 pub mod helpers;
+pub mod interrupt;
 pub mod lexer;
 pub mod native;
 pub mod opcodes;
