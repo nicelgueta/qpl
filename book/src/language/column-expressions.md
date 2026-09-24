@@ -38,7 +38,7 @@ Under the hood a list is a Polars `Series`, and each atomic type has a
 matching list type: `IntVec`, `FloatVec`, `StrVec`, `SymVec`, `BoolVec`, and
 one per temporal type. A column whose type has no list equivalent, or which
 contains nulls, will refuse to materialise rather than quietly losing
-information.
+information. Use `fill` or `dropnull` first; see [Nulls](expressions.md#nulls).
 
 A column expression can carry a `where` of its own, which filters the table's
 rows before the column is extracted:

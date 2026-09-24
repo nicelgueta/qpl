@@ -208,10 +208,14 @@ The full set:
 | `<n> diff <col>` | the change from `n` rows back |
 | `<n> pctchange <col>` | the fractional change from `n` rows back |
 | `<n> round <col>` | round to `n` decimal places |
+| `<v> fill <col>` | replace nulls with `v` |
 
 `round` takes its rounding mode from a session setting rather than from the
 expression, since it's the sort of thing you'd want to fix once for a whole
 script. [Config](config.md) covers it.
+
+The operand on the right can also be a whole table expression rather than a
+column: `"" fill select b from t` works the same as `"" fill t`b`.
 
 The row-relative verbs in that table — `shift`, `lead`, `diff`, `pctchange` —
 raise an obvious question: relative to which ordering? On their own they use
@@ -229,6 +233,35 @@ with `by`; they work the same way anywhere an aggregate makes sense.
 value, resolving ties to the smallest), `skew`, `kurt` (or `kurtosis`),
 `any`, `all`, `prod` (or `product`), `argmin`, `argmax`, `nnull` (or
 `null_count`), and `distinct` (or `n_unique`).
+
+`distinct` does double duty. In front of a column it is a plain alias for
+`n_unique` and counts the distinct values, so `select distinct sym from trades`
+gives a single number. In front of a table it deduplicates rows, as described
+in [Table operators](table-operators.md). Which one you get depends on where it
+appears: inside a select list it's the column verb, at the start of a
+statement it's the table operator.
+
+## Nulls
+
+Two verbs turn a column into a boolean per row, which is what `where` wants:
+
+```qpl
+select from t where isnull price        / rows with no price
+select count i from t where notnull sym / how many rows have a symbol
+```
+
+`nnull` counts the nulls in a column, and `<v> fill <col>` replaces them:
+
+```qpl
+select sym, 0 fill price from t
+update qty: 0 fill qty from t
+```
+
+To drop whole rows instead, use `dropnull`, a
+[table operator](table-operators.md#dropping-rows-with-nulls).
+
+Nulls live in tables. Lists deliberately can't hold them, so pulling a column
+that contains nulls into a list is an error. Fill or drop them first.
 
 A few more verbs transform a column without collapsing it, and are listed
 here for completeness since they appear in the same position: `abs`, `neg`,

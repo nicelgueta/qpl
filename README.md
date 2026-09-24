@@ -261,8 +261,18 @@ commute: `(int$"42") - 1`.
 
 **Aggregates:** `sum`, `avg`/`mean`, `min`, `max`, `count`, `first`, `last`,
 `std`/`dev`, `var`, `med`/`median`, `mode`/`modal`, `skew`, `kurt`, `any`,
-`all`, `prod`, `argmin`, `argmax`, `nnull`, `distinct`/`n_unique`, plus
+`all`, `prod`, `argmin`, `argmax`, `nnull`, `distinct`/`n_unique` (`distinct` on a column counts its unique values; on a
+table it deduplicates rows), plus
 `abs`, `neg`, `not`, `string`.
+
+**Null tests:** `isnull` / `notnull` give a boolean per row, for filtering:
+`select from t where isnull price`, `select count i from t where notnull sym`.
+`nnull` counts the nulls in a column.
+
+**Removing nulls:** `<value> fill <col>` replaces nulls in a column with a value
+(`select 0 fill price from t`, `update qty: 0 fill qty from t`), and `` `a`b dropnull <table> ``
+drops every row that has a null in any of the named columns (`` `price dropnull t ``). Lists can't hold
+nulls, so use these before pulling a nullable column into a list.
 
 **Cumulative:** `cumsum`, `cummax`, `cummin`, `cumprod`, `cumcount`, `ffill`,
 `bfill`. Most useful with `over` and an `order`.

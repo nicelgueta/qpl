@@ -795,6 +795,10 @@ impl Vm {
                             let lf = require_frame(&mut frame)?;
                             frame = Some(lf.unique_stable(None, UniqueKeepStrategy::First));
                         }
+                        PolarsFrameExpr::DropNull(columns) => {
+                            let lf = require_frame(&mut frame)?;
+                            frame = Some(lf.drop_nulls(Some(cols(columns))));
+                        }
                         PolarsFrameExpr::Limit => {
                             let limit = match pop1(&mut stack)?.unwrap_scalar()? {
                                 Value::Int(n) => n,
@@ -1736,6 +1740,8 @@ pub(crate) fn apply_call(func: &str, mut args: Vec<Expr>) -> Result<Expr, QplErr
         "argmin"                => arg.arg_min(),
         "argmax"                => arg.arg_max(),
         "nnull" | "null_count"  => arg.null_count(),
+        "isnull"                => arg.is_null(),
+        "notnull"               => arg.is_not_null(),
         "cumsum"                => arg.cum_sum(false),
         "cummax"                => arg.cum_max(false),
         "cummin"                => arg.cum_min(false),
@@ -1757,6 +1763,7 @@ pub(crate) fn apply_dyadic(func: &str, value: Expr, param: Expr) -> Result<Expr,
         "quantile" | "pctl" => value.quantile(param, QuantileMethod::Linear),
         "shift" | "lag"     => value.shift(param),
         "lead"              => value.shift(-param),
+        "fill"              => value.fill_null(param),
         "diff"              => value.diff(param, polars::series::ops::NullBehavior::Ignore),
         "pctchange"         => value.pct_change(param),
         _ => return Err(QplError::Runtime(format!("unknown dyadic verb '{func}'"))),
@@ -2628,6 +2635,44 @@ mod tests {
         let df = run(make_vm(), "update flag: c2 * 10 from t where c1 = `a");
         let flag: Vec<Option<i64>> = df.column("flag").unwrap().i64().unwrap().iter().collect();
         assert_eq!(flag, vec![Some(100), None, Some(300), None]);
+    }
+
+    #[test]
+    fn isnull_and_notnull_filter_rows() {
+        let mut vm = make_vm();
+        vm.tables.insert("n".into(), df!["x" => [Some(1i64), None, Some(3), None]].unwrap());
+        let df = run(vm, "select from n where isnull x");
+        assert_eq!(df.height(), 2);
+        let mut vm = make_vm();
+        vm.tables.insert("n".into(), df!["x" => [Some(1i64), None, Some(3), None]].unwrap());
+        let df = run(vm, "select from n where notnull x");
+        assert_eq!(df.height(), 2);
+    }
+
+    #[test]
+    fn fill_replaces_nulls_and_dropnull_drops_rows() {
+        let mk = || {
+            let mut vm = make_vm();
+            vm.tables.insert("n".into(), df!["x" => [Some(1i64), None, Some(3), None]].unwrap());
+            vm
+        };
+        let df = run(mk(), "select 0 fill x from n");
+        let x: Vec<Option<i64>> = df.column("x").unwrap().i64().unwrap().iter().collect();
+        assert_eq!(x, vec![Some(1), Some(0), Some(3), Some(0)]);
+        let df = run(mk(), "`x dropnull n");
+        assert_eq!(df.height(), 2);
+        let df = run(mk(), "select count i from (`x dropnull n)");
+        assert_eq!(df.height(), 1);
+    }
+
+    #[test]
+    fn distinct_on_a_column_is_n_unique() {
+        let df = run(make_vm(), "select distinct c1 from t");
+        assert_eq!(df.column("c1").unwrap().u32().unwrap().get(0), Some(3));
+        let df = run(make_vm(), "select n: distinct c1 by c2 from t");
+        assert_eq!(df.height(), 4);
+        // table position is unchanged: deduplicates rows
+        assert_eq!(run(make_vm(), "distinct select c1 from t").height(), 3);
     }
 
     #[test]

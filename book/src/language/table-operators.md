@@ -29,6 +29,9 @@ shape: (3, 1)
 Eight rows in, three out. Note that `distinct` applies to whole rows, so what
 it does depends on which columns you selected first.
 
+Inside a select list, `distinct` is something else: the column verb that counts
+distinct values, an alias for `n_unique`. See [Expressions](expressions.md).
+
 ## Limiting
 
 Taking the first few rows has two spellings that do the same thing. `limit`
@@ -81,6 +84,21 @@ This overlaps with `delete `price`size from trades` from the
 context; `_` is handy mid-pipeline, `delete` when the statement is already a
 query.
 
+## Dropping rows with nulls
+
+`dropnull` is the row-wise counterpart of `drop`. It takes a list of column
+names as symbols on the left and removes every row that has a null in any of
+them:
+
+```qpl
+`price dropnull trades           / one column
+`price`size dropnull trades      / a null in either drops the row
+clean: `price dropnull trades
+```
+
+Nulls in columns you didn't name are ignored. To keep rows and replace the
+nulls instead, use [`fill`](expressions.md#nulls).
+
 ## Sorting
 
 Sorting uses the dict-literal form you met at the end of
@@ -129,6 +147,7 @@ Since each of these takes a table expression and produces one, they stack:
 
 ```qpl
 `price`size drop distinct select from trades
+`price dropnull `size drop select from trades
 ```
 
 Because qpl evaluates right to left, the reading order is the order things

@@ -113,7 +113,7 @@ impl Parser {
                 // plain symbol — tables are referenced by name, never by symbol.
                 TokenKind::Symbol(_) | TokenKind::SymbolVec(_)
                     if !self.is_whopen_modifier()
-                        && (matches!(self.peek2(), TokenKind::Bang | TokenKind::Drop)
+                        && (matches!(self.peek2(), TokenKind::Bang | TokenKind::Drop | TokenKind::DropNull)
                             || matches!(self.peek2(), TokenKind::Name(n) if n == "_")) =>
                 {
                     self.assign_from_body(name)
@@ -247,7 +247,7 @@ impl Parser {
         // symbol. A bare `\`x` is a symbol value, not a table.
         let sym_table_op = !self.is_whopen_modifier()
             && matches!(self.peek(), TokenKind::Symbol(_) | TokenKind::SymbolVec(_))
-            && (matches!(self.peek2(), TokenKind::Bang | TokenKind::Drop)
+            && (matches!(self.peek2(), TokenKind::Bang | TokenKind::Drop | TokenKind::DropNull)
                 || matches!(self.peek2(), TokenKind::Name(n) if n == "_"));
         if (is_table_expr_start(self.peek()) && !leading_int) || int_table || neg_int_table
             || name_table_limit || sym_table_op
@@ -363,6 +363,10 @@ impl Parser {
                         self.next();
                         Ok(TableExpr::BuiltIn(BuiltIn::Drop(vec![s], Box::new(self.parse_table_expr()?))))
                     }
+                    TokenKind::DropNull => {
+                        self.next();
+                        Ok(TableExpr::BuiltIn(BuiltIn::DropNull(vec![s], Box::new(self.parse_table_expr()?))))
+                    }
                     _ => Err(QplError::Parse(format!("expected 'asc' or 'desc' after symbol, got {:?}", self.peek()))),
                 }
             }
@@ -372,6 +376,9 @@ impl Parser {
                 if matches!(peek, TokenKind::Drop) || matches!(&peek, TokenKind::Name(name) if name == "_") {
                     self.next();
                     Ok(TableExpr::BuiltIn(BuiltIn::Drop(v, Box::new(self.parse_table_expr()?))))
+                } else if matches!(peek, TokenKind::DropNull) {
+                    self.next();
+                    Ok(TableExpr::BuiltIn(BuiltIn::DropNull(v, Box::new(self.parse_table_expr()?))))
                 } else if matches!(peek, TokenKind::Bang) {
                     self.next(); // consume '!'
                     let peek = self.peek().clone();
@@ -537,12 +544,15 @@ impl Parser {
         // there means `[high, low]`, not `[column, param]`).
         if let TokenKind::Name(n) = self.peek()
             && matches!(n.as_str(),
-                "round" | "quantile" | "pctl" | "shift" | "lag" | "lead"
+                "round" | "quantile" | "pctl" | "shift" | "lag" | "lead" | "fill"
                 | "diff" | "pctchange" | "til")
         {
             let name = n.clone();
             self.next();
-            let value = self.parse_value()?;
+            let value = match self.try_parse_table_operand()? {
+                Some(e) => e,
+                None => self.parse_value()?,
+            };
             let call = Expr::Call { func: name, args: vec![value, left] };
             return self.finish_window(call, windows);
         }
@@ -1217,6 +1227,9 @@ impl Parser {
             // `enlist <value>` — the one-element list of an atom. A literal
             // folds here; anything else is applied at run time (`resolve::eval_value`).
             TokenKind::Name(n) if n == "enlist" => Ok(enlist(self.parse_value()?)),
+            // in expression position `distinct` is the column verb (alias of
+            // `n_unique`); in table position `parse_table_expr` claims it first
+            TokenKind::Distinct => Ok(Expr::ColRef("distinct".into())),
             TokenKind::Name(n) if n == "noop" => Ok(Expr::Noop),
             TokenKind::Name(n) if n == "while" && self.peek() == &TokenKind::LBracket => self.parse_while(),
             TokenKind::Name(n) if n == "while" => Err(QplError::Parse("'while' is a reserved word".into())),
@@ -1407,6 +1420,7 @@ fn render_tokens(tokens: &[Token]) -> String {
             TokenKind::Asc => "asc".to_string(),
             TokenKind::Desc => "desc".to_string(),
             TokenKind::Distinct => "distinct".to_string(),
+            TokenKind::DropNull => "dropnull".to_string(),
             TokenKind::Limit => "limit".to_string(),
             TokenKind::Drop => "drop".to_string(),
             TokenKind::Update => "update".to_string(),
@@ -1846,6 +1860,25 @@ mod tests {
     fn order_multiple_columns() {
         let s = sel("select from trades order col1 asc, col2 desc");
         assert_eq!(s.order, Some(vec![("col1".into(), false), ("col2".into(), true)]));
+    }
+
+    #[test]
+    fn dyadic_verb_accepts_a_table_operand() {
+        match p("0 fill select b from t") {
+            Stmt::SingleVar(Expr::Call { func, args }) => {
+                assert_eq!(func, "fill");
+                assert!(matches!(args[0], Expr::Table(_)));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropnull_select() {
+        assert!(matches!(
+            p("`price`qty dropnull select from trades"),
+            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::DropNull(cols, _))) if cols == vec!["price", "qty"]
+        ));
     }
 
     #[test]

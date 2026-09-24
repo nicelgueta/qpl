@@ -11,6 +11,7 @@ pub enum TokenKind {
     Asc,
     Desc,
     Distinct,
+    DropNull,
     Limit,
     Drop,
     Update,

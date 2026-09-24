@@ -20,6 +20,10 @@ explains it.
 | `like` | glob pattern match | [Expressions](expressions.md) |
 | `round` | `<n> round <col>`, mode from `.qpl.cfg round_type` | [Expressions](expressions.md) |
 | `quantile` `shift` `lag` `lead` `diff` `pctchange` | parameter-on-the-left verbs | [Expressions](expressions.md) |
+| `fill` | `<v> fill <col>` replaces nulls with `v` | [Expressions](expressions.md#nulls) |
+| `isnull` `notnull` | boolean per row: is / isn't null | [Expressions](expressions.md#nulls) |
+| `dropnull` | `` `a`b dropnull <table> `` drops rows with a null in those columns | [Table operators](table-operators.md#dropping-rows-with-nulls) |
+| `distinct` | table: unique rows; column: count of distinct values (`n_unique`) | [Table operators](table-operators.md), [Expressions](expressions.md) |
 | `over` | window: `` <expr> over `p [order `k asc] [rolling n] `` | [Window functions](window-functions.md) |
 | `rn` `rank` `drank` | ranking verbs, require `order` | [Window functions](window-functions.md) |
 | `i` | virtual row-index column, printed as `x` | [Window functions](window-functions.md) |

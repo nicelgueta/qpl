@@ -378,6 +378,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         "asc"    => TokenKind::Asc,
                         "desc"   => TokenKind::Desc,
                         "distinct" => TokenKind::Distinct,
+                        "dropnull" => TokenKind::DropNull,
                         "limit" => TokenKind::Limit,
                         "drop" => TokenKind::Drop,
                         "update" => TokenKind::Update,

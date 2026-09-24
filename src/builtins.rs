@@ -10,6 +10,9 @@ pub enum BuiltIn {
     Sink { src: Box<TableExpr>, path: Expr },
     Sort(Box<TableExpr>, Vec<(String, bool)>),
     Distinct(Box<TableExpr>),
+    /// `` `a`b dropnull <table-expr> `` — drop every row with a null in any of
+    /// the named columns.
+    DropNull(Vec<String>, Box<TableExpr>),
     /// `n limit <table-expr>` / `n#<table-expr>` — first `n` rows for `n >= 0`,
     /// last `|n|` rows (tail) for `n < 0`, kdb `#`-style. `n` is any
     /// scalar-valued expression (a literal, a bound global, …), evaluated at

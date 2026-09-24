@@ -65,6 +65,11 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), 
             out.push(Instruction::FrameExpr(PolarsFrameExpr::Distinct));
             Ok(())
         }
+        BuiltIn::DropNull(columns, tbl_expr) => {
+            compile_tbl_expr(tbl_expr.as_ref(), out)?;
+            out.push(Instruction::FrameExpr(PolarsFrameExpr::DropNull(columns.clone())));
+            Ok(())
+        }
         BuiltIn::Limit(tbl_expr, count) => {
             compile_tbl_expr(tbl_expr.as_ref(), out)?;
             out.push(Instruction::Eval(count.clone()));
