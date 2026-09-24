@@ -2,7 +2,7 @@
   "name": "qpl",
   "displayName": "qpl — Quick Polars Language",
   "description": "Syntax highlighting and an interactive REPL for the qpl language.",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "nicelgueta",
   "license": "MIT",
   "repository": {
