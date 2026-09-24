@@ -261,7 +261,7 @@ commute: `(int$"42") - 1`.
 
 **Aggregates:** `sum`, `avg`/`mean`, `min`, `max`, `count`, `first`, `last`,
 `std`/`dev`, `var`, `med`/`median`, `mode`/`modal`, `skew`, `kurt`, `any`,
-`all`, `prod`, `argmin`, `argmax`, `nnull`, `distinct`/`n_unique`, plus `abs`, `neg`, `not`, `string`. (In a select
+`all`, `prod`, `argmin`, `argmax`, `nnull`, `distinct`/`n_unique`, plus `abs`, `neg`, `not`. (In a select
 list `distinct` counts a column's unique values; in front of a table it
 deduplicates rows.)
 
@@ -494,7 +494,7 @@ brackets are open or after a trailing comma. [multi-line][multiline]
 log "rows > " thr ": " n         / rows > 150: 42
 log (f x) " done"                / juxtaposition separates items, so parenthesise
 log f[x] " done"                 / bracket application isn't ambiguous, no parens needed
-info: {[s] log[str$.qpl.ts " - INFO " s]}   / log[..] is bracket-scoped, so it works inside a function body
+info: {[s] log[str$.qpl.ts " - INFO " s]; noop}   / log[..] works in a body; noop stops the result echoing
 ```
 
 `.qpl.cfg key=value` sets session knobs: `maxcol`, `maxrow`, `tblwidth` (max
@@ -504,7 +504,7 @@ unlimited for `tblwidth`/`strlen`; `round_type` (`HALF_UP` or `HALF_TO_EVEN`)
 and `useqepoch` (`true`/`false`, see Temporal types above) do change answers.
 A bare `.qpl.cfg` prints the current settings. [config][config]
 
-### Namespaces & imports
+### Namespaces & imports · [chapter][imports]
 
 A namespaced name is any dotted identifier, `.ns.name`, nesting allowed. It's
 an ordinary variable, table or function reference that lives under a prefix
@@ -512,12 +512,12 @@ instead of in the flat session scope. `.qpl` is the one built in, holding the
 now-functions and `.qpl.cfg`.
 
 `\l <path>` loads a script flat into the shared scope. `\i "<path>"` instead
-*imports* it: every table, global and function it newly binds at its top
-level moves under `.<file-stem>.*`, so its pieces don't collide with names
-already in scope. The path is a quoted string because the namespace derives
-from it, which keeps it visually distinct from a namespaced identifier on the
-same line. `\i` behaves the same typed at the prompt or nested inside another
-script.
+*imports* it: every table, global and function it binds at its top level
+lands under `.<file-stem>.*` (`lib/my-lib.qpl` -> `.my_lib`), so an import
+never overwrites a name already in your session. The path is a quoted string because
+the namespace derives from it, which keeps it visually distinct from a
+namespaced identifier on the same line. `\i` behaves the same typed at the
+prompt or nested inside another script.
 
 ```q
 \i "lib/utils.qpl"       / defines helper: {[x] x*2}
@@ -527,8 +527,12 @@ script.
 A binding the imported script already namespaced itself is left alone rather
 than double-prefixed. A function's *body* can still call another top-level
 helper from the same script by its bare, unqualified name (`info` calling
-`_log`, say) — that unqualified call resolves against the importing
-function's own namespace before giving up.
+`_log`, say) — that unqualified call resolves against the called function's
+own namespace first, so a session name can't hijack it.
+
+An import is all-or-nothing: if the script fails, the session is restored as
+it was, and a re-import is a clean reload of the namespace. Inside a script,
+`\l`/`\i` paths are relative to that script's own directory.
 
 ### IPC · [chapter][ipc]
 
@@ -552,7 +556,7 @@ result: await pending
 ```
 
 A bare `hopen` is **read-only**, and the server rejects assignments, `sink`
-and `\1` from it. `` `w!hopen `` opens a write handle. The permission is
+and changing `.qpl.cfg` settings from it. `` `w!hopen `` opens a write handle. The permission is
 chosen by the client, enforced per request, and never applies to the server
 operator's own input.
 
@@ -601,7 +605,7 @@ operator's own input.
 | `\port <n>` | start the IPC listener (bare `\port` stops) |
 | `log <expr>` | print a scalar |
 | `cols <name>` | show a table's schema |
-| Ctrl-C | abandon a partial statement (or exit at an empty prompt) |
+| Ctrl-C | stop a running statement; otherwise abandon a partial statement (or exit at an empty prompt) |
 | Ctrl-D | exit |
 
 ```
@@ -692,6 +696,7 @@ wasm`. [The full story](tools/wasm/README.md).
 [multiline]: https://nicelgueta.github.io/qpl/language/multiline.html
 [logging]: https://nicelgueta.github.io/qpl/language/logging.html
 [config]: https://nicelgueta.github.io/qpl/language/config.html
+[imports]: https://nicelgueta.github.io/qpl/language/imports.html
 [ipc]: https://nicelgueta.github.io/qpl/language/ipc.html
 [operators]: https://nicelgueta.github.io/qpl/language/operator-reference.html
 [architecture]: https://nicelgueta.github.io/qpl/architecture.html

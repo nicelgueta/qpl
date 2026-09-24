@@ -31,6 +31,13 @@ pub struct Vm {
     /// own params/locals and the session globals, never an enclosing caller's
     /// frame, so this is lexical (not dynamic) scoping despite being a stack.
     pub scopes: Vec<Scope>,
+    /// The namespace of the `\i` import whose script is currently running
+    /// (e.g. `.utils`), if any — the top-level counterpart of
+    /// [`Scope::current_ns`]. While set, a bare top-level binding lands under
+    /// it (`x: 1` binds `.utils.x`), so an import can never overwrite a
+    /// session name, and a bare lookup tries it first. Saved and restored by
+    /// `repl::run_script_imported`, so nested imports each get their own.
+    pub import_ns: Option<String>,
     /// When set (via the `\1 <path>` command), every line printed through
     /// [`Vm::emit`] is also appended here — kdb-style stdout redirection.
     pub stdout_log: Option<std::fs::File>,
@@ -88,10 +95,10 @@ pub struct Scope {
     /// set by `apply_function` when the callee resolved to a namespaced name.
     /// `\i`'s import only renames a script's top-level bindings, it doesn't
     /// rewrite cross-references *inside* their bodies (`info`'s body still
-    /// calls plain `_log`, not `.logging._log`), so `Vm::lookup` retries an
-    /// unresolved bare name qualified by this before giving up — that's what
+    /// calls plain `_log`, not `.logging._log`), so `Vm::lookup` tries a bare
+    /// name qualified by this before the session's own bindings — that's what
     /// lets a namespaced function call an unqualified sibling from the same
-    /// import.
+    /// import, without a same-named session binding hijacking it.
     pub current_ns: Option<String>,
 }
 
@@ -162,6 +169,7 @@ impl Vm {
             globals: HashMap::new(),
             builtins: crate::native::builtins(),
             scopes: Vec::new(),
+            import_ns: None,
             stdout_log: None,
             capture: None,
             #[cfg(feature = "wasm")]
@@ -202,7 +210,7 @@ impl Vm {
     /// input — `request_mode` is only ever set for the duration of one
     /// dispatched command (see `with_request_permission`).
     #[cfg_attr(not(feature = "ipc"), allow(unused_variables))]
-    fn check_write_allowed(&self, what: &str) -> Result<(), QplError> {
+    pub(crate) fn check_write_allowed(&self, what: &str) -> Result<(), QplError> {
         #[cfg(feature = "ipc")]
         if self.request_mode == Some(crate::ipc::HandleMode::Read) {
             return Err(QplError::Runtime(format!(
@@ -223,11 +231,12 @@ impl Vm {
         self.scopes.pop();
     }
 
-    /// Resolve `name`: the active call frame (if any) first, then the session
-    /// globals. Deliberately **not** a walk of the whole `scopes` stack — a
-    /// function call only ever sees its own frame and the globals, never an
-    /// enclosing caller's frame, which is what makes this lexical scoping
-    /// rather than "whatever the dynamic call chain happens to have bound".
+    /// Resolve `name`: the active call frame (if any) first, then the active
+    /// namespace (if any — see [`Vm::qualify`]), then the session globals.
+    /// Deliberately **not** a walk of the whole `scopes` stack — a function
+    /// call only ever sees its own frame and the globals, never an enclosing
+    /// caller's frame, which is what makes this lexical scoping rather than
+    /// "whatever the dynamic call chain happens to have bound".
     pub(crate) fn lookup(&self, name: &str) -> Option<Lookup<'_>> {
         // checked first and unscoped: a builtin can never be shadowed (see
         // the `bind_*` guards below), so there's no ambiguity to resolve.
@@ -245,50 +254,71 @@ impl Vm {
                 return Some(Lookup::Table(df));
             }
         }
+        // A bare name inside an import's script or a namespaced function's
+        // body means that namespace's own binding first, so a same-named
+        // session binding can't hijack it.
+        if let Some(found) = self.qualify(name).and_then(|q| self.lookup_session(&q)) {
+            return Some(found);
+        }
+        self.lookup_session(name)
+    }
+
+    /// The session-level (frame-zero) half of [`Vm::lookup`].
+    fn lookup_session(&self, name: &str) -> Option<Lookup<'_>> {
         if let Some(v) = self.globals.get(name) {
             return Some(Lookup::Global(v));
         }
         if let Some(lf) = self.lazy_frames.get(name) {
             return Some(Lookup::LazyFrame(lf));
         }
-        if let Some(df) = self.tables.get(name) {
-            return Some(Lookup::Table(df));
+        self.tables.get(name).map(Lookup::Table)
+    }
+
+    /// The namespace in effect here: the active call's (`Scope::current_ns`),
+    /// or at the top level the running import's (`Vm::import_ns`).
+    fn active_ns(&self) -> Option<&String> {
+        match self.scopes.last() {
+            Some(scope) => scope.current_ns.as_ref(),
+            None => self.import_ns.as_ref(),
         }
-        // Unqualified sibling reference from inside a namespaced import's own
-        // function body (see `Scope::current_ns`) — retry once, qualified.
-        if let Some(ns) = self.scopes.last().and_then(|s| s.current_ns.as_ref()) {
-            let qualified = format!("{ns}.{name}");
-            if let Some(v) = self.globals.get(&qualified) {
-                return Some(Lookup::Global(v));
-            }
-            if let Some(lf) = self.lazy_frames.get(&qualified) {
-                return Some(Lookup::LazyFrame(lf));
-            }
-            if let Some(df) = self.tables.get(&qualified) {
-                return Some(Lookup::Table(df));
-            }
+    }
+
+    /// `name` qualified by the active namespace — `None` when there is none,
+    /// or `name` is already namespaced.
+    fn qualify(&self, name: &str) -> Option<String> {
+        if name.starts_with('.') {
+            return None;
         }
-        None
+        self.active_ns().map(|ns| format!("{ns}.{name}"))
     }
 
     /// The namespace a call to `name` should execute under, for propagating
     /// into the callee's own scope (`Scope::current_ns`) so its body can in
     /// turn call an unqualified sibling from the same import. `name` already
     /// qualified (`.logging.info`) uses its own namespace directly; a bare
-    /// name that only resolved via the *current* call's own namespace
-    /// fallback inherits that same namespace, so the chain keeps working
-    /// through more than one level of unqualified sibling calls.
+    /// name that resolved through the active namespace (see [`Vm::lookup`])
+    /// inherits that same namespace, so the chain keeps working through more
+    /// than one level of unqualified sibling calls. A local (a param holding
+    /// a function) or a plain session function runs un-namespaced.
     pub(crate) fn resolve_function_ns(&self, name: &str) -> Option<String> {
-        if let Some(i) = name.rfind('.') {
+        if let Some(i) = name.rfind('.').filter(|&i| i > 0) {
             return Some(name[..i].to_string());
         }
         let is_closure = |v: Option<&ast::Value>| matches!(v, Some(ast::Value::Closure(_)));
-        let resolved_directly = self.scopes.last().is_some_and(|s| is_closure(s.globals.get(name)))
-            || is_closure(self.globals.get(name));
-        if resolved_directly {
-            None
-        } else {
-            self.scopes.last().and_then(|s| s.current_ns.clone())
+        if self.scopes.last().is_some_and(|s| is_closure(s.globals.get(name))) {
+            return None;
+        }
+        let qualified = self.qualify(name)?;
+        is_closure(self.globals.get(&qualified)).then(|| self.active_ns().cloned()).flatten()
+    }
+
+    /// The name a top-level binding actually lands under: inside a running
+    /// `\i` import a bare name goes under the import's namespace (see
+    /// [`Vm::import_ns`]); an already-namespaced name is left alone.
+    fn top_level_name(&self, name: String) -> String {
+        match &self.import_ns {
+            Some(ns) if !name.starts_with('.') => format!("{ns}.{name}"),
+            _ => name,
         }
     }
 
@@ -336,6 +366,7 @@ impl Vm {
                 scope.globals.insert(name, val);
             }
             None => {
+                let name = self.top_level_name(name);
                 self.globals.insert(name, val);
             }
         }
@@ -354,6 +385,7 @@ impl Vm {
                 scope.tables.insert(name, df);
             }
             None => {
+                let name = self.top_level_name(name);
                 self.globals.remove(&name);
                 self.lazy_frames.remove(&name);
                 self.tables.insert(name, df);
@@ -372,6 +404,7 @@ impl Vm {
                 scope.lazy_frames.insert(name, lf);
             }
             None => {
+                let name = self.top_level_name(name);
                 self.globals.remove(&name);
                 self.tables.remove(&name);
                 self.lazy_frames.insert(name, lf);

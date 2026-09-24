@@ -148,7 +148,7 @@ Indexing works on anything that produces a list, not just a bound name:
 
 ```qpl
 sub: trades`price[2 3]       / rows 2 and 3 of the price column
-one: (trades`sym)[0]         / a single symbol
+one: (trades`sym)[0]         / a single value: str "AAPL"
 ```
 
 Following q, a parenthesised expression can also be indexed by just putting
@@ -229,7 +229,7 @@ only those above 400.
 
 ## Building lists and tables from nothing
 
-Two constructors round the chapter off. `til` generates a range, either from
+A few constructors round the chapter off. `til` generates a range, either from
 zero or between two bounds:
 
 ```qpl
@@ -243,6 +243,45 @@ i64[5]: 0 1 2 3 4
 ```qpl
 10 til 15                       / i64[5]: 10 11 12 13 14
 ```
+
+Strings can be written in a run too, separated by spaces. Wrap the run in
+parentheses so it stays apart from whatever sits next to it:
+
+```qpl
+qpl) ("ab" "cd" "ef")
+```
+
+```
+str[3]: "ab" "cd" "ef"
+```
+
+`enlist` makes a one-element list from any atom. A string counts as one atom,
+so `enlist "a"` is a `str[1]`, not a list of characters:
+
+```qpl
+qpl) enlist 23
+```
+
+```
+i64[1]: 23
+```
+
+`?` with a count on the left draws random values, **with replacement**. With
+an integer on the right it gives ints from zero up to (not including) that
+number. With a float it gives uniform floats in `[0, f)`. With a list it
+picks elements from that list, which can be any list at all, including a
+column:
+
+```qpl
+3?6                             / i64[3]: e.g. 2 5 4
+5?2.5                           / f64[5], uniform in [0, 2.5)
+2 ? 10 20 30 40                 / two picks from the list
+4?trades`sym                    / four random tickers
+```
+
+Don't confuse the infix `n?x` with the prefix `?[..]` conditional from
+[Expressions](expressions.md): the bracket straight after `?` is what makes
+it a conditional.
 
 And `zip` assembles a table from named lists of equal length:
 

@@ -14,7 +14,7 @@ explains it.
 | `/` | comment to end of line | [Comments](comments.md) |
 | `:` | bind a name; also alias a column in a query | [Assignment](assignment.md) |
 | `` `x `` | a symbol | [Symbols](symbols.md) |
-| `?[...]` | conditional: vectorised in a select; outside one an atom picks a branch, a vector gives an elementwise result of the same length | [Expressions](expressions.md) |
+| `?[...]` (prefix) | conditional: vectorised in a select; outside one an atom picks a branch, a vector gives an elementwise result of the same length | [Expressions](expressions.md) |
 | `while[test; s1; ...]` | loop: run statements in the current scope while `test` holds | [Control flow](control-flow.md) |
 | `noop` | nothing: prints nothing, can't be assigned or used as a value | [Control flow](control-flow.md) |
 | `like` | glob pattern match | [Expressions](expressions.md) |
@@ -36,9 +36,13 @@ explains it.
 | `_` | drop columns, `` `a`b _ t `` | [Table operators](table-operators.md) |
 | `where` | filter rows in a query; filter a list elementwise, where `x` is the element | [select](select-update-delete.md), [Column expressions](column-expressions.md) |
 | `til` | `til n` gives `0..n-1`; `lo til hi` gives `lo..hi-1` | [Column expressions](column-expressions.md) |
+| `enlist` | `enlist x` gives the one-element list of the atom `x` (a string is one atom) | [Column expressions](column-expressions.md) |
+| `?` (infix) | roll: `n?6` gives `n` random ints below 6, `n?2.5` uniform floats, `n?list` random elements; with replacement | [Column expressions](column-expressions.md) |
 | `zip` | build a table from a dict of named lists | [Column expressions](column-expressions.md) |
 | `lj` `ij` `rj` | left / inner / right join | [select](select-update-delete.md) |
 | `{...}` | lambda | [Functions](functions.md) |
 | `.qpl.dt` `.qpl.tm` `.qpl.ts` `.qpl.dlta` | current date / time / timestamp / timespan, UTC | [Temporal types](temporal-types.md) |
 | `.qpl.cfg` | session settings | [Config](config.md) |
+| `.ns.name` | a namespaced name: an ordinary binding under a dotted prefix | [Scripts, imports & namespaces](imports.md) |
+| `\l <path>` `\i "<path>"` | run a script flat; import one under `.<file-stem>.*` | [Scripts, imports & namespaces](imports.md) |
 | `hopen` `` `w!hopen `` `dispatch` `async dispatch` `await` | IPC client (`ipc` feature, on by default) | [IPC](ipc.md) |

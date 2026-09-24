@@ -36,14 +36,15 @@ against a description of what it should have done.
 
 The most useful way to read what follows is with that REPL open in another
 window. qpl is a language you learn by typing rather than by studying, and
-the examples are all a single line long precisely so that you can.
+nearly all the examples are a single line long precisely so that you can.
 
 ## Before you start
 
 If you have never used kdb+/q, two conventions will look strange on first
-contact, and both are explained properly when they come up: `/` starts a
-comment, which is why division is written `%` rather than `/`. Neither has
-any deeper meaning, and after an hour you will stop noticing.
+contact, and both are explained properly when they come up. First, `/`
+starts a comment, which is why division is written `%` rather than `/`.
+Second, expressions evaluate right to left, so `10 - 3 - 2` is `9`, not `5`.
+Neither has any deeper meaning, and after an hour you will stop noticing.
 
 If you *have* used q, most of your instincts will transfer intact, and the
 [Operator reference](language/operator-reference.md) is probably the fastest

@@ -41,3 +41,6 @@ Inside a `{[..] ..}` [function body](functions.md#writing-a-body-across-multiple
 the same rule applies one indent level in: each line at the body's own
 baseline indent is a separate statement (no `;` needed), and a line indented
 *further* continues the one above, exactly like the script rule above.
+
+[Scripts, imports & namespaces](imports.md) covers running scripts, and
+pulling one script into another.

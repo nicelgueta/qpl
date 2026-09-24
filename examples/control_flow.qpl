@@ -35,7 +35,7 @@ sumto: {[m] s: 0; while[m>0; s: s+m; m: m-1]; s}
 sumto[100]
 
 log "a conditional with function branches (pure, and only one is called)"
-shout: {[msg] log[msg]}
+shout: {[msg] log[msg]; noop}   / noop: return nothing, so the call doesn't echo msg
 n: 5
 ?[n>3; shout["big"]; shout["small"]]
 

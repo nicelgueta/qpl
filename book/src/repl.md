@@ -8,13 +8,17 @@ beginning with `\`, that administer the session rather than querying data.
 |---|---|
 | `\d <stmt>` | disassemble: show the compiled instructions without running them |
 | `\l <path>` | run a `.qpl` script inside the current session |
+| `\i "<path>"` | import a script, namespacing its new bindings under `.<file-stem>.*` |
 | `\1 <path>` | mirror all output to a file (bare `\1` stops) |
 | `\port <n>` | start the IPC listener, if built with that feature |
-| Ctrl-C | abandon a half-typed statement, or exit at an empty prompt |
+| Ctrl-C | stop the running statement; otherwise abandon a half-typed statement, or exit at an empty prompt |
 | Ctrl-D | exit |
 
-Two of those are covered elsewhere: `\1` in [Logging](language/logging.md)
-and `\port` in [IPC](language/ipc.md).
+Three of those are covered elsewhere: `\i` in
+[Scripts, imports & namespaces](language/imports.md), `\1` in
+[Logging](language/logging.md) and `\port` in [IPC](language/ipc.md).
+Stopping a running statement is described under
+[Control flow](language/control-flow.md#stopping-a-loop).
 
 ## Loading a script into a live session
 
@@ -29,6 +33,10 @@ qpl) \l setup.qpl
 This is the natural companion to the incremental style. Keep the settled part
 of your work in a file, load it, and carry on exploring from there. It also
 pairs with `qpl -i script.qpl`, which does the same thing at startup.
+
+`\l` loads the script *flat*, so its names become your names. For a library
+of helpers you'd rather keep out of the way, `\i` imports it under a
+namespace instead; see [Scripts, imports & namespaces](language/imports.md).
 
 ## Seeing what a statement compiles to
 

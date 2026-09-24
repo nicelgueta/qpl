@@ -8,7 +8,7 @@
 /   cargo run -- --load-demo examples/namespaces.qpl
 / ─────────────────────────────────────────────────────────────────────────────
 
-\i "examples/namespace_lib.qpl"
+\i "namespace_lib.qpl"               / relative to this script, not to where qpl was started
 
 log "a function imported under .namespace_lib.* — call it like any other function"
 log .namespace_lib.double[21]        / bracket call — parens only needed for bareword `f x`

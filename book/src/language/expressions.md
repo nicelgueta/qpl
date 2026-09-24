@@ -265,7 +265,8 @@ that contains nulls into a list is an error. Fill or drop them first.
 
 A few more verbs transform a column without collapsing it, and are listed
 here for completeness since they appear in the same position: `abs`, `neg`,
-`not`, `string`.
+`not`. (To turn a column into text, cast it: `str$price`, covered in
+[Casts](casts.md).)
 
 ## Cumulative and fill verbs
 

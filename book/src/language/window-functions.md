@@ -91,7 +91,7 @@ without one:
 
 ```qpl
 select sym, ts, price,
-    prev: lag price over `sym order `ts asc
+    prev: 1 lag price over `sym order `ts asc
     from trades
 ```
 

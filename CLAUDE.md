@@ -101,7 +101,9 @@ carries across lines because the same `Vm` is reused.
 zero-param function or builtin resolves *by being called* even when named
 bare (`resolve::call_niladic`), which is all `.qpl.ts` (and any user `{[] ..}`)
 is. `scopes: Vec<Scope>` is the call stack — only the innermost frame is
-searched, so scoping is lexical.
+searched, so scoping is lexical. `import_ns` (top level) / `Scope::current_ns`
+(inside a call) is the active `\i` namespace: a bare top-level bind lands
+under it, and a bare lookup tries it before the session globals.
 
 (plus `stdout_log: Option<File>` — the `\1` stdout mirror —
 `capture: Option<String>` — when set, `Vm::emit` appends here instead of

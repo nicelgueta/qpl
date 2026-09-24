@@ -2,9 +2,11 @@
 
 Two directions, one concrete and one open-ended.
 
-**A WASM build**, so that qpl can run in a browser. That would make it
-possible to try the language, and to run real queries against a modest
-dataset, without installing anything at all.
+**A cleaner WASM build.** qpl already runs in the browser (see
+[Install](install.md#try-it-in-a-browser-no-install)), but stock Polars
+doesn't compile for `wasm32-unknown-unknown`, so the build currently applies
+a small patch to Polars first. The goal is to drop that patch once upstream
+builds for the target unaided.
 
 **More of the language.** The gaps that exist today are called out in the
 chapter each one belongs to rather than collected here, on the grounds that a

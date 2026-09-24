@@ -11,7 +11,6 @@ use crate::resolve;
 use polars::prelude::*;
 #[cfg(feature = "cli")]
 use rustyline::{DefaultEditor, error::ReadlineError};
-use std::collections::HashMap;
 
 /// Run a `.qpl` script file, printing results. Returns Err on the first failure.
 pub fn run_script(path: &str, vm: &mut Vm) -> Result<(), QplError> {
@@ -39,10 +38,10 @@ fn run_line(src: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<(), Qpl
         return Ok(());
     }
     if let Some(target) = src.strip_prefix("\\l").map(str::trim) {
-        return run_script(target, vm);
+        return run_script(&script_relative(target, path), vm);
     }
     if let Some(target) = src.strip_prefix("\\i").map(str::trim) {
-        return run_script_imported(&parse_quoted_path(target)?, vm);
+        return run_script_imported(&script_relative(&parse_quoted_path(target)?, path), vm);
     }
     if let Some(result) = system_command(src, vm) {
         return result;
@@ -64,25 +63,49 @@ fn parse_quoted_path(rest: &str) -> Result<String, QplError> {
     }
 }
 
+/// A `\l`/`\i` path written inside a script is relative to that script's own
+/// directory, so a library can pull in its neighbours wherever qpl was
+/// started from. Typed at the prompt (`from` is `"<main>"`), or absolute,
+/// it's used as written — relative to the working directory.
+fn script_relative(target: &str, from: &str) -> String {
+    let target_path = std::path::Path::new(target);
+    if from == "<main>" || target_path.is_absolute() {
+        return target.to_string();
+    }
+    match std::path::Path::new(from).parent() {
+        Some(dir) => dir.join(target_path).to_string_lossy().into_owned(),
+        None => target.to_string(),
+    }
+}
+
 /// Run a `.qpl` script (`\i <path>`) as a *namespaced import*: every table and
-/// global the script newly binds at its top level (functions included — a
-/// function is an ordinary global holding a `Value::Closure`) — anything
-/// not already present before the run and not already namespaced itself —
-/// is moved under `.<ns>.<name>`, where `<ns>` is derived from the file's
-/// stem (`utils.qpl` -> `.utils`). Bare `\l` keeps loading flat into the
-/// shared session scope; this is the opt-in alternative.
+/// global the script binds at its top level (functions included — a function
+/// is an ordinary global holding a `Value::Closure`) lands under
+/// `.<ns>.<name>`, where `<ns>` is derived from the file's stem (`utils.qpl`
+/// -> `.utils`); an already-namespaced name is left alone. The renaming
+/// happens at bind time (see `Vm::import_ns`), so the script can never
+/// overwrite a session name. The import is all-or-nothing: it replaces the
+/// namespace's previous contents wholesale (a re-import is a clean reload),
+/// and if any statement fails the session's bindings are restored exactly as
+/// they were before. Bare `\l` keeps loading flat into the shared session
+/// scope; this is the opt-in alternative.
 pub fn run_script_imported(path: &str, vm: &mut Vm) -> Result<(), QplError> {
     let ns = namespace_from_path(path);
-    let before_tables: std::collections::HashSet<String> = vm.tables.keys().cloned().collect();
-    let before_lazy: std::collections::HashSet<String> = vm.lazy_frames.keys().cloned().collect();
-    let before_globals: std::collections::HashSet<String> = vm.globals.keys().cloned().collect();
+    // cheap: tables, plans and vector values are all reference-counted
+    let snapshot = (vm.tables.clone(), vm.lazy_frames.clone(), vm.globals.clone());
+    let prefix = format!("{ns}.");
+    vm.tables.retain(|k, _| !k.starts_with(&prefix));
+    vm.lazy_frames.retain(|k, _| !k.starts_with(&prefix));
+    vm.globals.retain(|k, _| !k.starts_with(&prefix));
 
-    run_script(path, vm)?;
+    let outer = vm.import_ns.replace(ns);
+    let result = run_script(path, vm);
+    vm.import_ns = outer;
 
-    namespace_new_keys(&mut vm.tables, &before_tables, &ns);
-    namespace_new_keys(&mut vm.lazy_frames, &before_lazy, &ns);
-    namespace_new_keys(&mut vm.globals, &before_globals, &ns);
-    Ok(())
+    if result.is_err() {
+        (vm.tables, vm.lazy_frames, vm.globals) = snapshot;
+    }
+    result
 }
 
 /// Derive a namespace (`.utils`, `.my_lib`) from a `\i`-imported script's
@@ -101,23 +124,6 @@ fn namespace_from_path(path: &str) -> String {
         cleaned.insert(0, '_');
     }
     format!(".{cleaned}")
-}
-
-/// Move every key in `map` that is new since `before` and not already
-/// namespaced (doesn't start with `.`) under `<ns>.<key>`.
-fn namespace_new_keys<V>(
-    map: &mut HashMap<String, V>,
-    before: &std::collections::HashSet<String>,
-    ns: &str,
-) {
-    let new_keys: Vec<String> = map.keys()
-        .filter(|k| !before.contains(*k) && !k.starts_with('.'))
-        .cloned()
-        .collect();
-    for k in new_keys {
-        let v = map.remove(&k).expect("key just listed from this map");
-        map.insert(format!("{ns}.{k}"), v);
-    }
 }
 
 /// Fold the physical lines of a script into logical statements.
@@ -639,6 +645,9 @@ fn apply_cfg(args: &str, vm: &mut Vm) -> Result<(), QplError> {
         vm.emit(&current);
         return Ok(());
     }
+    // changing a knob is a write to the session — a read-only IPC client
+    // may print the settings but not change them
+    vm.check_write_allowed(".qpl.cfg")?;
     for pair in args.split_whitespace() {
         let (key, value) = pair.split_once('=').ok_or_else(|| {
             QplError::Runtime(format!("expected key=value in `.qpl.cfg`, got '{pair}'"))
@@ -866,6 +875,140 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let ns = namespace_from_path(path.to_str().unwrap());
         assert!(vm.globals.contains_key(&format!("{ns}.z")));
+    }
+
+    /// A fresh scratch directory for one test's script files.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("qpl_{tag}_{:?}", std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn i_import_never_overwrites_an_existing_session_name() {
+        // regression: only names *new* since the import started used to be
+        // namespaced, so a library assigning `thr` silently replaced the
+        // session's own `thr` and nothing landed under `.lib`.
+        let dir = scratch_dir("i_clobber");
+        let lib = dir.join("lib.qpl");
+        std::fs::write(&lib, "thr: 99\nt: select from t where c > 1\nn: count t\n").unwrap();
+        let mut vm = Vm::new();
+        vm.tables.insert("t".into(), polars::df!["c" => [1i64, 2, 3]].unwrap());
+        vm.globals.insert("thr".into(), crate::ast::Value::Int(1));
+        run_script_imported(lib.to_str().unwrap(), &mut vm).expect("import");
+
+        assert_eq!(vm.globals.get("thr"), Some(&crate::ast::Value::Int(1)));
+        assert_eq!(vm.globals.get(".lib.thr"), Some(&crate::ast::Value::Int(99)));
+        assert_eq!(vm.tables["t"].height(), 3, "session table untouched");
+        assert_eq!(vm.tables[".lib.t"].height(), 2);
+        // the script's later `count t` saw its *own* `t`, not the session's
+        assert_eq!(vm.globals.get(".lib.n"), Some(&crate::ast::Value::Int(2)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn i_import_sibling_is_not_hijacked_by_a_session_name() {
+        // regression: the namespaced fallback used to run only after the
+        // session's own bindings, so a session `_log` bound after the import
+        // replaced the library's `_log` inside `.lg.info`.
+        let dir = scratch_dir("i_hijack");
+        let lib = dir.join("lg.qpl");
+        std::fs::write(&lib, "_log: {[s] s}\ninfo: {[s] _log[s]}\n").unwrap();
+        let mut vm = Vm::new();
+        run_script_imported(lib.to_str().unwrap(), &mut vm).expect("import");
+        run_line("_log: {[s] 0}", &mut vm, "<main>", 0).unwrap();
+        run_line(r#"l: .lg.info "hi""#, &mut vm, "<main>", 0).unwrap();
+        assert_eq!(vm.globals.get("l"), Some(&crate::ast::Value::Str("hi".into())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn i_import_is_rolled_back_when_the_script_fails() {
+        // regression: a failing import used to leave everything bound before
+        // the failure in the session under its *bare* name.
+        let dir = scratch_dir("i_rollback");
+        let lib = dir.join("bad.qpl");
+        std::fs::write(&lib, "good: 1\nthr: 5\noops: nosuchname + 1\n").unwrap();
+        let mut vm = Vm::new();
+        vm.globals.insert("thr".into(), crate::ast::Value::Int(1));
+        vm.globals.insert(".bad.old".into(), crate::ast::Value::Int(7));
+        run_script_imported(lib.to_str().unwrap(), &mut vm).expect_err("import should fail");
+
+        assert!(!vm.globals.contains_key("good"));
+        assert!(!vm.globals.contains_key(".bad.good"));
+        assert_eq!(vm.globals.get("thr"), Some(&crate::ast::Value::Int(1)));
+        // the previous import's contents survive a failed re-import
+        assert_eq!(vm.globals.get(".bad.old"), Some(&crate::ast::Value::Int(7)));
+        assert!(vm.import_ns.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn i_reimport_replaces_the_namespace_wholesale() {
+        let dir = scratch_dir("i_reimport");
+        let lib = dir.join("u.qpl");
+        std::fs::write(&lib, "a: 1\nb: 2\n").unwrap();
+        let mut vm = Vm::new();
+        run_script_imported(lib.to_str().unwrap(), &mut vm).expect("first import");
+        std::fs::write(&lib, "a: 10\n").unwrap();
+        run_script_imported(lib.to_str().unwrap(), &mut vm).expect("re-import");
+        assert_eq!(vm.globals.get(".u.a"), Some(&crate::ast::Value::Int(10)));
+        assert!(!vm.globals.contains_key(".u.b"), "a binding dropped from the library goes away");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nested_l_and_i_paths_are_relative_to_the_including_script() {
+        // regression: `\l`/`\i` inside a script resolved against the working
+        // directory, not the script's own location.
+        let dir = scratch_dir("i_relpath");
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/helpers.qpl"), "twice: {[x] x*2}\n").unwrap();
+        std::fs::write(dir.join("lib/flat.qpl"), "f: 3\n").unwrap();
+        std::fs::write(
+            dir.join("lib/report.qpl"),
+            "\\i \"helpers.qpl\"\n\\l flat.qpl\nr: .helpers.twice[f]\n",
+        ).unwrap();
+        let mut vm = Vm::new();
+        // imported by absolute path, from a working directory that is not `dir`
+        run_script_imported(dir.join("lib/report.qpl").to_str().unwrap(), &mut vm).expect("import");
+        assert_eq!(vm.globals.get(".report.r"), Some(&crate::ast::Value::Int(6)));
+        assert_eq!(vm.globals.get(".report.f"), Some(&crate::ast::Value::Int(3)), "`\\l` inside an import lands in its namespace");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn script_relative_leaves_prompt_and_absolute_paths_alone() {
+        assert_eq!(super::script_relative("a.qpl", "<main>"), "a.qpl");
+        assert_eq!(super::script_relative("/x/a.qpl", "lib/b.qpl"), "/x/a.qpl");
+        assert_eq!(super::script_relative("a.qpl", "b.qpl"), "a.qpl");
+        assert_eq!(
+            super::script_relative("a.qpl", "lib/b.qpl"),
+            std::path::Path::new("lib").join("a.qpl").to_string_lossy()
+        );
+    }
+
+    #[cfg(feature = "ipc")]
+    #[test]
+    fn read_handle_can_print_but_not_change_config() {
+        // regression: `.qpl.cfg key=value` bypassed the read-only gate, so a
+        // read handle could change e.g. `round_type`, which changes answers.
+        use crate::ipc::HandleMode;
+        let mut vm = Vm::new();
+        vm.with_request_permission(HandleMode::Read, |vm| super::eval_for_dispatch(".qpl.cfg", vm))
+            .expect("printing the settings is a read");
+        let err = vm
+            .with_request_permission(HandleMode::Read, |vm| {
+                super::eval_for_dispatch(".qpl.cfg round_type=HALF_UP", vm)
+            })
+            .expect_err("changing a knob is a write");
+        assert!(matches!(&err, crate::errors::QplError::Runtime(m) if m.contains("read-only")), "{err:?}");
+        assert!(vm.config.describe().contains("round_type=HALF_TO_EVEN"));
+        vm.with_request_permission(HandleMode::Write, |vm| {
+            super::eval_for_dispatch(".qpl.cfg round_type=HALF_UP", vm)
+        })
+        .expect("a write handle may change it");
     }
 
     #[test]

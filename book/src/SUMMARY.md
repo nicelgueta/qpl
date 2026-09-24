@@ -23,6 +23,7 @@
   - [Control flow](language/control-flow.md)
   - [lazy / collect](language/lazy-collect.md)
   - [Multi-line statements](language/multiline.md)
+  - [Scripts, imports & namespaces](language/imports.md)
   - [Logging](language/logging.md)
   - [Config](language/config.md)
   - [IPC](language/ipc.md)

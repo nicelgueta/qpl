@@ -1,6 +1,6 @@
 / ─────────────────────────────────────────────────────────────────────────────
-/ A tiny "library" script meant to be imported, not run directly. `\i` (REPL
-/ only — see examples/README.md) runs a script like `\l`, then moves every
+/ A tiny "library" script meant to be imported, not run directly. `\i` (at
+/ the prompt or nested in a script — see examples/README.md) runs a script like `\l`, then moves every
 / table/global/function it newly bound at its top level under `.namespace_lib.*`
 / (the file's stem), so it doesn't collide with names already in the session.
 / ─────────────────────────────────────────────────────────────────────────────

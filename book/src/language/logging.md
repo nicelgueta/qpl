@@ -65,13 +65,32 @@ bigger. `log[...]` is the same thing scoped with brackets instead, which is
 what makes it usable inside a function body or nested in a larger expression:
 
 ```qpl
-info: {[s] log[str$.qpl.ts " - INFO " s]}
+info: {[s] log[str$.qpl.ts " - INFO " s]; noop}
 info["service started"]
 ```
 
 ```
 2024.03.15D09:30:00.000000000 - INFO service started
 ```
+
+The `noop` at the end matters. `log[...]` returns the text it wrote as well
+as printing it, and a function returns its last statement's value. Without
+`noop`, `info`'s return value would be that text, and calling `info` as a
+statement would print it a second time as an ordinary result:
+
+```
+2024.03.15D09:30:00.000000000 - INFO service started
+str: "2024.03.15D09:30:00.000000000 - INFO service started"
+```
+
+That echo is more than untidy. It goes wherever output goes, so under
+[`\1`](#teeing-output-to-a-file) every log line would land in the log file
+twice, once as the message and once as a quoted result. Ending the body with
+[`noop`](control-flow.md#noop) makes the function return nothing, and
+nothing prints nothing, so each call writes exactly one line. Do this for
+any function you call only for its logging. (A `log[...]` standing alone as a
+whole statement never echoes; this is only about `log[...]` as a function's
+last statement.)
 
 Arguments inside the brackets are still space-separated and concatenated
 exactly like the bareword form (a `;` between them is accepted too, but never

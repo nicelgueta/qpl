@@ -28,7 +28,7 @@ A branch can also be a function call, so it can do things as well as compute
 values:
 
 ```qpl
-qpl) shout: {[msg] log[msg]}
+qpl) shout: {[msg] log[msg]; noop}   / noop: see Logging for why
 qpl) ?[n>3; shout["big"]; shout["small"]]
 ```
 

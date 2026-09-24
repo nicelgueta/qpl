@@ -53,7 +53,7 @@ could connect, so there has to be a prompt keeping the process alive.
 Every request that arrives is evaluated exactly as though someone had typed
 it at the server's own prompt. Assignments change the server's session,
 queries run against its tables. The exception is the `\`-prefixed commands
-(`\d`, `\l`, `\1`, and `\port` itself), which are local administration and
+(`\d`, `\l`, `\i`, `\1`, and `\port` itself), which are local administration and
 aren't something a remote caller can trigger.
 
 ## Connecting as a client
@@ -100,7 +100,9 @@ conn dispatch t: select from u
 A client that can run arbitrary statements on a server can also modify it, so
 qpl defaults to the cautious option. A bare `hopen` gives a **read-only**
 connection, and the server refuses anything that would write to its session:
-assignments, `sink`, and `\1`. Queries of every kind still work.
+assignments, `sink`, and changing a [`.qpl.cfg`](config.md) setting (a bare
+`.qpl.cfg`, which only prints them, is fine). Queries of every kind still
+work.
 
 ```qpl
 ro: hopen 5001                          / read-only, the default
