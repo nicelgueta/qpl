@@ -244,7 +244,7 @@ cols trades
 | conditional | `?[cond; then; cond2; then2; ...; else]`, vectorised, nests for else-if |
 | pattern match | `<str/sym> like <pattern>`, q-style glob |
 | cast | `type$expr` |
-| dyadic verbs | `<param> verb <col>`: `quantile`/`pctl`, `shift`/`lag`, `lead`, `diff`, `pctchange`, `round` |
+| dyadic verbs | `<param> verb <col>`: `quantile`/`pctl`, `shift`/`lag`, `lead`, `diff`, `pctchange`, `round`, `fill`; the operand may be a table expression (`"" fill select b from t`) |
 | window | `` <expr> over `p [order `k asc] [rolling n] `` |
 
 ```q
@@ -261,9 +261,9 @@ commute: `(int$"42") - 1`.
 
 **Aggregates:** `sum`, `avg`/`mean`, `min`, `max`, `count`, `first`, `last`,
 `std`/`dev`, `var`, `med`/`median`, `mode`/`modal`, `skew`, `kurt`, `any`,
-`all`, `prod`, `argmin`, `argmax`, `nnull`, `distinct`/`n_unique` (`distinct` on a column counts its unique values; on a
-table it deduplicates rows), plus
-`abs`, `neg`, `not`, `string`.
+`all`, `prod`, `argmin`, `argmax`, `nnull`, `distinct`/`n_unique`, plus `abs`, `neg`, `not`, `string`. (In a select
+list `distinct` counts a column's unique values; in front of a table it
+deduplicates rows.)
 
 **Null tests:** `isnull` / `notnull` give a boolean per row, for filtering:
 `select from t where isnull price`, `select count i from t where notnull sym`.
@@ -271,8 +271,9 @@ table it deduplicates rows), plus
 
 **Removing nulls:** `<value> fill <col>` replaces nulls in a column with a value
 (`select 0 fill price from t`, `update qty: 0 fill qty from t`), and `` `a`b dropnull <table> ``
-drops every row that has a null in any of the named columns (`` `price dropnull t ``). Lists can't hold
-nulls, so use these before pulling a nullable column into a list.
+drops every row that has a null in any of the named columns
+(`` `price dropnull t ``). Lists can't hold nulls, so use these before pulling a
+nullable column into a list.
 
 **Cumulative:** `cumsum`, `cummax`, `cummin`, `cumprod`, `cumcount`, `ffill`,
 `bfill`. Most useful with `over` and an `order`.
@@ -400,6 +401,7 @@ distinct select sym from trades
 10 limit select from trades      / 10#select from trades is the same
 -3 limit trades                  / last 3 rows; -3#trades is the same
 `price`size drop trades          / `price`size _ trades is the same
+`price dropnull trades           / drop rows with a null in the named columns
 `sym`price!01b trades            / sort map: 0 asc, 1 desc
 
 n: 10
