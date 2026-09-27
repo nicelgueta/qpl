@@ -39,7 +39,9 @@ fn rt<E: std::fmt::Display>(e: E) -> QplError {
 /// codebase, which already collapses to `Runtime` via the `rt`/`map_err(rt)` idiom).
 fn error_message(e: &QplError) -> String {
     match e {
-        QplError::Lex(m) | QplError::Parse(m) | QplError::Compile(m) | QplError::Runtime(m) => m.clone(),
+        QplError::Lex(m) | QplError::Parse(m) | QplError::Compile(m) | QplError::Runtime(m) => {
+            m.clone()
+        }
         QplError::Interrupted => "interrupted".to_string(),
     }
 }
@@ -151,7 +153,9 @@ pub fn hopen(addr: &str, mode: HandleMode) -> Result<ClientConn, QplError> {
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(ClientConn { tx, mode }),
         Ok(Err(e)) => Err(QplError::Runtime(format!("hopen '{addr}': {e}"))),
-        Err(_) => Err(QplError::Runtime(format!("hopen '{addr}': connection thread died"))),
+        Err(_) => Err(QplError::Runtime(format!(
+            "hopen '{addr}': connection thread died"
+        ))),
     }
 }
 
@@ -165,7 +169,9 @@ async fn dispatch_once(
     payload.extend_from_slice(command.as_bytes());
     req.send(payload.into()).await.map_err(rt)?;
     let msg = req.recv().await.map_err(rt)?;
-    let bytes: Vec<u8> = msg.try_into().map_err(|e: &str| QplError::Runtime(e.into()))?;
+    let bytes: Vec<u8> = msg
+        .try_into()
+        .map_err(|e: &str| QplError::Runtime(e.into()))?;
     decode_response(&bytes)
 }
 
@@ -192,7 +198,9 @@ fn recv_interruptible(rx: &ReplyRx, interrupt: &Interrupt) -> Result<EvalResult,
             Ok(reply) => return reply,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(QplError::Runtime("connection closed before replying".into()))
+                return Err(QplError::Runtime(
+                    "connection closed before replying".into(),
+                ));
             }
         }
     }
@@ -257,7 +265,10 @@ impl Drop for ServerHandle {
 
 /// `\port <n>` — bind and start the listener thread. Blocks until the bind
 /// either succeeds or fails, so a busy port is reported immediately.
-pub fn start_server(port: u16, main_tx: mpsc::Sender<PortRequest>) -> Result<ServerHandle, QplError> {
+pub fn start_server(
+    port: u16,
+    main_tx: mpsc::Sender<PortRequest>,
+) -> Result<ServerHandle, QplError> {
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -337,9 +348,14 @@ pub fn start_server(port: u16, main_tx: mpsc::Sender<PortRequest>) -> Result<Ser
     });
 
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(ServerHandle { shutdown_tx: Some(shutdown_tx), thread: Some(thread) }),
+        Ok(Ok(())) => Ok(ServerHandle {
+            shutdown_tx: Some(shutdown_tx),
+            thread: Some(thread),
+        }),
         Ok(Err(e)) => Err(QplError::Runtime(format!("\\port {port}: {e}"))),
-        Err(_) => Err(QplError::Runtime(format!("\\port {port}: listener thread died"))),
+        Err(_) => Err(QplError::Runtime(format!(
+            "\\port {port}: listener thread died"
+        ))),
     }
 }
 
@@ -392,19 +408,27 @@ pub fn encode_result(result: &Result<EvalResult, QplError>) -> Vec<u8> {
 }
 
 fn decode_response(bytes: &[u8]) -> Result<EvalResult, QplError> {
-    let (&tag, rest) = bytes.split_first().ok_or_else(|| rt("empty dispatch response"))?;
+    let (&tag, rest) = bytes
+        .split_first()
+        .ok_or_else(|| rt("empty dispatch response"))?;
     match tag {
-        TAG_ERROR => Err(QplError::Runtime(String::from_utf8_lossy(rest).into_owned())),
+        TAG_ERROR => Err(QplError::Runtime(
+            String::from_utf8_lossy(rest).into_owned(),
+        )),
         TAG_STORED => Ok(EvalResult::Stored),
         TAG_LAZY => Ok(EvalResult::Lazy(String::from_utf8_lossy(rest).into_owned())),
-        TAG_SCALAR => Ok(EvalResult::Scalar(ast::Value::decode(&mut Reader::new(rest))?)),
+        TAG_SCALAR => Ok(EvalResult::Scalar(ast::Value::decode(&mut Reader::new(
+            rest,
+        ))?)),
         TAG_TABLE => {
             let df = ParquetReader::new(Cursor::new(rest.to_vec()))
                 .finish()
                 .map_err(rt)?;
             Ok(EvalResult::Table(df))
         }
-        other => Err(QplError::Runtime(format!("unknown dispatch response tag {other}"))),
+        other => Err(QplError::Runtime(format!(
+            "unknown dispatch response tag {other}"
+        ))),
     }
 }
 
@@ -441,11 +465,28 @@ impl TryFrom<u8> for ValueTag {
     fn try_from(b: u8) -> Result<Self, QplError> {
         use ValueTag::*;
         Ok(match b {
-            0 => Int, 1 => Float, 2 => Str, 3 => Sym, 4 => Bool,
-            5 => Date, 6 => Month, 7 => Time, 8 => Minute, 9 => Second,
-            10 => Timestamp, 11 => Timespan, 12 => IntVec, 13 => FloatVec,
-            14 => SymVec, 15 => StrVec, 16 => BoolVec,
-            other => return Err(QplError::Runtime(format!("unknown dispatch value tag {other}"))),
+            0 => Int,
+            1 => Float,
+            2 => Str,
+            3 => Sym,
+            4 => Bool,
+            5 => Date,
+            6 => Month,
+            7 => Time,
+            8 => Minute,
+            9 => Second,
+            10 => Timestamp,
+            11 => Timespan,
+            12 => IntVec,
+            13 => FloatVec,
+            14 => SymVec,
+            15 => StrVec,
+            16 => BoolVec,
+            other => {
+                return Err(QplError::Runtime(format!(
+                    "unknown dispatch value tag {other}"
+                )));
+            }
         })
     }
 }
@@ -460,47 +501,93 @@ impl ast::Value {
     fn encode(&self, out: &mut Vec<u8>) {
         use ast::Value::*;
         match self {
-            Int(n) => { out.push(ValueTag::Int as u8); out.extend_from_slice(&n.to_le_bytes()); }
-            Float(n) => { out.push(ValueTag::Float as u8); out.extend_from_slice(&n.to_le_bytes()); }
-            Str(s) => { out.push(ValueTag::Str as u8); push_str(out, s); }
-            Sym(s) => { out.push(ValueTag::Sym as u8); push_str(out, s); }
-            Bool(b) => { out.push(ValueTag::Bool as u8); out.push(*b as u8); }
-            Date(n) => { out.push(ValueTag::Date as u8); out.extend_from_slice(&n.to_le_bytes()); }
-            Month(n) => { out.push(ValueTag::Month as u8); out.extend_from_slice(&n.to_le_bytes()); }
-            Time(n) => { out.push(ValueTag::Time as u8); out.extend_from_slice(&n.to_le_bytes()); }
-            Minute(n) => { out.push(ValueTag::Minute as u8); out.extend_from_slice(&n.to_le_bytes()); }
-            Second(n) => { out.push(ValueTag::Second as u8); out.extend_from_slice(&n.to_le_bytes()); }
-            Timestamp(n) => { out.push(ValueTag::Timestamp as u8); out.extend_from_slice(&n.to_le_bytes()); }
-            Timespan(n) => { out.push(ValueTag::Timespan as u8); out.extend_from_slice(&n.to_le_bytes()); }
+            Int(n) => {
+                out.push(ValueTag::Int as u8);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Float(n) => {
+                out.push(ValueTag::Float as u8);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Str(s) => {
+                out.push(ValueTag::Str as u8);
+                push_str(out, s);
+            }
+            Sym(s) => {
+                out.push(ValueTag::Sym as u8);
+                push_str(out, s);
+            }
+            Bool(b) => {
+                out.push(ValueTag::Bool as u8);
+                out.push(*b as u8);
+            }
+            Date(n) => {
+                out.push(ValueTag::Date as u8);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Month(n) => {
+                out.push(ValueTag::Month as u8);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Time(n) => {
+                out.push(ValueTag::Time as u8);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Minute(n) => {
+                out.push(ValueTag::Minute as u8);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Second(n) => {
+                out.push(ValueTag::Second as u8);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Timestamp(n) => {
+                out.push(ValueTag::Timestamp as u8);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Timespan(n) => {
+                out.push(ValueTag::Timespan as u8);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
             IntVec(v) => {
                 out.push(ValueTag::IntVec as u8);
                 let v = v.i64().unwrap();
                 out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for n in v.into_no_null_iter() { out.extend_from_slice(&n.to_le_bytes()); }
+                for n in v.into_no_null_iter() {
+                    out.extend_from_slice(&n.to_le_bytes());
+                }
             }
             FloatVec(v) => {
                 out.push(ValueTag::FloatVec as u8);
                 let v = v.f64().unwrap();
                 out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for n in v.into_no_null_iter() { out.extend_from_slice(&n.to_le_bytes()); }
+                for n in v.into_no_null_iter() {
+                    out.extend_from_slice(&n.to_le_bytes());
+                }
             }
             SymVec(v) => {
                 out.push(ValueTag::SymVec as u8);
                 let v = v.str().unwrap();
                 out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for s in v.iter().flatten() { push_str(out, s); }
+                for s in v.iter().flatten() {
+                    push_str(out, s);
+                }
             }
             StrVec(v) => {
                 out.push(ValueTag::StrVec as u8);
                 let v = v.str().unwrap();
                 out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for s in v.iter().flatten() { push_str(out, s); }
+                for s in v.iter().flatten() {
+                    push_str(out, s);
+                }
             }
             BoolVec(v) => {
                 out.push(ValueTag::BoolVec as u8);
                 let v = v.bool().unwrap();
                 out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for b in v.iter().flatten() { out.push(b as u8); }
+                for b in v.iter().flatten() {
+                    out.push(b as u8);
+                }
             }
             // connection/future handles and functions never cross the wire
             Handle(_) | Future(_) | Closure(_) => {
@@ -550,7 +637,11 @@ impl ast::Value {
             }
             BoolVec => {
                 let n = r.u32()?;
-                ast::bool_vec((0..n).map(|_| r.u8().map(|b| b != 0)).collect::<Result<_, _>>()?)
+                ast::bool_vec(
+                    (0..n)
+                        .map(|_| r.u8().map(|b| b != 0))
+                        .collect::<Result<_, _>>()?,
+                )
             }
         })
     }
@@ -567,7 +658,10 @@ impl<'a> Reader<'a> {
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8], QplError> {
         let end = self.pos + n;
-        let slice = self.buf.get(self.pos..end).ok_or_else(|| rt("truncated dispatch payload"))?;
+        let slice = self
+            .buf
+            .get(self.pos..end)
+            .ok_or_else(|| rt("truncated dispatch payload"))?;
         self.pos = end;
         Ok(slice)
     }
@@ -631,7 +725,10 @@ mod tests {
 
     #[test]
     fn value_round_trip_handles_empty_vectors_and_strings() {
-        assert_eq!(roundtrip_value(ast::Value::Str("".into())), ast::Value::Str("".into()));
+        assert_eq!(
+            roundtrip_value(ast::Value::Str("".into())),
+            ast::Value::Str("".into())
+        );
         assert_eq!(roundtrip_value(ast::int_vec(vec![])), ast::int_vec(vec![]));
     }
 
@@ -678,7 +775,10 @@ mod tests {
     /// with `respond(command)`'s encoded result. Mimics the REPL's polling
     /// loop (`PortSession::poll` + `eval_for_dispatch`) without needing the
     /// REPL itself.
-    fn spawn_stub_server(port: u16, respond: impl Fn(&str) -> Result<EvalResult, QplError> + Send + 'static) -> ServerHandle {
+    fn spawn_stub_server(
+        port: u16,
+        respond: impl Fn(&str) -> Result<EvalResult, QplError> + Send + 'static,
+    ) -> ServerHandle {
         let (tx, rx) = mpsc::channel::<PortRequest>();
         let handle = start_server(port, tx).expect("bind");
         thread::spawn(move || {
@@ -720,8 +820,12 @@ mod tests {
     fn dispatch_surfaces_a_remote_error_locally() {
         let server = spawn_stub_server(28903, |_cmd| Err(QplError::Runtime("nope".into())));
         let conn = hopen("28903", HandleMode::Read).expect("hopen");
-        let err = dispatch_blocking(&conn, "bad".into(), &Interrupt::default()).expect_err("expected an error");
-        assert_eq!(err.to_string(), QplError::Runtime("nope".into()).to_string());
+        let err = dispatch_blocking(&conn, "bad".into(), &Interrupt::default())
+            .expect_err("expected an error");
+        assert_eq!(
+            err.to_string(),
+            QplError::Runtime("nope".into()).to_string()
+        );
         server.close();
     }
 
@@ -740,7 +844,9 @@ mod tests {
 
     #[test]
     fn two_connections_to_the_same_server_are_independent() {
-        let server = spawn_stub_server(28905, |cmd| Ok(EvalResult::Scalar(ast::Value::Str(cmd.to_string()))));
+        let server = spawn_stub_server(28905, |cmd| {
+            Ok(EvalResult::Scalar(ast::Value::Str(cmd.to_string())))
+        });
         let a = hopen("28905", HandleMode::Read).expect("hopen a");
         let b = hopen("28905", HandleMode::Write).expect("hopen b");
         match dispatch_blocking(&a, "from-a".into(), &Interrupt::default()) {
@@ -766,7 +872,9 @@ mod tests {
         thread::spawn(move || {
             while let Ok((mode, command, reply_tx)) = rx.recv() {
                 let echoed = format!("{mode:?}:{command}");
-                let _ = reply_tx.send(encode_result(&Ok(EvalResult::Scalar(ast::Value::Str(echoed)))));
+                let _ = reply_tx.send(encode_result(&Ok(EvalResult::Scalar(ast::Value::Str(
+                    echoed,
+                )))));
             }
         });
 
@@ -814,7 +922,10 @@ mod tests {
         let err = dispatch_blocking(&conn, "slow".into(), &interrupt).expect_err("interrupted");
         t.join().unwrap();
         assert!(matches!(err, QplError::Interrupted), "{err:?}");
-        assert!(started.elapsed() < std::time::Duration::from_millis(350), "returned before the server replied");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(350),
+            "returned before the server replied"
+        );
         // the abandoned reply is drained by the worker; the next round trip is in step
         match dispatch_blocking(&conn, "fast".into(), &Interrupt::default()) {
             Ok(EvalResult::Scalar(ast::Value::Str(s))) => assert_eq!(s, "fast"),
@@ -829,7 +940,10 @@ mod tests {
         let conn = hopen("28911", HandleMode::Read).expect("hopen");
         let rx = enqueue(&conn, "slow".into()).expect("enqueue");
         let (interrupt, t) = interrupt_after(50);
-        assert!(matches!(await_reply(&rx, &interrupt), Err(QplError::Interrupted)));
+        assert!(matches!(
+            await_reply(&rx, &interrupt),
+            Err(QplError::Interrupted)
+        ));
         t.join().unwrap();
         match await_reply(&rx, &Interrupt::default()) {
             Ok(EvalResult::Scalar(ast::Value::Str(s))) => assert_eq!(s, "slow"),
@@ -844,7 +958,10 @@ mod tests {
         let conn = hopen("28912", HandleMode::Read).expect("hopen");
         let interrupt = Interrupt::default();
         interrupt.request();
-        assert!(matches!(dispatch_blocking(&conn, "slow".into(), &interrupt), Err(QplError::Interrupted)));
+        assert!(matches!(
+            dispatch_blocking(&conn, "slow".into(), &interrupt),
+            Err(QplError::Interrupted)
+        ));
         server.close();
     }
 

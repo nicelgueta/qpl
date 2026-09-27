@@ -37,6 +37,7 @@ fn rt(e: impl std::fmt::Display) -> QplError {
 pub fn df_to_ipc(df: &DataFrame) -> Result<Vec<u8>, QplError> {
     let compat = CompatLevel::oldest();
     // `iter_chunks` requires equal chunk layout across columns.
+    // TODO: see if we really need to clone here - could be v expensive for large df
     let mut df = df.clone();
     df.rechunk_mut();
 
@@ -111,8 +112,17 @@ pub fn row_count(vm: &Vm, name: &str) -> Result<usize, QplError> {
         return Ok(df.height());
     }
     if let Some(lf) = vm.lazy_frames.get(name) {
-        let n = lf.clone().select([len().alias("n")]).collect().map_err(rt)?;
-        return n.column("n").map_err(rt)?.u32().map_err(rt)?.get(0)
+        let n = lf
+            .clone()
+            .select([len().alias("n")])
+            .collect()
+            .map_err(rt)?;
+        return n
+            .column("n")
+            .map_err(rt)?
+            .u32()
+            .map_err(rt)?
+            .get(0)
             .map(|n| n as usize)
             .ok_or_else(|| QplError::Runtime(format!("could not count the rows of '{name}'")));
     }
@@ -130,7 +140,8 @@ mod tests {
             "price" => [1.5f64, 2.5, 3.5],
             "size"  => [10i64, 20, 30],
             "flag"  => [true, false, true],
-        ].unwrap()
+        ]
+        .unwrap()
     }
 
     #[test]
@@ -144,7 +155,8 @@ mod tests {
 
     #[test]
     fn round_trips_nulls_and_an_empty_frame() {
-        let df = df!["a" => [Some(1i64), None, Some(3)], "b" => [Some("x"), None, Some("z")]].unwrap();
+        let df =
+            df!["a" => [Some(1i64), None, Some(3)], "b" => [Some("x"), None, Some("z")]].unwrap();
         let back = ipc_to_df(&df_to_ipc(&df).unwrap()).unwrap();
         assert!(back.equals_missing(&df));
 
@@ -159,7 +171,11 @@ mod tests {
         let ipc = df_to_ipc(&sample()).unwrap();
         let mut cursor = Cursor::new(ipc.as_slice());
         let meta = read_stream_metadata(&mut cursor).unwrap();
-        let sym = meta.schema.iter_values().find(|f| f.name().as_str() == "sym").unwrap();
+        let sym = meta
+            .schema
+            .iter_values()
+            .find(|f| f.name().as_str() == "sym")
+            .unwrap();
         assert_eq!(sym.dtype(), &ArrowDataType::LargeUtf8);
     }
 

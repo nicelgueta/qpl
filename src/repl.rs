@@ -2,12 +2,12 @@ use crate::ast::{self, Expr, Stmt};
 use crate::compiler::compile;
 use crate::errors::QplError;
 use crate::lexer::tokenise;
-use crate::parser::{parse, parse_expr_seq};
-use crate::tokens::{Token, TokenKind};
-use crate::temporal;
 use crate::opcodes::disassemble_instructions;
-use crate::vm::{Vm, run_vm, EvalResult};
+use crate::parser::{parse, parse_expr_seq};
 use crate::resolve;
+use crate::temporal;
+use crate::tokens::{Token, TokenKind};
+use crate::vm::{EvalResult, Vm, run_vm};
 use polars::prelude::*;
 #[cfg(feature = "cli")]
 use rustyline::{DefaultEditor, error::ReadlineError};
@@ -56,7 +56,12 @@ fn run_line(src: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<(), Qpl
 /// `\i` on the same line.
 fn parse_quoted_path(rest: &str) -> Result<String, QplError> {
     match tokenise(rest)?.as_slice() {
-        [Token { kind: TokenKind::Str(s), .. }] => Ok(s.clone()),
+        [
+            Token {
+                kind: TokenKind::Str(s),
+                ..
+            },
+        ] => Ok(s.clone()),
         _ => Err(QplError::Runtime(format!(
             "\\i expects a quoted path, e.g. \\i \"lib/utils.qpl\", got '{rest}'"
         ))),
@@ -92,8 +97,13 @@ fn script_relative(target: &str, from: &str) -> String {
 pub fn run_script_imported(path: &str, vm: &mut Vm) -> Result<(), QplError> {
     let ns = namespace_from_path(path);
     // cheap: tables, plans and vector values are all reference-counted
-    let snapshot = (vm.tables.clone(), vm.lazy_frames.clone(), vm.globals.clone());
+    let snapshot = (
+        vm.tables.clone(),
+        vm.lazy_frames.clone(),
+        vm.globals.clone(),
+    );
     let prefix = format!("{ns}.");
+    // TODO: does this mean that two imports we lose the first?
     vm.tables.retain(|k, _| !k.starts_with(&prefix));
     vm.lazy_frames.retain(|k, _| !k.starts_with(&prefix));
     vm.globals.retain(|k, _| !k.starts_with(&prefix));
@@ -117,8 +127,15 @@ fn namespace_from_path(path: &str) -> String {
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
         .unwrap_or("ns");
-    let mut cleaned: String = stem.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+    let mut cleaned: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if cleaned.starts_with(|c: char| c.is_ascii_digit()) {
         cleaned.insert(0, '_');
@@ -229,7 +246,10 @@ pub fn wants_more(src: &str) -> bool {
     // nothing but blank / comment lines is a complete no-op (see `eval_capture`),
     // not an unfinished statement — otherwise a host that feeds a script line
     // by line glues a leading comment onto the statement after it
-    if src.lines().all(|l| l.trim().is_empty() || l.trim_start().starts_with('/')) {
+    if src
+        .lines()
+        .all(|l| l.trim().is_empty() || l.trim_start().starts_with('/'))
+    {
         return false;
     }
     let trimmed = src.trim_start();
@@ -297,7 +317,8 @@ pub fn start(vm: &mut Vm) {
                 PortEvent::Line(line) => process_submitted(&line, vm),
                 PortEvent::Request(mode, command, reply_tx) => {
                     let _running = vm.interrupt.statement();
-                    let result = vm.with_request_permission(mode, |vm| eval_for_dispatch(&command, vm));
+                    let result =
+                        vm.with_request_permission(mode, |vm| eval_for_dispatch(&command, vm));
                     let _ = reply_tx.send(crate::ipc::encode_result(&result));
                 }
                 PortEvent::StdinClosed => break,
@@ -340,11 +361,16 @@ pub fn start(vm: &mut Vm) {
             }
             Err(ReadlineError::Interrupted) => {
                 // abandon a partial statement, or exit at an empty prompt
-                if buf.is_empty() { break; }
+                if buf.is_empty() {
+                    break;
+                }
                 buf.clear();
             }
             Err(ReadlineError::Eof) => break,
-            Err(e) => { eprintln!("readline error: {e}"); break; }
+            Err(e) => {
+                eprintln!("readline error: {e}");
+                break;
+            }
         }
     }
 }
@@ -369,11 +395,16 @@ pub fn eval_capture(src: &str, vm: &mut Vm) -> (String, Option<String>) {
     // the terminal REPL drops blank and comment-only lines before they reach
     // `run_line` (they tokenise to nothing, which doesn't parse); a host that
     // submits a script line by line gets the same treatment here
-    if src.lines().all(|l| l.trim().is_empty() || l.trim_start().starts_with('/')) {
+    if src
+        .lines()
+        .all(|l| l.trim().is_empty() || l.trim_start().starts_with('/'))
+    {
         return (String::new(), None);
     }
     let outer = vm.capture.replace(String::new());
-    let err = run_line(src, vm, "<main>", 0).err().map(|e| fmt_repl_error(&e));
+    let err = run_line(src, vm, "<main>", 0)
+        .err()
+        .map(|e| fmt_repl_error(&e));
     let out = std::mem::replace(&mut vm.capture, outer).unwrap_or_default();
     (out, err)
 }
@@ -397,7 +428,11 @@ pub fn eval_capture_table(src: &str, vm: &mut Vm) -> TableEval {
     vm.last_table = None;
     let (output, error) = eval_capture(src, vm);
     vm.capture_table = outer_table;
-    TableEval { output, error, table: vm.last_table.take() }
+    TableEval {
+        output,
+        error,
+        table: vm.last_table.take(),
+    }
 }
 
 /// `\port <n>` opens a listener (closing any previously open one first);
@@ -410,7 +445,8 @@ fn handle_port_directive(rest: &str, session: &mut PortSession) -> Result<(), Qp
     if rest.is_empty() {
         return Ok(());
     }
-    let port: u16 = rest.parse()
+    let port: u16 = rest
+        .parse()
         .map_err(|_| QplError::Runtime(format!("\\port: expected a port number, got '{rest}'")))?;
     session.open_port(port)
 }
@@ -447,13 +483,20 @@ fn eval_for_dispatch(line: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
 #[cfg(all(feature = "ipc", feature = "cli"))]
 struct PortSession {
     stdin_rx: std::sync::mpsc::Receiver<String>,
-    port: Option<(crate::ipc::ServerHandle, std::sync::mpsc::Receiver<crate::ipc::PortRequest>)>,
+    port: Option<(
+        crate::ipc::ServerHandle,
+        std::sync::mpsc::Receiver<crate::ipc::PortRequest>,
+    )>,
 }
 
 #[cfg(all(feature = "ipc", feature = "cli"))]
 enum PortEvent {
     Line(String),
-    Request(crate::ipc::HandleMode, String, std::sync::mpsc::Sender<Vec<u8>>),
+    Request(
+        crate::ipc::HandleMode,
+        String,
+        std::sync::mpsc::Sender<Vec<u8>>,
+    ),
     StdinClosed,
 }
 
@@ -474,7 +517,10 @@ impl PortSession {
                 }
             }
         });
-        Self { stdin_rx: rx, port: None }
+        Self {
+            stdin_rx: rx,
+            port: None,
+        }
     }
 
     fn open_port(&mut self, port: u16) -> Result<(), QplError> {
@@ -536,7 +582,8 @@ pub fn load_demo_tables(vm: &mut Vm) {
             demo_ts("2024.03.15D10:15:00.000000000"),
             demo_ts("2024.03.15D10:20:35.000000000"),
         ],
-    ].expect("trades");
+    ]
+    .expect("trades");
     let trades = trades
         .lazy()
         .with_column(col("ts").cast(DataType::Datetime(TimeUnit::Nanoseconds, None)))
@@ -556,7 +603,8 @@ pub fn load_demo_tables(vm: &mut Vm) {
             demo_ts("2024.03.15D10:14:55.000000000"),
             demo_ts("2024.03.15D10:20:30.000000000"),
         ],
-    ].expect("quotes");
+    ]
+    .expect("quotes");
     let quotes = quotes
         .lazy()
         .with_column(col("ts").cast(DataType::Datetime(TimeUnit::Nanoseconds, None)))
@@ -569,7 +617,7 @@ pub fn load_demo_tables(vm: &mut Vm) {
 
 fn match_run_vm(line: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<(), QplError> {
     match eval_line(line, vm) {
-        Ok(())                       => Ok(()),
+        Ok(()) => Ok(()),
         Err(e) if path == "<main>" || matches!(e, QplError::Interrupted) => Err(e),
         Err(e) => Err(QplError::Runtime(format!("{}:{}: {e}", path, lineno + 1))),
     }
@@ -605,10 +653,10 @@ fn eval_line(line: &str, vm: &mut Vm) -> Result<(), QplError> {
     match run_vm(line, vm)? {
         #[cfg(feature = "wasm")]
         EvalResult::Table(df) if vm.capture_table => vm.last_table = Some(df),
-        EvalResult::Table(df)   => vm.emit(&df.to_string()),
-        EvalResult::Stored      => {}
+        EvalResult::Table(df) => vm.emit(&df.to_string()),
+        EvalResult::Stored => {}
         EvalResult::Scalar(val) => vm.emit(&fmt_val(&val)),
-        EvalResult::Lazy(plan)  => vm.emit(&plan),
+        EvalResult::Lazy(plan) => vm.emit(&plan),
     }
     Ok(())
 }
@@ -668,9 +716,18 @@ fn system_command(line: &str, vm: &mut Vm) -> Option<Result<(), QplError>> {
 fn vec_tag(kind: ast::VecKind) -> &'static str {
     use ast::VecKind::*;
     match kind {
-        Int => "i64", Float => "f64", Sym => "sym", Str => "str", Bool => "bool",
-        Date => "date", Month => "month", Time => "time", Minute => "minute",
-        Second => "second", Timestamp => "timestamp", Timespan => "timespan",
+        Int => "i64",
+        Float => "f64",
+        Sym => "sym",
+        Str => "str",
+        Bool => "bool",
+        Date => "date",
+        Month => "month",
+        Time => "time",
+        Minute => "minute",
+        Second => "second",
+        Timestamp => "timestamp",
+        Timespan => "timespan",
     }
 }
 
@@ -699,25 +756,56 @@ fn fmt_vec_elems(kind: ast::VecKind, s: &polars::prelude::Series, quote_str: boo
         Sym => ca_str().iter().flatten().map(|x| format!("`{x}")).collect(),
         Str => {
             if quote_str {
-                ca_str().iter().flatten().map(|x| format!("\"{x}\" ")).collect::<String>().trim_end().to_string()
+                ca_str()
+                    .iter()
+                    .flatten()
+                    .map(|x| format!("\"{x}\" "))
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
             } else {
                 ca_str().iter().flatten().collect::<Vec<_>>().join(" ")
             }
         }
-        Bool => s.bool().expect("BoolVec backed by a bool Series")
-            .iter().flatten().map(|b| if b { "1" } else { "0" }).collect(),
-        Int => s.i64().expect("IntVec backed by an i64 Series")
-            .iter().flatten().map(|n| n.to_string()).collect::<Vec<_>>().join(" "),
-        Float => s.f64().expect("FloatVec backed by an f64 Series")
-            .iter().flatten().map(|f| f.to_string()).collect::<Vec<_>>().join(" "),
-        Date | Month | Minute | Second => s.i32().expect("temporal vector backed by an i32 Series")
-            .iter().flatten()
+        Bool => s
+            .bool()
+            .expect("BoolVec backed by a bool Series")
+            .iter()
+            .flatten()
+            .map(|b| if b { "1" } else { "0" })
+            .collect(),
+        Int => s
+            .i64()
+            .expect("IntVec backed by an i64 Series")
+            .iter()
+            .flatten()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
+        Float => s
+            .f64()
+            .expect("FloatVec backed by an f64 Series")
+            .iter()
+            .flatten()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
+        Date | Month | Minute | Second => s
+            .i32()
+            .expect("temporal vector backed by an i32 Series")
+            .iter()
+            .flatten()
             .map(|n| temporal::format_temporal(&temporal_scalar_of(kind, n as i64)).unwrap())
-            .collect::<Vec<_>>().join(" "),
-        Time | Timestamp | Timespan => s.i64().expect("temporal vector backed by an i64 Series")
-            .iter().flatten()
+            .collect::<Vec<_>>()
+            .join(" "),
+        Time | Timestamp | Timespan => s
+            .i64()
+            .expect("temporal vector backed by an i64 Series")
+            .iter()
+            .flatten()
             .map(|n| temporal::format_temporal(&temporal_scalar_of(kind, n)).unwrap())
-            .collect::<Vec<_>>().join(" "),
+            .collect::<Vec<_>>()
+            .join(" "),
     }
 }
 
@@ -729,11 +817,11 @@ pub(crate) fn fmt_log_val(v: &ast::Value) -> String {
         return fmt_vec_elems(kind, s, false);
     }
     match v {
-        ast::Value::Str(s)   => s.clone(),
-        ast::Value::Sym(s)   => s.clone(),
-        ast::Value::Int(n)   => n.to_string(),
+        ast::Value::Str(s) => s.clone(),
+        ast::Value::Sym(s) => s.clone(),
+        ast::Value::Int(n) => n.to_string(),
         ast::Value::Float(f) => f.to_string(),
-        ast::Value::Bool(b)  => b.to_string(),
+        ast::Value::Bool(b) => b.to_string(),
         _ => temporal::format_temporal(v).unwrap_or_else(|| format!("{v:?}")),
     }
 }
@@ -741,25 +829,30 @@ pub(crate) fn fmt_log_val(v: &ast::Value) -> String {
 fn fmt_val(v: &ast::Value) -> String {
     if let Some(text) = temporal::format_temporal(v) {
         let tag = match v {
-            ast::Value::Date(_)      => "date",
-            ast::Value::Month(_)     => "month",
-            ast::Value::Time(_)      => "time",
-            ast::Value::Minute(_)    => "minute",
-            ast::Value::Second(_)    => "second",
+            ast::Value::Date(_) => "date",
+            ast::Value::Month(_) => "month",
+            ast::Value::Time(_) => "time",
+            ast::Value::Minute(_) => "minute",
+            ast::Value::Second(_) => "second",
             ast::Value::Timestamp(_) => "timestamp",
-            _                        => "timespan",
+            _ => "timespan",
         };
         return format!("{tag}: {text}");
     }
     if let Some((kind, s)) = v.as_vec() {
-        return format!("{}[{}]: {}", vec_tag(kind), s.len(), fmt_vec_elems(kind, s, true));
+        return format!(
+            "{}[{}]: {}",
+            vec_tag(kind),
+            s.len(),
+            fmt_vec_elems(kind, s, true)
+        );
     }
     match v {
-        ast::Value::Int(n)   => format!("i64: {n}"),
+        ast::Value::Int(n) => format!("i64: {n}"),
         ast::Value::Float(f) => format!("f64: {f}"),
-        ast::Value::Str(s)   => format!("str: \"{s}\""),
-        ast::Value::Sym(s)   => format!("sym: `{s}"),
-        ast::Value::Bool(b)  => format!("bool: {b}"),
+        ast::Value::Str(s) => format!("str: \"{s}\""),
+        ast::Value::Sym(s) => format!("sym: `{s}"),
+        ast::Value::Bool(b) => format!("bool: {b}"),
         ast::Value::Closure(f) => format!("func: {{[{}] ..}}", f.params.join(",")),
         // temporal variants are handled by the early return above; this keeps
         // the match total without a panic path if a new `Value` is added
@@ -779,21 +872,25 @@ fn fmt_repl_error(error: &QplError) -> String {
 
 fn disassemble(source: &str) -> Result<String, QplError> {
     let tokens = tokenise(source)?;
-    let stmt   = parse(tokens)?;
-    let prog   = compile(&stmt)?;
+    let stmt = parse(tokens)?;
+    let prog = compile(&stmt)?;
     Ok(disassemble_instructions(&prog).join("\n"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cfg_directive, eval_line, logical_statements, log_target, normalize_function_body_newlines, wants_more};
+    use super::{
+        cfg_directive, eval_line, log_target, logical_statements, normalize_function_body_newlines,
+        wants_more,
+    };
     use super::{eval_capture, namespace_from_path, run_line, run_script_imported};
-    use crate::vm::{Vm, run_vm, EvalResult};
+    use crate::vm::{EvalResult, Vm, run_vm};
 
     /// Run `line` through [`eval_line`] and return whatever it wrote via
     /// `Vm::emit`, by pointing the stdout-log tee at a scratch file.
     fn logged(vm: &mut Vm, line: &str) -> String {
-        let path = std::env::temp_dir().join(format!("qpl_repl_test_{:?}", std::thread::current().id()));
+        let path =
+            std::env::temp_dir().join(format!("qpl_repl_test_{:?}", std::thread::current().id()));
         vm.stdout_log = Some(std::fs::File::create(&path).unwrap());
         eval_line(line, vm).expect("eval_line");
         vm.stdout_log = None;
@@ -811,7 +908,8 @@ mod tests {
 
     #[test]
     fn i_import_namespaces_new_functions_globals_and_tables() {
-        let path = std::env::temp_dir().join(format!("qpl_i_test_{:?}.qpl", std::thread::current().id()));
+        let path =
+            std::env::temp_dir().join(format!("qpl_i_test_{:?}.qpl", std::thread::current().id()));
         std::fs::write(&path, "greeting: \"hi\"\ndouble: {[x] x*2}\n").unwrap();
         let mut vm = Vm::new();
         run_script_imported(path.to_str().unwrap(), &mut vm).expect("run_script_imported");
@@ -820,8 +918,15 @@ mod tests {
         let ns = namespace_from_path(path.to_str().unwrap());
         let ns_greeting = format!("{ns}.greeting");
         let ns_double = format!("{ns}.double");
-        assert!(vm.globals.contains_key(&ns_greeting), "{:?}", vm.globals.keys().collect::<Vec<_>>());
-        assert!(matches!(vm.globals.get(&ns_double), Some(crate::ast::Value::Closure(_))));
+        assert!(
+            vm.globals.contains_key(&ns_greeting),
+            "{:?}",
+            vm.globals.keys().collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            vm.globals.get(&ns_double),
+            Some(crate::ast::Value::Closure(_))
+        ));
         assert!(!vm.globals.contains_key("greeting"));
         assert!(!vm.globals.contains_key("double"));
     }
@@ -832,15 +937,22 @@ mod tests {
         // but doesn't rewrite cross-references *inside* their bodies, so a
         // function calling another top-level helper by its bare name used to
         // break after import with "'<helper>' is not a function".
-        let path = std::env::temp_dir().join(format!("qpl_i_sibling_test_{:?}.qpl", std::thread::current().id()));
+        let path = std::env::temp_dir().join(format!(
+            "qpl_i_sibling_test_{:?}.qpl",
+            std::thread::current().id()
+        ));
         std::fs::write(&path, "_log: {[s] s}\ninfo: {[s] _log[s]}\n").unwrap();
         let mut vm = Vm::new();
         run_script_imported(path.to_str().unwrap(), &mut vm).expect("run_script_imported");
         let _ = std::fs::remove_file(&path);
 
         let ns = namespace_from_path(path.to_str().unwrap());
-        run_line(&format!("l: {ns}.info \"hi\""), &mut vm, "<main>", 0).expect("call should resolve");
-        assert_eq!(vm.globals.get("l"), Some(&crate::ast::Value::Str("hi".into())));
+        run_line(&format!("l: {ns}.info \"hi\""), &mut vm, "<main>", 0)
+            .expect("call should resolve");
+        assert_eq!(
+            vm.globals.get("l"),
+            Some(&crate::ast::Value::Str("hi".into()))
+        );
     }
 
     #[test]
@@ -848,8 +960,12 @@ mod tests {
         // a script that itself `\i`s another script leaves that nested import's
         // already-namespaced bindings alone rather than re-prefixing them.
         let mut vm = Vm::new();
-        vm.globals.insert(".inner.x".into(), crate::ast::Value::Int(1));
-        let path = std::env::temp_dir().join(format!("qpl_i_nested_test_{:?}.qpl", std::thread::current().id()));
+        vm.globals
+            .insert(".inner.x".into(), crate::ast::Value::Int(1));
+        let path = std::env::temp_dir().join(format!(
+            "qpl_i_nested_test_{:?}.qpl",
+            std::thread::current().id()
+        ));
         std::fs::write(&path, "y: 2\n").unwrap();
         run_script_imported(path.to_str().unwrap(), &mut vm).expect("run_script_imported");
         let _ = std::fs::remove_file(&path);
@@ -860,18 +976,34 @@ mod tests {
 
     #[test]
     fn i_command_requires_a_quoted_path() {
-        let path = std::env::temp_dir().join(format!("qpl_i_quoted_test_{:?}.qpl", std::thread::current().id()));
+        let path = std::env::temp_dir().join(format!(
+            "qpl_i_quoted_test_{:?}.qpl",
+            std::thread::current().id()
+        ));
         std::fs::write(&path, "z: 1\n").unwrap();
         let mut vm = Vm::new();
 
         // bare/unquoted is rejected with a clear message
-        let err = run_line(&format!("\\i {}", path.to_str().unwrap()), &mut vm, "<main>", 0)
-            .expect_err("bare path should be rejected");
-        assert!(matches!(&err, crate::errors::QplError::Runtime(m) if m.contains("quoted path")), "{err:?}");
+        let err = run_line(
+            &format!("\\i {}", path.to_str().unwrap()),
+            &mut vm,
+            "<main>",
+            0,
+        )
+        .expect_err("bare path should be rejected");
+        assert!(
+            matches!(&err, crate::errors::QplError::Runtime(m) if m.contains("quoted path")),
+            "{err:?}"
+        );
 
         // quoted works, both at the REPL and (via run_script -> run_line) nested in a script
-        run_line(&format!("\\i \"{}\"", path.to_str().unwrap()), &mut vm, "<main>", 0)
-            .expect("quoted path should import");
+        run_line(
+            &format!("\\i \"{}\"", path.to_str().unwrap()),
+            &mut vm,
+            "<main>",
+            0,
+        )
+        .expect("quoted path should import");
         let _ = std::fs::remove_file(&path);
         let ns = namespace_from_path(path.to_str().unwrap());
         assert!(vm.globals.contains_key(&format!("{ns}.z")));
@@ -894,12 +1026,16 @@ mod tests {
         let lib = dir.join("lib.qpl");
         std::fs::write(&lib, "thr: 99\nt: select from t where c > 1\nn: count t\n").unwrap();
         let mut vm = Vm::new();
-        vm.tables.insert("t".into(), polars::df!["c" => [1i64, 2, 3]].unwrap());
+        vm.tables
+            .insert("t".into(), polars::df!["c" => [1i64, 2, 3]].unwrap());
         vm.globals.insert("thr".into(), crate::ast::Value::Int(1));
         run_script_imported(lib.to_str().unwrap(), &mut vm).expect("import");
 
         assert_eq!(vm.globals.get("thr"), Some(&crate::ast::Value::Int(1)));
-        assert_eq!(vm.globals.get(".lib.thr"), Some(&crate::ast::Value::Int(99)));
+        assert_eq!(
+            vm.globals.get(".lib.thr"),
+            Some(&crate::ast::Value::Int(99))
+        );
         assert_eq!(vm.tables["t"].height(), 3, "session table untouched");
         assert_eq!(vm.tables[".lib.t"].height(), 2);
         // the script's later `count t` saw its *own* `t`, not the session's
@@ -919,7 +1055,10 @@ mod tests {
         run_script_imported(lib.to_str().unwrap(), &mut vm).expect("import");
         run_line("_log: {[s] 0}", &mut vm, "<main>", 0).unwrap();
         run_line(r#"l: .lg.info "hi""#, &mut vm, "<main>", 0).unwrap();
-        assert_eq!(vm.globals.get("l"), Some(&crate::ast::Value::Str("hi".into())));
+        assert_eq!(
+            vm.globals.get("l"),
+            Some(&crate::ast::Value::Str("hi".into()))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -932,7 +1071,8 @@ mod tests {
         std::fs::write(&lib, "good: 1\nthr: 5\noops: nosuchname + 1\n").unwrap();
         let mut vm = Vm::new();
         vm.globals.insert("thr".into(), crate::ast::Value::Int(1));
-        vm.globals.insert(".bad.old".into(), crate::ast::Value::Int(7));
+        vm.globals
+            .insert(".bad.old".into(), crate::ast::Value::Int(7));
         run_script_imported(lib.to_str().unwrap(), &mut vm).expect_err("import should fail");
 
         assert!(!vm.globals.contains_key("good"));
@@ -954,7 +1094,10 @@ mod tests {
         std::fs::write(&lib, "a: 10\n").unwrap();
         run_script_imported(lib.to_str().unwrap(), &mut vm).expect("re-import");
         assert_eq!(vm.globals.get(".u.a"), Some(&crate::ast::Value::Int(10)));
-        assert!(!vm.globals.contains_key(".u.b"), "a binding dropped from the library goes away");
+        assert!(
+            !vm.globals.contains_key(".u.b"),
+            "a binding dropped from the library goes away"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -969,12 +1112,20 @@ mod tests {
         std::fs::write(
             dir.join("lib/report.qpl"),
             "\\i \"helpers.qpl\"\n\\l flat.qpl\nr: .helpers.twice[f]\n",
-        ).unwrap();
+        )
+        .unwrap();
         let mut vm = Vm::new();
         // imported by absolute path, from a working directory that is not `dir`
         run_script_imported(dir.join("lib/report.qpl").to_str().unwrap(), &mut vm).expect("import");
-        assert_eq!(vm.globals.get(".report.r"), Some(&crate::ast::Value::Int(6)));
-        assert_eq!(vm.globals.get(".report.f"), Some(&crate::ast::Value::Int(3)), "`\\l` inside an import lands in its namespace");
+        assert_eq!(
+            vm.globals.get(".report.r"),
+            Some(&crate::ast::Value::Int(6))
+        );
+        assert_eq!(
+            vm.globals.get(".report.f"),
+            Some(&crate::ast::Value::Int(3)),
+            "`\\l` inside an import lands in its namespace"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -996,14 +1147,19 @@ mod tests {
         // read handle could change e.g. `round_type`, which changes answers.
         use crate::ipc::HandleMode;
         let mut vm = Vm::new();
-        vm.with_request_permission(HandleMode::Read, |vm| super::eval_for_dispatch(".qpl.cfg", vm))
-            .expect("printing the settings is a read");
+        vm.with_request_permission(HandleMode::Read, |vm| {
+            super::eval_for_dispatch(".qpl.cfg", vm)
+        })
+        .expect("printing the settings is a read");
         let err = vm
             .with_request_permission(HandleMode::Read, |vm| {
                 super::eval_for_dispatch(".qpl.cfg round_type=HALF_UP", vm)
             })
             .expect_err("changing a knob is a write");
-        assert!(matches!(&err, crate::errors::QplError::Runtime(m) if m.contains("read-only")), "{err:?}");
+        assert!(
+            matches!(&err, crate::errors::QplError::Runtime(m) if m.contains("read-only")),
+            "{err:?}"
+        );
         assert!(vm.config.describe().contains("round_type=HALF_TO_EVEN"));
         vm.with_request_permission(HandleMode::Write, |vm| {
             super::eval_for_dispatch(".qpl.cfg round_type=HALF_UP", vm)
@@ -1042,7 +1198,10 @@ mod tests {
         // `info` returns whatever `log` wrote (its only/last statement), so a
         // bare call at top level also echoes that return value like any other
         // function call — only a standalone `log[..]` statement suppresses it.
-        assert_eq!(logged(&mut vm, r#"info["hi"]"#), "tag - hi\nstr: \"tag - hi\"");
+        assert_eq!(
+            logged(&mut vm, r#"info["hi"]"#),
+            "tag - hi\nstr: \"tag - hi\""
+        );
     }
 
     #[test]
@@ -1071,7 +1230,10 @@ mod tests {
     #[test]
     fn dispatch_still_supports_the_log_keyword_shorthand() {
         let mut vm = Vm::new();
-        let path = std::env::temp_dir().join(format!("qpl_dispatch_log_test_{:?}", std::thread::current().id()));
+        let path = std::env::temp_dir().join(format!(
+            "qpl_dispatch_log_test_{:?}",
+            std::thread::current().id()
+        ));
         vm.stdout_log = Some(std::fs::File::create(&path).unwrap());
         super::eval_for_dispatch(r#"log "hi""#, &mut vm).expect("eval_for_dispatch");
         vm.stdout_log = None;
@@ -1084,7 +1246,8 @@ mod tests {
     #[test]
     fn dispatch_runs_an_ordinary_statement() {
         let mut vm = Vm::new();
-        vm.tables.insert("t".into(), polars::df!["c" => [1i64, 2, 3]].unwrap());
+        vm.tables
+            .insert("t".into(), polars::df!["c" => [1i64, 2, 3]].unwrap());
         match super::eval_for_dispatch("select c from t where c > 1", &mut vm) {
             Ok(crate::vm::EvalResult::Table(df)) => assert_eq!(df.height(), 2),
             other => panic!("expected a table, got {other:?}"),
@@ -1127,8 +1290,14 @@ mod tests {
 
     #[test]
     fn cfg_directive_recognises_the_config_function() {
-        assert_eq!(cfg_directive(".qpl.cfg maxcol=8 maxrow=20"), Some("maxcol=8 maxrow=20"));
-        assert_eq!(cfg_directive("  .qpl.cfg  round_type=HALF_UP "), Some("round_type=HALF_UP"));
+        assert_eq!(
+            cfg_directive(".qpl.cfg maxcol=8 maxrow=20"),
+            Some("maxcol=8 maxrow=20")
+        );
+        assert_eq!(
+            cfg_directive("  .qpl.cfg  round_type=HALF_UP "),
+            Some("round_type=HALF_UP")
+        );
         assert_eq!(cfg_directive(".qpl.cfg"), Some(""));
         assert_eq!(cfg_directive(".qpl.cfgx maxcol=1"), None);
         assert_eq!(cfg_directive("select from t"), None);
@@ -1167,10 +1336,13 @@ mod tests {
     #[test]
     fn single_line_statements_pass_through() {
         let got = logical_statements("select from trades\nselect from quotes\n");
-        assert_eq!(got, vec![
-            (0, "select from trades".to_string()),
-            (1, "select from quotes".to_string()),
-        ]);
+        assert_eq!(
+            got,
+            vec![
+                (0, "select from trades".to_string()),
+                (1, "select from quotes".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1183,10 +1355,13 @@ mod tests {
     fn four_space_indent_continues_statement() {
         let src = "t: select a, b\n    by sym\n    where a > 1\nselect from t";
         let got = logical_statements(src);
-        assert_eq!(got, vec![
-            (0, "t: select a, b\n    by sym\n    where a > 1".to_string()),
-            (3, "select from t".to_string()),
-        ]);
+        assert_eq!(
+            got,
+            vec![
+                (0, "t: select a, b\n    by sym\n    where a > 1".to_string()),
+                (3, "select from t".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1199,20 +1374,26 @@ mod tests {
     fn blank_line_terminates_multiline_statement() {
         let src = "select a\n    from trades\n\nselect from quotes";
         let got = logical_statements(src);
-        assert_eq!(got, vec![
-            (0, "select a\n    from trades".to_string()),
-            (3, "select from quotes".to_string()),
-        ]);
+        assert_eq!(
+            got,
+            vec![
+                (0, "select a\n    from trades".to_string()),
+                (3, "select from quotes".to_string()),
+            ]
+        );
     }
 
     #[test]
     fn shallow_indent_is_a_new_statement() {
         // one/two/three spaces is not a continuation
         let got = logical_statements("select from trades\n  select from quotes");
-        assert_eq!(got, vec![
-            (0, "select from trades".to_string()),
-            (1, "  select from quotes".to_string()),
-        ]);
+        assert_eq!(
+            got,
+            vec![
+                (0, "select from trades".to_string()),
+                (1, "  select from quotes".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1225,9 +1406,13 @@ mod tests {
     fn indented_comment_inside_statement_is_kept_as_continuation() {
         let src = "select a\n    / pick columns\n    from trades";
         let got = logical_statements(src);
-        assert_eq!(got, vec![
-            (0, "select a\n    / pick columns\n    from trades".to_string()),
-        ]);
+        assert_eq!(
+            got,
+            vec![(
+                0,
+                "select a\n    / pick columns\n    from trades".to_string()
+            ),]
+        );
     }
 
     #[test]
@@ -1304,7 +1489,10 @@ mod tests {
     fn eval_capture_returns_output_and_error_separately() {
         let mut vm = Vm::new();
         assert_eq!(eval_capture("x: 41", &mut vm), (String::new(), None));
-        assert_eq!(eval_capture("x + 1", &mut vm), ("i64: 42\n".to_string(), None));
+        assert_eq!(
+            eval_capture("x + 1", &mut vm),
+            ("i64: 42\n".to_string(), None)
+        );
 
         let (out, err) = eval_capture("nosuchtable", &mut vm);
         assert!(out.is_empty(), "failed statement emitted {out:?}");
@@ -1318,7 +1506,13 @@ mod tests {
     #[test]
     fn eval_capture_ignores_blank_and_comment_only_input() {
         let mut vm = Vm::new();
-        for src in ["", "   ", "\n", "/ just a note", "  / indented\n/ two lines"] {
+        for src in [
+            "",
+            "   ",
+            "\n",
+            "/ just a note",
+            "  / indented\n/ two lines",
+        ] {
             assert_eq!(eval_capture(src, &mut vm), (String::new(), None), "{src:?}");
         }
         assert_eq!(eval_capture("/ note\nx: 5", &mut vm), (String::new(), None));
@@ -1334,8 +1528,14 @@ mod tests {
         let mut vm = Vm::new();
         let mut buf = String::new();
         for line in src.lines() {
-            buf = if buf.is_empty() { line.to_string() } else { format!("{buf}\n{line}") };
-            if wants_more(&buf) { continue; }
+            buf = if buf.is_empty() {
+                line.to_string()
+            } else {
+                format!("{buf}\n{line}")
+            };
+            if wants_more(&buf) {
+                continue;
+            }
             let (_, err) = eval_capture(&buf, &mut vm);
             assert!(err.is_none(), "{buf:?}: {err:?}");
             buf.clear();
@@ -1374,7 +1574,10 @@ mod tests {
 
     #[test]
     fn run_script_stops_at_an_interrupted_statement() {
-        let path = std::env::temp_dir().join(format!("qpl_interrupt_test_{:?}.qpl", std::thread::current().id()));
+        let path = std::env::temp_dir().join(format!(
+            "qpl_interrupt_test_{:?}.qpl",
+            std::thread::current().id()
+        ));
         std::fs::write(&path, "before: 1\nwhile[1b; noop]\nafter: 1\n").unwrap();
         let mut vm = Vm::new();
         let interrupt = vm.interrupt.clone();
@@ -1385,9 +1588,15 @@ mod tests {
         let err = super::run_script(path.to_str().unwrap(), &mut vm).expect_err("interrupted");
         t.join().unwrap();
         let _ = std::fs::remove_file(&path);
-        assert!(matches!(err, crate::errors::QplError::Interrupted), "{err:?}");
+        assert!(
+            matches!(err, crate::errors::QplError::Interrupted),
+            "{err:?}"
+        );
         assert!(vm.globals.contains_key("before"));
-        assert!(!vm.globals.contains_key("after"), "later lines must not run");
+        assert!(
+            !vm.globals.contains_key("after"),
+            "later lines must not run"
+        );
     }
 
     #[test]
@@ -1431,7 +1640,10 @@ mod tests {
     fn an_interrupt_in_a_loaded_script_keeps_its_variant() {
         // `\l` runs the script under its own path, which normally wraps a
         // failure as `path:line: ..` text — an interrupt must stay an interrupt.
-        let path = std::env::temp_dir().join(format!("qpl_interrupt_nested_{:?}.qpl", std::thread::current().id()));
+        let path = std::env::temp_dir().join(format!(
+            "qpl_interrupt_nested_{:?}.qpl",
+            std::thread::current().id()
+        ));
         std::fs::write(&path, "while[1b; noop]\n").unwrap();
         let mut vm = Vm::new();
         let interrupt = vm.interrupt.clone();
@@ -1439,18 +1651,29 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
             interrupt.request();
         });
-        let err = run_line(&format!("\\l {}", path.to_str().unwrap()), &mut vm, "<main>", 0)
-            .expect_err("interrupted");
+        let err = run_line(
+            &format!("\\l {}", path.to_str().unwrap()),
+            &mut vm,
+            "<main>",
+            0,
+        )
+        .expect_err("interrupted");
         t.join().unwrap();
         let _ = std::fs::remove_file(&path);
-        assert!(matches!(err, crate::errors::QplError::Interrupted), "{err:?}");
+        assert!(
+            matches!(err, crate::errors::QplError::Interrupted),
+            "{err:?}"
+        );
         // and the outer statement's guard has been released
         assert!(vm.interrupt.check().is_ok());
     }
 
     #[test]
     fn a_script_error_in_a_while_body_names_the_script_line() {
-        let path = std::env::temp_dir().join(format!("qpl_while_err_{:?}.qpl", std::thread::current().id()));
+        let path = std::env::temp_dir().join(format!(
+            "qpl_while_err_{:?}.qpl",
+            std::thread::current().id()
+        ));
         std::fs::write(&path, "ok: 1\nwhile[1b; nosuch[1]]\n").unwrap();
         let mut vm = Vm::new();
         let err = super::run_script(path.to_str().unwrap(), &mut vm).expect_err("should fail");

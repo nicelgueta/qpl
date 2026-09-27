@@ -7,7 +7,10 @@ pub enum BuiltIn {
     /// any table expression (`` `tbl ``, `select …`, `update …`, …), never a
     /// bare identifier. `path` is a string expression: a string literal or a
     /// string global.
-    Sink { src: Box<TableExpr>, path: Expr },
+    Sink {
+        src: Box<TableExpr>,
+        path: Expr,
+    },
     Sort(Box<TableExpr>, Vec<(String, bool)>),
     Distinct(Box<TableExpr>),
     /// `` `a`b dropnull <table-expr> `` — drop every row with a null in any of

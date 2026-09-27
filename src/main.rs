@@ -16,8 +16,7 @@ struct Cli {
     interactive: bool,
 
     #[arg(long = "load-demo", action = SetTrue)]
-    load_demo: bool
-
+    load_demo: bool,
 }
 
 fn main() {

@@ -39,10 +39,10 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     if chars[i] == '\\' && i + 1 < n {
                         i += 1;
                         buf.push(match chars[i] {
-                            'n'  => '\n',
-                            't'  => '\t',
-                            'r'  => '\r',
-                            '"'  => '"',
+                            'n' => '\n',
+                            't' => '\t',
+                            'r' => '\r',
+                            '"' => '"',
                             '\\' => '\\',
                             other => other,
                         });
@@ -67,22 +67,22 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 while i < n && is_valid_symbol_char(chars[i]) {
                     i += 1;
                 }
-                if ! (i < n && chars[i] == '`'){
+                if !(i < n && chars[i] == '`') {
                     let name: String = chars[s..i].iter().collect();
                     tokens.push(Token {
                         kind: TokenKind::Symbol(name),
                         pos: start,
                     });
-                    continue
+                    continue;
                 }
-                
+
                 // this looks like a symbol vector
                 // this should be a list of symbols separated by backticks, e.g. `a`b`c
                 let mut symbols = Vec::new();
                 let mut j = s;
                 while j < n {
                     let k = j;
-                    while j < n && is_valid_symbol_char(chars[j]){
+                    while j < n && is_valid_symbol_char(chars[j]) {
                         j += 1;
                     }
                     let sym: String = chars[k..j].iter().collect();
@@ -99,7 +99,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     kind: TokenKind::SymbolVec(symbols),
                     pos: start,
                 });
-                i = j;    
+                i = j;
             }
             '0'..='9' => {
                 let mut j = i;
@@ -126,7 +126,9 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 // float / int paths below when the shape doesn't match.
                 if j < n && matches!(chars[j], '.' | ':' | 'D') {
                     let mut k = j;
-                    while k < n && (chars[k].is_ascii_digit() || matches!(chars[k], '.' | ':' | 'D')) {
+                    while k < n
+                        && (chars[k].is_ascii_digit() || matches!(chars[k], '.' | ':' | 'D'))
+                    {
                         k += 1;
                     }
                     if k < n && chars[k] == 'm' {
@@ -134,7 +136,10 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     }
                     let slice: String = chars[i..k].iter().collect();
                     if let Some(val) = crate::temporal::parse_temporal(&slice) {
-                        tokens.push(Token { kind: TokenKind::Temporal(val), pos: start });
+                        tokens.push(Token {
+                            kind: TokenKind::Temporal(val),
+                            pos: start,
+                        });
                         i = k;
                         continue;
                     }
@@ -177,7 +182,9 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         } else {
                             let exp_str: String = chars[exp_digits_start..k].iter().collect();
                             int_exp = Some(exp_str.parse().map_err(|_| {
-                                QplError::Lex(format!("invalid exponent in numeric literal '{exp_str}'"))
+                                QplError::Lex(format!(
+                                    "invalid exponent in numeric literal '{exp_str}'"
+                                ))
                             })?);
                         }
                         j = k;
@@ -197,9 +204,13 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 }
                 if let Some(exponent) = int_exp {
                     let literal: String = chars[i..j].iter().collect();
-                    let mantissa: i64 = chars[i..digits_end].iter().collect::<String>().parse().map_err(|_| {
-                        QplError::Lex(format!("Invalid integer literal: {}", literal))
-                    })?;
+                    let mantissa: i64 = chars[i..digits_end]
+                        .iter()
+                        .collect::<String>()
+                        .parse()
+                        .map_err(|_| {
+                            QplError::Lex(format!("Invalid integer literal: {}", literal))
+                        })?;
                     let scale = 10i64.checked_pow(exponent).ok_or_else(|| {
                         QplError::Lex(format!("integer literal '{literal}' overflows i64"))
                     })?;
@@ -215,9 +226,9 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 }
                 // integer
                 let int_str: String = chars[i..j].iter().collect();
-                let int_val: i64 = int_str.parse().map_err(|_| {
-                    QplError::Lex(format!("Invalid integer literal: {}", int_str))
-                })?;
+                let int_val: i64 = int_str
+                    .parse()
+                    .map_err(|_| QplError::Lex(format!("Invalid integer literal: {}", int_str)))?;
                 tokens.push(Token {
                     kind: TokenKind::Int(int_val),
                     pos: start,
@@ -227,10 +238,16 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
             }
             ':' => {
                 if chars.get(i + 1) == Some(&':') {
-                    tokens.push(Token { kind: TokenKind::ColonColon, pos: start });
+                    tokens.push(Token {
+                        kind: TokenKind::ColonColon,
+                        pos: start,
+                    });
                     i += 2;
                 } else {
-                    tokens.push(Token { kind: TokenKind::Colon, pos: start });
+                    tokens.push(Token {
+                        kind: TokenKind::Colon,
+                        pos: start,
+                    });
                     i += 1;
                 }
             }
@@ -257,23 +274,27 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     while k < n && is_name_char(chars[k]) {
                         k += 1;
                     }
-                    while k < n && chars[k] == '.'
-                        && k + 1 < n && is_name_start(chars[k + 1])
-                    {
+                    while k < n && chars[k] == '.' && k + 1 < n && is_name_start(chars[k + 1]) {
                         k += 1;
                         while k < n && is_name_char(chars[k]) {
                             k += 1;
                         }
                     }
                     let name: String = chars[i..k].iter().collect();
-                    tokens.push(Token { kind: TokenKind::Name(name), pos: start });
+                    tokens.push(Token {
+                        kind: TokenKind::Name(name),
+                        pos: start,
+                    });
                     i = k;
                     continue;
                 }
                 return Err(QplError::Lex(format!("Unexpected character: {c}")));
             }
             ';' => {
-                tokens.push(Token { kind: TokenKind::Semicolon, pos: start });
+                tokens.push(Token {
+                    kind: TokenKind::Semicolon,
+                    pos: start,
+                });
                 i += 1;
             }
             '#' => {
@@ -285,12 +306,18 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
             }
             '?' => {
                 // vectorised conditional: `?[cond;then;else]`
-                tokens.push(Token { kind: TokenKind::Op("?".to_string()), pos: start });
+                tokens.push(Token {
+                    kind: TokenKind::Op("?".to_string()),
+                    pos: start,
+                });
                 i += 1;
             }
             '&' | '|' => {
                 // logical and / or; single-char, no run-glomming
-                tokens.push(Token { kind: TokenKind::Op(chars[i].to_string()), pos: start });
+                tokens.push(Token {
+                    kind: TokenKind::Op(chars[i].to_string()),
+                    pos: start,
+                });
                 i += 1;
             }
             '(' => {
@@ -308,19 +335,31 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 i += 1;
             }
             '[' => {
-                tokens.push(Token { kind: TokenKind::LBracket, pos: start });
+                tokens.push(Token {
+                    kind: TokenKind::LBracket,
+                    pos: start,
+                });
                 i += 1;
             }
             ']' => {
-                tokens.push(Token { kind: TokenKind::RBracket, pos: start });
+                tokens.push(Token {
+                    kind: TokenKind::RBracket,
+                    pos: start,
+                });
                 i += 1;
             }
             '{' => {
-                tokens.push(Token { kind: TokenKind::LBrace, pos: start });
+                tokens.push(Token {
+                    kind: TokenKind::LBrace,
+                    pos: start,
+                });
                 i += 1;
             }
             '}' => {
-                tokens.push(Token { kind: TokenKind::RBrace, pos: start });
+                tokens.push(Token {
+                    kind: TokenKind::RBrace,
+                    pos: start,
+                });
                 i += 1;
             }
             '!' => {
@@ -370,23 +409,23 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     let kind = match name.as_str() {
                         // key words
                         "select" => TokenKind::Select,
-                        "by"     => TokenKind::By,
-                        "from"   => TokenKind::From,
-                        "where"  => TokenKind::Where,
-                        "over"   => TokenKind::Over,
-                        "order"  => TokenKind::Order,
-                        "asc"    => TokenKind::Asc,
-                        "desc"   => TokenKind::Desc,
+                        "by" => TokenKind::By,
+                        "from" => TokenKind::From,
+                        "where" => TokenKind::Where,
+                        "over" => TokenKind::Over,
+                        "order" => TokenKind::Order,
+                        "asc" => TokenKind::Asc,
+                        "desc" => TokenKind::Desc,
                         "distinct" => TokenKind::Distinct,
                         "dropnull" => TokenKind::DropNull,
                         "limit" => TokenKind::Limit,
                         "drop" => TokenKind::Drop,
                         "update" => TokenKind::Update,
                         "delete" => TokenKind::Delete,
-                        "cols"   => TokenKind::Cols,
-                        "load"   => TokenKind::Load,
-                        "sink"   => TokenKind::Sink,
-                        "lazy"    => TokenKind::Lazy,
+                        "cols" => TokenKind::Cols,
+                        "load" => TokenKind::Load,
+                        "sink" => TokenKind::Sink,
+                        "lazy" => TokenKind::Lazy,
                         "collect" => TokenKind::Collect,
                         _ => TokenKind::Name(name),
                     };
@@ -397,7 +436,6 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 }
             }
         }
-
     }
     Ok(tokens)
 }
@@ -425,11 +463,10 @@ mod tests {
 
     #[test]
     fn integer_multiple() {
-        assert_eq!(kinds("1 2 3"), vec![
-            TokenKind::Int(1),
-            TokenKind::Int(2),
-            TokenKind::Int(3),
-        ]);
+        assert_eq!(
+            kinds("1 2 3"),
+            vec![TokenKind::Int(1), TokenKind::Int(2), TokenKind::Int(3),]
+        );
     }
 
     #[test]
@@ -476,13 +513,34 @@ mod tests {
     #[test]
     fn temporal_literals_lex_to_values() {
         use crate::ast::Value;
-        assert_eq!(kinds("2024.03.15"), vec![TokenKind::Temporal(Value::Date(8840))]);
-        assert_eq!(kinds("2000.01.01"), vec![TokenKind::Temporal(Value::Date(0))]);
-        assert_eq!(kinds("2024.03m"), vec![TokenKind::Temporal(Value::Month(290))]);
-        assert_eq!(kinds("09:30"), vec![TokenKind::Temporal(Value::Minute(570))]);
-        assert_eq!(kinds("12:30:00"), vec![TokenKind::Temporal(Value::Second(45000))]);
-        assert_eq!(kinds("12:30:00.000"), vec![TokenKind::Temporal(Value::Time(45_000_000_000_000))]);
-        assert_eq!(kinds("0D00:00:00.000000001"), vec![TokenKind::Temporal(Value::Timespan(1))]);
+        assert_eq!(
+            kinds("2024.03.15"),
+            vec![TokenKind::Temporal(Value::Date(8840))]
+        );
+        assert_eq!(
+            kinds("2000.01.01"),
+            vec![TokenKind::Temporal(Value::Date(0))]
+        );
+        assert_eq!(
+            kinds("2024.03m"),
+            vec![TokenKind::Temporal(Value::Month(290))]
+        );
+        assert_eq!(
+            kinds("09:30"),
+            vec![TokenKind::Temporal(Value::Minute(570))]
+        );
+        assert_eq!(
+            kinds("12:30:00"),
+            vec![TokenKind::Temporal(Value::Second(45000))]
+        );
+        assert_eq!(
+            kinds("12:30:00.000"),
+            vec![TokenKind::Temporal(Value::Time(45_000_000_000_000))]
+        );
+        assert_eq!(
+            kinds("0D00:00:00.000000001"),
+            vec![TokenKind::Temporal(Value::Timespan(1))]
+        );
         assert_eq!(
             kinds("2000.01.01D00:00:00.000000000"),
             vec![TokenKind::Temporal(Value::Timestamp(0))],
@@ -492,11 +550,14 @@ mod tests {
     #[test]
     fn temporal_literal_composes_with_an_operator() {
         use crate::ast::Value;
-        assert_eq!(kinds("2024.03.15 + 10"), vec![
-            TokenKind::Temporal(Value::Date(8840)),
-            TokenKind::Op("+".into()),
-            TokenKind::Int(10),
-        ]);
+        assert_eq!(
+            kinds("2024.03.15 + 10"),
+            vec![
+                TokenKind::Temporal(Value::Date(8840)),
+                TokenKind::Op("+".into()),
+                TokenKind::Int(10),
+            ]
+        );
     }
 
     #[test]
@@ -513,16 +574,25 @@ mod tests {
     #[test]
     fn qpl_now_functions_lex_as_their_own_token() {
         assert_eq!(kinds(".qpl.dt"), vec![TokenKind::Name(".qpl.dt".into())]);
-        assert_eq!(kinds("log .qpl.ts"), vec![
-            TokenKind::Name("log".into()),
-            TokenKind::Name(".qpl.ts".into()),
-        ]);
+        assert_eq!(
+            kinds("log .qpl.ts"),
+            vec![
+                TokenKind::Name("log".into()),
+                TokenKind::Name(".qpl.ts".into()),
+            ]
+        );
     }
 
     #[test]
     fn namespaced_identifier_lexes_as_a_dotted_name() {
-        assert_eq!(kinds(".utils.helper"), vec![TokenKind::Name(".utils.helper".into())]);
-        assert_eq!(kinds(".utils.sub.thing"), vec![TokenKind::Name(".utils.sub.thing".into())]);
+        assert_eq!(
+            kinds(".utils.helper"),
+            vec![TokenKind::Name(".utils.helper".into())]
+        );
+        assert_eq!(
+            kinds(".utils.sub.thing"),
+            vec![TokenKind::Name(".utils.sub.thing".into())]
+        );
     }
 
     // --- booleans ---
@@ -541,12 +611,18 @@ mod tests {
 
     #[test]
     fn bool_vec_basic() {
-        assert_eq!(kinds("1010b"), vec![TokenKind::BoolVec(vec![true, false, true, false])]);
+        assert_eq!(
+            kinds("1010b"),
+            vec![TokenKind::BoolVec(vec![true, false, true, false])]
+        );
     }
 
     #[test]
     fn bool_vec_all_false() {
-        assert_eq!(kinds("000b"), vec![TokenKind::BoolVec(vec![false, false, false])]);
+        assert_eq!(
+            kinds("000b"),
+            vec![TokenKind::BoolVec(vec![false, false, false])]
+        );
     }
 
     // --- strings ---
@@ -558,7 +634,10 @@ mod tests {
 
     #[test]
     fn string_escaped_quote() {
-        assert_eq!(kinds(r#""say \"hi\"""#), vec![TokenKind::Str(r#"say "hi""#.into())]);
+        assert_eq!(
+            kinds(r#""say \"hi\"""#),
+            vec![TokenKind::Str(r#"say "hi""#.into())]
+        );
     }
 
     #[test]
@@ -594,28 +673,39 @@ mod tests {
 
     #[test]
     fn symbol_list() {
-        assert_eq!(kinds("`a`b`c"), vec![
-            TokenKind::SymbolVec(vec!["a".into(), "b".into(), "c".into()]),
-        ]);
+        assert_eq!(
+            kinds("`a`b`c"),
+            vec![TokenKind::SymbolVec(vec![
+                "a".into(),
+                "b".into(),
+                "c".into()
+            ]),]
+        );
     }
 
     #[test]
     fn dict_basic() {
-        assert_eq!(kinds("`a`b!1 2"), vec![
-            TokenKind::SymbolVec(vec!["a".into(), "b".into()]),
-            TokenKind::Bang,
-            TokenKind::Int(1),
-            TokenKind::Int(2),
-        ]);
+        assert_eq!(
+            kinds("`a`b!1 2"),
+            vec![
+                TokenKind::SymbolVec(vec!["a".into(), "b".into()]),
+                TokenKind::Bang,
+                TokenKind::Int(1),
+                TokenKind::Int(2),
+            ]
+        );
     }
 
     #[test]
     fn dict_bool_vec() {
-        assert_eq!(kinds("`a`b`c!101b"), vec![
-            TokenKind::SymbolVec(vec!["a".into(), "b".into(), "c".into()]),
-            TokenKind::Bang,
-            TokenKind::BoolVec(vec![true, false, true]),
-        ]);
+        assert_eq!(
+            kinds("`a`b`c!101b"),
+            vec![
+                TokenKind::SymbolVec(vec!["a".into(), "b".into(), "c".into()]),
+                TokenKind::Bang,
+                TokenKind::BoolVec(vec![true, false, true]),
+            ]
+        );
     }
 
     // --- keywords ---
@@ -647,12 +737,18 @@ mod tests {
 
     #[test]
     fn keyword_order_directions() {
-        assert_eq!(kinds("order asc desc"), vec![TokenKind::Order, TokenKind::Asc, TokenKind::Desc]);
+        assert_eq!(
+            kinds("order asc desc"),
+            vec![TokenKind::Order, TokenKind::Asc, TokenKind::Desc]
+        );
     }
 
     #[test]
     fn keyword_table_operators() {
-        assert_eq!(kinds("distinct limit #"), vec![TokenKind::Distinct, TokenKind::Limit, TokenKind::Hash]);
+        assert_eq!(
+            kinds("distinct limit #"),
+            vec![TokenKind::Distinct, TokenKind::Limit, TokenKind::Hash]
+        );
     }
 
     #[test]
@@ -678,29 +774,35 @@ mod tests {
 
     #[test]
     fn keyword_lazy_and_collect() {
-        assert_eq!(kinds("lazy collect"), vec![TokenKind::Lazy, TokenKind::Collect]);
+        assert_eq!(
+            kinds("lazy collect"),
+            vec![TokenKind::Lazy, TokenKind::Collect]
+        );
     }
 
     #[test]
     fn case_punctuation() {
-        assert_eq!(kinds("?[a>1;`large;a>0;`small;`none]"), vec![
-            TokenKind::Op("?".into()),
-            TokenKind::LBracket,
-            TokenKind::Name("a".into()),
-            TokenKind::Op(">".into()),
-            TokenKind::Int(1),
-            TokenKind::Semicolon,
-            TokenKind::Symbol("large".into()),
-            TokenKind::Semicolon,
-            TokenKind::Name("a".into()),
-            TokenKind::Op(">".into()),
-            TokenKind::Int(0),
-            TokenKind::Semicolon,
-            TokenKind::Symbol("small".into()),
-            TokenKind::Semicolon,
-            TokenKind::Symbol("none".into()),
-            TokenKind::RBracket,
-        ]);
+        assert_eq!(
+            kinds("?[a>1;`large;a>0;`small;`none]"),
+            vec![
+                TokenKind::Op("?".into()),
+                TokenKind::LBracket,
+                TokenKind::Name("a".into()),
+                TokenKind::Op(">".into()),
+                TokenKind::Int(1),
+                TokenKind::Semicolon,
+                TokenKind::Symbol("large".into()),
+                TokenKind::Semicolon,
+                TokenKind::Name("a".into()),
+                TokenKind::Op(">".into()),
+                TokenKind::Int(0),
+                TokenKind::Semicolon,
+                TokenKind::Symbol("small".into()),
+                TokenKind::Semicolon,
+                TokenKind::Symbol("none".into()),
+                TokenKind::RBracket,
+            ]
+        );
     }
 
     // --- identifiers ---
@@ -717,7 +819,10 @@ mod tests {
 
     #[test]
     fn name_mixed_case() {
-        assert_eq!(kinds("camelCase"), vec![TokenKind::Name("camelCase".into())]);
+        assert_eq!(
+            kinds("camelCase"),
+            vec![TokenKind::Name("camelCase".into())]
+        );
     }
 
     #[test]
@@ -747,19 +852,26 @@ mod tests {
     #[test]
     fn op_comparison() {
         for (src, expected) in [("<", "<"), (">", ">"), ("<=", "<="), (">=", ">=")] {
-            assert_eq!(kinds(src), vec![TokenKind::Op(expected.into())], "op: {src}");
+            assert_eq!(
+                kinds(src),
+                vec![TokenKind::Op(expected.into())],
+                "op: {src}"
+            );
         }
     }
 
     #[test]
     fn dollar_never_gloms_a_following_operator() {
         // `int$-45.3` must tokenise as a cast of a negative literal
-        assert_eq!(kinds("int$-45.3"), vec![
-            TokenKind::Name("int".into()),
-            TokenKind::Op("$".into()),
-            TokenKind::Op("-".into()),
-            TokenKind::Float(45.3),
-        ]);
+        assert_eq!(
+            kinds("int$-45.3"),
+            vec![
+                TokenKind::Name("int".into()),
+                TokenKind::Op("$".into()),
+                TokenKind::Op("-".into()),
+                TokenKind::Float(45.3),
+            ]
+        );
     }
 
     #[test]
@@ -768,11 +880,14 @@ mod tests {
             assert_eq!(kinds(op), vec![TokenKind::Op(op.into())], "op: {op}");
         }
         // no run-glomming with adjacent operators
-        assert_eq!(kinds("a|b"), vec![
-            TokenKind::Name("a".into()),
-            TokenKind::Op("|".into()),
-            TokenKind::Name("b".into()),
-        ]);
+        assert_eq!(
+            kinds("a|b"),
+            vec![
+                TokenKind::Name("a".into()),
+                TokenKind::Op("|".into()),
+                TokenKind::Name("b".into()),
+            ]
+        );
     }
 
     // --- punctuation ---
@@ -785,16 +900,24 @@ mod tests {
     #[test]
     fn punct_colon_colon() {
         assert_eq!(kinds("::"), vec![TokenKind::ColonColon]);
-        assert_eq!(kinds("a: b"), vec![
-            TokenKind::Name("a".into()), TokenKind::Colon, TokenKind::Name("b".into()),
-        ]);
-        assert_eq!(kinds("lvl::`$b"), vec![
-            TokenKind::Name("lvl".into()),
-            TokenKind::ColonColon,
-            TokenKind::Symbol("".into()),
-            TokenKind::Op("$".into()),
-            TokenKind::Name("b".into()),
-        ]);
+        assert_eq!(
+            kinds("a: b"),
+            vec![
+                TokenKind::Name("a".into()),
+                TokenKind::Colon,
+                TokenKind::Name("b".into()),
+            ]
+        );
+        assert_eq!(
+            kinds("lvl::`$b"),
+            vec![
+                TokenKind::Name("lvl".into()),
+                TokenKind::ColonColon,
+                TokenKind::Symbol("".into()),
+                TokenKind::Op("$".into()),
+                TokenKind::Name("b".into()),
+            ]
+        );
     }
 
     #[test]
@@ -817,7 +940,10 @@ mod tests {
     #[test]
     fn comment_rest_of_line() {
         // '/' comments out to end of line
-        assert_eq!(kinds("42 / ignore this\n99"), vec![TokenKind::Int(42), TokenKind::Int(99)]);
+        assert_eq!(
+            kinds("42 / ignore this\n99"),
+            vec![TokenKind::Int(42), TokenKind::Int(99)]
+        );
     }
 
     #[test]
@@ -829,11 +955,14 @@ mod tests {
 
     #[test]
     fn assignment() {
-        assert_eq!(kinds("x: 42"), vec![
-            TokenKind::Name("x".into()),
-            TokenKind::Colon,
-            TokenKind::Int(42),
-        ]);
+        assert_eq!(
+            kinds("x: 42"),
+            vec![
+                TokenKind::Name("x".into()),
+                TokenKind::Colon,
+                TokenKind::Int(42),
+            ]
+        );
     }
 
     // --- full select query ---
@@ -841,36 +970,42 @@ mod tests {
     #[test]
     fn select_query() {
         let src = "select px: price, qty from trades where sym = `AAPL";
-        assert_eq!(kinds(src), vec![
-            TokenKind::Select,
-            TokenKind::Name("px".into()),
-            TokenKind::Colon,
-            TokenKind::Name("price".into()),
-            TokenKind::Comma,
-            TokenKind::Name("qty".into()),
-            TokenKind::From,
-            TokenKind::Name("trades".into()),
-            TokenKind::Where,
-            TokenKind::Name("sym".into()),
-            TokenKind::Op("=".into()),
-            TokenKind::Symbol("AAPL".into()),
-        ]);
+        assert_eq!(
+            kinds(src),
+            vec![
+                TokenKind::Select,
+                TokenKind::Name("px".into()),
+                TokenKind::Colon,
+                TokenKind::Name("price".into()),
+                TokenKind::Comma,
+                TokenKind::Name("qty".into()),
+                TokenKind::From,
+                TokenKind::Name("trades".into()),
+                TokenKind::Where,
+                TokenKind::Name("sym".into()),
+                TokenKind::Op("=".into()),
+                TokenKind::Symbol("AAPL".into()),
+            ]
+        );
     }
 
     #[test]
     fn select_order_query() {
         let src = "select from trades order `col1 asc, `col2 desc";
-        assert_eq!(kinds(src), vec![
-            TokenKind::Select,
-            TokenKind::From,
-            TokenKind::Name("trades".into()),
-            TokenKind::Order,
-            TokenKind::Symbol("col1".into()),
-            TokenKind::Asc,
-            TokenKind::Comma,
-            TokenKind::Symbol("col2".into()),
-            TokenKind::Desc,
-        ]);
+        assert_eq!(
+            kinds(src),
+            vec![
+                TokenKind::Select,
+                TokenKind::From,
+                TokenKind::Name("trades".into()),
+                TokenKind::Order,
+                TokenKind::Symbol("col1".into()),
+                TokenKind::Asc,
+                TokenKind::Comma,
+                TokenKind::Symbol("col2".into()),
+                TokenKind::Desc,
+            ]
+        );
     }
 
     // --- positions ---
@@ -892,18 +1027,20 @@ mod tests {
 
     #[test]
     fn braces_lex_to_brace_tokens() {
-        assert_eq!(kinds("{[x,y] x+y }"), vec![
-            TokenKind::LBrace,
-            TokenKind::LBracket,
-            TokenKind::Name("x".into()),
-            TokenKind::Comma,
-            TokenKind::Name("y".into()),
-            TokenKind::RBracket,
-            TokenKind::Name("x".into()),
-            TokenKind::Op("+".into()),
-            TokenKind::Name("y".into()),
-            TokenKind::RBrace,
-        ]);
+        assert_eq!(
+            kinds("{[x,y] x+y }"),
+            vec![
+                TokenKind::LBrace,
+                TokenKind::LBracket,
+                TokenKind::Name("x".into()),
+                TokenKind::Comma,
+                TokenKind::Name("y".into()),
+                TokenKind::RBracket,
+                TokenKind::Name("x".into()),
+                TokenKind::Op("+".into()),
+                TokenKind::Name("y".into()),
+                TokenKind::RBrace,
+            ]
+        );
     }
 }
-

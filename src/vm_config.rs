@@ -2,8 +2,8 @@
 //! give it a field + default here and a match arm in [`VmConfig::set`] —
 //! nothing else in the pipeline needs to change.
 
-use polars_ops::prelude::RoundMode;
 use crate::errors::QplError;
+use polars_ops::prelude::RoundMode;
 
 #[derive(Debug, Clone)]
 pub struct VmConfig {
@@ -51,9 +51,11 @@ impl VmConfig {
             "tblwidth" => self.tblwidth = parse_cfg_i64(key, value)?,
             "strlen" => self.strlen = parse_cfg_i64(key, value)?,
             "useqepoch" => self.useqepoch = parse_cfg_bool(key, value)?,
-            _ => return Err(QplError::Runtime(format!(
-                "unknown config '{key}' (known: maxcol, maxrow, round_type, tblwidth, strlen, useqepoch)"
-            ))),
+            _ => {
+                return Err(QplError::Runtime(format!(
+                    "unknown config '{key}' (known: maxcol, maxrow, round_type, tblwidth, strlen, useqepoch)"
+                )));
+            }
         }
         self.export_render_limits(key);
         Ok(())
@@ -70,15 +72,25 @@ impl VmConfig {
     #[cfg(not(target_family = "wasm"))]
     fn export_render_limits(&self, key: &str) {
         match key {
-            "maxcol" => unsafe { std::env::set_var("POLARS_FMT_MAX_COLS", self.maxcol.to_string()) },
-            "maxrow" => unsafe { std::env::set_var("POLARS_FMT_MAX_ROWS", self.maxrow.to_string()) },
-            "tblwidth" => unsafe { std::env::set_var("POLARS_TABLE_WIDTH", self.tblwidth.to_string()) },
+            "maxcol" => unsafe {
+                std::env::set_var("POLARS_FMT_MAX_COLS", self.maxcol.to_string())
+            },
+            "maxrow" => unsafe {
+                std::env::set_var("POLARS_FMT_MAX_ROWS", self.maxrow.to_string())
+            },
+            "tblwidth" => unsafe {
+                std::env::set_var("POLARS_TABLE_WIDTH", self.tblwidth.to_string())
+            },
             // Polars' formatter takes a negative POLARS_FMT_STR_LEN literally as
             // usize::MAX and then overflows adding padding to it (fmt.rs), unlike
             // POLARS_TABLE_WIDTH which clamps negatives to u16::MAX itself — so
             // `-1` (unlimited) is translated to a large-but-safe finite value here.
             "strlen" => unsafe {
-                let v = if self.strlen < 0 { i32::MAX as i64 } else { self.strlen };
+                let v = if self.strlen < 0 {
+                    i32::MAX as i64
+                } else {
+                    self.strlen
+                };
                 std::env::set_var("POLARS_FMT_STR_LEN", v.to_string())
             },
             _ => {}
@@ -92,7 +104,11 @@ impl VmConfig {
     pub fn describe(&self) -> String {
         format!(
             "maxcol={}\nmaxrow={}\nround_type={}\ntblwidth={}\nstrlen={}\nuseqepoch={}",
-            self.maxcol, self.maxrow, round_type_name(self.round_type), self.tblwidth, self.strlen,
+            self.maxcol,
+            self.maxrow,
+            round_type_name(self.round_type),
+            self.tblwidth,
+            self.strlen,
             self.useqepoch,
         )
     }
@@ -100,14 +116,16 @@ impl VmConfig {
 
 fn parse_cfg_usize(key: &str, value: &str) -> Result<usize, QplError> {
     value.parse().map_err(|_| {
-        QplError::Runtime(format!("config '{key}' expects a non-negative integer, got '{value}'"))
+        QplError::Runtime(format!(
+            "config '{key}' expects a non-negative integer, got '{value}'"
+        ))
     })
 }
 
 fn parse_cfg_i64(key: &str, value: &str) -> Result<i64, QplError> {
-    value.parse().map_err(|_| {
-        QplError::Runtime(format!("config '{key}' expects an integer, got '{value}'"))
-    })
+    value
+        .parse()
+        .map_err(|_| QplError::Runtime(format!("config '{key}' expects an integer, got '{value}'")))
 }
 
 fn parse_cfg_bool(key: &str, value: &str) -> Result<bool, QplError> {

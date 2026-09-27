@@ -58,12 +58,16 @@ impl Interrupt {
         if !prev {
             self.0.requested.store(false, Ordering::Relaxed);
         }
-        StatementGuard { state: self.0.clone(), prev }
+        StatementGuard {
+            state: self.0.clone(),
+            prev,
+        }
     }
 
     /// Called from the signal-handler thread.
     pub fn on_ctrl_c(&self) -> CtrlC {
-        if !self.0.running.load(Ordering::Relaxed) || self.0.requested.swap(true, Ordering::Relaxed) {
+        if !self.0.running.load(Ordering::Relaxed) || self.0.requested.swap(true, Ordering::Relaxed)
+        {
             CtrlC::Exit
         } else {
             CtrlC::Interrupting
@@ -108,7 +112,10 @@ mod tests {
         let i = Interrupt::default();
         i.request();
         let outer = i.statement();
-        assert!(i.check().is_ok(), "entering the outermost statement clears a stale request");
+        assert!(
+            i.check().is_ok(),
+            "entering the outermost statement clears a stale request"
+        );
         {
             let _inner = i.statement();
             i.request();
@@ -117,13 +124,20 @@ mod tests {
         assert!(i.check().is_err());
         assert_eq!(i.on_ctrl_c(), CtrlC::Exit);
         drop(outer);
-        assert!(i.check().is_ok(), "leaving the outermost statement clears the request");
+        assert!(
+            i.check().is_ok(),
+            "leaving the outermost statement clears the request"
+        );
     }
 
     #[test]
     fn ctrl_c_escalates_only_while_running() {
         let i = Interrupt::default();
-        assert_eq!(i.on_ctrl_c(), CtrlC::Exit, "idle: exit like an unhandled SIGINT");
+        assert_eq!(
+            i.on_ctrl_c(),
+            CtrlC::Exit,
+            "idle: exit like an unhandled SIGINT"
+        );
         let _g = i.statement();
         assert_eq!(i.on_ctrl_c(), CtrlC::Interrupting);
         assert_eq!(i.on_ctrl_c(), CtrlC::Exit, "second Ctrl-C forces quit");

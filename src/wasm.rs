@@ -44,7 +44,9 @@ extern "C" {
 /// `RuntimeError: unreachable` with no message; this logs the real one first.
 #[wasm_bindgen(start)]
 fn start() {
-    std::panic::set_hook(Box::new(|info| console_error(&format!("qpl panic: {info}"))));
+    std::panic::set_hook(Box::new(|info| {
+        console_error(&format!("qpl panic: {info}"))
+    }));
 }
 
 /// A qpl session: one [`Vm`], fed one line at a time.
@@ -96,7 +98,9 @@ impl Repl {
     /// this. Throws if `name` isn't a table.
     #[wasm_bindgen(js_name = rowCount)]
     pub fn row_count(&self, name: &str) -> Result<f64, JsError> {
-        arrow_io::row_count(&self.vm, name).map(|n| n as f64).map_err(|e| JsError::new(&e.to_string()))
+        arrow_io::row_count(&self.vm, name)
+            .map(|n| n as f64)
+            .map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// Like [`eval`](Self::eval), but a table result comes back as data.
@@ -140,7 +144,8 @@ impl Repl {
     /// Lazy plans count as tables (no `columns`/`rows`: resolving a plan's
     /// schema can be expensive). Sorted by name.
     pub fn symbols(&self) -> JsValue {
-        js_sys::JSON::parse(&symbols_json(&self.vm).to_string()).expect("serde_json output is valid JSON")
+        js_sys::JSON::parse(&symbols_json(&self.vm).to_string())
+            .expect("serde_json output is valid JSON")
     }
 
     /// Bind the demo `trades` / `quotes` tables — the `--load-demo` flag.
@@ -185,7 +190,8 @@ impl Default for Repl {
 #[wasm_bindgen(js_name = qplLangConfig)]
 pub fn qpl_lang_config() -> JsValue {
     let vocab: Json = serde_json::from_str(VOCABULARY).expect("vocabulary.json is valid JSON");
-    let config: Json = serde_json::from_str(LANG_CONFIG).expect("language-configuration.json is valid JSON");
+    let config: Json =
+        serde_json::from_str(LANG_CONFIG).expect("language-configuration.json is valid JSON");
     let snippets: Json = serde_json::from_str(SNIPPETS).expect("snippets/qpl.json is valid JSON");
 
     let value = json!({
@@ -290,7 +296,9 @@ fn completions(vocab: &Json, snippets: &Json) -> Json {
 
     if let Some(map) = snippets.as_object() {
         for snippet in map.values() {
-            let Some(prefix) = snippet["prefix"].as_str() else { continue };
+            let Some(prefix) = snippet["prefix"].as_str() else {
+                continue;
+            };
             items.push(json!({
                 "label": prefix,
                 "kind": "Snippet",
@@ -328,7 +336,9 @@ fn list<'a>(vocab: &'a Json, key: &str) -> Vec<&'a str> {
 /// convert the four such fields in place, after the round-trip through
 /// `JSON.parse`.
 fn regexify_configuration(root: &JsValue) {
-    let Ok(config) = Reflect::get(root, &"configuration".into()) else { return };
+    let Ok(config) = Reflect::get(root, &"configuration".into()) else {
+        return;
+    };
     to_regex(&config, "wordPattern");
     if let Ok(rules) = Reflect::get(&config, &"indentationRules".into()) {
         to_regex(&rules, "increaseIndentPattern");
@@ -347,8 +357,12 @@ fn regexify_configuration(root: &JsValue) {
 
 /// Replace `obj[key]`, a pattern string, with the equivalent `RegExp`.
 fn to_regex(obj: &JsValue, key: &str) {
-    let Ok(current) = Reflect::get(obj, &key.into()) else { return };
-    let Some(pattern) = current.as_string() else { return };
+    let Ok(current) = Reflect::get(obj, &key.into()) else {
+        return;
+    };
+    let Some(pattern) = current.as_string() else {
+        return;
+    };
     set(obj, key, &js_sys::RegExp::new(&pattern, "").into());
 }
 
@@ -359,7 +373,11 @@ fn symbols_json(vm: &Vm) -> Json {
         .tables
         .iter()
         .map(|(name, df)| {
-            let columns: Vec<String> = df.get_column_names().iter().map(|c| c.to_string()).collect();
+            let columns: Vec<String> = df
+                .get_column_names()
+                .iter()
+                .map(|c| c.to_string())
+                .collect();
             json!({ "name": name, "columns": columns, "rows": df.height() })
         })
         .chain(vm.lazy_frames.keys().map(|name| json!({ "name": name })))
@@ -395,8 +413,13 @@ mod tests {
     fn embedded_vocabulary_has_every_list() {
         let vocab: Json = serde_json::from_str(VOCABULARY).unwrap();
         for key in [
-            "statementKeywords", "builtinKeywords", "joinOperators", "wordOperators",
-            "aggregates", "castTypes", "replCommands",
+            "statementKeywords",
+            "builtinKeywords",
+            "joinOperators",
+            "wordOperators",
+            "aggregates",
+            "castTypes",
+            "replCommands",
         ] {
             assert!(!list(&vocab, key).is_empty(), "{key} is missing or empty");
         }
@@ -413,10 +436,14 @@ mod tests {
         let vocab: Json = serde_json::from_str(VOCABULARY).unwrap();
         let m = monarch(&vocab);
         let cases = &m["tokenizer"]["root"]
-            .as_array().unwrap().iter()
+            .as_array()
+            .unwrap()
+            .iter()
             .find_map(|rule| rule.get(1).and_then(|a| a.get("cases")))
             .expect("the identifier rule has a cases block")
-            .as_object().unwrap().clone();
+            .as_object()
+            .unwrap()
+            .clone();
         for name in cases.keys().filter(|k| *k != "@default") {
             let attr = name.trim_start_matches('@');
             assert!(m[attr].is_array(), "monarch is missing the `{attr}` list");
@@ -432,11 +459,20 @@ mod tests {
         let vocab: Json = serde_json::from_str(VOCABULARY).unwrap();
         let wire = monarch(&vocab).to_string();
         let parsed: Json = serde_json::from_str(&wire).unwrap();
-        let cases = parsed["tokenizer"]["root"].as_array().unwrap().iter()
+        let cases = parsed["tokenizer"]["root"]
+            .as_array()
+            .unwrap()
+            .iter()
             .find_map(|rule| rule.get(1).and_then(|a| a.get("cases")))
-            .unwrap().as_object().unwrap();
+            .unwrap()
+            .as_object()
+            .unwrap();
         let keys: Vec<&String> = cases.keys().collect();
-        assert_eq!(keys.last().map(|k| k.as_str()), Some("@default"), "{keys:?}");
+        assert_eq!(
+            keys.last().map(|k| k.as_str()),
+            Some("@default"),
+            "{keys:?}"
+        );
     }
 
     #[test]
@@ -446,8 +482,19 @@ mod tests {
         repl::eval_capture("n: 3", &mut vm);
         repl::eval_capture("f: {[x] x + 1}", &mut vm);
         let s = symbols_json(&vm);
-        let trades = s["tables"].as_array().unwrap().iter().find(|t| t["name"] == "trades").unwrap();
-        assert!(trades["columns"].as_array().unwrap().iter().any(|c| c == "price"));
+        let trades = s["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "trades")
+            .unwrap();
+        assert!(
+            trades["columns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == "price")
+        );
         assert_eq!(s["variables"], json!(["n"]));
         assert_eq!(s["functions"], json!(["f"]));
     }
@@ -458,11 +505,21 @@ mod tests {
         let snippets: Json = serde_json::from_str(SNIPPETS).unwrap();
         let items = completions(&vocab, &snippets);
         let labelled = |label: &str| -> Json {
-            items.as_array().unwrap().iter()
-                .find(|i| i["label"] == label).cloned().unwrap_or(Json::Null)
+            items
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["label"] == label)
+                .cloned()
+                .unwrap_or(Json::Null)
         };
         assert_eq!(labelled("select")["kind"], "Keyword");
-        assert!(labelled("select")["detail"].as_str().unwrap().contains("from"));
+        assert!(
+            labelled("select")["detail"]
+                .as_str()
+                .unwrap()
+                .contains("from")
+        );
         assert_eq!(labelled("lj")["kind"], "Operator");
         assert_eq!(labelled("sum")["kind"], "Function");
         assert_eq!(labelled("f64")["kind"], "TypeParameter");

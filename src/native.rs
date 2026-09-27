@@ -26,10 +26,34 @@ pub struct Builtin {
 /// The session-wide builtin table, populated once in [`Vm::new`](crate::vm::Vm::new).
 pub fn builtins() -> HashMap<String, Builtin> {
     let mut m = HashMap::new();
-    m.insert(".qpl.dt".to_string(), Builtin { arity: 0, typ: temporal::TemporalNowFuncType::Date });
-    m.insert(".qpl.tm".to_string(), Builtin { arity: 0, typ: temporal::TemporalNowFuncType::Time });
-    m.insert(".qpl.ts".to_string(), Builtin { arity: 0, typ: temporal::TemporalNowFuncType::Timestamp });
-    m.insert(".qpl.dlta".to_string(), Builtin { arity: 0, typ: temporal::TemporalNowFuncType::Timespan });
+    m.insert(
+        ".qpl.dt".to_string(),
+        Builtin {
+            arity: 0,
+            typ: temporal::TemporalNowFuncType::Date,
+        },
+    );
+    m.insert(
+        ".qpl.tm".to_string(),
+        Builtin {
+            arity: 0,
+            typ: temporal::TemporalNowFuncType::Time,
+        },
+    );
+    m.insert(
+        ".qpl.ts".to_string(),
+        Builtin {
+            arity: 0,
+            typ: temporal::TemporalNowFuncType::Timestamp,
+        },
+    );
+    m.insert(
+        ".qpl.dlta".to_string(),
+        Builtin {
+            arity: 0,
+            typ: temporal::TemporalNowFuncType::Timespan,
+        },
+    );
     m
 }
 

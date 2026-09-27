@@ -31,7 +31,7 @@ impl From<PolarsError> for QplError {
     fn from(err: PolarsError) -> Self {
         match &err {
             PolarsError::ShapeMismatch(_) => QplError::Runtime(format!("Shape mismatch: {}", err)),
-            _ => QplError::Runtime(err.to_string())
+            _ => QplError::Runtime(err.to_string()),
         }
     }
 }

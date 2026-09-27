@@ -1,8 +1,7 @@
-
-use crate::ast::{Expr, TableExpr, SelectStmt, Stmt, Value};
-use crate::enums::{PolarsStackArg, WindowFn};
+use crate::ast::{Expr, SelectStmt, Stmt, TableExpr, Value};
 use crate::builtins::BuiltIn;
 use crate::enums::PolarsFrameExpr;
+use crate::enums::{PolarsStackArg, WindowFn};
 use crate::errors::QplError;
 use crate::opcodes::Instruction;
 
@@ -22,16 +21,30 @@ fn compile_stmt(stmt: &Stmt, out: &mut Vec<Instruction>) -> Result<(), QplError>
             }
             out.push(Instruction::Result);
             Ok(())
-        },
+        }
         // assignment: compile the body; workspace binding is handled by the VM
-        Stmt::Assign { name, body, .. } => { compile_stmt(body, out)?; out.push(Instruction::Assign(name.clone())); Ok(()) },
+        Stmt::Assign { name, body, .. } => {
+            compile_stmt(body, out)?;
+            out.push(Instruction::Assign(name.clone()));
+            Ok(())
+        }
         // scalar assigns are evaluated by the REPL before reaching the compiler
-        Stmt::ScalarAssign { name, expr } => { out.push(Instruction::Eval(expr.clone())); out.push(Instruction::Assign(name.clone())); Ok(()) },
-        Stmt::SingleVar(expr) => { out.push(Instruction::Eval(expr.clone())); Ok(())}
+        Stmt::ScalarAssign { name, expr } => {
+            out.push(Instruction::Eval(expr.clone()));
+            out.push(Instruction::Assign(name.clone()));
+            Ok(())
+        }
+        Stmt::SingleVar(expr) => {
+            out.push(Instruction::Eval(expr.clone()));
+            Ok(())
+        }
     }
 }
 
-pub(crate) fn compile_tbl_expr(tbl_expr: &TableExpr, out: &mut Vec<Instruction>) -> Result<(), QplError> {
+pub(crate) fn compile_tbl_expr(
+    tbl_expr: &TableExpr,
+    out: &mut Vec<Instruction>,
+) -> Result<(), QplError> {
     match tbl_expr {
         TableExpr::Select(sel) => compile_select(sel, out),
         TableExpr::BuiltIn(func) => compile_builtin(func, out),
@@ -57,7 +70,9 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), 
         }
         BuiltIn::Sort(tbl_expr, sort_map) => {
             compile_tbl_expr(tbl_expr.as_ref(), out)?;
-            out.push(Instruction::FrameExpr(PolarsFrameExpr::Sort(sort_map.clone())));
+            out.push(Instruction::FrameExpr(PolarsFrameExpr::Sort(
+                sort_map.clone(),
+            )));
             Ok(())
         }
         BuiltIn::Distinct(tbl_expr) => {
@@ -67,7 +82,9 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), 
         }
         BuiltIn::DropNull(columns, tbl_expr) => {
             compile_tbl_expr(tbl_expr.as_ref(), out)?;
-            out.push(Instruction::FrameExpr(PolarsFrameExpr::DropNull(columns.clone())));
+            out.push(Instruction::FrameExpr(PolarsFrameExpr::DropNull(
+                columns.clone(),
+            )));
             Ok(())
         }
         BuiltIn::Limit(tbl_expr, count) => {
@@ -78,7 +95,9 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Vec<Instruction>) -> Result<(), 
         }
         BuiltIn::Drop(columns, tbl_expr) => {
             compile_tbl_expr(tbl_expr.as_ref(), out)?;
-            out.push(Instruction::FrameExpr(PolarsFrameExpr::Drop(columns.clone())));
+            out.push(Instruction::FrameExpr(PolarsFrameExpr::Drop(
+                columns.clone(),
+            )));
             Ok(())
         }
         BuiltIn::Lazy(tbl_expr) => {
@@ -104,11 +123,22 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
                     out.push(Instruction::BinOp("&".into()));
                 }
             }
-            out.push(Instruction::Call { func: "not".into(), args_count: 1 });
+            out.push(Instruction::Call {
+                func: "not".into(),
+                args_count: 1,
+            });
             out.push(Instruction::FrameExpr(PolarsFrameExpr::Filter(1)));
         }
-        let columns = sel.cols.iter().map(delete_column_name).collect::<Result<Vec<_>, _>>()?;
-        out.push(Instruction::BuildProj { count: 0, exclude: columns, predicates: 0 });
+        let columns = sel
+            .cols
+            .iter()
+            .map(delete_column_name)
+            .collect::<Result<Vec<_>, _>>()?;
+        out.push(Instruction::BuildProj {
+            count: 0,
+            exclude: columns,
+            predicates: 0,
+        });
         out.push(Instruction::Select);
         return Ok(());
     }
@@ -131,11 +161,19 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
         }
         for alias in &sel.cols {
             compile_expr(&alias.expr, out)?;
-            out.push(Instruction::Alias { name: alias.name.clone() });
+            out.push(Instruction::Alias {
+                name: alias.name.clone(),
+            });
         }
-        let columns = sel.cols.iter().map(|alias| {
-            alias.name.clone().ok_or_else(|| QplError::Compile("update expressions require column aliases".into()))
-        }).collect::<Result<Vec<_>, _>>()?;
+        let columns = sel
+            .cols
+            .iter()
+            .map(|alias| {
+                alias.name.clone().ok_or_else(|| {
+                    QplError::Compile("update expressions require column aliases".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         out.push(Instruction::BuildProj {
             count: sel.cols.len(),
             exclude: columns,
@@ -144,12 +182,14 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
         out.push(Instruction::Select);
         return Ok(());
     }
-    
+
     // Join phrase - done first so that the join is applied before any where clause filters
     if let Some((join_src, left_on, right_on, join_type)) = &sel.join {
         compile_tbl_expr(&sel.from, out)?;
         out.push(Instruction::Result); // get the left frame onto the stack for the join
-        out.push(Instruction::PushPolarsArg(PolarsStackArg::Join(join_type.clone())));
+        out.push(Instruction::PushPolarsArg(PolarsStackArg::Join(
+            join_type.clone(),
+        )));
         let left_count = if let Value::SymVec(_) = left_on {
             let names = left_on.vec_strings().map_err(QplError::Runtime)?;
             for name in &names {
@@ -157,7 +197,10 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
             }
             names.len()
         } else {
-            return Err(QplError::Runtime(format!("Expected symbol for left_on, got {:?}", left_on)));
+            return Err(QplError::Runtime(format!(
+                "Expected symbol for left_on, got {:?}",
+                left_on
+            )));
         };
         let right_count = if let Value::SymVec(_) = right_on {
             let names = right_on.vec_strings().map_err(QplError::Runtime)?;
@@ -166,11 +209,17 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
             }
             names.len()
         } else {
-            return Err(QplError::Runtime(format!("Expected symbol for right_on, got {:?}", right_on)));
+            return Err(QplError::Runtime(format!(
+                "Expected symbol for right_on, got {:?}",
+                right_on
+            )));
         };
         compile_tbl_expr(join_src, out)?;
         out.push(Instruction::Result); // get the right frame onto the stack for the join
-        out.push(Instruction::FrameExpr(PolarsFrameExpr::Join { l: left_count, r: right_count }));
+        out.push(Instruction::FrameExpr(PolarsFrameExpr::Join {
+            l: left_count,
+            r: right_count,
+        }));
     } else {
         // From phrase
         compile_tbl_expr(&sel.from, out)?;
@@ -208,16 +257,28 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
     let mut proj_count = 0;
     for alias in &sel.cols {
         let name = alias.name.clone().or_else(|| implicit_alias(&alias.expr));
-        if has_by && name.as_deref().is_some_and(|n| by_names.iter().any(|k| k == n)) {
+        if has_by
+            && name
+                .as_deref()
+                .is_some_and(|n| by_names.iter().any(|k| k == n))
+        {
             continue;
         }
         compile_expr(&alias.expr, out)?;
         out.push(Instruction::Alias { name });
         proj_count += 1;
     }
-    out.push(Instruction::BuildProj { count: proj_count, exclude: vec![], predicates: 0 });
+    out.push(Instruction::BuildProj {
+        count: proj_count,
+        exclude: vec![],
+        predicates: 0,
+    });
 
-    out.push(if has_by { Instruction::SelectBy } else { Instruction::Select });
+    out.push(if has_by {
+        Instruction::SelectBy
+    } else {
+        Instruction::Select
+    });
     if let Some(order) = &sel.order {
         out.push(Instruction::FrameExpr(PolarsFrameExpr::Sort(order.clone())));
     }
@@ -227,7 +288,9 @@ fn compile_select(sel: &SelectStmt, out: &mut Vec<Instruction>) -> Result<(), Qp
 fn delete_column_name(alias: &crate::ast::Alias) -> Result<String, QplError> {
     match &alias.expr {
         Expr::ColRef(name) | Expr::Sym(name) => Ok(name.clone()),
-        other => Err(QplError::Compile(format!("delete expects column names, got {other:?}"))),
+        other => Err(QplError::Compile(format!(
+            "delete expects column names, got {other:?}"
+        ))),
     }
 }
 
@@ -248,12 +311,17 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
         // rounding mode is resolved from VM config at run time.
         Expr::Call { func, args } if func == "round" => {
             let [value, precision] = args.as_slice() else {
-                return Err(QplError::Compile("round expects `<precision> round <column>`".into()));
+                return Err(QplError::Compile(
+                    "round expects `<precision> round <column>`".into(),
+                ));
             };
             let decimals = match precision {
                 Expr::Lit(Value::Int(n)) if *n >= 0 => *n as u32,
-                _ => return Err(QplError::Compile(
-                    "round precision must be a non-negative integer literal".into())),
+                _ => {
+                    return Err(QplError::Compile(
+                        "round precision must be a non-negative integer literal".into(),
+                    ));
+                }
             };
             compile_expr(value, out)?;
             out.push(Instruction::Round { decimals });
@@ -262,7 +330,10 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
             for arg in args {
                 compile_expr(arg, out)?;
             }
-            out.push(Instruction::Call { func: func.clone(), args_count: args.len() });
+            out.push(Instruction::Call {
+                func: func.clone(),
+                args_count: args.len(),
+            });
         }
         Expr::Cast { target, expr } => {
             compile_expr(expr, out)?;
@@ -274,11 +345,20 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
                 compile_expr(value, out)?;
             }
             compile_expr(default, out)?;
-            out.push(Instruction::Case { branches: branches.len() });
+            out.push(Instruction::Case {
+                branches: branches.len(),
+            });
         }
-        Expr::Window { func, partition, order, rolling } => {
+        Expr::Window {
+            func,
+            partition,
+            order,
+            rolling,
+        } => {
             if partition.is_empty() {
-                return Err(QplError::Compile("`over` needs at least one partition symbol".into()));
+                return Err(QplError::Compile(
+                    "`over` needs at least one partition symbol".into(),
+                ));
             }
             // `<agg> <col> <n>!rolling over ...` — push the *raw* column and carry
             // the aggregate name in the instruction; the VM applies the rolling
@@ -287,7 +367,9 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
                 let (agg, column) = match func.as_ref() {
                     Expr::Call { func: agg, args } if args.len() == 1 => (agg.clone(), &args[0]),
                     _ => return Err(QplError::Compile(
-                        "`rolling` must wrap a plain aggregate, e.g. `sum px 5!rolling over `k`".into())),
+                        "`rolling` must wrap a plain aggregate, e.g. `sum px 5!rolling over `k`"
+                            .into(),
+                    )),
                 };
                 compile_expr(column, out)?;
                 out.push(Instruction::Window {
@@ -303,8 +385,8 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
             // expression applied per partition.
             let ranking = match func.as_ref() {
                 Expr::ColRef(name) => match name.as_str() {
-                    "rn"    => Some(WindowFn::RowNumber),
-                    "rank"  => Some(WindowFn::Rank),
+                    "rn" => Some(WindowFn::RowNumber),
+                    "rank" => Some(WindowFn::Rank),
                     "drank" => Some(WindowFn::DenseRank),
                     _ => None,
                 },
@@ -314,7 +396,8 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
                 Some(_) => {
                     if order.is_empty() {
                         return Err(QplError::Compile(
-                            "`rn` / `rank` / `drank` need an `order` sub-clause".into()));
+                            "`rn` / `rank` / `drank` need an `order` sub-clause".into(),
+                        ));
                     }
                 }
                 None => compile_expr(func, out)?,
@@ -326,23 +409,47 @@ fn compile_expr(node: &Expr, out: &mut Vec<Instruction>) -> Result<(), QplError>
                 rolling: None,
             });
         }
-        Expr::Dict(_) => return Err(QplError::Runtime("Dict expressions are not supported in select statements (yet)".into())),
+        Expr::Dict(_) => {
+            return Err(QplError::Runtime(
+                "Dict expressions are not supported in select statements (yet)".into(),
+            ));
+        }
         // column expressions / slices / indexing are value-context only — they are
         // tree-walked by `resolve::eval_value`, never lowered into a projection.
         Expr::Table(_) => return Err(QplError::Compile(
-            "a `table`col` / `select` column expression cannot appear inside a select projection".into())),
-        Expr::Take { .. } => return Err(QplError::Compile(
-            "`n#…` slicing is only valid outside a select projection".into())),
-        Expr::Index { .. } => return Err(QplError::Compile(
-            "positional indexing is only valid outside a select projection".into())),
-        Expr::Apply { .. } => return Err(QplError::Compile(
-            "a user function call `f[..]` is only valid outside a select projection".into())),
-        Expr::Dispatch { .. } => return Err(QplError::Compile(
-            "`dispatch` is only valid outside a select projection".into())),
-        Expr::ListWhere { .. } => return Err(QplError::Compile(
-            "a list `where` is only valid outside a select projection".into())),
-        Expr::While { .. } | Expr::Noop => return Err(QplError::Compile(
-            "`while` / `noop` are only valid outside a select projection".into())),
+            "a `table`col` / `select` column expression cannot appear inside a select projection"
+                .into(),
+        )),
+        Expr::Take { .. } => {
+            return Err(QplError::Compile(
+                "`n#…` slicing is only valid outside a select projection".into(),
+            ));
+        }
+        Expr::Index { .. } => {
+            return Err(QplError::Compile(
+                "positional indexing is only valid outside a select projection".into(),
+            ));
+        }
+        Expr::Apply { .. } => {
+            return Err(QplError::Compile(
+                "a user function call `f[..]` is only valid outside a select projection".into(),
+            ));
+        }
+        Expr::Dispatch { .. } => {
+            return Err(QplError::Compile(
+                "`dispatch` is only valid outside a select projection".into(),
+            ));
+        }
+        Expr::ListWhere { .. } => {
+            return Err(QplError::Compile(
+                "a list `where` is only valid outside a select projection".into(),
+            ));
+        }
+        Expr::While { .. } | Expr::Noop => {
+            return Err(QplError::Compile(
+                "`while` / `noop` are only valid outside a select projection".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -372,7 +479,7 @@ fn leftmost_leaf(node: &Expr) -> &Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Value, TableSource};
+    use crate::ast::{TableSource, Value};
     use crate::lexer::tokenise;
     use crate::opcodes::Instruction::{self, *};
     use crate::parser::parse;
@@ -383,82 +490,199 @@ mod tests {
         compile(&stmt).expect("compile error")
     }
 
-    fn alias(name: &str) -> Instruction { Alias { name: Some(name.into()) } }
+    fn alias(name: &str) -> Instruction {
+        Alias {
+            name: Some(name.into()),
+        }
+    }
     // fn no_alias() -> Instruction       { Alias { name: None } }
-    fn from_table(t: &str) -> Instruction    { FromSrc(TableSource::InMem(t.into())) }
-    fn col(c: &str) -> Instruction     { PushColRef(c.into()) }
-    fn int(n: i64) -> Instruction      { PushConst(Value::Int(n)) }
-    fn sym(s: &str) -> Instruction     { PushConst(Value::Str(s.into())) }
-    fn op(o: &str) -> Instruction      { BinOp(o.into()) }
-    fn call(f: &str, n: usize) -> Instruction { Call { func: f.into(), args_count: n } }
+    fn from_table(t: &str) -> Instruction {
+        FromSrc(TableSource::InMem(t.into()))
+    }
+    fn col(c: &str) -> Instruction {
+        PushColRef(c.into())
+    }
+    fn int(n: i64) -> Instruction {
+        PushConst(Value::Int(n))
+    }
+    fn sym(s: &str) -> Instruction {
+        PushConst(Value::Str(s.into()))
+    }
+    fn op(o: &str) -> Instruction {
+        BinOp(o.into())
+    }
+    fn call(f: &str, n: usize) -> Instruction {
+        Call {
+            func: f.into(),
+            args_count: n,
+        }
+    }
 
     // --- simple selects ---
 
     #[test]
     fn select_single_col() {
-        assert_eq!(compile_src("select px from trades"), vec![
-            from_table("trades"), col("px"), alias("px"), BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select px from trades"),
+            vec![
+                from_table("trades"),
+                col("px"),
+                alias("px"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn select_multi_col() {
-        assert_eq!(compile_src("select px, qty from trades"), vec![
-            from_table("trades"),
-            col("px"),  alias("px"),
-            col("qty"), alias("qty"),
-            BuildProj { count: 2, exclude: vec![], predicates: 0 }, Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select px, qty from trades"),
+            vec![
+                from_table("trades"),
+                col("px"),
+                alias("px"),
+                col("qty"),
+                alias("qty"),
+                BuildProj {
+                    count: 2,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn select_all_cols() {
         // empty select phrase = return all columns
-        assert_eq!(compile_src("select from t"), vec![
-            from_table("t"), BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select from t"),
+            vec![
+                from_table("t"),
+                BuildProj {
+                    count: 0,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     // --- aliases ---
 
     #[test]
     fn explicit_alias() {
-        assert_eq!(compile_src("select p: price from trades"), vec![
-            from_table("trades"), col("price"), alias("p"), BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select p: price from trades"),
+            vec![
+                from_table("trades"),
+                col("price"),
+                alias("p"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn implicit_alias_from_colref() {
         // no alias: column name becomes the implicit alias
-        assert_eq!(compile_src("select price from trades"), vec![
-            from_table("trades"), col("price"), alias("price"), BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select price from trades"),
+            vec![
+                from_table("trades"),
+                col("price"),
+                alias("price"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     // --- computed columns ---
 
     #[test]
     fn explicit_alias_binop() {
-        assert_eq!(compile_src("select dbl: c3*2 from t"), vec![
-            from_table("t"), col("c3"), int(2), op("*"), alias("dbl"), BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select dbl: c3*2 from t"),
+            vec![
+                from_table("t"),
+                col("c3"),
+                int(2),
+                op("*"),
+                alias("dbl"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn implicit_alias_binop_uses_leftmost_leaf() {
         // per spec: leftmost term (c3) becomes the implicit alias
-        assert_eq!(compile_src("select c3*2 from t"), vec![
-            from_table("t"), col("c3"), int(2), op("*"), alias("c3"), BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select c3*2 from t"),
+            vec![
+                from_table("t"),
+                col("c3"),
+                int(2),
+                op("*"),
+                alias("c3"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn implicit_alias_call_uses_leftmost_arg() {
         // sum price: leftmost arg is price → alias "price"
-        assert_eq!(compile_src("select sum price from t"), vec![
-            from_table("t"), col("price"), call("sum", 1), alias("price"), BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select sum price from t"),
+            vec![
+                from_table("t"),
+                col("price"),
+                call("sum", 1),
+                alias("price"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     // --- virtual column i ---
@@ -466,116 +690,248 @@ mod tests {
     #[test]
     fn select_icol() {
         // i is virtual, never a real column name → implicit alias is "x"
-        assert_eq!(compile_src("select i from t"), vec![
-            from_table("t"), PushIColRef, alias("x"), BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select i from t"),
+            vec![
+                from_table("t"),
+                PushIColRef,
+                alias("x"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     // --- where clause ---
 
     #[test]
     fn where_single_pred() {
-        assert_eq!(compile_src("select px from trades where qty > 0"), vec![
-            from_table("trades"),
-            col("qty"), int(0), op(">"), FrameExpr(PolarsFrameExpr::Filter(1)),
-            col("px"), alias("px"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
-            Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select px from trades where qty > 0"),
+            vec![
+                from_table("trades"),
+                col("qty"),
+                int(0),
+                op(">"),
+                FrameExpr(PolarsFrameExpr::Filter(1)),
+                col("px"),
+                alias("px"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn where_symbol_eq() {
-        assert_eq!(compile_src("select px from trades where sym = `AAPL"), vec![
-            from_table("trades"),
-            col("sym"), sym("AAPL"), op("="), FrameExpr(PolarsFrameExpr::Filter(1)),
-            col("px"), alias("px"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
-            Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select px from trades where sym = `AAPL"),
+            vec![
+                from_table("trades"),
+                col("sym"),
+                sym("AAPL"),
+                op("="),
+                FrameExpr(PolarsFrameExpr::Filter(1)),
+                col("px"),
+                alias("px"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn where_like() {
-        assert_eq!(compile_src(r#"select px from trades where sym like "AA*""#), vec![
-            from_table("trades"),
-            col("sym"), sym("AA*"), op("like"), FrameExpr(PolarsFrameExpr::Filter(1)),
-            col("px"), alias("px"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
-            Select, Result,
-        ]);
+        assert_eq!(
+            compile_src(r#"select px from trades where sym like "AA*""#),
+            vec![
+                from_table("trades"),
+                col("sym"),
+                sym("AA*"),
+                op("like"),
+                FrameExpr(PolarsFrameExpr::Filter(1)),
+                col("px"),
+                alias("px"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn where_multiple_subphrases() {
         // successive filters: spec says each subphrase applied to result of previous
-        assert_eq!(compile_src("select px from trades where sym=`AAPL, qty>0"), vec![
-            from_table("trades"),
-            col("sym"), sym("AAPL"), op("="),
-            col("qty"), int(0), op(">"),
-            FrameExpr(PolarsFrameExpr::Filter(2)),
-            col("px"), alias("px"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
-            Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select px from trades where sym=`AAPL, qty>0"),
+            vec![
+                from_table("trades"),
+                col("sym"),
+                sym("AAPL"),
+                op("="),
+                col("qty"),
+                int(0),
+                op(">"),
+                FrameExpr(PolarsFrameExpr::Filter(2)),
+                col("px"),
+                alias("px"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn order_multiple_columns() {
-        assert_eq!(compile_src("select from trades order `col1 asc, `col2 desc"), vec![
-            from_table("trades"),
-            BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
-            FrameExpr(PolarsFrameExpr::Sort(vec![("col1".into(), false), ("col2".into(), true)])),
-            Result,
-        ]);
+        assert_eq!(
+            compile_src("select from trades order `col1 asc, `col2 desc"),
+            vec![
+                from_table("trades"),
+                BuildProj {
+                    count: 0,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                FrameExpr(PolarsFrameExpr::Sort(vec![
+                    ("col1".into(), false),
+                    ("col2".into(), true)
+                ])),
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn distinct_and_limit() {
-        assert_eq!(compile_src("distinct select from trades"), vec![
-            from_table("trades"), BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
-            FrameExpr(PolarsFrameExpr::Distinct), Result,
-        ]);
-        assert_eq!(compile_src("10 limit select from trades"), vec![
-            from_table("trades"), BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
-            Eval(Expr::Lit(Value::Int(10))), FrameExpr(PolarsFrameExpr::Limit), Result,
-        ]);
+        assert_eq!(
+            compile_src("distinct select from trades"),
+            vec![
+                from_table("trades"),
+                BuildProj {
+                    count: 0,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                FrameExpr(PolarsFrameExpr::Distinct),
+                Result,
+            ]
+        );
+        assert_eq!(
+            compile_src("10 limit select from trades"),
+            vec![
+                from_table("trades"),
+                BuildProj {
+                    count: 0,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Eval(Expr::Lit(Value::Int(10))),
+                FrameExpr(PolarsFrameExpr::Limit),
+                Result,
+            ]
+        );
         // `n#…` is a value expression, tree-walked from a single Eval
-        assert!(matches!(compile_src("10#select from trades").as_slice(), [Eval(_)]));
+        assert!(matches!(
+            compile_src("10#select from trades").as_slice(),
+            [Eval(_)]
+        ));
     }
 
     #[test]
     fn update_preserves_table_shape() {
-        assert_eq!(compile_src("update price: price * 2 from trades"), vec![
-            from_table("trades"),
-            col("price"), int(2), op("*"), alias("price"),
-            BuildProj { count: 1, exclude: vec!["price".into()], predicates: 0 }, Select,
-            Result,
-        ]);
+        assert_eq!(
+            compile_src("update price: price * 2 from trades"),
+            vec![
+                from_table("trades"),
+                col("price"),
+                int(2),
+                op("*"),
+                alias("price"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec!["price".into()],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn delete_rows_uses_negated_filter_and_select() {
-        assert_eq!(compile_src("delete from trades where size > 100"), vec![
-            from_table("trades"),
-            col("size"), int(100), op(">"), call("not", 1),
-            FrameExpr(PolarsFrameExpr::Filter(1)),
-            BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("delete from trades where size > 100"),
+            vec![
+                from_table("trades"),
+                col("size"),
+                int(100),
+                op(">"),
+                call("not", 1),
+                FrameExpr(PolarsFrameExpr::Filter(1)),
+                BuildProj {
+                    count: 0,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn lazy_prefixes_the_plan_and_stays_uncollected() {
-        assert_eq!(compile_src("l: lazy select from trades"), vec![
-            Lazy,
-            from_table("trades"),
-            BuildProj { count: 0, exclude: vec![], predicates: 0 }, Select,
-            Result, Assign("l".into()),
-        ]);
+        assert_eq!(
+            compile_src("l: lazy select from trades"),
+            vec![
+                Lazy,
+                from_table("trades"),
+                BuildProj {
+                    count: 0,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+                Assign("l".into()),
+            ]
+        );
     }
 
     #[test]
     fn collect_appends_a_collect_instruction() {
-        assert_eq!(compile_src("tm: collect t"), vec![
-            from_table("t"),
-            Collect, Result, Assign("tm".into()),
-        ]);
+        assert_eq!(
+            compile_src("tm: collect t"),
+            vec![from_table("t"), Collect, Result, Assign("tm".into()),]
+        );
     }
 
     #[test]
@@ -606,10 +962,14 @@ mod tests {
     #[test]
     fn sink_is_terminal_without_trailing_result() {
         let prog = compile_src("t sink \"out.parquet\"");
-        assert_eq!(prog, vec![
-            from_table("t"),
-            Eval(Expr::Lit(Value::Str("out.parquet".into()))), Sink,
-        ]);
+        assert_eq!(
+            prog,
+            vec![
+                from_table("t"),
+                Eval(Expr::Lit(Value::Str("out.parquet".into()))),
+                Sink,
+            ]
+        );
     }
 
     #[test]
@@ -624,13 +984,27 @@ mod tests {
         // the outer select's own `select`/`from` compiles around whatever
         // instructions the inner select compiles to.
         let prog = compile_src("select from select price from trades");
-        assert_eq!(prog, vec![
-            from_table("trades"), col("price"), alias("price"),
-            BuildProj { count: 1, exclude: vec![], predicates: 0 },
-            Select,
-            BuildProj { count: 0, exclude: vec![], predicates: 0 },
-            Select, Result,
-        ]);
+        assert_eq!(
+            prog,
+            vec![
+                from_table("trades"),
+                col("price"),
+                alias("price"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                BuildProj {
+                    count: 0,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
@@ -641,7 +1015,8 @@ mod tests {
         let prog = compile_src("select price from trades `sym lj (distinct quotes) `sym");
         assert!(prog.contains(&FrameExpr(PolarsFrameExpr::Distinct)));
         assert!(matches!(
-            prog.iter().find(|i| matches!(i, FrameExpr(PolarsFrameExpr::Join { .. }))),
+            prog.iter()
+                .find(|i| matches!(i, FrameExpr(PolarsFrameExpr::Join { .. }))),
             Some(FrameExpr(PolarsFrameExpr::Join { .. })),
         ));
     }
@@ -649,16 +1024,31 @@ mod tests {
     #[test]
     fn case_expression_compiles() {
         let program = compile_src("select bin: ?[c2>20;`high;c2>10;`mid;`low] from t");
-        assert!(program.iter().any(|instruction| matches!(instruction, Case { branches: 2 })));
+        assert!(
+            program
+                .iter()
+                .any(|instruction| matches!(instruction, Case { branches: 2 }))
+        );
     }
 
     #[test]
     fn round_compiles_to_round_instruction_with_precision() {
-        assert_eq!(compile_src("select r: 2 round px from t"), vec![
-            from_table("t"),
-            col("px"), Round { decimals: 2 }, alias("r"),
-            BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select r: 2 round px from t"),
+            vec![
+                from_table("t"),
+                col("px"),
+                Round { decimals: 2 },
+                alias("r"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
@@ -672,24 +1062,53 @@ mod tests {
     #[test]
     fn window_over_compiles_the_target_then_a_window_instruction() {
         use crate::enums::WindowFn;
-        assert_eq!(compile_src("select m: max px over `s from t"), vec![
-            from_table("t"),
-            col("px"), call("max", 1),
-            Window { func: WindowFn::Over, partition: vec!["s".into()], order: vec![], rolling: None },
-            alias("m"),
-            BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select m: max px over `s from t"),
+            vec![
+                from_table("t"),
+                col("px"),
+                call("max", 1),
+                Window {
+                    func: WindowFn::Over,
+                    partition: vec!["s".into()],
+                    order: vec![],
+                    rolling: None
+                },
+                alias("m"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn window_ranking_verb_emits_only_the_window_instruction() {
         use crate::enums::WindowFn;
-        assert_eq!(compile_src("select r: rn over `s order `px desc from t"), vec![
-            from_table("t"),
-            Window { func: WindowFn::RowNumber, partition: vec!["s".into()], order: vec![("px".into(), true)], rolling: None },
-            alias("r"),
-            BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select r: rn over `s order `px desc from t"),
+            vec![
+                from_table("t"),
+                Window {
+                    func: WindowFn::RowNumber,
+                    partition: vec!["s".into()],
+                    order: vec![("px".into(), true)],
+                    rolling: None
+                },
+                alias("r"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
@@ -701,52 +1120,102 @@ mod tests {
     #[test]
     fn window_order_on_a_plain_aggregate_is_allowed() {
         use crate::enums::WindowFn;
-        assert_eq!(compile_src("select c: cumsum px over `s order `px asc from t"), vec![
-            from_table("t"),
-            col("px"), call("cumsum", 1),
-            Window { func: WindowFn::Over, partition: vec!["s".into()], order: vec![("px".into(), false)], rolling: None },
-            alias("c"),
-            BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select c: cumsum px over `s order `px asc from t"),
+            vec![
+                from_table("t"),
+                col("px"),
+                call("cumsum", 1),
+                Window {
+                    func: WindowFn::Over,
+                    partition: vec!["s".into()],
+                    order: vec![("px".into(), false)],
+                    rolling: None
+                },
+                alias("c"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn rolling_window_pushes_raw_column_and_carries_agg_name() {
         use crate::enums::WindowFn;
-        assert_eq!(compile_src("select r: sum px over `s order `ts asc rolling 3 from t"), vec![
-            from_table("t"),
-            col("px"),
-            Window {
-                func: WindowFn::Over,
-                partition: vec!["s".into()],
-                order: vec![("ts".into(), false)],
-                rolling: Some(("sum".into(), 3)),
-            },
-            alias("r"),
-            BuildProj { count: 1, exclude: vec![], predicates: 0 }, Select, Result,
-        ]);
+        assert_eq!(
+            compile_src("select r: sum px over `s order `ts asc rolling 3 from t"),
+            vec![
+                from_table("t"),
+                col("px"),
+                Window {
+                    func: WindowFn::Over,
+                    partition: vec!["s".into()],
+                    order: vec![("ts".into(), false)],
+                    rolling: Some(("sum".into(), 3)),
+                },
+                alias("r"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                Select,
+                Result,
+            ]
+        );
     }
 
     // --- by clause ---
 
     #[test]
     fn by_single_key() {
-        assert_eq!(compile_src("select sum px by sym from trades"), vec![
-            from_table("trades"),
-            col("sym"), alias("sym"), BuildKeys(1),
-            col("px"), call("sum", 1), alias("px"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
-            SelectBy, Result,
-        ]);
+        assert_eq!(
+            compile_src("select sum px by sym from trades"),
+            vec![
+                from_table("trades"),
+                col("sym"),
+                alias("sym"),
+                BuildKeys(1),
+                col("px"),
+                call("sum", 1),
+                alias("px"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                SelectBy,
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn by_explicit_alias() {
-        assert_eq!(compile_src("select sum px by s: sym from trades"), vec![
-            from_table("trades"),
-            col("sym"), alias("s"), BuildKeys(1),
-            col("px"), call("sum", 1), alias("px"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
-            SelectBy, Result,
-        ]);
+        assert_eq!(
+            compile_src("select sum px by s: sym from trades"),
+            vec![
+                from_table("trades"),
+                col("sym"),
+                alias("s"),
+                BuildKeys(1),
+                col("px"),
+                call("sum", 1),
+                alias("px"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                SelectBy,
+                Result,
+            ]
+        );
     }
 
     #[test]
@@ -754,28 +1223,54 @@ mod tests {
         // `group_by(keys).agg(proj)` already carries the key columns through;
         // re-projecting `sym` under its own name would hand Polars two columns
         // named `sym`, so the compiler drops it from the projection phase.
-        assert_eq!(compile_src("select sym, price, ret: 1 diff price by sym from trades"), vec![
-            from_table("trades"),
-            col("sym"), alias("sym"), BuildKeys(1),
-            col("price"), alias("price"),
-            col("price"), int(1), call("diff", 2), alias("ret"),
-            BuildProj { count: 2, exclude: vec![], predicates: 0 },
-            SelectBy, Result,
-        ]);
+        assert_eq!(
+            compile_src("select sym, price, ret: 1 diff price by sym from trades"),
+            vec![
+                from_table("trades"),
+                col("sym"),
+                alias("sym"),
+                BuildKeys(1),
+                col("price"),
+                alias("price"),
+                col("price"),
+                int(1),
+                call("diff", 2),
+                alias("ret"),
+                BuildProj {
+                    count: 2,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                SelectBy,
+                Result,
+            ]
+        );
     }
 
     #[test]
     fn by_key_reprojected_under_an_alias_is_kept() {
         // only a name collision with the key is dropped — an *aliased*
         // reprojection of the key column is a distinct output name and stays.
-        assert_eq!(compile_src("select s: sym, price by sym from trades"), vec![
-            from_table("trades"),
-            col("sym"), alias("sym"), BuildKeys(1),
-            col("sym"), alias("s"),
-            col("price"), alias("price"),
-            BuildProj { count: 2, exclude: vec![], predicates: 0 },
-            SelectBy, Result,
-        ]);
+        assert_eq!(
+            compile_src("select s: sym, price by sym from trades"),
+            vec![
+                from_table("trades"),
+                col("sym"),
+                alias("sym"),
+                BuildKeys(1),
+                col("sym"),
+                alias("s"),
+                col("price"),
+                alias("price"),
+                BuildProj {
+                    count: 2,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                SelectBy,
+                Result,
+            ]
+        );
     }
 
     // --- full example from spec ---
@@ -783,13 +1278,30 @@ mod tests {
     #[test]
     fn full_query() {
         // select dbl: c3*2 by c1 from t where c2>15
-        assert_eq!(compile_src("select dbl: c3*2 by c1 from t where c2>15"), vec![
-            from_table("t"),
-            col("c2"), int(15), op(">"), FrameExpr(PolarsFrameExpr::Filter(1)),
-            col("c1"), alias("c1"), BuildKeys(1),
-            col("c3"), int(2), op("*"), alias("dbl"), BuildProj { count: 1, exclude: vec![], predicates: 0 },
-            SelectBy, Result,
-        ]);
+        assert_eq!(
+            compile_src("select dbl: c3*2 by c1 from t where c2>15"),
+            vec![
+                from_table("t"),
+                col("c2"),
+                int(15),
+                op(">"),
+                FrameExpr(PolarsFrameExpr::Filter(1)),
+                col("c1"),
+                alias("c1"),
+                BuildKeys(1),
+                col("c3"),
+                int(2),
+                op("*"),
+                alias("dbl"),
+                BuildProj {
+                    count: 1,
+                    exclude: vec![],
+                    predicates: 0
+                },
+                SelectBy,
+                Result,
+            ]
+        );
     }
 
     #[test]
@@ -797,7 +1309,10 @@ mod tests {
         for src in ["select noop from t", "select a: while[1b; 2] from t"] {
             let stmt = parse(tokenise(src).expect("lex error")).expect("parse error");
             let err = compile(&stmt).expect_err("value-context only");
-            assert!(err.to_string().contains("only valid outside a select"), "{err}");
+            assert!(
+                err.to_string().contains("only valid outside a select"),
+                "{err}"
+            );
         }
     }
 }

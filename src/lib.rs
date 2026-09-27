@@ -13,6 +13,8 @@ pub mod enums;
 pub mod errors;
 pub mod helpers;
 pub mod interrupt;
+#[cfg(feature = "ipc")]
+pub mod ipc;
 pub mod lexer;
 pub mod native;
 pub mod opcodes;
@@ -23,7 +25,5 @@ pub mod temporal;
 pub mod tokens;
 pub mod vm;
 pub mod vm_config;
-#[cfg(feature = "ipc")]
-pub mod ipc;
 #[cfg(feature = "wasm")]
 mod wasm;

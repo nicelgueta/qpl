@@ -47,15 +47,11 @@ fn to_snake_case(s: &str) -> String {
 
 pub fn rename_columns_snake_case(lf: LazyFrame) -> PolarsResult<LazyFrame> {
     let schema = lf.clone().collect_schema()?;
-    let old_names: Vec<String> = schema
-        .iter_names()
-        .map(|n| n.to_string())
-        .collect();
+    let old_names: Vec<String> = schema.iter_names().map(|n| n.to_string()).collect();
     let new_names: Vec<String> = old_names.iter().map(|n| to_snake_case(n)).collect();
 
     Ok(lf.rename(&old_names, &new_names, true))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -144,10 +140,7 @@ mod tests {
             .map(|n| n.to_string())
             .collect();
 
-        assert_eq!(
-            names,
-            vec!["open_price", "close_price", "volume_usd"]
-        );
+        assert_eq!(names, vec!["open_price", "close_price", "volume_usd"]);
         Ok(())
     }
 
@@ -159,7 +152,10 @@ mod tests {
 
         let renamed = rename_columns_snake_case(df.lazy())?.collect()?;
         let col = renamed.column("my_column")?;
-        assert_eq!(col.i32()?.into_no_null_iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            col.i32()?.into_no_null_iter().collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
         Ok(())
     }
 
@@ -204,7 +200,9 @@ fn seed() -> u64 {
 #[cfg(not(all(feature = "wasm", target_family = "wasm")))]
 fn seed() -> u64 {
     use std::hash::{BuildHasher, Hasher};
-    std::collections::hash_map::RandomState::new().build_hasher().finish()
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
 }
 
 /// Uniform in `0..n` (`n > 0`).

@@ -2,7 +2,6 @@ use polars::prelude::{JoinType, NamedFrom, Series};
 
 use crate::builtins::BuiltIn;
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Int(i64),
@@ -15,7 +14,7 @@ pub enum Value {
     /// kdb+ temporal scalars. Each carries the integer offset kdb uses; the
     /// conversion to the Polars (1970) epoch happens in `vm::ast_val_to_expr`.
     /// See [`crate::temporal`].
-    Date(i32),      // days since 2000.01.01
+    Date(i32), // days since 2000.01.01
     Month(i32),     // months since 2000.01
     Time(i64),      // ns since midnight
     Minute(i32),    // minutes since midnight
@@ -63,8 +62,18 @@ pub enum Value {
 /// generically, instead of once per vector variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VecKind {
-    Int, Float, Sym, Str, Bool,
-    Date, Month, Time, Minute, Second, Timestamp, Timespan,
+    Int,
+    Float,
+    Sym,
+    Str,
+    Bool,
+    Date,
+    Month,
+    Time,
+    Minute,
+    Second,
+    Timestamp,
+    Timespan,
 }
 
 impl Value {
@@ -142,24 +151,48 @@ impl Value {
     }
 }
 
-pub fn int_vec(v: Vec<i64>) -> Value { Value::IntVec(Series::new("".into(), v)) }
-pub fn float_vec(v: Vec<f64>) -> Value { Value::FloatVec(Series::new("".into(), v)) }
-pub fn bool_vec(v: Vec<bool>) -> Value { Value::BoolVec(Series::new("".into(), v)) }
-pub fn sym_vec(v: Vec<String>) -> Value { Value::SymVec(str_series(v)) }
-pub fn str_vec(v: Vec<String>) -> Value { Value::StrVec(str_series(v)) }
-pub fn date_vec(v: Vec<i32>) -> Value { Value::DateVec(Series::new("".into(), v)) }
+pub fn int_vec(v: Vec<i64>) -> Value {
+    Value::IntVec(Series::new("".into(), v))
+}
+pub fn float_vec(v: Vec<f64>) -> Value {
+    Value::FloatVec(Series::new("".into(), v))
+}
+pub fn bool_vec(v: Vec<bool>) -> Value {
+    Value::BoolVec(Series::new("".into(), v))
+}
+pub fn sym_vec(v: Vec<String>) -> Value {
+    Value::SymVec(str_series(v))
+}
+pub fn str_vec(v: Vec<String>) -> Value {
+    Value::StrVec(str_series(v))
+}
+pub fn date_vec(v: Vec<i32>) -> Value {
+    Value::DateVec(Series::new("".into(), v))
+}
 // `month` / `minute` / `second` have no native Polars dtype (only `date` /
 // `time` / `datetime` / `duration` do), so — matching `CastTarget::Prim`,
 // which only ever resolves those three for a *scalar* cast — nothing
 // materialises a `MonthVec`/`MinuteVec`/`SecondVec` from a real column; only
 // `enlist` produces them. The type has full parity with every other atomic
 // scalar (see `VecKind`), ready for a real producer.
-pub fn month_vec(v: Vec<i32>) -> Value { Value::MonthVec(Series::new("".into(), v)) }
-pub fn time_vec(v: Vec<i64>) -> Value { Value::TimeVec(Series::new("".into(), v)) }
-pub fn minute_vec(v: Vec<i32>) -> Value { Value::MinuteVec(Series::new("".into(), v)) }
-pub fn second_vec(v: Vec<i32>) -> Value { Value::SecondVec(Series::new("".into(), v)) }
-pub fn timestamp_vec(v: Vec<i64>) -> Value { Value::TimestampVec(Series::new("".into(), v)) }
-pub fn timespan_vec(v: Vec<i64>) -> Value { Value::TimespanVec(Series::new("".into(), v)) }
+pub fn month_vec(v: Vec<i32>) -> Value {
+    Value::MonthVec(Series::new("".into(), v))
+}
+pub fn time_vec(v: Vec<i64>) -> Value {
+    Value::TimeVec(Series::new("".into(), v))
+}
+pub fn minute_vec(v: Vec<i32>) -> Value {
+    Value::MinuteVec(Series::new("".into(), v))
+}
+pub fn second_vec(v: Vec<i32>) -> Value {
+    Value::SecondVec(Series::new("".into(), v))
+}
+pub fn timestamp_vec(v: Vec<i64>) -> Value {
+    Value::TimestampVec(Series::new("".into(), v))
+}
+pub fn timespan_vec(v: Vec<i64>) -> Value {
+    Value::TimespanVec(Series::new("".into(), v))
+}
 
 fn str_series(v: Vec<String>) -> Series {
     let strs: Vec<&str> = v.iter().map(String::as_str).collect();
@@ -191,10 +224,23 @@ pub enum Expr {
     /// see `resolve::eval_value`'s `zip` handling.
     Dict(Vec<(String, Expr)>),
     IColRef, // virtual i col (for indexing like: select i, col1, col2 from df)
-    BinOp { left: Box<Expr>, op: String, right: Box<Expr>,},
-    Call { func: String, args: Vec<Expr>,}, //  used for agg funcs like sum etc
-    Cast { target: CastTarget, expr: Box<Expr> },
-    Case { branches: Vec<(Expr, Expr)>, default: Box<Expr> },
+    BinOp {
+        left: Box<Expr>,
+        op: String,
+        right: Box<Expr>,
+    },
+    Call {
+        func: String,
+        args: Vec<Expr>,
+    }, //  used for agg funcs like sum etc
+    Cast {
+        target: CastTarget,
+        expr: Box<Expr>,
+    },
+    Case {
+        branches: Vec<(Expr, Expr)>,
+        default: Box<Expr>,
+    },
     /// `<func> over `p1`p2 [order `k1 asc `k2 desc]` — a window function.
     /// `func` is either a column expression (`max salary`) applied per partition,
     /// or the bare ranking verb `rn` / `rank` / `drank`. `order` is empty unless
@@ -217,16 +263,25 @@ pub enum Expr {
     /// `<n>#<expr>` — take the first `n` rows (`n >= 0`) or the last `-n`
     /// (`n < 0`) of a frame or list. `n` is any scalar-valued expression
     /// (a literal, a bound global, …), evaluated at run time.
-    Take { n: Box<Expr>, expr: Box<Expr> },
+    Take {
+        n: Box<Expr>,
+        expr: Box<Expr>,
+    },
     /// `(<expr>) <i>` / `(<expr>) <i j k>` — positional index into a list with a
     /// single int or an int run.
-    Index { expr: Box<Expr>, idx: Box<Expr> },
+    Index {
+        expr: Box<Expr>,
+        idx: Box<Expr>,
+    },
     /// `f[a;b]` / `f[]` — apply a function to a semicolon-separated argument
     /// list. `f[x]` with a single argument and no `;` parses as `Index` instead
     /// and is resolved to an application at run time when `f` names a function.
     /// Value context only. `func` is usually an `Expr::ColRef`, but any
     /// expression evaluating to a `Value::Closure` applies.
-    Apply { func: Box<Expr>, args: Vec<Expr> },
+    Apply {
+        func: Box<Expr>,
+        args: Vec<Expr>,
+    },
     /// `<conn> dispatch <rest of statement>` / `<conn> async dispatch <rest>` —
     /// ship `command` (the exact remaining source, reconstructed from tokens
     /// at parse time) to the connection named by `conn` and evaluate it there
@@ -235,13 +290,20 @@ pub enum Expr {
     /// later by `await`. `ipc` feature only (see `Value::Handle`). Value
     /// context only, tree-walked by `resolve::eval_value` like `Table` above —
     /// there's nothing here for the compiler to lower.
-    Dispatch { conn: Box<Expr>, command: String, is_async: bool },
+    Dispatch {
+        conn: Box<Expr>,
+        command: String,
+        is_async: bool,
+    },
     /// `while[test; s1; ...; sn]` — while `test` (a boolean atom) is true, run
     /// the statements in order in the *current* scope (so assignments bind
     /// whatever scope the loop sits in: globals at the top level, locals inside
     /// a function). Yields noop. Value context only, tree-walked by
     /// `resolve::eval_value` like `Case` — nothing for the compiler to lower.
-    While { cond: Box<Expr>, body: Vec<Stmt> },
+    While {
+        cond: Box<Expr>,
+        body: Vec<Stmt>,
+    },
     /// `noop` — evaluates to nothing: prints nothing, and can be neither
     /// assigned nor used as an operand (`resolve::EvalValue::Noop`). Value
     /// context only.
@@ -253,9 +315,11 @@ pub enum Expr {
     /// resolves against the list's own (single, `x`-named) materialisation —
     /// see `resolve::eval_value`'s `Expr::ListWhere` arm. Value context only,
     /// never lowered to stack instructions.
-    ListWhere { list: Box<Expr>, where_: Vec<Expr> },
+    ListWhere {
+        list: Box<Expr>,
+        where_: Vec<Expr>,
+    },
 }
-
 
 /// used for aliasing columns in select statements
 #[derive(Debug, Clone, PartialEq)]
@@ -263,7 +327,6 @@ pub struct Alias {
     pub name: Option<String>, // might not always have an alias, e.g. select col1 from df
     pub expr: Expr,
 }
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableSource {
@@ -273,7 +336,6 @@ pub enum TableSource {
     /// `TableSource::Load` arm).
     Load(Box<Expr>),
 }
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {

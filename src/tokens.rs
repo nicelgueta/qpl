@@ -1,4 +1,3 @@
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // keywords
@@ -55,7 +54,6 @@ pub enum TokenKind {
     Op(String),
     Eof,
 }
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {

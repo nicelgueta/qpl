@@ -7,20 +7,23 @@
 //! one-column `select` / `` table`col `` into a materialised list, reduces a
 //! column to a scalar, and slices / indexes lists.
 
-use polars::prelude::*;
 use crate::ast::{self, Alias, Expr, SelectStmt, TableExpr, TableSource, Value};
 use crate::errors::QplError;
 use crate::helpers;
-use crate::vm::{Lookup, Vm};
 #[cfg(feature = "ipc")]
 use crate::vm::EvalResult;
+use crate::vm::{Lookup, Vm};
+use polars::prelude::*;
 
 /// The outcome of evaluating a value expression: a concrete scalar / list, or a
 /// frame (a bare table name, a multi-column `select`, `n#<table>`).
 #[allow(clippy::large_enum_variant)] // mirrors `vm::StackObj` / `EvalResult`
 pub enum EvalValue {
     Scalar(ast::Value),
-    Frame { lf: LazyFrame, lazy: bool },
+    Frame {
+        lf: LazyFrame,
+        lazy: bool,
+    },
     /// Nothing: what `noop` and `while` evaluate to. Prints nothing; `x: <noop>`
     /// and any use as an operand are runtime errors.
     Noop,
@@ -34,9 +37,9 @@ fn rt<E: std::fmt::Display>(e: E) -> QplError {
 fn expect_scalar(v: EvalValue) -> Result<ast::Value, QplError> {
     match v {
         EvalValue::Scalar(s) => Ok(s),
-        EvalValue::Frame { .. } => {
-            Err(QplError::Runtime("expected a scalar here, got a table".into()))
-        }
+        EvalValue::Frame { .. } => Err(QplError::Runtime(
+            "expected a scalar here, got a table".into(),
+        )),
         EvalValue::Noop => Err(no_value()),
     }
 }
@@ -61,7 +64,10 @@ fn eval_test(vm: &mut Vm, test: &Expr, what: &str) -> Result<bool, QplError> {
 #[cfg(feature = "ipc")]
 fn eval_result_to_value(result: EvalResult) -> Result<EvalValue, QplError> {
     Ok(match result {
-        EvalResult::Table(df) => EvalValue::Frame { lf: df.lazy(), lazy: false },
+        EvalResult::Table(df) => EvalValue::Frame {
+            lf: df.lazy(),
+            lazy: false,
+        },
         EvalResult::Scalar(v) => EvalValue::Scalar(v),
         EvalResult::Stored => EvalValue::Scalar(Value::Bool(true)),
         EvalResult::Lazy(text) => EvalValue::Scalar(Value::Str(text)),
@@ -348,7 +354,11 @@ fn eval_case_vector(
     // (Polars would silently stringify the numbers) and to keep an all-symbol
     // result a symbol vector rather than strings.
     let mut kinds: Vec<(bool, bool)> = Vec::new();
-    let mut operand = |vm: &mut Vm, e: &Expr, what: &str, bool_only: bool| -> Result<polars::prelude::Expr, QplError> {
+    let mut operand = |vm: &mut Vm,
+                       e: &Expr,
+                       what: &str,
+                       bool_only: bool|
+     -> Result<polars::prelude::Expr, QplError> {
         let v = expect_scalar(eval_value(vm, e)?)?;
         if bool_only && !matches!(v, Value::Bool(_) | Value::BoolVec(_)) {
             return Err(QplError::Runtime(
@@ -365,7 +375,10 @@ fn eval_case_vector(
         }
         if !bool_only {
             kinds.push((
-                matches!(v, Value::Str(_) | Value::Sym(_) | Value::StrVec(_) | Value::SymVec(_)),
+                matches!(
+                    v,
+                    Value::Str(_) | Value::Sym(_) | Value::StrVec(_) | Value::SymVec(_)
+                ),
                 matches!(v, Value::Sym(_) | Value::SymVec(_)),
             ));
         }
@@ -391,10 +404,16 @@ fn eval_case_vector(
         ));
     }
     let all_sym = kinds.iter().all(|k| k.1);
-    let df = df!("_" => [0i64]).map_err(rt)?.lazy().select([acc.alias("r")]).collect().map_err(rt)?;
+    let df = df!("_" => [0i64])
+        .map_err(rt)?
+        .lazy()
+        .select([acc.alias("r")])
+        .collect()
+        .map_err(rt)?;
     if df.height() != n {
         return Err(QplError::Runtime(format!(
-            "`?[..]` produced {} value(s), expected {n} (the length of the condition)", df.height()
+            "`?[..]` produced {} value(s), expected {n} (the length of the condition)",
+            df.height()
         )));
     }
     let out = column_to_value(df.column("r").map_err(rt)?)?;
@@ -413,10 +432,16 @@ fn resolve_name(vm: &mut Vm, name: &str) -> Result<EvalValue, QplError> {
     match vm.lookup(name) {
         Some(Lookup::Global(v)) => return Ok(EvalValue::Scalar(v.clone())),
         Some(Lookup::LazyFrame(lf)) => {
-            return Ok(EvalValue::Frame { lf: lf.clone(), lazy: true });
+            return Ok(EvalValue::Frame {
+                lf: lf.clone(),
+                lazy: true,
+            });
         }
         Some(Lookup::Table(df)) => {
-            return Ok(EvalValue::Frame { lf: df.clone().lazy(), lazy: false });
+            return Ok(EvalValue::Frame {
+                lf: df.clone().lazy(),
+                lazy: false,
+            });
         }
         // a user function *is* a value and falls out of `Lookup::Global` above;
         // a builtin is not, so naming one bare (and not niladic) is an error.
@@ -505,7 +530,10 @@ fn eval_list_where(vm: &mut Vm, list: &Expr, where_: &[Expr]) -> Result<EvalValu
     }
     vm.lazy_frames.insert(TMP.into(), list_to_lazy(list_val)?);
     let sel = TableExpr::Select(SelectStmt {
-        cols: vec![Alias { name: None, expr: Expr::ColRef("x".into()) }],
+        cols: vec![Alias {
+            name: None,
+            expr: Expr::ColRef("x".into()),
+        }],
         from: Box::new(TableExpr::Source(TableSource::InMem(TMP.into()))),
         by: None,
         where_: Some(where_.to_vec()),
@@ -552,7 +580,9 @@ fn eval_til(vm: &mut Vm, args: &[Expr]) -> Result<EvalValue, QplError> {
     let int_of = |vm: &Vm, e: &Expr| -> Result<i64, QplError> {
         match vm.eval_scalar(e)? {
             Value::Int(n) => Ok(n),
-            other => Err(QplError::Runtime(format!("'til' expects an integer, got {other:?}"))),
+            other => Err(QplError::Runtime(format!(
+                "'til' expects an integer, got {other:?}"
+            ))),
         }
     };
     let (lo, hi) = match args {
@@ -574,29 +604,41 @@ fn eval_til(vm: &mut Vm, args: &[Expr]) -> Result<EvalValue, QplError> {
 fn eval_roll(vm: &mut Vm, args: &[Expr]) -> Result<EvalValue, QplError> {
     let n = match expect_scalar(eval_value(vm, &args[1])?)? {
         Value::Int(n) if n >= 0 => n as usize,
-        other => return Err(QplError::Runtime(format!(
-            "'?' expects a non-negative int count on the left, got {other:?}"
-        ))),
+        other => {
+            return Err(QplError::Runtime(format!(
+                "'?' expects a non-negative int count on the left, got {other:?}"
+            )));
+        }
     };
     let rolled = match to_list(vm, &args[0])? {
-        Value::Int(hi) if hi > 0 => {
-            ast::int_vec((0..n).map(|_| helpers::rand_below(hi as u64) as i64).collect())
+        Value::Int(hi) if hi > 0 => ast::int_vec(
+            (0..n)
+                .map(|_| helpers::rand_below(hi as u64) as i64)
+                .collect(),
+        ),
+        Value::Int(hi) => {
+            return Err(QplError::Runtime(format!(
+                "'?' needs a positive upper bound to roll ints in, got {hi}"
+            )));
         }
-        Value::Int(hi) => return Err(QplError::Runtime(format!(
-            "'?' needs a positive upper bound to roll ints in, got {hi}"
-        ))),
         Value::Float(hi) => ast::float_vec((0..n).map(|_| hi * helpers::rand_unit()).collect()),
         list if is_list_value(&list) => {
             let len = list.as_vec().expect("checked by is_list_value").1.len();
             if len == 0 && n > 0 {
-                return Err(QplError::Runtime("'?' cannot roll from an empty list".into()));
+                return Err(QplError::Runtime(
+                    "'?' cannot roll from an empty list".into(),
+                ));
             }
-            let idx: Vec<i64> = (0..n).map(|_| helpers::rand_below(len as u64) as i64).collect();
+            let idx: Vec<i64> = (0..n)
+                .map(|_| helpers::rand_below(len as u64) as i64)
+                .collect();
             index_list(list, &idx)?
         }
-        other => return Err(QplError::Runtime(format!(
-            "'?' expects an int, float or list on the right, got {other:?}"
-        ))),
+        other => {
+            return Err(QplError::Runtime(format!(
+                "'?' expects an int, float or list on the right, got {other:?}"
+            )));
+        }
     };
     Ok(EvalValue::Scalar(rolled))
 }
@@ -608,10 +650,16 @@ fn zip_column(vm: &mut Vm, name: &str, expr: &Expr) -> Result<Series, QplError> 
     // applied to the column directly: a list `Value` only holds i64 / f64 /
     // str / bool / temporal, so going through one would lose the narrower
     // integer / float widths and the categorical.
-    if let Expr::Cast { target, expr: inner } = expr {
+    if let Expr::Cast {
+        target,
+        expr: inner,
+    } = expr
+    {
         let list = to_list(vm, inner)?;
         if !is_list_value(&list) {
-            return Err(QplError::Runtime(format!("'zip' column '{name}' is not a list: {list:?}")));
+            return Err(QplError::Runtime(format!(
+                "'zip' column '{name}' is not a list: {list:?}"
+            )));
         }
         let lf = list_to_lazy(list)?;
         let casted = vm.build_cast_expr(target, col("x"), Some(&lf))?;
@@ -625,9 +673,16 @@ fn zip_column(vm: &mut Vm, name: &str, expr: &Expr) -> Result<Series, QplError> 
     // a temporal list holds kdb offsets (days / ns since 2000); the column
     // must carry the native Polars dtype, so give it the same conversion a
     // literal gets in any query (`ast_val_to_expr`)
-    if matches!(kind, ast::VecKind::Date | ast::VecKind::Month | ast::VecKind::Time
-        | ast::VecKind::Minute | ast::VecKind::Second | ast::VecKind::Timestamp | ast::VecKind::Timespan)
-    {
+    if matches!(
+        kind,
+        ast::VecKind::Date
+            | ast::VecKind::Month
+            | ast::VecKind::Time
+            | ast::VecKind::Minute
+            | ast::VecKind::Second
+            | ast::VecKind::Timestamp
+            | ast::VecKind::Timespan
+    ) {
         let df = list_to_lazy(list_val.clone())?.collect().map_err(rt)?;
         return Ok(df.column("x").map_err(rt)?.as_materialized_series().clone());
     }
@@ -643,7 +698,7 @@ fn eval_zip(vm: &mut Vm, dict_expr: &Expr) -> Result<EvalValue, QplError> {
         other => {
             return Err(QplError::Runtime(format!(
                 "'zip' expects a dict (`` `col1`col2!v1 v2 ``), got {other:?}"
-            )))
+            )));
         }
     };
     if pairs.is_empty() {
@@ -659,7 +714,7 @@ fn eval_zip(vm: &mut Vm, dict_expr: &Expr) -> Result<EvalValue, QplError> {
                 return Err(QplError::Runtime(format!(
                     "'zip' columns have mismatched lengths: '{name}' has {}, expected {l}",
                     s.len()
-                )))
+                )));
             }
             _ => {}
         }
@@ -668,7 +723,10 @@ fn eval_zip(vm: &mut Vm, dict_expr: &Expr) -> Result<EvalValue, QplError> {
         columns.push(Column::from(s));
     }
     let df = DataFrame::new(len.expect("checked non-empty above"), columns).map_err(rt)?;
-    Ok(EvalValue::Frame { lf: df.lazy(), lazy: false })
+    Ok(EvalValue::Frame {
+        lf: df.lazy(),
+        lazy: false,
+    })
 }
 
 /// Coerce a value expression to a concrete list: materialise a single-column
@@ -724,12 +782,10 @@ fn eval_call(vm: &mut Vm, func: &str, args: &[Expr]) -> Result<EvalValue, QplErr
     let applied = if func == "round" {
         let decimals = match args.get(1) {
             Some(Expr::Lit(Value::Int(n))) if *n >= 0 => *n as u32,
-            _ => {
-                return Err(QplError::Runtime(
-                    "round expects `<precision> round <column>` with a non-negative integer literal"
-                        .into(),
-                ))
-            }
+            _ => return Err(QplError::Runtime(
+                "round expects `<precision> round <column>` with a non-negative integer literal"
+                    .into(),
+            )),
         };
         base.round(decimals, vm.config.round_type)
     } else if let Some(param) = args.get(1) {
@@ -774,10 +830,13 @@ fn apply_function(vm: &mut Vm, func: &Expr, args: &[Expr]) -> Result<EvalValue, 
         let name = name.expect("builtin was looked up by name");
         if args.len() != b.arity {
             return Err(QplError::Runtime(format!(
-                "'{name}' takes {} argument(s), got {}", b.arity, args.len()
+                "'{name}' takes {} argument(s), got {}",
+                b.arity,
+                args.len()
             )));
         }
-        let arg_vals = args.iter()
+        let arg_vals = args
+            .iter()
             .map(|a| expect_scalar(eval_value(vm, a)?))
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(EvalValue::Scalar(b.call(&arg_vals)?));
@@ -791,7 +850,7 @@ fn apply_function(vm: &mut Vm, func: &Expr, args: &[Expr]) -> Result<EvalValue, 
             other => {
                 return Err(QplError::Runtime(format!(
                     "cannot apply {other:?} — not a function"
-                )))
+                )));
             }
         },
     };
@@ -883,10 +942,34 @@ fn exec_stmt(vm: &mut Vm, st: &ast::Stmt) -> Result<EvalValue, QplError> {
 fn is_reducer(f: &str) -> bool {
     matches!(
         f,
-        "sum" | "avg" | "mean" | "min" | "max" | "first" | "last" | "count"
-            | "std" | "dev" | "var" | "median" | "med" | "mode" | "modal"
-            | "skew" | "kurt" | "kurtosis" | "any" | "all" | "prod" | "product"
-            | "argmin" | "argmax" | "nnull" | "null_count" | "distinct" | "n_unique"
+        "sum"
+            | "avg"
+            | "mean"
+            | "min"
+            | "max"
+            | "first"
+            | "last"
+            | "count"
+            | "std"
+            | "dev"
+            | "var"
+            | "median"
+            | "med"
+            | "mode"
+            | "modal"
+            | "skew"
+            | "kurt"
+            | "kurtosis"
+            | "any"
+            | "all"
+            | "prod"
+            | "product"
+            | "argmin"
+            | "argmax"
+            | "nnull"
+            | "null_count"
+            | "distinct"
+            | "n_unique"
     )
 }
 
@@ -926,14 +1009,19 @@ pub(crate) fn column_to_value(col: &Column) -> Result<Value, QplError> {
     if dt.is_categorical() || dt.is_enum() {
         let c = col.cast(&DataType::String).map_err(rt)?;
         let ca = c.str().map_err(rt)?;
-        return Ok(ast::sym_vec(ca.iter().flatten().map(str::to_owned).collect()));
+        return Ok(ast::sym_vec(
+            ca.iter().flatten().map(str::to_owned).collect(),
+        ));
     }
     Ok(match dt {
-        DataType::Boolean => {
-            ast::bool_vec(col.bool().map_err(rt)?.iter().flatten().collect())
-        }
+        DataType::Boolean => ast::bool_vec(col.bool().map_err(rt)?.iter().flatten().collect()),
         DataType::String => ast::str_vec(
-            col.str().map_err(rt)?.iter().flatten().map(str::to_owned).collect(),
+            col.str()
+                .map_err(rt)?
+                .iter()
+                .flatten()
+                .map(str::to_owned)
+                .collect(),
         ),
         DataType::Float32 | DataType::Float64 => {
             let c = col.cast(&DataType::Float64).map_err(rt)?;
@@ -942,25 +1030,35 @@ pub(crate) fn column_to_value(col: &Column) -> Result<Value, QplError> {
         DataType::Date => {
             let c = col.cast(&DataType::Int32).map_err(rt)?;
             ast::date_vec(
-                c.i32().map_err(rt)?.into_no_null_iter()
-                    .map(|d| d - crate::temporal::DAYS_2000_TO_1970).collect(),
+                c.i32()
+                    .map_err(rt)?
+                    .into_no_null_iter()
+                    .map(|d| d - crate::temporal::DAYS_2000_TO_1970)
+                    .collect(),
             )
         }
         // normalise to nanoseconds first — a column loaded from a file may be
         // ms / us resolution, not ns
         DataType::Datetime(_, _) => {
             let c = col
-                .cast(&DataType::Datetime(TimeUnit::Nanoseconds, None)).map_err(rt)?
-                .cast(&DataType::Int64).map_err(rt)?;
+                .cast(&DataType::Datetime(TimeUnit::Nanoseconds, None))
+                .map_err(rt)?
+                .cast(&DataType::Int64)
+                .map_err(rt)?;
             ast::timestamp_vec(
-                c.i64().map_err(rt)?.into_no_null_iter()
-                    .map(|n| n - crate::temporal::NS_2000_TO_1970).collect(),
+                c.i64()
+                    .map_err(rt)?
+                    .into_no_null_iter()
+                    .map(|n| n - crate::temporal::NS_2000_TO_1970)
+                    .collect(),
             )
         }
         DataType::Duration(_) => {
             let c = col
-                .cast(&DataType::Duration(TimeUnit::Nanoseconds)).map_err(rt)?
-                .cast(&DataType::Int64).map_err(rt)?;
+                .cast(&DataType::Duration(TimeUnit::Nanoseconds))
+                .map_err(rt)?
+                .cast(&DataType::Int64)
+                .map_err(rt)?;
             ast::timespan_vec(c.i64().map_err(rt)?.into_no_null_iter().collect())
         }
         DataType::Time => {
@@ -975,16 +1073,18 @@ pub(crate) fn column_to_value(col: &Column) -> Result<Value, QplError> {
         other => {
             return Err(QplError::Runtime(format!(
                 "column dtype {other:?} cannot be materialised into a list"
-            )))
+            )));
         }
     })
 }
 
 /// A one-element list collapses to the corresponding scalar.
 fn scalarise(v: Value) -> Result<Value, QplError> {
-    let (kind, s) = v
-        .as_vec()
-        .ok_or_else(|| QplError::Runtime(format!("expected a single value from the reduction, got {v:?}")))?;
+    let (kind, s) = v.as_vec().ok_or_else(|| {
+        QplError::Runtime(format!(
+            "expected a single value from the reduction, got {v:?}"
+        ))
+    })?;
     if s.len() != 1 {
         return Err(QplError::Runtime(format!(
             "expected a single value from the reduction, got a list of length {}",
@@ -1060,7 +1160,7 @@ fn gather(s: &Series, idx: &[i64]) -> Result<Series, QplError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::{run_vm, EvalResult, Vm};
+    use crate::vm::{EvalResult, Vm, run_vm};
 
     fn make_vm() -> Vm {
         let df = df![
@@ -1077,7 +1177,10 @@ mod tests {
     fn scalar(vm: &mut Vm, src: &str) -> Value {
         match run_vm(src, vm).expect("run") {
             EvalResult::Scalar(v) => v,
-            other => panic!("expected scalar, got a different result kind: {}", kind(&other)),
+            other => panic!(
+                "expected scalar, got a different result kind: {}",
+                kind(&other)
+            ),
         }
     }
 
@@ -1097,8 +1200,14 @@ mod tests {
     #[test]
     fn juxtaposed_strings_are_a_str_vec() {
         let mut vm = make_vm();
-        assert_eq!(scalar(&mut vm, r#"("string1" "string2")"#), ast::str_vec(vec!["string1".into(), "string2".into()]));
-        assert_eq!(scalar(&mut vm, r#""a" "b" "c""#), ast::str_vec(vec!["a".into(), "b".into(), "c".into()]));
+        assert_eq!(
+            scalar(&mut vm, r#"("string1" "string2")"#),
+            ast::str_vec(vec!["string1".into(), "string2".into()])
+        );
+        assert_eq!(
+            scalar(&mut vm, r#""a" "b" "c""#),
+            ast::str_vec(vec!["a".into(), "b".into(), "c".into()])
+        );
         // a string vector composes as a value: bindable, indexable
         scalar_or_stored(&mut vm, r#"v: ("a" "b" "c")"#);
         assert_eq!(scalar(&mut vm, "v[1]"), Value::Str("b".into()));
@@ -1116,8 +1225,14 @@ mod tests {
         assert_eq!(scalar(&mut vm, "enlist 1b"), ast::bool_vec(vec![true]));
         assert_eq!(scalar(&mut vm, "enlist `a"), ast::sym_vec(vec!["a".into()]));
         // a string is one atom, not a list of characters
-        assert_eq!(scalar(&mut vm, r#"enlist "hello""#), ast::str_vec(vec!["hello".into()]));
-        assert_eq!(scalar(&mut vm, "enlist 2024.03.15"), ast::date_vec(vec![8840]));
+        assert_eq!(
+            scalar(&mut vm, r#"enlist "hello""#),
+            ast::str_vec(vec!["hello".into()])
+        );
+        assert_eq!(
+            scalar(&mut vm, "enlist 2024.03.15"),
+            ast::date_vec(vec![8840])
+        );
     }
 
     #[test]
@@ -1139,7 +1254,14 @@ mod tests {
         let mut vm = make_vm();
         for _ in 0..20 {
             let v = scalar(&mut vm, "50?6");
-            let got: Vec<i64> = v.as_vec().unwrap().1.i64().unwrap().into_no_null_iter().collect();
+            let got: Vec<i64> = v
+                .as_vec()
+                .unwrap()
+                .1
+                .i64()
+                .unwrap()
+                .into_no_null_iter()
+                .collect();
             assert_eq!(got.len(), 50);
             assert!(got.iter().all(|n| (0..6).contains(n)), "{got:?}");
         }
@@ -1149,9 +1271,20 @@ mod tests {
     fn roll_actually_varies() {
         let mut vm = make_vm();
         let v = scalar(&mut vm, "200?1000000");
-        let got: Vec<i64> = v.as_vec().unwrap().1.i64().unwrap().into_no_null_iter().collect();
+        let got: Vec<i64> = v
+            .as_vec()
+            .unwrap()
+            .1
+            .i64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
         let distinct: std::collections::HashSet<_> = got.iter().collect();
-        assert!(distinct.len() > 150, "200 draws from 1e6 had only {} distinct values", distinct.len());
+        assert!(
+            distinct.len() > 150,
+            "200 draws from 1e6 had only {} distinct values",
+            distinct.len()
+        );
     }
 
     #[test]
@@ -1160,23 +1293,50 @@ mod tests {
         let v = scalar(&mut vm, "2 ? 10 20 30 40");
         assert_eq!(v.as_vec().unwrap().1.len(), 2);
         let v = scalar(&mut vm, "30 ? 10 20");
-        let got: Vec<i64> = v.as_vec().unwrap().1.i64().unwrap().into_no_null_iter().collect();
+        let got: Vec<i64> = v
+            .as_vec()
+            .unwrap()
+            .1
+            .i64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
         assert_eq!(got.len(), 30, "more draws than elements: replacement");
         assert!(got.iter().all(|n| *n == 10 || *n == 20));
         // works for any list kind, and for a column
         let v = scalar(&mut vm, "20 ? `a`b`c");
-        assert!(matches!(v, Value::SymVec(_)) && strs(&v).iter().all(|s| ["a", "b", "c"].contains(&s.as_str())));
+        assert!(
+            matches!(v, Value::SymVec(_))
+                && strs(&v)
+                    .iter()
+                    .all(|s| ["a", "b", "c"].contains(&s.as_str()))
+        );
         let v = scalar(&mut vm, r#"20 ? ("x" "y")"#);
         assert!(matches!(v, Value::StrVec(_)) && strs(&v).iter().all(|s| s == "x" || s == "y"));
         let v = scalar(&mut vm, "20 ? t`c2");
-        assert!(v.as_vec().unwrap().1.i64().unwrap().into_no_null_iter().all(|n| [10, 20, 30, 15].contains(&n)));
+        assert!(
+            v.as_vec()
+                .unwrap()
+                .1
+                .i64()
+                .unwrap()
+                .into_no_null_iter()
+                .all(|n| [10, 20, 30, 15].contains(&n))
+        );
     }
 
     #[test]
     fn roll_floats_and_zero_count() {
         let mut vm = make_vm();
         let v = scalar(&mut vm, "50?2.5");
-        let got: Vec<f64> = v.as_vec().unwrap().1.f64().unwrap().into_no_null_iter().collect();
+        let got: Vec<f64> = v
+            .as_vec()
+            .unwrap()
+            .1
+            .f64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
         assert_eq!(got.len(), 50);
         assert!(got.iter().all(|f| (0.0..2.5).contains(f)));
         assert_eq!(scalar(&mut vm, "0?5").as_vec().unwrap().1.len(), 0);
@@ -1202,12 +1362,27 @@ mod tests {
     #[test]
     fn zip_gives_temporal_lists_their_native_dtype() {
         let mut vm = make_vm();
-        scalar_or_stored(&mut vm, "ts: `timestamp$1700000000000000000 1700086400123456789");
-        scalar_or_stored(&mut vm, "t2: zip `ts`day`tm`span!(ts) (`date$ts) (`time$ts) (`timespan$5 6)");
+        scalar_or_stored(
+            &mut vm,
+            "ts: `timestamp$1700000000000000000 1700086400123456789",
+        );
+        scalar_or_stored(
+            &mut vm,
+            "t2: zip `ts`day`tm`span!(ts) (`date$ts) (`time$ts) (`timespan$5 6)",
+        );
         let df = &vm.tables["t2"];
         let dtypes: Vec<_> = df.dtypes().iter().map(|d| d.to_string()).collect();
         assert_eq!(dtypes, ["datetime[ns]", "date", "time", "duration[ns]"]);
-        assert_eq!(df.null_count().sum_horizontal(NullStrategy::Ignore).unwrap().unwrap().u32().unwrap().get(0), Some(0));
+        assert_eq!(
+            df.null_count()
+                .sum_horizontal(NullStrategy::Ignore)
+                .unwrap()
+                .unwrap()
+                .u32()
+                .unwrap()
+                .get(0),
+            Some(0)
+        );
         // and the values survive the round trip through the column
         assert_eq!(scalar(&mut vm, "t2`day"), scalar(&mut vm, "`date$ts"));
     }
@@ -1215,8 +1390,15 @@ mod tests {
     #[test]
     fn zip_applies_a_top_level_cast_to_the_column_keeping_its_dtype() {
         let mut vm = make_vm();
-        scalar_or_stored(&mut vm, "t3: zip `a`b`c`d`e!(i8$10 20 30) (i32$1 2 3) (f32$3 ? 1.0) (`$`x`y`x) (`timestamp$1700000000000000000 1700000000000000001 1700000000000000002)");
-        let dtypes: Vec<_> = vm.tables["t3"].dtypes().iter().map(|d| d.to_string()).collect();
+        scalar_or_stored(
+            &mut vm,
+            "t3: zip `a`b`c`d`e!(i8$10 20 30) (i32$1 2 3) (f32$3 ? 1.0) (`$`x`y`x) (`timestamp$1700000000000000000 1700000000000000001 1700000000000000002)",
+        );
+        let dtypes: Vec<_> = vm.tables["t3"]
+            .dtypes()
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
         assert_eq!(dtypes, ["i8", "i32", "f32", "cat", "datetime[ns]"]);
         // an operand may itself be a roll
         scalar_or_stored(&mut vm, "t4: zip `a!(i8$5 ? 100)");
@@ -1226,7 +1408,10 @@ mod tests {
 
     #[test]
     fn table_col_materialises_to_a_list() {
-        assert_eq!(scalar(&mut make_vm(), "t`c3"), ast::float_vec(vec![1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(
+            scalar(&mut make_vm(), "t`c3"),
+            ast::float_vec(vec![1.0, 2.0, 3.0, 4.0])
+        );
     }
 
     // --- functions ---
@@ -1288,8 +1473,13 @@ mod tests {
         run_vm("q: {[k] select c2 from t where c1 = k}", &mut vm).unwrap();
         match run_vm("q[`a]", &mut vm).expect("run") {
             EvalResult::Table(df) => {
-                let got: Vec<i64> =
-                    df.column("c2").unwrap().i64().unwrap().into_no_null_iter().collect();
+                let got: Vec<i64> = df
+                    .column("c2")
+                    .unwrap()
+                    .i64()
+                    .unwrap()
+                    .into_no_null_iter()
+                    .collect();
                 assert_eq!(got, vec![10, 30]);
             }
             other => panic!("expected a table, got {}", kind(&other)),
@@ -1399,7 +1589,10 @@ mod tests {
         let mut vm = make_vm();
         run_vm("myfn: {[x] x+1}", &mut vm).unwrap();
         let err = run_vm("select a: myfn from t", &mut vm).unwrap_err();
-        assert!(format!("{err:?}").contains("cannot be used in a query expression"), "{err:?}");
+        assert!(
+            format!("{err:?}").contains("cannot be used in a query expression"),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -1417,32 +1610,50 @@ mod tests {
     #[test]
     fn one_column_select_in_assignment_materialises_to_a_list() {
         let mut vm = make_vm();
-        assert!(matches!(run_vm("px: select c2 from t", &mut vm), Ok(EvalResult::Stored)));
-        assert_eq!(vm.globals.get("px"), Some(&ast::int_vec(vec![10, 20, 30, 15])));
+        assert!(matches!(
+            run_vm("px: select c2 from t", &mut vm),
+            Ok(EvalResult::Stored)
+        ));
+        assert_eq!(
+            vm.globals.get("px"),
+            Some(&ast::int_vec(vec![10, 20, 30, 15]))
+        );
     }
 
     #[test]
     fn bare_one_column_select_still_prints_a_table() {
-        assert!(matches!(run_vm("select c2 from t", &mut make_vm()), Ok(EvalResult::Table(_))));
+        assert!(matches!(
+            run_vm("select c2 from t", &mut make_vm()),
+            Ok(EvalResult::Table(_))
+        ));
     }
 
     #[test]
     fn where_filters_a_column_expression() {
-        assert_eq!(scalar(&mut make_vm(), "t`c2 where c2 > 15"), ast::int_vec(vec![20, 30]));
+        assert_eq!(
+            scalar(&mut make_vm(), "t`c2 where c2 > 15"),
+            ast::int_vec(vec![20, 30])
+        );
     }
 
     #[test]
     fn list_where_filters_a_bare_list_by_its_own_elements() {
         let mut vm = make_vm();
         run_vm("l: 10 20 30 40 50", &mut vm).unwrap();
-        assert_eq!(scalar(&mut vm, "l where x > 25"), ast::int_vec(vec![30, 40, 50]));
+        assert_eq!(
+            scalar(&mut vm, "l where x > 25"),
+            ast::int_vec(vec![30, 40, 50])
+        );
     }
 
     #[test]
     fn list_where_supports_comma_separated_predicates() {
         let mut vm = make_vm();
         run_vm("l: 10 20 30 40 50", &mut vm).unwrap();
-        assert_eq!(scalar(&mut vm, "l where x > 10, x < 50"), ast::int_vec(vec![20, 30, 40]));
+        assert_eq!(
+            scalar(&mut vm, "l where x > 10, x < 50"),
+            ast::int_vec(vec![20, 30, 40])
+        );
     }
 
     // `` t`c2 where <pred> `` is already claimed by the *existing* column-expr
@@ -1468,13 +1679,19 @@ mod tests {
     #[test]
     fn reduction_collapses_to_a_scalar_global() {
         let mut vm = make_vm();
-        assert!(matches!(run_vm("m: max t`c2", &mut vm), Ok(EvalResult::Stored)));
+        assert!(matches!(
+            run_vm("m: max t`c2", &mut vm),
+            Ok(EvalResult::Stored)
+        ));
         assert_eq!(vm.globals.get("m"), Some(&Value::Int(30)));
     }
 
     #[test]
     fn reduction_over_a_one_column_select() {
-        assert_eq!(scalar(&mut make_vm(), "first select c1 from t"), Value::Str("a".into()));
+        assert_eq!(
+            scalar(&mut make_vm(), "first select c1 from t"),
+            Value::Str("a".into())
+        );
     }
 
     #[test]
@@ -1515,7 +1732,10 @@ mod tests {
     #[test]
     fn take_head_and_tail() {
         assert_eq!(scalar(&mut make_vm(), "2#t`c2"), ast::int_vec(vec![10, 20]));
-        assert_eq!(scalar(&mut make_vm(), "-2#t`c2"), ast::int_vec(vec![30, 15]));
+        assert_eq!(
+            scalar(&mut make_vm(), "-2#t`c2"),
+            ast::int_vec(vec![30, 15])
+        );
     }
 
     #[test]
@@ -1528,18 +1748,27 @@ mod tests {
         assert_eq!(scalar(&mut vm, "k#t`c2"), ast::int_vec(vec![10, 20]));
         assert_eq!(scalar(&mut vm, "-k#t`c2"), ast::int_vec(vec![30, 15]));
         assert!(matches!(run_vm("k#t", &mut vm), Ok(EvalResult::Table(_))));
-        assert!(matches!(run_vm("(k+1)#t", &mut vm), Ok(EvalResult::Table(_))));
+        assert!(matches!(
+            run_vm("(k+1)#t", &mut vm),
+            Ok(EvalResult::Table(_))
+        ));
     }
 
     #[test]
     fn positional_index_with_an_int_run() {
-        assert_eq!(scalar(&mut make_vm(), "(t`c2) 0 3"), ast::int_vec(vec![10, 15]));
+        assert_eq!(
+            scalar(&mut make_vm(), "(t`c2) 0 3"),
+            ast::int_vec(vec![10, 15])
+        );
     }
 
     #[test]
     fn bracket_index_atom_vs_slice() {
         let mut vm = make_vm();
-        assert!(matches!(run_vm("l: 5 6 7 8 9", &mut vm), Ok(EvalResult::Stored)));
+        assert!(matches!(
+            run_vm("l: 5 6 7 8 9", &mut vm),
+            Ok(EvalResult::Stored)
+        ));
         // a single int picks an atom; an int run picks a sub-list
         assert_eq!(scalar(&mut vm, "l[0]"), Value::Int(5));
         assert_eq!(scalar(&mut vm, "l[1 3 4]"), ast::int_vec(vec![6, 8, 9]));
@@ -1550,7 +1779,10 @@ mod tests {
 
     #[test]
     fn bare_table_name_prints_as_a_table() {
-        assert!(matches!(run_vm("t", &mut make_vm()), Ok(EvalResult::Table(_))));
+        assert!(matches!(
+            run_vm("t", &mut make_vm()),
+            Ok(EvalResult::Table(_))
+        ));
     }
 
     #[test]
@@ -1562,7 +1794,10 @@ mod tests {
 
     #[test]
     fn take_over_a_bare_table_stays_a_table() {
-        assert!(matches!(run_vm("2#t", &mut make_vm()), Ok(EvalResult::Table(_))));
+        assert!(matches!(
+            run_vm("2#t", &mut make_vm()),
+            Ok(EvalResult::Table(_))
+        ));
     }
 
     #[test]
@@ -1616,7 +1851,10 @@ mod tests {
     fn while_body_may_run_table_statements() {
         let mut vm = make_vm();
         run_stored(&mut vm, "k: 0");
-        run_stored(&mut vm, "while[k<2; t: select from t where c2 > 10; k: k+1]");
+        run_stored(
+            &mut vm,
+            "while[k<2; t: select from t where c2 > 10; k: k+1]",
+        );
         assert_eq!(vm.tables["t"].height(), 3);
     }
 
@@ -1626,7 +1864,11 @@ mod tests {
         run_stored(&mut vm, "s: 100");
         run_stored(&mut vm, "g: {[n] s: 0; while[n>0; s: s+n; n: n-1]; s}");
         assert_eq!(scalar(&mut vm, "g[4]"), Value::Int(10));
-        assert_eq!(scalar(&mut vm, "s"), Value::Int(100), "the global is untouched");
+        assert_eq!(
+            scalar(&mut vm, "s"),
+            Value::Int(100),
+            "the global is untouched"
+        );
     }
 
     #[test]
@@ -1660,7 +1902,11 @@ mod tests {
         let mut vm = make_vm();
         run_stored(&mut vm, "f: {[] noop}");
         for src in ["x: noop", "x: f[]", "x: while[0b; 1]", "x: ?[1b; noop; 1]"] {
-            assert_eq!(run_err(&mut vm, src), "'cannot assign a no-op expression.", "{src}");
+            assert_eq!(
+                run_err(&mut vm, src),
+                "'cannot assign a no-op expression.",
+                "{src}"
+            );
         }
         assert!(vm.globals.get("x").is_none());
     }
@@ -1671,7 +1917,10 @@ mod tests {
         run_stored(&mut vm, "g: {[a] a}");
         run_stored(&mut vm, "f: {[] noop}");
         for src in ["1 + noop", "g[noop]", "sum f[]"] {
-            assert!(run_err(&mut vm, src).contains("no-op expression as a value"), "{src}");
+            assert!(
+                run_err(&mut vm, src).contains("no-op expression as a value"),
+                "{src}"
+            );
         }
     }
 
@@ -1686,7 +1935,9 @@ mod tests {
         });
         {
             let _running = vm.interrupt.statement();
-            let err = run_vm("while[1b; x: x+1]", &mut vm).err().expect("should be interrupted");
+            let err = run_vm("while[1b; x: x+1]", &mut vm)
+                .err()
+                .expect("should be interrupted");
             assert!(matches!(err, QplError::Interrupted), "{err}");
         }
         t.join().unwrap();
@@ -1702,7 +1953,10 @@ mod tests {
         let mut vm = make_vm();
         run_stored(&mut vm, "f: {[n] f[n+1]}");
         vm.interrupt.request();
-        assert!(matches!(run_vm("f[0]", &mut vm), Err(QplError::Interrupted)));
+        assert!(matches!(
+            run_vm("f[0]", &mut vm),
+            Err(QplError::Interrupted)
+        ));
         let _running = vm.interrupt.statement(); // a new statement clears the stale request
         assert_eq!(scalar(&mut vm, "1+1"), Value::Int(2));
     }
@@ -1712,10 +1966,17 @@ mod tests {
         let mut vm = make_vm();
         run_stored(&mut vm, "a: 0");
         run_stored(&mut vm, "n: 0");
-        run_stored(&mut vm, "while[a<3; b: 0; while[b<2; b: b+1; n: n+1]; a: a+1]");
+        run_stored(
+            &mut vm,
+            "while[a<3; b: 0; while[b<2; b: b+1; n: n+1]; a: a+1]",
+        );
         assert_eq!(scalar(&mut vm, "a"), Value::Int(3));
         assert_eq!(scalar(&mut vm, "b"), Value::Int(2));
-        assert_eq!(scalar(&mut vm, "n"), Value::Int(6), "inner body ran 3 x 2 times");
+        assert_eq!(
+            scalar(&mut vm, "n"),
+            Value::Int(6),
+            "inner body ran 3 x 2 times"
+        );
     }
 
     #[test]
@@ -1761,7 +2022,11 @@ mod tests {
         let mut vm = make_vm();
         run_stored(&mut vm, "c: 0");
         assert!(run_err(&mut vm, "while[c<5; c: c+1; boom[]; c: 100]").contains("boom"));
-        assert_eq!(scalar(&mut vm, "c"), Value::Int(1), "the first iteration got as far as `boom[]`");
+        assert_eq!(
+            scalar(&mut vm, "c"),
+            Value::Int(1),
+            "the first iteration got as far as `boom[]`"
+        );
     }
 
     #[test]
@@ -1784,7 +2049,10 @@ mod tests {
         let mut vm = make_vm();
         run_stored(&mut vm, "f: {[n] while[n>0; n: n-1]}");
         run_stored(&mut vm, "f[3]");
-        assert_eq!(run_err(&mut vm, "y: f[3]"), "'cannot assign a no-op expression.");
+        assert_eq!(
+            run_err(&mut vm, "y: f[3]"),
+            "'cannot assign a no-op expression."
+        );
     }
 
     #[test]
@@ -1792,11 +2060,19 @@ mod tests {
         let mut vm = make_vm();
         run_stored(&mut vm, "lim: 3");
         run_stored(&mut vm, "f: {[] c: 0; while[c<lim; c: c+1]; c}");
-        assert_eq!(scalar(&mut vm, "f[]"), Value::Int(3), "the test reads the global");
+        assert_eq!(
+            scalar(&mut vm, "f[]"),
+            Value::Int(3),
+            "the test reads the global"
+        );
         // assigning the same name in the body binds a *local* that then shadows it
         run_stored(&mut vm, "g: {[] c: 0; while[c<lim; c: c+1; lim: 5]; c}");
         assert_eq!(scalar(&mut vm, "g[]"), Value::Int(5));
-        assert_eq!(scalar(&mut vm, "lim"), Value::Int(3), "the global is untouched");
+        assert_eq!(
+            scalar(&mut vm, "lim"),
+            Value::Int(3),
+            "the global is untouched"
+        );
     }
 
     #[test]
@@ -1804,7 +2080,13 @@ mod tests {
         let mut vm = make_vm();
         run_stored(&mut vm, "id: {[a] a}");
         run_stored(&mut vm, "nil: {[] noop}");
-        for src in ["id[noop]", "id[nil[]]", "sum noop", "count noop", "{[a] a}[noop]"] {
+        for src in [
+            "id[noop]",
+            "id[nil[]]",
+            "sum noop",
+            "count noop",
+            "{[a] a}[noop]",
+        ] {
             assert!(run_err(&mut vm, src).contains("no-op expression"), "{src}");
         }
     }
@@ -1814,7 +2096,10 @@ mod tests {
         let mut vm = make_vm();
         for src in ["3#noop", "f64$noop", "noop[0]"] {
             let err = run_err(&mut vm, src);
-            assert!(err.contains("no-op") || err.contains("noop"), "{src}: {err}");
+            assert!(
+                err.contains("no-op") || err.contains("noop"),
+                "{src}: {err}"
+            );
         }
     }
 
@@ -1830,8 +2115,14 @@ mod tests {
     fn an_interrupt_before_a_query_stops_it_and_binds_nothing() {
         let mut vm = make_vm();
         vm.interrupt.request();
-        assert!(matches!(run_vm("select from t", &mut vm), Err(QplError::Interrupted)));
-        assert!(matches!(run_vm("x: 1", &mut vm), Err(QplError::Interrupted)));
+        assert!(matches!(
+            run_vm("select from t", &mut vm),
+            Err(QplError::Interrupted)
+        ));
+        assert!(matches!(
+            run_vm("x: 1", &mut vm),
+            Err(QplError::Interrupted)
+        ));
         assert!(!vm.globals.contains_key("x"));
         let _running = vm.interrupt.statement();
         assert_eq!(scalar(&mut vm, "1"), Value::Int(1));
@@ -1849,10 +2140,16 @@ mod tests {
         });
         {
             let _running = vm.interrupt.statement();
-            assert!(matches!(run_vm("g[0]", &mut vm), Err(QplError::Interrupted)));
+            assert!(matches!(
+                run_vm("g[0]", &mut vm),
+                Err(QplError::Interrupted)
+            ));
         }
         t.join().unwrap();
-        assert!(vm.scopes.is_empty(), "every call frame was popped on the way out");
+        assert!(
+            vm.scopes.is_empty(),
+            "every call frame was popped on the way out"
+        );
         assert_eq!(scalar(&mut vm, "1+1"), Value::Int(2));
     }
 
@@ -1869,8 +2166,14 @@ mod tests {
     #[test]
     fn a_vector_condition_gives_an_elementwise_result() {
         let mut vm = make_vm();
-        assert_eq!(scalar(&mut vm, "?[1011b; 1; 0]"), ast::int_vec(vec![1, 0, 1, 1]));
-        assert_eq!(scalar(&mut vm, "?[1011b; 1 2 3 4; 5 6 7 8]"), ast::int_vec(vec![1, 6, 3, 4]));
+        assert_eq!(
+            scalar(&mut vm, "?[1011b; 1; 0]"),
+            ast::int_vec(vec![1, 0, 1, 1])
+        );
+        assert_eq!(
+            scalar(&mut vm, "?[1011b; 1 2 3 4; 5 6 7 8]"),
+            ast::int_vec(vec![1, 6, 3, 4])
+        );
         assert_eq!(
             scalar(&mut vm, r#"?[1011b; "yes"; "no"]"#),
             ast::str_vec(vec!["yes".into(), "no".into(), "yes".into(), "yes".into()])
@@ -1881,7 +2184,10 @@ mod tests {
     fn a_vector_condition_may_come_from_a_variable_or_a_comparison() {
         let mut vm = make_vm();
         run_stored(&mut vm, "x: 5 6 7 8");
-        assert_eq!(scalar(&mut vm, "?[x>6; x; 0]"), ast::int_vec(vec![0, 0, 7, 8]));
+        assert_eq!(
+            scalar(&mut vm, "?[x>6; x; 0]"),
+            ast::int_vec(vec![0, 0, 7, 8])
+        );
         run_stored(&mut vm, "f: {[m] ?[m; 1; 0]}");
         assert_eq!(scalar(&mut vm, "f[10b]"), ast::int_vec(vec![1, 0]));
     }
@@ -1889,17 +2195,30 @@ mod tests {
     #[test]
     fn a_vector_branch_must_match_the_condition_length() {
         let mut vm = make_vm();
-        for src in ["?[1011b; 1 2 3; 0]", "?[1011b; 1; 5 6 7 8 9]", "?[10b; 1 2 3 4; 0]"] {
+        for src in [
+            "?[1011b; 1 2 3; 0]",
+            "?[1011b; 1; 5 6 7 8 9]",
+            "?[10b; 1 2 3 4; 0]",
+        ] {
             let err = run_err(&mut vm, src);
-            assert!(err.contains("has length") && err.contains("length of the condition"), "{src}: {err}");
+            assert!(
+                err.contains("has length") && err.contains("length of the condition"),
+                "{src}: {err}"
+            );
         }
     }
 
     #[test]
     fn a_chained_vector_conditional_takes_the_first_true_condition_per_element() {
         let mut vm = make_vm();
-        assert_eq!(scalar(&mut vm, "?[1011b; 1; 0110b; 2; 3]"), ast::int_vec(vec![1, 2, 1, 1]));
-        assert_eq!(scalar(&mut vm, "?[0110b; 1; 0011b; 2; 3]"), ast::int_vec(vec![3, 1, 1, 2]));
+        assert_eq!(
+            scalar(&mut vm, "?[1011b; 1; 0110b; 2; 3]"),
+            ast::int_vec(vec![1, 2, 1, 1])
+        );
+        assert_eq!(
+            scalar(&mut vm, "?[0110b; 1; 0011b; 2; 3]"),
+            ast::int_vec(vec![3, 1, 1, 2])
+        );
         // every later condition must be boolean and as long as the first
         assert!(run_err(&mut vm, "?[1011b; 1; 01b; 2; 3]").contains("condition has length 2"));
         assert!(run_err(&mut vm, "?[1011b; 1; 1; 2; 3]").contains("boolean scalar or vector"));
@@ -1908,24 +2227,42 @@ mod tests {
     #[test]
     fn an_atom_condition_after_a_vector_one_is_broadcast() {
         let mut vm = make_vm();
-        assert_eq!(scalar(&mut vm, "?[1011b; 1; 1b; 2; 3]"), ast::int_vec(vec![1, 2, 1, 1]));
-        assert_eq!(scalar(&mut vm, "?[1011b; 1; 0b; 2; 3]"), ast::int_vec(vec![1, 3, 1, 1]));
+        assert_eq!(
+            scalar(&mut vm, "?[1011b; 1; 1b; 2; 3]"),
+            ast::int_vec(vec![1, 2, 1, 1])
+        );
+        assert_eq!(
+            scalar(&mut vm, "?[1011b; 1; 0b; 2; 3]"),
+            ast::int_vec(vec![1, 3, 1, 1])
+        );
     }
 
     #[test]
     fn atom_conditions_before_a_vector_one_still_short_circuit() {
         let mut vm = make_vm();
-        assert_eq!(scalar(&mut vm, "?[0b; undefined_fn[1]; 1011b; 5; 6]"), ast::int_vec(vec![5, 6, 5, 5]));
+        assert_eq!(
+            scalar(&mut vm, "?[0b; undefined_fn[1]; 1011b; 5; 6]"),
+            ast::int_vec(vec![5, 6, 5, 5])
+        );
         // a true atom returns its branch as-is, whatever its length
-        assert_eq!(scalar(&mut vm, "?[1b; 1 2 3; 1011b; 5; 6]"), ast::int_vec(vec![1, 2, 3]));
+        assert_eq!(
+            scalar(&mut vm, "?[1b; 1 2 3; 1011b; 5; 6]"),
+            ast::int_vec(vec![1, 2, 3])
+        );
     }
 
     #[test]
     fn a_vector_conditional_keeps_symbols_symbols_and_rejects_a_text_number_mix() {
         let mut vm = make_vm();
-        assert_eq!(scalar(&mut vm, "?[1011b; `a`b`c`d; `z]"), ast::sym_vec(vec!["a".into(), "z".into(), "c".into(), "d".into()]));
+        assert_eq!(
+            scalar(&mut vm, "?[1011b; `a`b`c`d; `z]"),
+            ast::sym_vec(vec!["a".into(), "z".into(), "c".into(), "d".into()])
+        );
         assert!(run_err(&mut vm, r#"?[1011b; 1; "a"]"#).contains("mix text and non-text"));
-        assert_eq!(scalar(&mut vm, "?[1011b; 1; 2.5]"), ast::float_vec(vec![1.0, 2.5, 1.0, 1.0]));
+        assert_eq!(
+            scalar(&mut vm, "?[1011b; 1; 2.5]"),
+            ast::float_vec(vec![1.0, 2.5, 1.0, 1.0])
+        );
     }
 
     #[test]

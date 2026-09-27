@@ -29,7 +29,7 @@ pub enum TemporalNowFuncType {
     Date,
     Time,
     Timestamp,
-    Timespan
+    Timespan,
 }
 
 // ── calendar math (Hinnant, epoch 1970-01-01) ──────────────────────────────
@@ -74,7 +74,11 @@ pub fn parse_temporal(s: &str) -> Option<Value> {
             let days = (days_1970 - DAYS_2000_TO_1970) as i64;
             return Some(Value::Timestamp(days * NS_PER_DAY + tod));
         }
-        let days: i64 = if left.is_empty() { 0 } else { left.parse().ok()? };
+        let days: i64 = if left.is_empty() {
+            0
+        } else {
+            left.parse().ok()?
+        };
         return Some(Value::Timespan(days * NS_PER_DAY + tod));
     }
 
@@ -142,7 +146,11 @@ fn parse_tod_ns(s: &str) -> Option<i64> {
         Some(v) => v.parse().ok()?,
         None => 0,
     };
-    if it.next().is_some() || !(0..24).contains(&h) || !(0..60).contains(&m) || !(0..60).contains(&sec) {
+    if it.next().is_some()
+        || !(0..24).contains(&h)
+        || !(0..60).contains(&m)
+        || !(0..60).contains(&sec)
+    {
         return None;
     }
     let mut ns = ((h * 60 + m) * 60 + sec) * NS_PER_SEC;
@@ -196,7 +204,10 @@ pub fn format_temporal(v: &Value) -> Option<String> {
         Value::Timestamp(ns) => {
             let days = ns.div_euclid(NS_PER_DAY);
             let (y, m, day) = civil_from_days(days as i32 + DAYS_2000_TO_1970);
-            format!("{y:04}.{m:02}.{day:02}D{}", fmt_tod(ns.rem_euclid(NS_PER_DAY), 9))
+            format!(
+                "{y:04}.{m:02}.{day:02}D{}",
+                fmt_tod(ns.rem_euclid(NS_PER_DAY), 9)
+            )
         }
         Value::Timespan(ns) => {
             let sign = if ns < 0 { "-" } else { "" };
@@ -217,7 +228,10 @@ fn fmt_tod(ns: i64, frac_digits: usize) -> String {
     let secs = ns / ns_per_sec;
     let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
     let frac = (ns % ns_per_sec) / 10u64.pow((9 - frac_digits) as u32);
-    format!("{sign}{h:02}:{m:02}:{s:02}.{frac:0width$}", width = frac_digits)
+    format!(
+        "{sign}{h:02}:{m:02}:{s:02}.{frac:0width$}",
+        width = frac_digits
+    )
 }
 
 // ── `.qpl.*` now-functions ────────────────────────────────────────────────
@@ -232,10 +246,14 @@ pub fn now_value(func: TemporalNowFuncType) -> Result<Value, QplError> {
     let sub_ns = dur.subsec_nanos() as i64;
     let ns_of_day = secs.rem_euclid(86_400) * NS_PER_SEC + sub_ns;
     Ok(match func {
-        TemporalNowFuncType::Date       => Value::Date((secs.div_euclid(86_400)) as i32 - DAYS_2000_TO_1970),
-        TemporalNowFuncType::Time       => Value::Time(ns_of_day),
-        TemporalNowFuncType::Timestamp  => Value::Timestamp(secs * NS_PER_SEC + sub_ns - NS_2000_TO_1970),
-        TemporalNowFuncType::Timespan   => Value::Timespan(ns_of_day)
+        TemporalNowFuncType::Date => {
+            Value::Date((secs.div_euclid(86_400)) as i32 - DAYS_2000_TO_1970)
+        }
+        TemporalNowFuncType::Time => Value::Time(ns_of_day),
+        TemporalNowFuncType::Timestamp => {
+            Value::Timestamp(secs * NS_PER_SEC + sub_ns - NS_2000_TO_1970)
+        }
+        TemporalNowFuncType::Timespan => Value::Timespan(ns_of_day),
     })
 }
 
@@ -252,7 +270,10 @@ mod tests {
         // leap day
         assert_eq!(civil_from_days(days_from_civil(2024, 2, 29)), (2024, 2, 29));
         // pre-2000
-        assert_eq!(civil_from_days(days_from_civil(1999, 12, 31)), (1999, 12, 31));
+        assert_eq!(
+            civil_from_days(days_from_civil(1999, 12, 31)),
+            (1999, 12, 31)
+        );
     }
 
     fn round_trip(src: &str) -> String {
@@ -273,10 +294,7 @@ mod tests {
             round_trip("2024.03.15D12:30:00.000000000"),
             "2024.03.15D12:30:00.000000000"
         );
-        assert_eq!(
-            round_trip("0D12:30:00.000000000"),
-            "0D12:30:00.000000000"
-        );
+        assert_eq!(round_trip("0D12:30:00.000000000"), "0D12:30:00.000000000");
     }
 
     #[test]
@@ -289,7 +307,10 @@ mod tests {
         assert_eq!(parse_temporal("01:00"), Some(Value::Minute(60)));
         assert_eq!(parse_temporal("00:00:05"), Some(Value::Second(5)));
         assert_eq!(parse_temporal("00:00:00.001"), Some(Value::Time(1_000_000)));
-        assert_eq!(parse_temporal("0D00:00:00.000000001"), Some(Value::Timespan(1)));
+        assert_eq!(
+            parse_temporal("0D00:00:00.000000001"),
+            Some(Value::Timespan(1))
+        );
         assert_eq!(
             parse_temporal("2000.01.01D00:00:00.000000000"),
             Some(Value::Timestamp(0))
@@ -316,21 +337,42 @@ mod tests {
     #[test]
     fn formats_negative_and_over_a_day_times() {
         // a `time` can leave [0,24h) through arithmetic
-        assert_eq!(format_temporal(&Value::Time(-14_400_000_000_000)), Some("-04:00:00.000".into()));
-        assert_eq!(format_temporal(&Value::Time(108_000_000_000_000)), Some("30:00:00.000".into()));
+        assert_eq!(
+            format_temporal(&Value::Time(-14_400_000_000_000)),
+            Some("-04:00:00.000".into())
+        );
+        assert_eq!(
+            format_temporal(&Value::Time(108_000_000_000_000)),
+            Some("30:00:00.000".into())
+        );
     }
 
     #[test]
     fn timespan_can_be_negative() {
-        assert_eq!(format_temporal(&Value::Timespan(-NS_PER_DAY)), Some("-1D00:00:00.000000000".into()));
+        assert_eq!(
+            format_temporal(&Value::Timespan(-NS_PER_DAY)),
+            Some("-1D00:00:00.000000000".into())
+        );
     }
 
     #[test]
     fn now_functions_have_the_right_shapes() {
-        assert!(matches!(now_value(TemporalNowFuncType::Date), Ok(Value::Date(_))));
-        assert!(matches!(now_value(TemporalNowFuncType::Time), Ok(Value::Time(_))));
-        assert!(matches!(now_value(TemporalNowFuncType::Timestamp), Ok(Value::Timestamp(_))));
-        assert!(matches!(now_value(TemporalNowFuncType::Timespan), Ok(Value::Timespan(_))));
+        assert!(matches!(
+            now_value(TemporalNowFuncType::Date),
+            Ok(Value::Date(_))
+        ));
+        assert!(matches!(
+            now_value(TemporalNowFuncType::Time),
+            Ok(Value::Time(_))
+        ));
+        assert!(matches!(
+            now_value(TemporalNowFuncType::Timestamp),
+            Ok(Value::Timestamp(_))
+        ));
+        assert!(matches!(
+            now_value(TemporalNowFuncType::Timespan),
+            Ok(Value::Timespan(_))
+        ));
         if let Ok(Value::Time(ns)) = now_value(TemporalNowFuncType::Time) {
             assert!((0..NS_PER_DAY).contains(&ns));
         }

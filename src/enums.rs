@@ -1,11 +1,9 @@
 use polars::{self, prelude::JoinType};
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum PolarsStackArg {
-    Join(JoinType)
+    Join(JoinType),
 }
-
 
 /// Which window computation `Instruction::Window` performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +21,10 @@ pub enum WindowFn {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PolarsFrameExpr {
     Filter(usize),
-    Join{ l: usize, r: usize },
+    Join {
+        l: usize,
+        r: usize,
+    },
     Sort(Vec<(String, bool)>), // col name -> descending
     Distinct,
     DropNull(Vec<String>),
@@ -31,5 +32,5 @@ pub enum PolarsFrameExpr {
     /// popped from the value stack (a preceding `Instruction::Eval` pushes it)
     Limit,
     Drop(Vec<String>),
-    Cols
+    Cols,
 }
