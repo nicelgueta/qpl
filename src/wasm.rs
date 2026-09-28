@@ -369,30 +369,25 @@ fn to_regex(obj: &JsValue, key: &str) {
 /// The session's top-level bindings as JSON (see [`Repl::symbols`]).
 fn symbols_json(vm: &Vm) -> Json {
     use crate::ast::Value;
-    let mut tables: Vec<Json> = vm
-        .tables
-        .iter()
-        .map(|(name, df)| {
-            let columns: Vec<String> = df
-                .get_column_names()
-                .iter()
-                .map(|c| c.to_string())
-                .collect();
-            json!({ "name": name, "columns": columns, "rows": df.height() })
-        })
-        .chain(vm.lazy_frames.keys().map(|name| json!({ "name": name })))
-        .collect();
-    tables.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-
+    let mut tables: Vec<Json> = Vec::new();
     let mut variables = Vec::new();
     let mut functions = Vec::new();
     for (name, v) in &vm.globals {
-        if matches!(v, Value::Closure(_)) {
-            functions.push(name.clone());
-        } else {
-            variables.push(name.clone());
+        match v {
+            Value::Table(df) => {
+                let columns: Vec<String> = df
+                    .get_column_names()
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect();
+                tables.push(json!({ "name": name, "columns": columns, "rows": df.height() }));
+            }
+            Value::Lazy(_) => tables.push(json!({ "name": name })),
+            Value::Closure(_) => functions.push(name.clone()),
+            _ => variables.push(name.clone()),
         }
     }
+    tables.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     variables.sort();
     functions.sort();
     json!({ "tables": tables, "variables": variables, "functions": functions })

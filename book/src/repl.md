@@ -46,20 +46,31 @@ operations before the VM runs it, and this prints that sequence:
 
 ```
 qpl) \d select avg price by sym from trades where size > 100
-0000: FROM_SRC InMem("trades")
-0001: PUSH_COL_REF size
-0002: PUSH_CONST Int(100)
-0003: BIN_OP >
-0004: FRAME_EXPR Filter(1)
-0005: PUSH_COL_REF sym
-0006: ALIAS Some("sym")
-0007: BUILD_KEYS 1
-0008: PUSH_COL_REF price
-0009: CALL avg 1
-0010: ALIAS Some("price")
-0011: BUILD_PROJ 1
-0012: SELECT_BY
-0013: RESULT
+0000  PUSH       Name(trades)
+0001  SOURCE
+0002  PUSH       Name(size)
+0003  LOAD_COL
+0004  PUSH       Value(Int(100))
+0005  PUSH       BinOp(Gt)
+0006  BINOP
+0007  PUSH       Count(1)
+0008  FILTER
+0009  PUSH       Name(sym)
+0010  LOAD_COL
+0011  PUSH       Name(sym)
+0012  ALIAS
+0013  PUSH       Count(1)
+0014  LIST
+0015  PUSH       Name(price)
+0016  LOAD_COL
+0017  PUSH       Count(1)
+0018  PUSH       Verb(avg)
+0019  VERB
+0020  PUSH       Name(price)
+0021  ALIAS
+0022  PUSH       Count(1)
+0023  LIST
+0024  SELECT_BY
 ```
 
 Read top to bottom it follows the query closely: start from `trades`, push

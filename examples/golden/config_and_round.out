@@ -1,0 +1,61 @@
+`.qpl.cfg key=value ...` sets session-wide knobs; a bare `.qpl.cfg` prints them
+maxcol=6
+maxrow=4
+round_type=HALF_TO_EVEN
+tblwidth=-1
+strlen=30
+useqepoch=false
+maxrow / maxcol only affect how much is *printed* - the query is unchanged
+shape: (8, 5)
+┌──────┬───────┬──────┬──────┬─────────────────────┐
+│ sym  ┆ price ┆ size ┆ side ┆ ts                  │
+│ ---  ┆ ---   ┆ ---  ┆ ---  ┆ ---                 │
+│ str  ┆ f64   ┆ i64  ┆ str  ┆ datetime[ns]        │
+╞══════╪═══════╪══════╪══════╪═════════════════════╡
+│ AAPL ┆ 182.3 ┆ 100  ┆ buy  ┆ 2024-03-15 09:30:00 │
+│ AAPL ┆ 183.1 ┆ 250  ┆ sell ┆ 2024-03-15 09:31:15 │
+│ AAPL ┆ 184.0 ┆ 500  ┆ sell ┆ 2024-03-15 10:15:00 │
+│ MSFT ┆ 414.8 ┆ 200  ┆ sell ┆ 2024-03-15 10:20:35 │
+│ …    ┆ …     ┆ …    ┆ …    ┆ …                   │
+└──────┴───────┴──────┴──────┴─────────────────────┘
+`tblwidth` caps the printed width, `strlen` the characters shown per cell (-1 = unlimited)
+shape: (8, 5)
+┌──────┬───────┬──────┬──────┬───────┐
+│ sym  ┆ pric… ┆ size ┆ side ┆ ts    │
+│ ---  ┆ ---   ┆ ---  ┆ ---  ┆ ---   │
+│ str  ┆ f64   ┆ i64  ┆ str  ┆ datet │
+│      ┆       ┆      ┆      ┆ ime[n │
+│      ┆       ┆      ┆      ┆ s]    │
+╞══════╪═══════╪══════╪══════╪═══════╡
+│ AAPL ┆ 182.… ┆ 100  ┆ buy  ┆ 2024… │
+│ AAPL ┆ 183.… ┆ 250  ┆ sell ┆ 2024… │
+│ AAPL ┆ 184.… ┆ 500  ┆ sell ┆ 2024… │
+│ MSFT ┆ 414.… ┆ 200  ┆ sell ┆ 2024… │
+│ …    ┆ …     ┆ …    ┆ …    ┆ …     │
+└──────┴───────┴──────┴──────┴───────┘
+`round` is dyadic, q-style: <precision> round <column>; mode comes from round_type
+shape: (8, 2)
+┌──────┬────────┐
+│ sym  ┆ spread │
+│ ---  ┆ ---    │
+│ str  ┆ f64    │
+╞══════╪════════╡
+│ AAPL ┆ 0.37   │
+│ AAPL ┆ 0.73   │
+│ AAPL ┆ 1.82   │
+│ MSFT ┆ 2.07   │
+│ …    ┆ …      │
+└──────┴────────┘
+HALF_TO_EVEN (banker's rounding) is the default; switch to HALF_UP
+shape: (8, 2)
+┌──────┬────────┐
+│ sym  ┆ spread │
+│ ---  ┆ ---    │
+│ str  ┆ f64    │
+╞══════╪════════╡
+│ AAPL ┆ 0.37   │
+│ AAPL ┆ 0.73   │
+│ AAPL ┆ 1.82   │
+│ MSFT ┆ 2.07   │
+│ …    ┆ …      │
+└──────┴────────┘

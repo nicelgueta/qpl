@@ -1,8 +1,8 @@
-use polars::prelude::{JoinType, NamedFrom, Series};
+use polars::prelude::{DataFrame, JoinType, LazyFrame, NamedFrom, Series};
 
 use crate::builtins::BuiltIn;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 pub enum Value {
     Int(i64),
     Float(f64),
@@ -34,14 +34,34 @@ pub enum Value {
     /// is no captured environment (see [`Function`]), so the `Arc` is shared
     /// purely to keep cloning a binding cheap. Meaningless inside a query
     /// expression — `vm::ast_val_to_expr` rejects it.
-    Closure(std::sync::Arc<Function>),
+    ///
+    /// This wraps
+    /// [`crate::program::Closure`] (params, its compiled entry point, and the
+    /// `Arc<Program>` it belongs to) rather than the raw AST `Function` — a
+    /// function literal compiles to bytecode once, at parse/compile time, and
+    /// is invoked via `CALL`/`RET`, not re-walked per call.
+    Closure(std::sync::Arc<crate::program::Closure>),
+    /// A materialised table binding — one of `Vm`'s single binding map's two
+    /// table-shaped kinds (see `Vm::globals` / `Vm::bind`). Meaningless inside
+    /// a query expression — `vm::ast_val_to_expr` rejects it, and a bare
+    /// lookup of one from `vm::Vm::lookup_global` returns `None` so it is
+    /// never substituted as a literal into a column expression.
+    Table(DataFrame),
+    /// A stored **lazy** query plan (`x: lazy select ...`) — the other
+    /// table-shaped binding kind. See `Table` above. Boxed: `LazyFrame` itself
+    /// is a large struct (its whole optimizer/plan state, not just a handle),
+    /// and inlining it here would balloon every `Value` — including the
+    /// common scalar cases — to its size, which is enough to blow the stack
+    /// on realistic function-call recursion (128 levels deep, each holding
+    /// several `Value`/`Slot`s on the stack).
+    Lazy(Box<LazyFrame>),
     /// Vector variants are all backed by a Polars `Series` so that native
     /// vectorised Polars operations (arithmetic, casts, gather/slice) apply
     /// directly instead of hand-rolled Rust loops. Each carries the same raw
     /// element representation as its scalar counterpart (e.g. `DateVec` holds
     /// day offsets since 2000.01.01, matching `Date`) — conversion to/from a
     /// native Polars dtype happens only in `vm::ast_val_to_expr` /
-    /// `resolve::column_to_value`. See [`VecKind`] for generic dispatch over
+    /// `ops::column_to_value`. See [`VecKind`] for generic dispatch over
     /// these variants.
     IntVec(Series),
     FloatVec(Series),
@@ -55,6 +75,92 @@ pub enum Value {
     SecondVec(Series),
     TimestampVec(Series),
     TimespanVec(Series),
+}
+
+/// Manual only because `LazyFrame` has no `Debug` impl (a query plan isn't
+/// meaningfully printable without collecting it, which `{v:?}` must never do
+/// as a side effect); every other variant is formatted exactly as `derive`
+/// would.
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use Value::*;
+        match self {
+            Int(v) => f.debug_tuple("Int").field(v).finish(),
+            Float(v) => f.debug_tuple("Float").field(v).finish(),
+            Str(v) => f.debug_tuple("Str").field(v).finish(),
+            Sym(v) => f.debug_tuple("Sym").field(v).finish(),
+            Bool(v) => f.debug_tuple("Bool").field(v).finish(),
+            Date(v) => f.debug_tuple("Date").field(v).finish(),
+            Month(v) => f.debug_tuple("Month").field(v).finish(),
+            Time(v) => f.debug_tuple("Time").field(v).finish(),
+            Minute(v) => f.debug_tuple("Minute").field(v).finish(),
+            Second(v) => f.debug_tuple("Second").field(v).finish(),
+            Timestamp(v) => f.debug_tuple("Timestamp").field(v).finish(),
+            Timespan(v) => f.debug_tuple("Timespan").field(v).finish(),
+            Handle(v) => f.debug_tuple("Handle").field(v).finish(),
+            Future(v) => f.debug_tuple("Future").field(v).finish(),
+            Closure(v) => f.debug_tuple("Closure").field(v).finish(),
+            Table(v) => f.debug_tuple("Table").field(v).finish(),
+            Lazy(_) => write!(f, "Lazy(<lazy frame>)"),
+            IntVec(v) => f.debug_tuple("IntVec").field(v).finish(),
+            FloatVec(v) => f.debug_tuple("FloatVec").field(v).finish(),
+            SymVec(v) => f.debug_tuple("SymVec").field(v).finish(),
+            StrVec(v) => f.debug_tuple("StrVec").field(v).finish(),
+            BoolVec(v) => f.debug_tuple("BoolVec").field(v).finish(),
+            DateVec(v) => f.debug_tuple("DateVec").field(v).finish(),
+            MonthVec(v) => f.debug_tuple("MonthVec").field(v).finish(),
+            TimeVec(v) => f.debug_tuple("TimeVec").field(v).finish(),
+            MinuteVec(v) => f.debug_tuple("MinuteVec").field(v).finish(),
+            SecondVec(v) => f.debug_tuple("SecondVec").field(v).finish(),
+            TimestampVec(v) => f.debug_tuple("TimestampVec").field(v).finish(),
+            TimespanVec(v) => f.debug_tuple("TimespanVec").field(v).finish(),
+        }
+    }
+}
+
+/// Manual because `DataFrame` has no total-order-free equality worth deriving
+/// (`equals_missing` treats nulls as equal to themselves, unlike Polars'
+/// regular `==`), `LazyFrame` has none at all (comparing plans isn't
+/// meaningful), and `Closure` compares by identity (`Arc::ptr_eq`) rather than
+/// structurally — a function is only ever "the same" as itself in a `qpl`
+/// program. Every other variant keeps the field-by-field equality `derive`
+/// would have produced.
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        use Value::*;
+        match (self, other) {
+            (Int(a), Int(b)) => a == b,
+            (Float(a), Float(b)) => a == b,
+            (Str(a), Str(b)) => a == b,
+            (Sym(a), Sym(b)) => a == b,
+            (Bool(a), Bool(b)) => a == b,
+            (Date(a), Date(b)) => a == b,
+            (Month(a), Month(b)) => a == b,
+            (Time(a), Time(b)) => a == b,
+            (Minute(a), Minute(b)) => a == b,
+            (Second(a), Second(b)) => a == b,
+            (Timestamp(a), Timestamp(b)) => a == b,
+            (Timespan(a), Timespan(b)) => a == b,
+            (Handle(a), Handle(b)) => a == b,
+            (Future(a), Future(b)) => a == b,
+            (Closure(a), Closure(b)) => std::sync::Arc::ptr_eq(a, b),
+            (Table(a), Table(b)) => a.equals_missing(b),
+            (Lazy(_), Lazy(_)) => false,
+            (IntVec(a), IntVec(b)) => a == b,
+            (FloatVec(a), FloatVec(b)) => a == b,
+            (SymVec(a), SymVec(b)) => a == b,
+            (StrVec(a), StrVec(b)) => a == b,
+            (BoolVec(a), BoolVec(b)) => a == b,
+            (DateVec(a), DateVec(b)) => a == b,
+            (MonthVec(a), MonthVec(b)) => a == b,
+            (TimeVec(a), TimeVec(b)) => a == b,
+            (MinuteVec(a), MinuteVec(b)) => a == b,
+            (SecondVec(a), SecondVec(b)) => a == b,
+            (TimestampVec(a), TimestampVec(b)) => a == b,
+            (TimespanVec(a), TimespanVec(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// Which element type a vector `Value` variant holds. Lets list-shaped
@@ -220,8 +326,10 @@ pub enum Expr {
     /// `` `k1`k2!v1 v2 `` — a dict literal: an ordered list of (key, value-expr)
     /// pairs (order matters — it becomes column order when fed to `zip`).
     /// Each value is parsed as a single noun; a compound expression needs
-    /// parens. Value context only, never lowered to stack instructions —
-    /// see `resolve::eval_value`'s `zip` handling.
+    /// parens. Value context only, and only meaningful as `zip`'s own
+    /// argument — `compiler::compile_value_expr`'s `zip` arm compiles it
+    /// directly to `CAST_LIST`/`ZIP`; a bare `Dict` anywhere else is a
+    /// compile-time error ("not supported in scalar context").
     Dict(Vec<(String, Expr)>),
     IColRef, // virtual i col (for indexing like: select i, col1, col2 from df)
     BinOp {
@@ -257,8 +365,9 @@ pub enum Expr {
     /// `` name`c1`c2 ``, or a `select … from …` whose result feeds a reduction,
     /// slice, index or assignment rather than being printed as a table. A
     /// one-column `Select` is a *column expression* (materialises to a list
-    /// `Value`); anything else stays a frame. Tree-walked by `resolve::eval_value`,
-    /// never lowered to stack instructions.
+    /// `Value`); anything else stays a frame. Compiled by
+    /// `compiler::compile_value_expr`'s `Table` arm: frame ops, plus
+    /// `COLUMN` when it's a one-column select.
     Table(Box<TableExpr>),
     /// `<n>#<expr>` — take the first `n` rows (`n >= 0`) or the last `-n`
     /// (`n < 0`) of a frame or list. `n` is any scalar-valued expression
@@ -282,14 +391,19 @@ pub enum Expr {
         func: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// `{[p1,p2] stmt; ...; last-expr}` — a function literal. Compiled
+    /// to `PUSH Func(proto)`, with the body
+    /// appended as bytecode after the enclosing program's main code — see
+    /// `compiler::compile_value_expr`'s `Lambda` arm. Value context only.
+    Lambda(Function),
     /// `<conn> dispatch <rest of statement>` / `<conn> async dispatch <rest>` —
     /// ship `command` (the exact remaining source, reconstructed from tokens
     /// at parse time) to the connection named by `conn` and evaluate it there
     /// as if typed at that server's REPL. `is_async`: `dispatch` blocks for the
     /// reply; `async dispatch` returns a `Value::Future` immediately, resolved
     /// later by `await`. `ipc` feature only (see `Value::Handle`). Value
-    /// context only, tree-walked by `resolve::eval_value` like `Table` above —
-    /// there's nothing here for the compiler to lower.
+    /// context only; compiled directly to `Op::Dispatch`
+    /// (`compiler::compile_value_expr`'s `Dispatch` arm).
     Dispatch {
         conn: Box<Expr>,
         command: String,
@@ -298,14 +412,15 @@ pub enum Expr {
     /// `while[test; s1; ...; sn]` — while `test` (a boolean atom) is true, run
     /// the statements in order in the *current* scope (so assignments bind
     /// whatever scope the loop sits in: globals at the top level, locals inside
-    /// a function). Yields noop. Value context only, tree-walked by
-    /// `resolve::eval_value` like `Case` — nothing for the compiler to lower.
+    /// a function). Yields noop. Value context only; compiled by
+    /// `compiler::compile_while` to a backward `JUMP`/`JUMP_IF_FALSE` pair —
+    /// nothing is interpreted from the AST.
     While {
         cond: Box<Expr>,
         body: Vec<Stmt>,
     },
     /// `noop` — evaluates to nothing: prints nothing, and can be neither
-    /// assigned nor used as an operand (`resolve::EvalValue::Noop`). Value
+    /// assigned nor used as an operand (`Slot::Noop`). Value
     /// context only.
     Noop,
     /// `<expr> where <predicate>[, <predicate>...]` where `<expr>` is a *list*
@@ -313,8 +428,9 @@ pub enum Expr {
     /// via `TableExpr::Select`'s `where_`) — filters the list elementwise.
     /// Each predicate is written against `x`, a plain column reference that
     /// resolves against the list's own (single, `x`-named) materialisation —
-    /// see `resolve::eval_value`'s `Expr::ListWhere` arm. Value context only,
-    /// never lowered to stack instructions.
+    /// see `compiler::compile_value_expr`'s `ListWhere` arm:
+    /// `LIST_WHERE_FRAME`, the predicates in query context, `FILTER`, `COLUMN`.
+    /// Value context only.
     ListWhere {
         list: Box<Expr>,
         where_: Vec<Expr>,
@@ -332,8 +448,9 @@ pub struct Alias {
 pub enum TableSource {
     InMem(String),
     /// `load "path.parquet"` / `load path` — a string literal or a bound
-    /// scalar global, resolved to a path at run time (see `vm::run_program`'s
-    /// `TableSource::Load` arm).
+    /// scalar global; the path expression compiles to bytecode
+    /// (`compiler::compile_source`) and is resolved by `Op::LoadFile` at run
+    /// time.
     Load(Box<Expr>),
 }
 
@@ -361,10 +478,35 @@ pub enum TableExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     RetTable(TableExpr),
-    Assign { name: String, body: Box<Stmt> },
-    ScalarAssign { name: String, expr: Expr },
+    Assign {
+        name: String,
+        body: Box<Stmt>,
+    },
+    ScalarAssign {
+        name: String,
+        expr: Expr,
+    },
     // single var on its own - this just evals and prints in repl
     SingleVar(Expr),
+    /// The stdout write, in its bareword spelling: `log a b c` (each `Expr` is
+    /// rendered and concatenated) or bare `log` (prints a blank line, `args`
+    /// empty). The bracketed spelling `log[..]` parses as an ordinary
+    /// `SingleVar(Expr::Call{func: "log", ..})` instead — see
+    /// `compiler::compile_program`'s handling of a top-level `log[..]` call,
+    /// which suppresses printing the same way this variant's compiled form
+    /// does.
+    Log(Vec<Expr>),
+    /// `.qpl.cfg key=value key=value ...` (or a bare `.qpl.cfg`, `args`
+    /// empty, which prints the current configuration).
+    Cfg(String),
+    /// A `\`-prefixed system command: `\d <stmt>` (disassemble), `\l <path>`
+    /// (load a script flat), `\i "<path>"` (load a script as a namespaced
+    /// import — `arg` is already the unquoted path), `\1 <path>` (mirror
+    /// stdout to `<path>`; bare `\1` with an empty `arg` detaches it).
+    System {
+        cmd: char,
+        arg: String,
+    },
 }
 
 /// A function literal: `{[p1,p2] stmt; stmt; last-expr}`. Wrapped in a
@@ -382,8 +524,8 @@ pub struct Function {
 }
 
 /// Prints as the source shape (`{[x,y] ..}`) rather than the whole body AST.
-/// `{v:?}` on a `Value` is user-facing — it's what `\d` disassembles an
-/// `EVAL` to and what runtime errors interpolate — and a dumped body drowns
+/// `{v:?}` on a `Value` is user-facing — it's what runtime errors
+/// interpolate — and a dumped body drowns
 /// both.
 impl std::fmt::Debug for Function {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

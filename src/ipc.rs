@@ -15,7 +15,9 @@
 //! *response* mirrors `vm::EvalResult`: a one-byte tag followed by an
 //! encoding specific to that variant (tables go over as Parquet bytes, reusing
 //! the same format `load`/`sink` already use — no new Polars feature needed;
-//! scalars use a small hand-rolled tag+payload encoding for `ast::Value`).
+//! scalars use the shared [`crate::codec`] tag+payload encoding for
+//! `ast::Value`, also used by `.qplc` bytecode files — see `encode_scalar`
+//! for the one wire-only wrinkle, an unrepresentable value's placeholder text).
 
 use std::io::Cursor;
 use std::sync::mpsc;
@@ -388,7 +390,7 @@ pub fn encode_result(result: &Result<EvalResult, QplError>) -> Vec<u8> {
         }
         Ok(EvalResult::Scalar(v)) => {
             let mut out = vec![TAG_SCALAR];
-            v.encode(&mut out);
+            encode_scalar(v, &mut out);
             out
         }
         Ok(EvalResult::Table(df)) => {
@@ -417,9 +419,9 @@ fn decode_response(bytes: &[u8]) -> Result<EvalResult, QplError> {
         )),
         TAG_STORED => Ok(EvalResult::Stored),
         TAG_LAZY => Ok(EvalResult::Lazy(String::from_utf8_lossy(rest).into_owned())),
-        TAG_SCALAR => Ok(EvalResult::Scalar(ast::Value::decode(&mut Reader::new(
-            rest,
-        ))?)),
+        TAG_SCALAR => Ok(EvalResult::Scalar(crate::codec::decode_value(
+            &mut crate::codec::Reader::new(rest),
+        )?)),
         TAG_TABLE => {
             let df = ParquetReader::new(Cursor::new(rest.to_vec()))
                 .finish()
@@ -432,257 +434,19 @@ fn decode_response(bytes: &[u8]) -> Result<EvalResult, QplError> {
     }
 }
 
-/// The one-byte tag identifying which `ast::Value` variant follows on the
-/// wire. Explicit discriminants so the encoding is stable across builds.
-/// Kept as an enum (rather than loose `u8` constants) specifically so that
-/// adding a new `Value` variant forces a decision here too: `Value::encode`'s
-/// match is exhaustive over `ValueTag`, so the compiler catches a forgotten
-/// wire-format update the moment a new tag is added but not handled.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-enum ValueTag {
-    Int = 0,
-    Float = 1,
-    Str = 2,
-    Sym = 3,
-    Bool = 4,
-    Date = 5,
-    Month = 6,
-    Time = 7,
-    Minute = 8,
-    Second = 9,
-    Timestamp = 10,
-    Timespan = 11,
-    IntVec = 12,
-    FloatVec = 13,
-    SymVec = 14,
-    StrVec = 15,
-    BoolVec = 16,
-}
-
-impl TryFrom<u8> for ValueTag {
-    type Error = QplError;
-    fn try_from(b: u8) -> Result<Self, QplError> {
-        use ValueTag::*;
-        Ok(match b {
-            0 => Int,
-            1 => Float,
-            2 => Str,
-            3 => Sym,
-            4 => Bool,
-            5 => Date,
-            6 => Month,
-            7 => Time,
-            8 => Minute,
-            9 => Second,
-            10 => Timestamp,
-            11 => Timespan,
-            12 => IntVec,
-            13 => FloatVec,
-            14 => SymVec,
-            15 => StrVec,
-            16 => BoolVec,
-            other => {
-                return Err(QplError::Runtime(format!(
-                    "unknown dispatch value tag {other}"
-                )));
-            }
-        })
-    }
-}
-
-fn push_str(out: &mut Vec<u8>, s: &str) {
-    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-    out.extend_from_slice(s.as_bytes());
-}
-
-impl ast::Value {
-    /// Wire-encode this value, tagged with its `ValueTag` — see `decode`.
-    fn encode(&self, out: &mut Vec<u8>) {
-        use ast::Value::*;
-        match self {
-            Int(n) => {
-                out.push(ValueTag::Int as u8);
-                out.extend_from_slice(&n.to_le_bytes());
-            }
-            Float(n) => {
-                out.push(ValueTag::Float as u8);
-                out.extend_from_slice(&n.to_le_bytes());
-            }
-            Str(s) => {
-                out.push(ValueTag::Str as u8);
-                push_str(out, s);
-            }
-            Sym(s) => {
-                out.push(ValueTag::Sym as u8);
-                push_str(out, s);
-            }
-            Bool(b) => {
-                out.push(ValueTag::Bool as u8);
-                out.push(*b as u8);
-            }
-            Date(n) => {
-                out.push(ValueTag::Date as u8);
-                out.extend_from_slice(&n.to_le_bytes());
-            }
-            Month(n) => {
-                out.push(ValueTag::Month as u8);
-                out.extend_from_slice(&n.to_le_bytes());
-            }
-            Time(n) => {
-                out.push(ValueTag::Time as u8);
-                out.extend_from_slice(&n.to_le_bytes());
-            }
-            Minute(n) => {
-                out.push(ValueTag::Minute as u8);
-                out.extend_from_slice(&n.to_le_bytes());
-            }
-            Second(n) => {
-                out.push(ValueTag::Second as u8);
-                out.extend_from_slice(&n.to_le_bytes());
-            }
-            Timestamp(n) => {
-                out.push(ValueTag::Timestamp as u8);
-                out.extend_from_slice(&n.to_le_bytes());
-            }
-            Timespan(n) => {
-                out.push(ValueTag::Timespan as u8);
-                out.extend_from_slice(&n.to_le_bytes());
-            }
-            IntVec(v) => {
-                out.push(ValueTag::IntVec as u8);
-                let v = v.i64().unwrap();
-                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for n in v.into_no_null_iter() {
-                    out.extend_from_slice(&n.to_le_bytes());
-                }
-            }
-            FloatVec(v) => {
-                out.push(ValueTag::FloatVec as u8);
-                let v = v.f64().unwrap();
-                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for n in v.into_no_null_iter() {
-                    out.extend_from_slice(&n.to_le_bytes());
-                }
-            }
-            SymVec(v) => {
-                out.push(ValueTag::SymVec as u8);
-                let v = v.str().unwrap();
-                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for s in v.iter().flatten() {
-                    push_str(out, s);
-                }
-            }
-            StrVec(v) => {
-                out.push(ValueTag::StrVec as u8);
-                let v = v.str().unwrap();
-                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for s in v.iter().flatten() {
-                    push_str(out, s);
-                }
-            }
-            BoolVec(v) => {
-                out.push(ValueTag::BoolVec as u8);
-                let v = v.bool().unwrap();
-                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for b in v.iter().flatten() {
-                    out.push(b as u8);
-                }
-            }
-            // connection/future handles and functions never cross the wire
-            Handle(_) | Future(_) | Closure(_) => {
-                out.push(ValueTag::Str as u8);
-                push_str(out, "<unrepresentable>");
-            }
-            // remaining temporal vector variants have no `hopen`/`dispatch` path today
-            DateVec(_) | MonthVec(_) | TimeVec(_) | MinuteVec(_) | SecondVec(_)
-            | TimestampVec(_) | TimespanVec(_) => {
-                out.push(ValueTag::Str as u8);
-                push_str(out, "<unrepresentable>");
-            }
-        }
-    }
-
-    /// Inverse of `encode` — see `Reader` below.
-    fn decode(r: &mut Reader) -> Result<ast::Value, QplError> {
-        use ValueTag::*;
-        Ok(match ValueTag::try_from(r.u8()?)? {
-            Int => ast::Value::Int(r.i64()?),
-            Float => ast::Value::Float(r.f64()?),
-            Str => ast::Value::Str(r.string()?),
-            Sym => ast::Value::Sym(r.string()?),
-            Bool => ast::Value::Bool(r.u8()? != 0),
-            Date => ast::Value::Date(r.i32()?),
-            Month => ast::Value::Month(r.i32()?),
-            Time => ast::Value::Time(r.i64()?),
-            Minute => ast::Value::Minute(r.i32()?),
-            Second => ast::Value::Second(r.i32()?),
-            Timestamp => ast::Value::Timestamp(r.i64()?),
-            Timespan => ast::Value::Timespan(r.i64()?),
-            IntVec => {
-                let n = r.u32()?;
-                ast::int_vec((0..n).map(|_| r.i64()).collect::<Result<_, _>>()?)
-            }
-            FloatVec => {
-                let n = r.u32()?;
-                ast::float_vec((0..n).map(|_| r.f64()).collect::<Result<_, _>>()?)
-            }
-            SymVec => {
-                let n = r.u32()?;
-                ast::sym_vec((0..n).map(|_| r.string()).collect::<Result<_, _>>()?)
-            }
-            StrVec => {
-                let n = r.u32()?;
-                ast::str_vec((0..n).map(|_| r.string()).collect::<Result<_, _>>()?)
-            }
-            BoolVec => {
-                let n = r.u32()?;
-                ast::bool_vec(
-                    (0..n)
-                        .map(|_| r.u8().map(|b| b != 0))
-                        .collect::<Result<_, _>>()?,
-                )
-            }
-        })
-    }
-}
-
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
-    }
-    fn take(&mut self, n: usize) -> Result<&'a [u8], QplError> {
-        let end = self.pos + n;
-        let slice = self
-            .buf
-            .get(self.pos..end)
-            .ok_or_else(|| rt("truncated dispatch payload"))?;
-        self.pos = end;
-        Ok(slice)
-    }
-    fn u8(&mut self) -> Result<u8, QplError> {
-        Ok(self.take(1)?[0])
-    }
-    fn i32(&mut self) -> Result<i32, QplError> {
-        Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-    fn i64(&mut self) -> Result<i64, QplError> {
-        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-    fn f64(&mut self) -> Result<f64, QplError> {
-        Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-    fn u32(&mut self) -> Result<u32, QplError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-    fn string(&mut self) -> Result<String, QplError> {
-        let len = self.u32()? as usize;
-        Ok(String::from_utf8_lossy(self.take(len)?).into_owned())
+/// Wire-encode a scalar `Value` for `encode_result`'s `TAG_SCALAR` payload,
+/// using the shared [`crate::codec`]. A connection/future handle, a closure, or a table/lazy value that
+/// somehow ends up wrapped in a *scalar* response (table results normally go
+/// through `encode_result`'s dedicated `EvalResult::Table` Parquet path
+/// instead) has no lossless encoding — `codec::encode_value` errors on those,
+/// and this falls back to the same `"<unrepresentable>"` placeholder string
+/// the wire format has always used for them, rather than propagating the
+/// error (nothing on the other end of a dispatch could act on a decode
+/// failure any more usefully than on the placeholder text).
+fn encode_scalar(v: &ast::Value, out: &mut Vec<u8>) {
+    if crate::codec::encode_value(v, out).is_err() {
+        crate::codec::encode_value(&ast::Value::Str("<unrepresentable>".into()), out)
+            .expect("a Str value always encodes");
     }
 }
 
@@ -692,8 +456,8 @@ mod tests {
 
     fn roundtrip_value(v: ast::Value) -> ast::Value {
         let mut buf = Vec::new();
-        v.encode(&mut buf);
-        ast::Value::decode(&mut Reader::new(&buf)).expect("decode")
+        encode_scalar(&v, &mut buf);
+        crate::codec::decode_value(&mut crate::codec::Reader::new(&buf)).expect("decode")
     }
 
     #[test]

@@ -1,0 +1,167 @@
+projection + aliasing
+shape: (8, 3)
+┌──────┬───────┬─────┐
+│ sym  ┆ px    ┆ qty │
+│ ---  ┆ ---   ┆ --- │
+│ str  ┆ f64   ┆ i64 │
+╞══════╪═══════╪═════╡
+│ AAPL ┆ 182.3 ┆ 100 │
+│ AAPL ┆ 183.1 ┆ 250 │
+│ AAPL ┆ 184.0 ┆ 500 │
+│ GOOG ┆ 140.5 ┆ 150 │
+│ GOOG ┆ 141.2 ┆ 90  │
+│ MSFT ┆ 414.8 ┆ 200 │
+│ MSFT ┆ 415.2 ┆ 80  │
+│ MSFT ┆ 416.0 ┆ 300 │
+└──────┴───────┴─────┘
+scalar variable, reused in a later query
+shape: (4, 5)
+┌──────┬───────┬──────┬──────┬─────────────────────┐
+│ sym  ┆ price ┆ size ┆ side ┆ ts                  │
+│ ---  ┆ ---   ┆ ---  ┆ ---  ┆ ---                 │
+│ str  ┆ f64   ┆ i64  ┆ str  ┆ datetime[ns]        │
+╞══════╪═══════╪══════╪══════╪═════════════════════╡
+│ AAPL ┆ 183.1 ┆ 250  ┆ sell ┆ 2024-03-15 09:31:15 │
+│ AAPL ┆ 184.0 ┆ 500  ┆ sell ┆ 2024-03-15 10:15:00 │
+│ MSFT ┆ 414.8 ┆ 200  ┆ sell ┆ 2024-03-15 10:20:35 │
+│ MSFT ┆ 416.0 ┆ 300  ┆ buy  ┆ 2024-03-15 09:45:05 │
+└──────┴───────┴──────┴──────┴─────────────────────┘
+casts fold in a scalar context too - `int$` truncates, strings are parsed
+shape: (4, 5)
+┌──────┬───────┬──────┬──────┬─────────────────────┐
+│ sym  ┆ price ┆ size ┆ side ┆ ts                  │
+│ ---  ┆ ---   ┆ ---  ┆ ---  ┆ ---                 │
+│ str  ┆ f64   ┆ i64  ┆ str  ┆ datetime[ns]        │
+╞══════╪═══════╪══════╪══════╪═════════════════════╡
+│ AAPL ┆ 183.1 ┆ 250  ┆ sell ┆ 2024-03-15 09:31:15 │
+│ AAPL ┆ 184.0 ┆ 500  ┆ sell ┆ 2024-03-15 10:15:00 │
+│ MSFT ┆ 414.8 ┆ 200  ┆ sell ┆ 2024-03-15 10:20:35 │
+│ MSFT ┆ 416.0 ┆ 300  ┆ buy  ┆ 2024-03-15 09:45:05 │
+└──────┴───────┴──────┴──────┴─────────────────────┘
+where with multiple successive filters (comma = AND)
+shape: (3, 2)
+┌──────┬───────┐
+│ sym  ┆ price │
+│ ---  ┆ ---   │
+│ str  ┆ f64   │
+╞══════╪═══════╡
+│ AAPL ┆ 183.1 │
+│ AAPL ┆ 184.0 │
+│ GOOG ┆ 140.5 │
+└──────┴───────┘
+combine predicates with & (and) / | (or); parenthesise, q has no precedence
+shape: (2, 5)
+┌──────┬───────┬──────┬──────┬─────────────────────┐
+│ sym  ┆ price ┆ size ┆ side ┆ ts                  │
+│ ---  ┆ ---   ┆ ---  ┆ ---  ┆ ---                 │
+│ str  ┆ f64   ┆ i64  ┆ str  ┆ datetime[ns]        │
+╞══════╪═══════╪══════╪══════╪═════════════════════╡
+│ AAPL ┆ 184.0 ┆ 500  ┆ sell ┆ 2024-03-15 10:15:00 │
+│ GOOG ┆ 140.5 ┆ 150  ┆ sell ┆ 2024-03-15 10:01:30 │
+└──────┴───────┴──────┴──────┴─────────────────────┘
+like: q-style glob match — * any sequence, ? any single char, [..] a class
+shape: (3, 1)
+┌──────┐
+│ sym  │
+│ ---  │
+│ str  │
+╞══════╡
+│ AAPL │
+│ AAPL │
+│ AAPL │
+└──────┘
+shape: (6, 1)
+┌──────┐
+│ sym  │
+│ ---  │
+│ str  │
+╞══════╡
+│ AAPL │
+│ AAPL │
+│ AAPL │
+│ MSFT │
+│ MSFT │
+│ MSFT │
+└──────┘
+shape: (5, 5)
+┌──────┬───────┬──────┬──────┬─────────────────────┐
+│ sym  ┆ price ┆ size ┆ side ┆ ts                  │
+│ ---  ┆ ---   ┆ ---  ┆ ---  ┆ ---                 │
+│ str  ┆ f64   ┆ i64  ┆ str  ┆ datetime[ns]        │
+╞══════╪═══════╪══════╪══════╪═════════════════════╡
+│ GOOG ┆ 140.5 ┆ 150  ┆ sell ┆ 2024-03-15 10:01:30 │
+│ GOOG ┆ 141.2 ┆ 90   ┆ buy  ┆ 2024-03-15 10:02:50 │
+│ MSFT ┆ 414.8 ┆ 200  ┆ sell ┆ 2024-03-15 10:20:35 │
+│ MSFT ┆ 415.2 ┆ 80   ┆ buy  ┆ 2024-03-15 09:32:40 │
+│ MSFT ┆ 416.0 ┆ 300  ┆ buy  ┆ 2024-03-15 09:45:05 │
+└──────┴───────┴──────┴──────┴─────────────────────┘
+group-by aggregation
+shape: (6, 4)
+┌──────┬──────┬────────┬────────┐
+│ sym  ┆ side ┆ traded ┆ apx    │
+│ ---  ┆ ---  ┆ ---    ┆ ---    │
+│ str  ┆ str  ┆ i64    ┆ f64    │
+╞══════╪══════╪════════╪════════╡
+│ AAPL ┆ buy  ┆ 100    ┆ 182.3  │
+│ AAPL ┆ sell ┆ 750    ┆ 183.55 │
+│ GOOG ┆ buy  ┆ 90     ┆ 141.2  │
+│ GOOG ┆ sell ┆ 150    ┆ 140.5  │
+│ MSFT ┆ buy  ┆ 380    ┆ 415.6  │
+│ MSFT ┆ sell ┆ 200    ┆ 414.8  │
+└──────┴──────┴────────┴────────┘
+conditional column via ?[...] (vectorised conditional, q-style)
+shape: (8, 2)
+┌──────┬──────┐
+│ sym  ┆ tier │
+│ ---  ┆ ---  │
+│ str  ┆ str  │
+╞══════╪══════╡
+│ AAPL ┆ mid  │
+│ AAPL ┆ mid  │
+│ AAPL ┆ mid  │
+│ GOOG ┆ low  │
+│ GOOG ┆ low  │
+│ MSFT ┆ high │
+│ MSFT ┆ high │
+│ MSFT ┆ high │
+└──────┴──────┘
+order + type cast (order by columns that survive the projection)
+shape: (8, 2)
+┌──────┬───────┐
+│ sym  ┆ sz    │
+│ ---  ┆ ---   │
+│ str  ┆ f64   │
+╞══════╪═══════╡
+│ AAPL ┆ 100.0 │
+│ AAPL ┆ 250.0 │
+│ AAPL ┆ 500.0 │
+│ GOOG ┆ 150.0 │
+│ GOOG ┆ 90.0  │
+│ MSFT ┆ 200.0 │
+│ MSFT ┆ 300.0 │
+│ MSFT ┆ 80.0  │
+└──────┴───────┘
+from takes any table expression, not just a table name — here, a nested select
+shape: (6, 1)
+┌──────┐
+│ sym  │
+│ ---  │
+│ str  │
+╞══════╡
+│ AAPL │
+│ AAPL │
+│ AAPL │
+│ MSFT │
+│ MSFT │
+│ MSFT │
+└──────┘
+table operators compose the same way — cols on a nested select
+shape: (2, 2)
+┌────────┬───────┐
+│ column ┆ dtype │
+│ ---    ┆ ---   │
+│ str    ┆ str   │
+╞════════╪═══════╡
+│ price  ┆ f64   │
+│ sym    ┆ str   │
+└────────┴───────┘

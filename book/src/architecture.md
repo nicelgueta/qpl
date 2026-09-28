@@ -1,18 +1,24 @@
 # Architecture
 
-Every line you type takes the same path, one statement at a time:
+A whole script, or a single line typed at the prompt, takes the same path:
 
 ```
-source -> lexer -> tokens -> parser -> AST -> compiler -> instructions -> VM (Polars LazyFrame) -> DataFrame
+source -> lexer -> tokens -> parser -> AST -> compiler -> bytecode program -> VM (Polars LazyFrame) -> DataFrame
 ```
 
 | Stage | Role |
 |---|---|
 | `lexer` | turn source text into tokens |
-| `parser` | build a typed syntax tree from those tokens |
-| `compiler` | emit stack-machine instructions from the tree |
-| `vm` | execute the instructions, building and collecting a Polars `LazyFrame` |
+| `parser` | build a typed syntax tree from those tokens; for a script, the whole file at once |
+| `compiler` | emit a one-byte-per-instruction bytecode program from the tree |
+| `vm` | execute the program, building and collecting a Polars `LazyFrame` |
 | `repl` | the interactive loop and the script runner |
+
+A script compiles to one program and runs in a single pass: a syntax error
+anywhere in the file — even on the last line — is caught before the first
+statement runs. A line typed at the REPL, or a request arriving over
+[IPC](language/ipc.md), is the same thing on a smaller scale: a small program
+compiled and run against the same session.
 
 The `\d` command from the [previous chapter](repl.md) prints the output of
 the compiler stage, which is the last point at which the pipeline is still
@@ -27,9 +33,8 @@ output shown in [lazy / collect](language/lazy-collect.md).
 
 This division is why the whole interpreter is a fairly small amount of code
 for a language that queries at the speed it does, and it's also why the
-language stays deliberately compact. New syntax generally means new
-instructions for the VM to execute, and the project treats that as a cost to
-justify rather than a default, preferring to reuse the existing instruction
-set wherever a new feature can be expressed in terms of it. That's a
-maintainer's concern more than a user's, but it explains why the
+language stays deliberately compact: the project prefers to express a new
+feature in terms of the existing instruction set over growing it, and to
+grow the instruction set over adding special-case machinery elsewhere. That's
+a maintainer's concern more than a user's, but it explains why the
 [operator reference](language/operator-reference.md) fits on a single page.

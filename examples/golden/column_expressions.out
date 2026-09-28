@@ -1,0 +1,80 @@
+`table`col` and a one-column `select` are equivalent
+f64[8]: 182.3 183.1 415.2 416 140.5 141.2 184 414.8
+a `where` may be attached to a column expression (but not to a persisted list)
+f64[3]: 183.1 416 184
+any aggregate verb (max/min/sum/avg/first/last/count/std/...) collapses a column expression to a single value
+f64: 416
+scalars compose with later queries just like any other global
+shape: (3, 2)
+┌──────┬───────┐
+│ sym  ┆ price │
+│ ---  ┆ ---   │
+│ str  ┆ f64   │
+╞══════╪═══════╡
+│ MSFT ┆ 414.8 │
+│ MSFT ┆ 415.2 │
+│ MSFT ┆ 416.0 │
+└──────┴───────┘
+slicing with n# - first three rows, last three rows
+f64[3]: 182.3 183.1 415.2
+f64[3]: 141.2 184 414.8
+f64[3]: 182.3 183.1 415.2
+positional indexing: list[i] picks one element, list[i j k] gathers a sub-list
+i64: 10
+i64[3]: 20 40 50
+f64[2]: 415.2 416
+str: "AAPL"
+f64[2]: 415.2 416
+a name is looked up as a global, then a lazy frame, then a table
+shape: (2, 5)
+┌──────┬───────┬──────┬──────┬─────────────────────┐
+│ sym  ┆ price ┆ size ┆ side ┆ ts                  │
+│ ---  ┆ ---   ┆ ---  ┆ ---  ┆ ---                 │
+│ str  ┆ f64   ┆ i64  ┆ str  ┆ datetime[ns]        │
+╞══════╪═══════╪══════╪══════╪═════════════════════╡
+│ AAPL ┆ 182.3 ┆ 100  ┆ buy  ┆ 2024-03-15 09:30:00 │
+│ AAPL ┆ 183.1 ┆ 250  ┆ sell ┆ 2024-03-15 09:31:15 │
+└──────┴───────┴──────┴──────┴─────────────────────┘
+list + scalar, scalar + list, list op list, and comparisons are all elementwise
+i64[5]: 12 22 32 42 52
+i64[5]: 20 40 60 80 100
+bool[5]: 00111
+f64[8]: 0 0.799999999999983 232.89999999999998 233.7 -41.80000000000001 -41.10000000000002 1.6999999999999886 232.5
+a temporal column materialises to its typed list (e.g. TimestampVec), which shifts the same way a temporal scalar does
+timestamp[8]: 2024.03.15D09:31:00.000000000 2024.03.15D09:32:15.000000000 2024.03.15D09:33:40.000000000 2024.03.15D09:46:05.000000000 2024.03.15D10:02:30.000000000 2024.03.15D10:03:50.000000000 2024.03.15D10:16:00.000000000 2024.03.15D10:21:35.000000000
+list `where`: x is the current element, a comma joins predicates with AND
+i64[3]: 30 40 50
+i64[3]: 20 30 40
+f64[3]: 415.2 416 414.8
+f64[1]: 414.8
+til: a range list constructor
+i64[5]: 0 1 2 3 4
+i64[5]: 10 11 12 13 14
+zip: assemble named lists into a table
+shape: (20, 2)
+┌──────┬──────┐
+│ cola ┆ colb │
+│ ---  ┆ ---  │
+│ i64  ┆ i64  │
+╞══════╪══════╡
+│ 0    ┆ 0    │
+│ 1    ┆ 2    │
+│ 15   ┆ 30   │
+│ 16   ┆ 32   │
+│ 17   ┆ 34   │
+│ 18   ┆ 36   │
+│ 19   ┆ 38   │
+│ 2    ┆ 4    │
+│ 3    ┆ 6    │
+│ 4    ┆ 8    │
+│ …    ┆ …    │
+└──────┴──────┘
+shape: (2, 2)
+┌────────┬───────┐
+│ column ┆ dtype │
+│ ---    ┆ ---   │
+│ str    ┆ str   │
+╞════════╪═══════╡
+│ cola   ┆ i64   │
+│ colb   ┆ i64   │
+└────────┴───────┘

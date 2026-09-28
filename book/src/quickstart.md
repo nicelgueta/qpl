@@ -171,6 +171,9 @@ qpl                 # REPL, with no tables loaded
 qpl --load-demo     # REPL, with `trades` and `quotes` as above
 qpl script.qpl      # run a script, print its output, exit
 qpl -i script.qpl   # run a script, then stay in the REPL with its state
+qpl -c '<command>'  # run one ad hoc command and exit, like `python -c`
+qpl -C script.qpl   # compile to script.qplc (add -o to redirect); doesn't run it
+qpl script.qplc     # run a compiled script — no lexing/parsing/compiling
 ```
 
 That last one is worth remembering. It's how you'd load your real tables from

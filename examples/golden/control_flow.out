@@ -1,0 +1,17 @@
+a countdown
+3
+2
+1
+accumulate: 1 + 2 + ... + 10
+i64: 55
+a while inside a function binds locals only
+i64: 5050
+a conditional with function branches (pure, and only one is called)
+big
+a vector condition is elementwise; a vector branch must match its length
+i64[4]: 1 0 1 1
+i64[4]: 10 0 30 40
+recursion through ?[..]
+i64: 120
+noop: a branch that does nothing prints nothing
+using a noop as a value is an error (uncomment to see it)

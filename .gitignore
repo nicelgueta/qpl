@@ -5,6 +5,9 @@
 
 # stdout logs written by examples/logging.qpl (and \1 in general)
 *.log
+
+# compiled bytecode artifacts (qpl -C)
+*.qplc
 *.vsix
 
 .claude/worktrees/

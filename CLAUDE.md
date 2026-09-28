@@ -11,6 +11,9 @@ and rationale are documented in [README.md](README.md) and [examples/](examples/
 read those for language semantics; this file covers build/dev workflow and
 internal architecture.
 
+The interpreter went through a bytecode-VM refactor (branch `bytes`); this
+file describes the result.
+
 ## Commands
 
 ```bash
@@ -24,6 +27,9 @@ cargo run -- --load-demo    # REPL preloaded with demo `trades` / `quotes` table
 cargo run -- script.qpl     # execute a script
 cargo run -- -i script.qpl  # execute a script, then drop into the REPL
 cargo run -- examples/lazy_join_pipeline.qpl   # run an example
+cargo run -- -c 'select avg price by sym from trades' --load-demo   # run an ad hoc command and exit
+cargo run -- -C script.qpl                      # compile to script.qplc (add -o to redirect)
+cargo run -- script.qplc                        # run a compiled artifact — no lexing/parsing/compiling
 cargo build --no-default-features               # drop `ipc` (hopen/dispatch/await, \port — see Architecture)
 cargo test --no-default-features --features wasm   # browser bindings, host-side tests
 make wasm                   # browser bundle -> tools/wasm/pkg (patches polars first,
@@ -36,11 +42,19 @@ them. `cli` gates the binary itself (`[[bin]] required-features`) along with
 clap/rustyline/mimalloc; the interpreter lives in `src/lib.rs` so that the binary
 and the `wasm` bindings are both thin front-ends over the same library.
 
-There is no separate lint step configured; use `cargo clippy` and `cargo fmt` as normal.
+There is no separate lint step configured; use `cargo clippy --all-targets` and
+`cargo fmt` as normal. `cargo clippy --all-targets` is expected to be
+**warning-free** for the default feature set, `--no-default-features`, and
+`--no-default-features --features wasm` — check all three before calling a
+change done.
 
 Tests are colocated with the code they cover (`#[cfg(test)] mod tests` at the
 bottom of each `src/*.rs`). There is no `tests/` directory. `vm.rs`,
-`parser.rs`, `compiler.rs`, and `lexer.rs` carry the bulk of them.
+`parser.rs`, `compiler.rs`, and `lexer.rs` carry the bulk of them. `repl.rs`
+also has a `golden` test module that runs every `examples/*.qpl` and diffs
+its captured output against `examples/golden/<name>.out`
+(`UPDATE_GOLDEN=1 cargo test golden` regenerates them — only do this for a
+deliberate, reviewed output change, never to make a red test green).
 
 ## Release process
 
@@ -55,133 +69,168 @@ nothing else.
 
 ## Architecture
 
-The pipeline is a classic interpreter, one line of source at a time:
+A whole source file compiles and runs in one pass:
 
 ```
-source line → tokenise (lexer) → parse (parser) → AST (ast) → compile (compiler) → Vec<Instruction> → run_vm (vm) → EvalResult
+source file → parse_program (lexer + parser, whole file) → compile_program → Program { code: Vec<u8>, operands, lines } → Vm::run_compiled → EvalResult / printed output
 ```
+
+`Program.code` is one byte per instruction (`Op`, `#[repr(u8)]`); `operands`
+is a side stream that only `Op::Push` reads; `lines` maps an instruction
+pointer back to `(path, line)` for error messages. A REPL line, a `\port`/IPC
+request, or a `\l`/`\i` target is exactly the same thing on a smaller scale —
+each compiles to its own small `Program` and either runs against the
+session's `Vm` directly (REPL, IPC) or is embedded inside the including
+script's `Program` as `Operand::Program(Arc<Program>)` and executed in place
+by the `\l`/`\i` native (`\l`/`\i` targets are read, parsed and compiled
+*when the including script is compiled*, not at run time — see "Namespaces"
+below).
 
 Entry points: `main.rs` parses CLI args (clap) and constructs one long-lived
-`vm::Vm`, then calls into `repl.rs`. `repl::run_script` and `repl::start` both
-funnel every non-comment line through `repl::match_run_vm` → `vm::run_vm`, which
-re-runs the whole tokenise→parse→compile→execute chain for that line. State
-carries across lines because the same `Vm` is reused.
+`vm::Vm`, then calls into `repl.rs`. `repl::run_script` (a file) and
+`repl::start`'s REPL loop both funnel source through `parser::parse_program`
+→ `compiler::compile_program` → `Vm::run_compiled`. `vm::run_vm(source, vm)`
+— still the entry point most tests use — compiles a *single* statement
+(`parser::parse` + `compiler::compile`) in `Result` mode (§"Statements and
+results" in the plan) and reduces it to an `EvalResult` via `Vm::eval`. State
+carries across runs because the same `Vm` (its `globals` map and registers)
+is reused.
 
 ### Key modules
 
 | Module | Role |
 |--------|------|
 | `lexer` | source text → `Vec<Token>` (`tokens.rs` defines `Token`) |
-| `parser` | tokens → `Stmt` / `TableExpr` / `Expr` AST (`ast.rs`); largest front-end file |
-| `ast` | AST types. `Stmt` (assignment vs. bare expr), `TableExpr` (`Select` vs. `BuiltIn`), `SelectStmt` (unified select/update/delete via `update`/`delete` flags), `Expr` |
+| `parser` | tokens → `Stmt` / `TableExpr` / `Expr` AST (`ast.rs`); largest front-end file. `parse` compiles one statement (used by `run_vm`); `parse_program(src, path)` parses a whole file into `Vec<(line, Stmt)>` — statement splitting (`logical_statements`, `normalize_function_body_newlines`) lives here too. Owns the string-level `\` commands and `.qpl.cfg`/`log` as real `Stmt` variants (`Stmt::System`, `Stmt::Cfg`, `Stmt::Log`) rather than leaving them to `repl.rs` string-matching |
+| `ast` | AST types. `Stmt` (assignment / bare expr / `Log`/`Cfg`/`System`), `TableExpr` (`Select` vs. `BuiltIn`), `SelectStmt` (unified select/update/delete via `update`/`delete` flags), `Expr`. `Value` includes `Table(DataFrame)` and `Lazy(LazyFrame)` (there's no separate table-shaped binding map anymore) and `Closure(Arc<program::Closure>)` |
 | `builtins` | `BuiltIn` enum — non-select table operations: `cols`, `sink`, `sort`, `distinct`, `limit`, `drop`, `lazy`, `collect` |
-| `compiler` | AST → `Vec<Instruction>`. Stack-machine codegen; `compile_select` is the core |
-| `opcodes` | `Instruction` enum + `disassemble_instructions` (the `\d` REPL command). `Display` impls are the disassembly format |
-| `enums` | `PolarsFrameExpr` / `PolarsStackArg` — thin wrappers over Polars ops (join type, filter, sort, distinct, limit, drop) referenced from instructions |
-| `vm` | executes instructions against a `StackObj` stack, building a Polars `LazyFrame`; holds all interpreter state |
-| `repl` | REPL loop, script runner (`logical_statements` folds indented continuation lines into one statement; the interactive loop instead uses `wants_more` — brackets/trailing-comma/parse-cut-off — to decide whether to keep reading), demo tables, result formatting. Also home to the string-level features that never reach the VM: `\` system commands (`\d` disassemble, `\l <path>` run a script, `\1 <path>` stdout log) and the `log` / `1` stdout-write (`parser::parse_expr_seq` parses its space-separated args, each rendered via `eval_scalar` and concatenated). All printing goes through `Vm::emit`, which mirrors to the stdout log |
-| `native` | built-in (native) functions — a `name → Builtin { arity, call }` map built once in `Vm::new`; resolved through `Vm::lookup` exactly like a user function (`Lookup::Builtin`), except the name can never be bound over. Adding one needs no lexer/parser/compiler change |
+| `compiler` | AST → `Program`. `compile`/`compile_stmt` (single statement) and `compile_program`/`CompileCtx` (whole file: `Script` mode prints each statement, `Result` mode leaves only the last statement's value on the stack) share `compile_tbl_expr`/`compile_value_expr` for the actual codegen. Also does compile-time `\i` namespace qualification (`qualify_top_level`/`collect_ns_names`) and `\l`/`\i` cycle detection (`CompileCtx::including`) |
+| `program` | `Program` (`code`/`operands`/`lines`), `Op` (the one-byte opcode enum, stable discriminants — see "Invariants" below), `Operand` (everything `Op::Push` can push: `Name`, `Count`, `Target{ip,cp}`, `BinOp`, `Verb`, `Native`, `Sort`, `Cast`, `Window`, `Func`, `Text`, `Program`, …), `Closure`/`FuncProto`, `WindowFn`/`WindowSpec`, the disassembler (`\d`'s output), and `Program::to_bytes`/`from_bytes` — the `.qplc` bytecode-file format (`qpl -C`/`qpl script.qplc`, see the "Compiled artifacts" subsection below) |
+| `codec` | Ungated (not `ipc`-gated): the lossless `ast::Value` binary codec (`encode_value`/`decode_value`, plus the shared `Reader` cursor) used by both `.qplc` operand encoding (`program.rs`) and the IPC wire format (`ipc.rs`) |
+| `ops` | Type-dispatched semantics the opcode dispatch loop delegates to, so `vm.rs`'s `match` arms stay thin: scalar/vector/temporal binops and casts, verb application, `like`, natives that don't need a native-function slot to themselves (`til`, `enlist`, roll, `zip`, `log`, `hopen`/`whopen`/`await`, `dispatch` — `call_by_name` is the shadowable-by-name dispatch point) |
+| `vm` | `Vm` (the single evaluator), `Slot` (stack entries), `CallFrame`-equivalent (`Slot::Call`), the `Op` decode/dispatch loop (`Vm::run_compiled`) — each arm small, delegating to `ops.rs`. `run_vm` (single-statement helper) and `EvalResult` also live here |
+| `native` | Built-in (native) functions — a `name → Builtin` map built once in `Vm::new`, resolved through `Vm::lookup` exactly like a user function, except a builtin name can never be bound over. `NativeId` (`Enlist`/`Roll`/`Cfg`/…) is for the handful of primitives the compiler references *by id* instead of by name, so they can't be shadowed at all. Adding a name-resolved native needs no lexer/parser/compiler change |
 | `vm_config` | `VmConfig` — session knobs set by `.qpl.cfg key=value` (`maxcol`, `maxrow`, `tblwidth`, `strlen`, `round_type`, `useqepoch`); a new knob is a field + a `VmConfig::set` arm and nothing else |
 | `errors` | `QplError` (Lex/Parse/Compile/Runtime variants) — the single error type threaded everywhere |
-| `wasm` | `wasm` feature only (`#[cfg(feature = "wasm")] mod wasm;` in `lib.rs`). `Repl` (a `Vm` behind `eval(line)`, driven by `repl::eval_capture` — same `run_line` the terminal REPL uses, with output captured instead of printed) and `qplLangConfig()` (Monaco tokenizer/config/completions, built at compile time from `tools/vscode/`'s JSON). Builds only against a patched Polars (stock 0.55.2 doesn't compile for `wasm32-unknown-unknown`) — [`tools/wasm/README.md`](tools/wasm/README.md) has the build steps and the patch |
-| `interrupt` | Ctrl-C flag (`Interrupt`, an `Arc` of two atomics on `Vm`). The `cli` handler in `main.rs` sets it; the interpreter polls `vm.interrupt.check()` (each `while` iteration, function entry, `exec_stmt`, around Polars `collect`s, IPC waits) and returns `QplError::Interrupted`. Each top-level statement runs under `interrupt.statement()` (in `repl::run_line`) |
+| `repl` | The REPL loop, `run_script` (parse_program → compile_program → run_compiled for a whole file, aborting before any statement runs on a parse/compile error anywhere in it — including inside a `\l`/`\i` target; also runs a `.qplc` file straight from bytes, sniffed by magic number), `compile_script` (source → `Program`, no run — `qpl -C`), `run_command` (`qpl -c`), demo tables, result formatting. `wants_more` (interactive-loop-only: brackets/trailing-comma/parse-cut-off) decides whether to keep reading a half-typed statement. All printing goes through `Vm::emit`, which mirrors to the stdout log. `\port` (the IPC listener) is REPL-loop-only; everything else a submitted line can be goes through the same `run_source`/`eval_for_dispatch` path REPL, IPC and script-running share |
+| `wasm` | `wasm` feature only (`#[cfg(feature = "wasm")] mod wasm;` in `lib.rs`). `Repl` (a `Vm` behind `eval(line)`, driven by `repl::eval_capture` — same path the terminal REPL uses, with output captured instead of printed) and `qplLangConfig()` (Monaco tokenizer/config/completions, built at compile time from `tools/vscode/`'s JSON). Builds only against a patched Polars (stock 0.55.2 doesn't compile for `wasm32-unknown-unknown`) — [`tools/wasm/README.md`](tools/wasm/README.md) has the build steps and the patch |
+| `interrupt` | Ctrl-C flag (`Interrupt`, an `Arc` of two atomics on `Vm`). The `cli` handler in `main.rs` sets it; the interpreter polls `vm.interrupt.check()` (each backward `JUMP`, `CALL`, around Polars `collect`s, IPC waits) and returns `QplError::Interrupted`. One `interrupt.statement()` guard covers a whole `run_source` call (a full script or one REPL line), however many statements it contains |
 | `ipc` | `ipc` feature only (`#[cfg(feature = "ipc")]`, `mod ipc;` in `main.rs` is itself gated). Client (`hopen`/`dispatch`/`async dispatch`/`await`) and server (`\port`) over a plain `zeromq` REQ/REP pair — see the IPC subsection below |
 
 ### VM state and evaluation model
 
-`Vm` (in `vm.rs`) holds the binding maps that persist for the session:
+`Vm` (in `vm.rs`) holds exactly one binding map plus a set of registers —
+there is no `tables`/`lazy_frames`/`functions` split and no `scopes` stack:
 
-- `tables: HashMap<String, DataFrame>` — materialised named tables
-- `lazy_frames: HashMap<String, LazyFrame>` — stored **query plans** from `lazy` bindings; nothing runs until `collect` or `sink`
-- `globals: HashMap<String, Value>` — scalar variables
-- `functions: HashMap<String, Function>` — user functions (`name: {[..] ..}`)
-- `builtins: HashMap<String, Builtin>` — native functions from `native.rs`, built once in `Vm::new` and never mutated; a builtin name cannot be bound over
+- `globals: HashMap<String, ast::Value>` — every session-level binding:
+  scalars, vectors, `Value::Table` (an eager binding), `Value::Lazy` (a
+  `lazy select ...` plan), `Value::Closure` (a user function). A namespaced
+  name (`.lib.x`) is just a `globals` key with dots in it — there's no
+  separate namespace map.
+- `builtins: HashMap<String, Builtin>` — native functions from `native.rs`,
+  built once in `Vm::new` and never mutated; a builtin name cannot be bound
+  over.
+- Registers: `prog: Arc<Program>` (the program currently executing), `ip`
+  (instruction pointer into `prog.code`), `cp` (operand-stream cursor into
+  `prog.operands`, advanced only by `Op::Push`), `fp: Option<usize>` (index
+  into `stack` of the innermost `Slot::Call` frame), `call_depth` (count of
+  live `Slot::Call` frames, checked against `MAX_CALL_DEPTH = 128`).
+- `stack: Vec<Slot>` — everything else. `Slot` variants: `Expr` (a Polars
+  column expression, query context), `Frame { lf, lazy }` (a table being
+  built — laziness travels with the frame value itself: reading a
+  `Value::Lazy` binding or `Op::Lazy` sets `lazy: true`, `Op::Collect`/`cols`
+  clears it), `Scalar(ast::Value)`, `List(Vec<Expr>)` (a projection/key/
+  predicate list under construction), `Operand(Operand)` (a value just
+  pushed by `Op::Push` for the next opcode to consume), and `Call` (a
+  function activation: return `(prog, ip, cp, fp)`, locals, return mode).
 
-`Vm::lookup` searches all five and returns a `Lookup` discriminating them; a
-zero-param function or builtin resolves *by being called* even when named
-bare (`resolve::call_niladic`), which is all `.qpl.ts` (and any user `{[] ..}`)
-is. `scopes: Vec<Scope>` is the call stack — only the innermost frame is
-searched, so scoping is lexical. `import_ns` (top level) / `Scope::current_ns`
-(inside a call) is the active `\i` namespace: a bare top-level bind lands
-under it, and a bare lookup tries it before the session globals.
+`CALL`/`RET` push/pop `Slot::Call` frames on the same stack instead of
+recursing in Rust: `CALL` on a closure does an arity/depth/interrupt check,
+pushes a `Slot::Call` with the args bound into its `locals`, and jumps to the
+closure's entry point (switching `prog` if the closure belongs to a
+different `Program`); `RET` pops the result, truncates the stack back to
+`fp`, restores the caller's registers from the frame, and pushes the result.
+Scoping stays lexical: a bare-name lookup (`Vm::lookup`) searches only the
+innermost call frame's `locals`, then `globals` — never an enclosing caller's
+frame. A jump target (`while`, `?[..]`, a closure's entry point, a call's
+return address) is itself an operand, `Operand::Target { ip, cp }` — `JUMP`
+sets both registers, so a loop body re-reads its own operands each time
+around and a skipped branch skips its operands too.
 
-(plus `stdout_log: Option<File>` — the `\1` stdout mirror —
-`capture: Option<String>` — when set, `Vm::emit` appends here instead of
-writing to stdout, which is how the wasm `Repl` collects a statement's output —
-and `config: VmConfig`, the `.qpl.cfg` knobs; none of the three is query state.)
+`Vm::run_compiled(Arc<Program>)` is the single decode/dispatch loop (backing
+both `Vm::eval`, used by `run_vm`/the REPL/scripts, and the `\l`/`\i`
+natives' nested sub-program runs); `prog`/`ip`/`cp` are saved and restored
+around a nested run so it composes freely with an already-active call. A
+top-level statement's result reduces to `EvalResult`: `Table(DataFrame)`,
+`Scalar(Value)`, `Lazy(String)` (an explained plan), or `Stored` (an
+assignment — nothing to print).
 
-The VM executes instructions by pushing/popping a `StackObj` stack (`Expr`,
-`Frame`, `Scalar`, `PolarsArg`). Everything table-shaped is assembled as a
-Polars `LazyFrame` and only `.collect()`-ed at the end unless the statement is
-lazy. `run_vm` returns an `EvalResult`: `Table(DataFrame)`, `Scalar(Value)`,
-`Lazy(String)` (an explained plan, printed instead of a table), or `Stored`
-(an assignment — nothing to print).
+Namespaces (`\i`) are resolved at **compile time**, not by any runtime
+lookup order: `compiler::compile_program` pre-scans a `\i`-imported file's
+top-level assignment names and rewrites every bare `STORE` target and every
+bare reference to one of those names (anywhere in the file, including inside
+function bodies, but not a param/local shadowing it) to its namespaced form
+before compiling it. This means a bare name that the file binds at top level
+*always* refers to the import's own binding, even in a statement that runs
+before that binding's own statement does — a library can no longer read a
+session-level `t` and rebind it with `t: select from t where ...`; it reads
+its own (as-yet-unbound) `.lib.t` and fails with an undefined-name error
+instead. The runtime `\i` native still does today's transaction: snapshot
+`globals`, drop any existing `.lib.*` keys, run the embedded program, restore
+the snapshot on error.
 
-`while[..]` and `noop` are value-context `Expr` variants tree-walked in
-`resolve::eval_value` like `Case` (no instruction, no compiler lowering);
-`EvalValue::Noop` is what they yield, and `Instruction::Eval` pushes nothing for
-it, which is why `x: noop` fails at `Assign` (empty stack) with "cannot assign a
-no-op expression.". `exec_stmt` runs one statement in the current scope and is
-shared by function bodies and `while` bodies. `while` and `noop` are reserved
-words (`parser::RESERVED`); the conditional stays `?[..]` (atom condition: short-circuit; boolean-vector condition: `resolve::eval_case_vector`, elementwise via a Polars `when/then` with a length check), and functions stay
-pure (only plain assignment or a `while` body changes outer state).
+The virtual column `i` (row index) is compiled by inserting `Op::RowIndex`
+right after any table source a query references `i` from — a compile-time
+scan of the query, not a runtime flag.
 
-**Scalars are evaluated in Rust, not Polars.** `Vm::eval_scalar` folds
-literal/global-only expressions to a `Value`; at query time those values are
-injected as Polars `lit(...)` so `threshold: 150` composes with column
-expressions in later queries.
+### Invariants
 
-The virtual column `i` (row index) is `PushIColRef` / `Expr::IColRef`, aliased
-to `x` in output per q convention.
+This design trades the old "keep the VM small" rule (still worth following
+in spirit — don't add surface area you don't need) for a stricter set of
+constraints that keep the bytecode itself simple to reason about and safe to
+extend:
 
-### IPC (`ipc` feature)
+- **One evaluator.** Everything — scalar maths, calls, closures, `while`,
+  `?[..]`, lists, IPC — compiles to bytecode and runs through
+  `Vm::run_compiled`'s single dispatch loop. There is no tree-walking
+  fallback anywhere in the codebase.
+- **Every instruction is exactly one byte.** `Op` is `#[repr(u8)]`; no
+  opcode carries an inline operand.
+- **`Op::Push` is the only reader of the operand stream.** Every other
+  opcode takes all of its inputs from `stack`. The compiler emits operands
+  in exactly the order the corresponding `Push`es execute on a straight-line
+  path; a jump changes both `ip` and `cp` together so a re-executed region
+  re-reads its own operands.
+- **Opcode discriminants are stable.** Never renumber an existing `Op`
+  variant — retire it (leave a past-tense comment noting what used to be
+  there) instead of reusing its number; `program.rs` has a test pinning a
+  handful of byte values specifically to catch accidental renumbering.
+- **No execution state outside the stack, `globals`, and the registers.**
+  No per-statement locals living directly on `Vm`, no separate table/lazy
+  binding maps, no call-stack `Vec` of scopes.
 
-On by default (drop it with `--no-default-features`); `zeromq`/`tokio` are
-`optional` deps in `Cargo.toml`, pulled in only by `ipc = ["dep:tokio", "dep:zeromq"]`
-and enabled by default via `default = ["ipc"]`. This is the one place the codebase
-is not fully synchronous, and it's deliberately confined: `Vm` itself is never
-shared across threads (the one exception is `interrupt`, an `Arc` of atomics that only the Ctrl-C handler touches; no `Mutex` anywhere) — every connection's
-worker thread (client) and the listener thread (server, `\port`) only ever
-exchange owned `String`/`Vec<u8>` values over `std::sync::mpsc`, and the *only*
-thread that ever calls into `resolve::eval_value`/`vm::run_vm` is the main
-REPL thread, exactly as if the request had been typed locally. See `ipc.rs`'s
-module doc for the full design.
+**Adding a new opcode**: add an `Op` variant (append — don't renumber),
+teach the disassembler (`Op`'s `Display`/short-form, `program.rs`) and the
+dispatch loop (`vm.rs`'s big `match`, delegating any nontrivial semantics to
+`ops.rs`) about it, and emit it from the compiler. Prefer parameterising an
+existing opcode via a new `Operand` variant over adding a new opcode, and
+prefer expressing a new language feature in terms of existing opcodes over
+either. Opcode count is deliberately kept well under the 256 a single byte
+allows.
 
-`hopen`/`await` needed **zero** parser/lexer changes — they ride the existing
-generic bareword-call grammar (`sum price`, `not sym`), landing as new
-`Expr::Call` arms in `resolve::eval_value` (which has `&mut Vm`; `vm::eval_scalar`
-does not, and can't be the integration point for anything with side effects).
-`dispatch`/`async dispatch` needed one new `Expr::Dispatch` variant (value-context
-only, tree-walked like `Expr::Table` — nothing for the compiler to lower) plus a
-parser addition that captures the rest of the statement as raw text via
-`render_tokens` (an inverse-lexer in `parser.rs`), since the payload can be a
-whole table expression, not a scalar arg. `ast::Value` gained two variants,
-`Handle`/`Future`, for connection/pending-response handles — not `#[cfg]`-gated
-themselves (that would force every exhaustive `match` over `Value` elsewhere to
-grow a `#[cfg]` arm too), only the code that produces them is.
+**Adding a new native function**: add an entry to `native::builtins()` (or,
+if it must never be shadowable and the compiler can reference it directly
+without a name lookup, a `NativeId` variant) — no lexer/parser/compiler
+change needed for a name-resolved native.
 
-The wire response mirrors `vm::EvalResult` (`ipc::encode_result`/`decode_response`):
-a table serialises via the existing Parquet writer/reader (already linked for
-`load`/`sink`, no new Polars feature), a scalar via a small hand-rolled
-tag+payload encoding for every `ast::Value` variant (no serde dependency).
+**Adding a new statement form** (a new `\` command, a new top-level
+directive): add an `ast::Stmt` variant, parse it in `parser::parse_program`'s
+top-level loop, lower it in `compiler::compile_program_stmt` (typically to a
+native call), and implement the native in `vm.rs`/`ops.rs`.
 
-## Making language changes
-
-**Keep the VM small.** The single most important constraint on this codebase is
-avoiding bloat in `vm.rs` (and the instruction set it executes). Before adding a
-new `Instruction` or a new match arm in the VM, exhaust the alternatives: can an
-existing instruction be parameterised, can the work be done in the compiler or
-parser instead, can it reuse an existing `PolarsFrameExpr` / `BuiltIn` /
-`StackObj` path? A change should touch **only what is absolutely necessary** and
-reuse as much of the existing machinery as possible. New VM surface area is a
-last resort, not a default.
-
-A new operator or keyword usually touches the chain end to end: `lexer` (token),
-`parser` (grammar → AST), `ast`/`builtins` (new node if needed), `compiler` (emit
-instructions), `opcodes` (new `Instruction` + `Display`), `vm` (execute it) —
-but prefer to stop as early in that chain as you can.
-Add `#[cfg(test)]` cases in each file you touch and, where it's a user-visible
-feature, a runnable snippet under `examples/` and a note in `README.md`.
+Add `#[cfg(test)]` cases in each file you touch and, where it's a
+user-visible feature, a runnable snippet under `examples/` and a note in
+`README.md`.
 
 **Every user-visible language change (new keyword, operator, or builtin) must
 also update [`tools/vscode/`](tools/vscode/)** — this is not optional cleanup,
@@ -203,3 +252,71 @@ do it in the same change:
 
 Don't touch `CHANGELOG.md`/version bumps for this — those are a separate,
 maintainer-driven release step, not tied to individual language changes.
+
+### IPC (`ipc` feature)
+
+On by default (drop it with `--no-default-features`); `zeromq`/`tokio` are
+`optional` deps in `Cargo.toml`, pulled in only by `ipc = ["dep:tokio", "dep:zeromq"]`
+and enabled by default via `default = ["ipc"]`. This is the one place the codebase
+is not fully synchronous, and it's deliberately confined: `Vm` itself is never
+shared across threads (the one exception is `interrupt`, an `Arc` of atomics that only the Ctrl-C handler touches; no `Mutex` anywhere) — every connection's
+worker thread (client) and the listener thread (server, `\port`) only ever
+exchange owned `String`/`Vec<u8>` values over `std::sync::mpsc`, and the *only*
+thread that ever calls into `Vm::run_compiled`/`vm::run_vm` is the main
+REPL thread, exactly as if the request had been typed locally. See `ipc.rs`'s
+module doc for the full design.
+
+`hopen`/`await`/`dispatch` are ordinary natives and an opcode, not special
+parser productions: `hopen`/`whopen`/`await` are resolved by name through
+`ops::call_by_name` (the same fallback `til`/`log` go through once neither a
+user closure nor a builtin-table entry matches), and `<conn> [async] dispatch
+<cmd>` compiles to `Op::Dispatch`, which pops the connection, the payload
+text and the async flag off the stack. `ast::Value` has two variants,
+`Handle`/`Future`, for connection/pending-response handles — not
+`#[cfg]`-gated themselves (that would force every exhaustive `match` over
+`Value` elsewhere to grow a `#[cfg]` arm too), only the code that produces
+them is.
+
+The wire response mirrors `vm::EvalResult` (`ipc::encode_result`/`decode_response`):
+a table serialises via the existing Parquet writer/reader (already linked for
+`load`/`sink`, no new Polars feature), a scalar via the shared `codec::encode_value`/
+`decode_value` tag+payload encoding for every `ast::Value` variant (no serde
+dependency) — see "Compiled artifacts" below for the other consumer of that
+codec. The server side (`\port`, `repl::eval_for_dispatch`) compiles each
+incoming request as a `Result`-mode whole program and rejects `Stmt::System`
+(a `\` command) outright — those stay REPL-loop-only; `Cfg` and `Log`
+statements are still allowed remotely.
+
+### Compiled artifacts (`qpl -C` / `qpl -c`, `.qplc`)
+
+`qpl -C script.qpl [-o out.qplc]` compiles a script to a `.qplc` file and
+exits without running it (`repl::compile_script` + `Program::to_bytes`,
+written via a temp file + rename so a failed compile never leaves a partial
+artifact); `qpl script.qplc` (or any file whose first bytes are the `"QPLC"`
+magic — `repl::run_script` sniffs this, not the extension) runs it directly
+via `Program::from_bytes` + `Vm::run_compiled`, with no lexing, parsing or
+compiling at all. `\l`/`\i` targets are already embedded sub-`Program`s
+(Phase 5), so a `.qplc` never needs its original source files — it's a fully
+self-contained artifact, not a security boundary, exactly equivalent to
+running the source. `qpl -c '<command>'` runs a short ad hoc command and
+exits (`repl::run_command`, source text through the same
+parse→compile→run path as a script, reported unprefixed like `<main>` REPL
+input); `-C`, `-c`, `-i`, and a `file` argument all conflict with each other
+in `main.rs`'s clap `Cli`.
+
+`Program::to_bytes`/`from_bytes` (`program.rs`) serialise `code`/`operands`/
+`lines` (recursing into an embedded `Operand::Program`), gated by a `u16
+format_version` (currently 1). **Any change to `Op`'s discriminants, to
+`Operand`'s on-disk tags, or to `codec::ValueTag`'s discriminants must bump
+`FORMAT_VERSION`** — a stale `.qplc` then fails with a clean "compiled with
+an incompatible qpl" error instead of misdecoding. `from_bytes` never panics:
+a truncated file, an unknown opcode/operand/value tag, an out-of-range jump
+target, or trailing garbage all come back as `Err` (see `program.rs`'s
+`.qplc` serialisation tests). The value codec itself (`codec::encode_value`/
+`decode_value`) is lossless for everything that can appear in an
+`Operand::Value` — every scalar and vector `Value` variant, nulls included
+(a per-element validity flag, not the lossy `"<unrepresentable>"`/
+null-dropping the pre-Phase-7 IPC-only encoder used); `Table`/`Lazy`/
+`Closure`/`Handle`/`Future` have no operand encoding (a closure literal is
+always `Operand::Func`, never a baked-in runtime closure) and `to_bytes`
+errors rather than writing garbage if one somehow reached an operand.

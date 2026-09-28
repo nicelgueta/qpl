@@ -22,6 +22,7 @@ use polars_arrow::io::ipc::read::{StreamReader, StreamState, read_stream_metadat
 use polars_arrow::io::ipc::write::{StreamWriter, WriteOptions};
 use std::io::Cursor;
 
+use crate::ast;
 use crate::errors::QplError;
 use crate::vm::Vm;
 
@@ -101,32 +102,31 @@ pub fn register_table(vm: &mut Vm, name: &str, ipc: &[u8]) -> Result<(), QplErro
         )));
     }
     let df = ipc_to_df(ipc)?;
-    vm.bind_table(name.to_string(), df)
+    vm.bind(name.to_string(), ast::Value::Table(df))
 }
 
 /// Number of rows in the table (or lazy frame) bound to `name`, the way a host
 /// UI needs it for paging. Not the language's `count`, which counts the non-null
 /// values of a table's first column.
 pub fn row_count(vm: &Vm, name: &str) -> Result<usize, QplError> {
-    if let Some(df) = vm.tables.get(name) {
-        return Ok(df.height());
+    match vm.globals.get(name) {
+        Some(ast::Value::Table(df)) => Ok(df.height()),
+        Some(ast::Value::Lazy(lf)) => {
+            let n = (**lf)
+                .clone()
+                .select([len().alias("n")])
+                .collect()
+                .map_err(rt)?;
+            n.column("n")
+                .map_err(rt)?
+                .u32()
+                .map_err(rt)?
+                .get(0)
+                .map(|n| n as usize)
+                .ok_or_else(|| QplError::Runtime(format!("could not count the rows of '{name}'")))
+        }
+        _ => Err(QplError::Runtime(format!("unknown table '{name}'"))),
     }
-    if let Some(lf) = vm.lazy_frames.get(name) {
-        let n = lf
-            .clone()
-            .select([len().alias("n")])
-            .collect()
-            .map_err(rt)?;
-        return n
-            .column("n")
-            .map_err(rt)?
-            .u32()
-            .map_err(rt)?
-            .get(0)
-            .map(|n| n as usize)
-            .ok_or_else(|| QplError::Runtime(format!("could not count the rows of '{name}'")));
-    }
-    Err(QplError::Runtime(format!("unknown table '{name}'")))
 }
 
 #[cfg(test)]
@@ -234,6 +234,6 @@ mod tests {
         let mut vm = Vm::new();
         assert!(register_table(&mut vm, "2bad", &df_to_ipc(&sample()).unwrap()).is_err());
         assert!(register_table(&mut vm, "ok", b"junk").is_err());
-        assert!(vm.tables.is_empty());
+        assert!(vm.globals.is_empty());
     }
 }

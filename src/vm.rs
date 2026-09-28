@@ -1,23 +1,24 @@
-use crate::ast::{self, TableSource, Value};
+use crate::ast::{self, Value};
 use crate::compiler::compile;
-use crate::enums::{PolarsFrameExpr, PolarsStackArg, WindowFn};
 use crate::errors::QplError;
 use crate::helpers::rename_columns_snake_case;
 use crate::lexer::tokenise;
 use crate::native::Builtin;
-use crate::opcodes::Instruction;
+use crate::ops;
 use crate::parser::parse;
-use crate::resolve;
+use crate::program::{Closure, Op, Operand, Program, WindowFn};
 use crate::temporal;
 use crate::vm_config::VmConfig;
 #[cfg(not(target_family = "wasm"))]
 use polars::io::utils::sync_on_close::SyncOnCloseType;
 use polars::prelude::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub struct Vm {
-    pub tables: HashMap<String, DataFrame>,
-    pub lazy_frames: HashMap<String, LazyFrame>,
+    /// The single session-level binding map: scalars, vectors, closures, and
+    /// table-shaped values too:
+    /// `Value::Table` for an eager binding, `Value::Lazy` for `lazy select ...`.
     pub globals: HashMap<String, ast::Value>,
     /// Native functions (`.qpl.dt`, ...), populated once in [`Vm::new`] and
     /// never mutated afterwards — resolved by [`Vm::lookup`] like any other
@@ -25,19 +26,42 @@ pub struct Vm {
     /// below). A *user* function isn't a binding kind at all: it's a
     /// `Value::Closure` living in `globals` like any other value. See
     /// [`crate::native`].
-    pub builtins: HashMap<String, Builtin>,
-    /// The active user-function call stack. Empty at the top level. Only the
-    /// *innermost* frame is ever searched (see [`Vm::lookup`]) — a call sees its
-    /// own params/locals and the session globals, never an enclosing caller's
-    /// frame, so this is lexical (not dynamic) scoping despite being a stack.
-    pub scopes: Vec<Scope>,
-    /// The namespace of the `\i` import whose script is currently running
-    /// (e.g. `.utils`), if any — the top-level counterpart of
-    /// [`Scope::current_ns`]. While set, a bare top-level binding lands under
-    /// it (`x: 1` binds `.utils.x`), so an import can never overwrite a
-    /// session name, and a bare lookup tries it first. Saved and restored by
-    /// `repl::run_script_imported`, so nested imports each get their own.
-    pub import_ns: Option<String>,
+    pub(crate) builtins: HashMap<String, Builtin>,
+    /// The VM's operand stack — the only
+    /// execution state that survives across nested/re-entrant runs (see
+    /// [`Vm::run_compiled`]). Holds ordinary computation values *and*
+    /// [`Slot::Call`] activation records, interleaved with whatever a call was
+    /// in the middle of computing when it made a nested call.
+    pub(crate) stack: Vec<Slot>,
+    /// The `Program` currently executing. Switched by `CALL`/`RET` (to the
+    /// callee's own program and back) and saved/restored around a re-entrant
+    /// [`Vm::run_compiled`].
+    pub(crate) prog: Arc<Program>,
+    /// Instruction pointer into `prog.code`.
+    pub(crate) ip: usize,
+    /// Operand-stream cursor into `prog.operands`, consumed only by `PUSH`.
+    pub(crate) cp: usize,
+    /// Index into `stack` of the innermost [`Slot::Call`] frame, or `None` at
+    /// the top level. Only this frame's `locals` are ever searched (see
+    /// [`Vm::lookup`]) — a call sees its own params/locals and the session
+    /// globals, never an enclosing caller's frame, so this is lexical (not
+    /// dynamic) scoping despite being implemented as a stack of frames.
+    pub(crate) fp: Option<usize>,
+    /// Count of [`Slot::Call`] frames currently on `stack` — an O(1) stand-in
+    /// for scanning the stack, checked against [`MAX_CALL_DEPTH`] by
+    /// [`Vm::begin_closure_call`].
+    pub(crate) call_depth: usize,
+    /// The site of the first error to escape a top-level [`Vm::run_compiled`]
+    /// call: the `Arc<Program>` that was
+    /// executing and the `ip` of the opcode that failed, captured by
+    /// [`Vm::run_loop`] before any register is restored. Whichever `Program`
+    /// was live at the moment of failure carries the right `path`/`lines` for
+    /// the error — the main script, or (if the failure happened while running
+    /// an embedded `\l`/`\i` target, or inside a namespaced import's own
+    /// function) that target's own compiled `Program`. Consumed once by
+    /// [`Vm::take_error_site`] and translated to a `path:line:` prefix by
+    /// `repl::run_script`.
+    pub(crate) error_site: Option<(Arc<Program>, usize)>,
     /// When set (via the `\1 <path>` command), every line printed through
     /// [`Vm::emit`] is also appended here — kdb-style stdout redirection.
     pub stdout_log: Option<std::fs::File>,
@@ -83,105 +107,278 @@ pub struct Vm {
     pub request_mode: Option<crate::ipc::HandleMode>,
 }
 
-/// One user-function call frame: params and any names the body binds, isolated
-/// from every other frame. Mirrors the four top-level namespaces on [`Vm`] —
-/// the session globals are, in effect, frame zero at the bottom of the search.
-#[derive(Default)]
-pub struct Scope {
-    pub globals: HashMap<String, ast::Value>,
-    pub tables: HashMap<String, DataFrame>,
-    pub lazy_frames: HashMap<String, LazyFrame>,
-    /// The namespace this call is executing under (e.g. `.logging`), if any —
-    /// set by `apply_function` when the callee resolved to a namespaced name.
-    /// `\i`'s import only renames a script's top-level bindings, it doesn't
-    /// rewrite cross-references *inside* their bodies (`info`'s body still
-    /// calls plain `_log`, not `.logging._log`), so `Vm::lookup` tries a bare
-    /// name qualified by this before the session's own bindings — that's what
-    /// lets a namespaced function call an unqualified sibling from the same
-    /// import, without a same-named session binding hijacking it.
-    pub current_ns: Option<String>,
+/// One user-function call activation, pushed onto [`Vm::stack`] as
+/// [`Slot::Call`] by [`Vm::begin_closure_call`]. `locals` isolates a call's
+/// params/assignments from every other frame, and `ret_*` are the caller's
+/// registers, restored by `Op::Ret`.
+pub(crate) struct CallFrame {
+    pub ret_prog: Arc<Program>,
+    pub ret_ip: usize,
+    pub ret_cp: usize,
+    pub ret_fp: Option<usize>,
+    pub locals: HashMap<String, ast::Value>,
 }
 
 /// The kind of binding [`Vm::lookup`] found for a name.
 pub(crate) enum Lookup<'a> {
-    Global(&'a ast::Value),
-    LazyFrame(&'a LazyFrame),
-    Table(&'a DataFrame),
+    Value(&'a ast::Value),
     Builtin(&'a Builtin),
 }
 
 /// Hard cap on user-function call nesting (a clearer error than a stack
-/// overflow); checked against `Vm::scopes.len()`. A function call recurses
-/// through the native Rust call stack (`apply_function` -> `eval` ->
-/// `eval_value` -> ...), so this is calibrated against the ~8 MiB default main
-/// thread stack the REPL runs on — a much smaller stack (a worker thread, or a
-/// future WASM build) could still overflow before reaching this many levels.
+/// overflow); checked against `Vm::call_depth`. A call (`CALL`/`RET`) never recurses
+/// through the native Rust call stack — it only pushes a `Slot::Call`
+/// onto `Vm::stack` and jumps — so this cap is purely a language-level
+/// guard against runaway recursion, not a Rust-stack-overflow avoidance
+/// measure.
 pub(crate) const MAX_CALL_DEPTH: usize = 128;
 
-enum StackObj {
+/// The VM's operand stack slot. Everything
+/// `run_compiled` needs while executing a statement lives here — there is no
+/// longer a separate `frame` / `keys` / `proj` / `lazy_mode` local: a table
+/// being built is `Frame`, a `by`/projection list under construction is
+/// `List`, and `Noop` is an explicit "nothing" result (`noop` / `while` /
+/// a niladic call that returns nothing) rather than "nothing was pushed".
+///
+/// `LazyFrame` is boxed inside `Frame` for the same reason `ast::Value::Lazy`
+/// boxes it: unboxed it's a large struct (its whole optimizer/plan state),
+/// and every `Slot` variant sits inline in `Vm::stack`, so leaving it
+/// unboxed would balloon every entry on that stack to its size — enough to
+/// risk the same stack overflow `ast::Value::Lazy` was boxed to avoid,
+/// especially wherever a `Vm::run_compiled` sub-program still nests through
+/// the native Rust call stack (`\l`/`\i`'s embedded `Operand::Program`,
+/// `native_load_script`/`native_import_script`).
+pub(crate) enum Slot {
     Expr(Expr),
-    Frame(LazyFrame),
+    /// A table being built. Laziness travels with the frame itself — reading
+    /// a `Value::Lazy` binding, or `Op::Lazy`, sets `lazy: true`; `Op::Collect`
+    /// (and `cols`) sets it back to `false`.
+    Frame {
+        lf: Box<LazyFrame>,
+        lazy: bool,
+    },
     Scalar(ast::Value),
-    PolarsArg(PolarsStackArg),
+    /// A projection / key / predicate list under construction (`Op::List`),
+    /// popped whole by `Select` / `SelectBy` / `Join` / `Update`.
+    List(Vec<Expr>),
+    /// A payload just pushed by `Op::Push` for the very next opcode to
+    /// interpret (a name, count, spec, ...) — everything an `Operand` carries
+    /// except `Operand::Value`, which becomes `Slot::Scalar` directly (see
+    /// `Vm::run_compiled`'s `Op::Push` arm).
+    Operand(Operand),
+    /// A raw, already-typed Polars column produced by `Op::CastList` (a `zip`
+    /// column whose value carried a top-level cast) — kept as a `Column`
+    /// rather than round-tripped through `ast::Value` so a narrow width
+    /// (`i8`, categorical, …) survives into the assembled table. Transient:
+    /// only `Op::Zip` ever pops one.
+    Column(polars::prelude::Column),
+    /// The result of `noop`, a `while` statement, or any value-context
+    /// construct that yields nothing. `Store` of a `Noop` is the existing
+    /// "cannot assign a no-op expression." error; at the top level `Vm::eval`
+    /// reports it as `EvalResult::Stored`, same as an empty stack today.
+    Noop,
+    /// A user-function call activation —
+    /// see [`CallFrame`]. Pushed by `Vm::begin_closure_call`, popped by
+    /// `Op::Ret`. Never appears as an opcode's *input*; it's addressed
+    /// directly by index (`Vm::fp`), not popped through the usual stack
+    /// helpers.
+    Call(CallFrame),
 }
 
-impl StackObj {
-    fn unwrap_expr(&self) -> Result<Expr, QplError> {
+impl Slot {
+    pub(crate) fn unwrap_frame(self) -> Result<(LazyFrame, bool), QplError> {
         match self {
-            StackObj::Expr(e) => Ok(e.clone()),
-            _ => Err(QplError::Runtime(format!(
-                "Expected Expr on stack, got {}",
-                self.type_name()
-            ))),
-        }
-    }
-    fn unwrap_frame(&self) -> Result<LazyFrame, QplError> {
-        match self {
-            StackObj::Frame(f) => Ok(f.clone()),
-            _ => Err(QplError::Runtime(format!(
+            Slot::Frame { lf, lazy } => Ok((*lf, lazy)),
+            other => Err(QplError::Runtime(format!(
                 "Expected Frame on stack, got {}",
-                self.type_name()
+                other.type_name()
             ))),
         }
     }
-    fn unwrap_scalar(&self) -> Result<ast::Value, QplError> {
+    pub(crate) fn unwrap_scalar(self) -> Result<ast::Value, QplError> {
         match self {
-            StackObj::Scalar(s) => Ok(s.clone()),
-            _ => Err(QplError::Runtime(format!(
+            Slot::Scalar(s) => Ok(s),
+            other => Err(QplError::Runtime(format!(
                 "Expected Scalar on stack, got {}",
-                self.type_name()
+                other.type_name()
             ))),
         }
     }
-    fn unwrap_polars_arg(&self) -> Result<PolarsStackArg, QplError> {
+    pub(crate) fn unwrap_list(self) -> Result<Vec<Expr>, QplError> {
         match self {
-            StackObj::PolarsArg(a) => Ok(a.clone()),
-            _ => Err(QplError::Runtime(format!(
-                "Expected PolarsArg on stack, got {}",
-                self.type_name()
+            Slot::List(l) => Ok(l),
+            other => Err(QplError::Runtime(format!(
+                "Expected List on stack, got {}",
+                other.type_name()
+            ))),
+        }
+    }
+    pub(crate) fn unwrap_operand(self) -> Result<Operand, QplError> {
+        match self {
+            Slot::Operand(o) => Ok(o),
+            other => Err(QplError::Runtime(format!(
+                "Expected an operand on stack, got {}",
+                other.type_name()
             ))),
         }
     }
 
-    fn type_name(&self) -> &'static str {
+    pub(crate) fn type_name(&self) -> &'static str {
         match self {
-            StackObj::Expr(_) => "Expr",
-            StackObj::Frame(_) => "Frame",
-            StackObj::Scalar(_) => "Scalar",
-            StackObj::PolarsArg(_) => "PolarsArg",
+            Slot::Expr(_) => "Expr",
+            Slot::Frame { .. } => "Frame",
+            Slot::Scalar(_) => "Scalar",
+            Slot::List(_) => "List",
+            Slot::Operand(_) => "Operand",
+            Slot::Column(_) => "Column",
+            Slot::Noop => "Noop",
+            Slot::Call(_) => "Call",
         }
+    }
+}
+
+/// Pop the top of the stack as a column expression: an `Expr` slot as-is, or
+/// a `Scalar` lifted with [`ast_val_to_expr`] (a literal `Op::Push`ed by
+/// `Operand::Value` — `PUSH` pushes it as a plain scalar since it doesn't
+/// know the context it will be used in; whichever opcode expects a column
+/// expression is responsible for lifting it). Anything else is a runtime
+/// error.
+fn pop_expr(stack: &mut Vec<Slot>) -> Result<Expr, QplError> {
+    slot_to_expr(pop1(stack)?)
+}
+
+/// The owned-`Slot` half of [`pop_expr`], for callers that already popped a
+/// batch of slots (e.g. `Op::Verb`'s `popn`) and need to convert each one.
+fn slot_to_expr(slot: Slot) -> Result<Expr, QplError> {
+    match slot {
+        Slot::Expr(e) => Ok(e),
+        Slot::Scalar(v) => ast_val_to_expr(v),
+        other => Err(QplError::Runtime(format!(
+            "Expected Expr on stack, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `BINOP`'s "not both `Scalar`" path: an `Expr` slot as-is, a `Scalar` lifted
+/// with [`ast_val_to_expr`] — same as [`slot_to_expr`], except a `Frame` /
+/// `Noop` operand gets the dedicated error
+/// text for a table / no-op used as a binop operand in value context.
+fn expr_for_binop(slot: Slot) -> Result<Expr, QplError> {
+    match slot {
+        Slot::Expr(e) => Ok(e),
+        Slot::Scalar(v) => ast_val_to_expr(v),
+        Slot::Frame { .. } => Err(QplError::Runtime(
+            "expected a scalar here, got a table".into(),
+        )),
+        Slot::Noop => Err(QplError::Runtime(
+            "cannot use a no-op expression as a value".into(),
+        )),
+        other => Err(QplError::Runtime(format!(
+            "Expected Expr on stack, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Pop the top of the stack, expecting an `Operand::Name`.
+fn pop_name(stack: &mut Vec<Slot>) -> Result<std::sync::Arc<str>, QplError> {
+    match pop1(stack)?.unwrap_operand()? {
+        Operand::Name(n) => Ok(n),
+        other => Err(QplError::Runtime(format!(
+            "Expected a Name operand, got {other:?}"
+        ))),
+    }
+}
+
+/// Pop the top of the stack, expecting an `Operand::Count`.
+fn pop_count(stack: &mut Vec<Slot>) -> Result<usize, QplError> {
+    match pop1(stack)?.unwrap_operand()? {
+        Operand::Count(n) => Ok(n as usize),
+        other => Err(QplError::Runtime(format!(
+            "Expected a Count operand, got {other:?}"
+        ))),
+    }
+}
+
+/// Pop the top of the stack, expecting an `Operand::Target`.
+fn pop_target(stack: &mut Vec<Slot>) -> Result<(u32, u32), QplError> {
+    match pop1(stack)?.unwrap_operand()? {
+        Operand::Target { ip, cp } => Ok((ip, cp)),
+        other => Err(QplError::Runtime(format!(
+            "Expected a Target operand, got {other:?}"
+        ))),
+    }
+}
+
+/// Pop the single expected `Str` argument of a statement-native (`.qpl.cfg`,
+/// `\1`, `\d`) — these are always compiled with exactly one `Operand::Value`
+/// argument, so this is an internal-consistency check (a "corrupt bytecode"
+/// message), not a user-facing arity error.
+fn expect_one_str(args: &mut Vec<Slot>, what: &str) -> Result<String, QplError> {
+    if args.len() != 1 {
+        return Err(QplError::Runtime(format!(
+            "corrupt bytecode: '{what}' expects exactly 1 argument, got {}",
+            args.len()
+        )));
+    }
+    match args.remove(0).unwrap_scalar()? {
+        Value::Str(s) => Ok(s),
+        other => Err(QplError::Runtime(format!(
+            "corrupt bytecode: '{what}' expected a string argument, got {other:?}"
+        ))),
+    }
+}
+
+/// Pop the single expected embedded-program argument of `\l`/`\i` —
+/// `Operand::Program`, pushed by `compiler::compile_system` and never
+/// resolved by name, so a mismatch here is also a "corrupt bytecode" error.
+fn expect_one_program(args: &mut Vec<Slot>, what: &str) -> Result<Arc<Program>, QplError> {
+    if args.is_empty() {
+        return Err(QplError::Runtime(format!(
+            "corrupt bytecode: '{what}' expects an embedded program argument"
+        )));
+    }
+    match args.remove(0) {
+        Slot::Operand(Operand::Program(p)) => Ok(p),
+        other => Err(QplError::Runtime(format!(
+            "corrupt bytecode: '{what}' expected an embedded program, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// The nearest `Frame` at or below the top of the stack — the dtype probe for
+/// a column-context cast (`` type$expr ``): while a select's projection is
+/// mid-construction, the frame it will run against sits somewhere below the
+/// expression currently on top, not necessarily immediately below it (e.g.
+/// while a `by` key list or an earlier projected column is also on the
+/// stack). Doesn't pop — the frame stays right where later frame ops expect it.
+fn nearest_frame(stack: &[Slot]) -> Option<&LazyFrame> {
+    stack.iter().rev().find_map(|s| match s {
+        Slot::Frame { lf, .. } => Some(lf.as_ref()),
+        _ => None,
+    })
+}
+
+impl Default for Vm {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl Vm {
     pub fn new() -> Self {
         Self {
-            tables: HashMap::new(),
-            lazy_frames: HashMap::new(),
             globals: HashMap::new(),
             builtins: crate::native::builtins(),
-            scopes: Vec::new(),
-            import_ns: None,
+            stack: Vec::new(),
+            prog: Arc::new(Program::default()),
+            ip: 0,
+            cp: 0,
+            fp: None,
+            call_depth: 0,
+            error_site: None,
             stdout_log: None,
             capture: None,
             #[cfg(feature = "wasm")]
@@ -232,127 +429,63 @@ impl Vm {
         Ok(())
     }
 
-    /// Push a fresh call frame (a user-function call). The caller is
-    /// responsible for popping it (`pop_scope`) on every exit path.
-    pub(crate) fn push_scope(&mut self) {
-        self.scopes.push(Scope::default());
+    /// The innermost active call frame, if any.
+    pub(crate) fn current_frame(&self) -> Option<&CallFrame> {
+        self.fp.map(|i| match &self.stack[i] {
+            Slot::Call(f) => f,
+            other => unreachable!(
+                "Vm::fp must always index a Slot::Call, got {}",
+                other.type_name()
+            ),
+        })
     }
 
-    /// Pop the innermost call frame, discarding whatever it bound.
-    pub(crate) fn pop_scope(&mut self) {
-        self.scopes.pop();
+    /// Mutable counterpart of [`Vm::current_frame`].
+    fn current_frame_mut(&mut self) -> Option<&mut CallFrame> {
+        match self.fp {
+            Some(i) => match &mut self.stack[i] {
+                Slot::Call(f) => Some(f),
+                _ => unreachable!("Vm::fp must always index a Slot::Call"),
+            },
+            None => None,
+        }
     }
 
-    /// Resolve `name`: the active call frame (if any) first, then the active
-    /// namespace (if any — see [`Vm::qualify`]), then the session globals.
-    /// Deliberately **not** a walk of the whole `scopes` stack — a function
-    /// call only ever sees its own frame and the globals, never an enclosing
-    /// caller's frame, which is what makes this lexical scoping rather than
-    /// "whatever the dynamic call chain happens to have bound".
+    /// Resolve `name`: the active call frame (if any) first, then the session
+    /// globals. Deliberately **not** a walk of the whole call stack — a
+    /// function call only ever sees its own frame and the globals, never an
+    /// enclosing caller's frame, which is what makes this lexical scoping
+    /// rather than "whatever the dynamic call chain happens to have bound".
+    ///
+    /// Namespace qualification
+    /// (`\i "lib.qpl"`) is resolved entirely at **compile time**
+    /// (`compiler::qualify_program`):
+    /// every bare reference to a name the imported file itself binds at its
+    /// top level is already rewritten to `.lib.name` in the compiled
+    /// bytecode, so there is no namespace-aware fallback here — a
+    /// bare `LOAD`/`LOAD_COL`/`CALL` target is looked up exactly as written.
     pub(crate) fn lookup(&self, name: &str) -> Option<Lookup<'_>> {
         // checked first and unscoped: a builtin can never be shadowed (see
         // the `bind_*` guards below), so there's no ambiguity to resolve.
         if let Some(b) = self.builtins.get(name) {
             return Some(Lookup::Builtin(b));
         }
-        if let Some(scope) = self.scopes.last() {
-            if let Some(v) = scope.globals.get(name) {
-                return Some(Lookup::Global(v));
-            }
-            if let Some(lf) = scope.lazy_frames.get(name) {
-                return Some(Lookup::LazyFrame(lf));
-            }
-            if let Some(df) = scope.tables.get(name) {
-                return Some(Lookup::Table(df));
-            }
+        if let Some(v) = self.current_frame().and_then(|f| f.locals.get(name)) {
+            return Some(Lookup::Value(v));
         }
-        // A bare name inside an import's script or a namespaced function's
-        // body means that namespace's own binding first, so a same-named
-        // session binding can't hijack it.
-        if let Some(found) = self.qualify(name).and_then(|q| self.lookup_session(&q)) {
-            return Some(found);
-        }
-        self.lookup_session(name)
+        self.globals.get(name).map(Lookup::Value)
     }
 
-    /// The session-level (frame-zero) half of [`Vm::lookup`].
-    fn lookup_session(&self, name: &str) -> Option<Lookup<'_>> {
-        if let Some(v) = self.globals.get(name) {
-            return Some(Lookup::Global(v));
-        }
-        if let Some(lf) = self.lazy_frames.get(name) {
-            return Some(Lookup::LazyFrame(lf));
-        }
-        self.tables.get(name).map(Lookup::Table)
-    }
-
-    /// The namespace in effect here: the active call's (`Scope::current_ns`),
-    /// or at the top level the running import's (`Vm::import_ns`).
-    fn active_ns(&self) -> Option<&String> {
-        match self.scopes.last() {
-            Some(scope) => scope.current_ns.as_ref(),
-            None => self.import_ns.as_ref(),
-        }
-    }
-
-    /// `name` qualified by the active namespace — `None` when there is none,
-    /// or `name` is already namespaced.
-    fn qualify(&self, name: &str) -> Option<String> {
-        if name.starts_with('.') {
-            return None;
-        }
-        self.active_ns().map(|ns| format!("{ns}.{name}"))
-    }
-
-    /// The namespace a call to `name` should execute under, for propagating
-    /// into the callee's own scope (`Scope::current_ns`) so its body can in
-    /// turn call an unqualified sibling from the same import. `name` already
-    /// qualified (`.logging.info`) uses its own namespace directly; a bare
-    /// name that resolved through the active namespace (see [`Vm::lookup`])
-    /// inherits that same namespace, so the chain keeps working through more
-    /// than one level of unqualified sibling calls. A local (a param holding
-    /// a function) or a plain session function runs un-namespaced.
-    pub(crate) fn resolve_function_ns(&self, name: &str) -> Option<String> {
-        if let Some(i) = name.rfind('.').filter(|&i| i > 0) {
-            return Some(name[..i].to_string());
-        }
-        let is_closure = |v: Option<&ast::Value>| matches!(v, Some(ast::Value::Closure(_)));
-        if self
-            .scopes
-            .last()
-            .is_some_and(|s| is_closure(s.globals.get(name)))
-        {
-            return None;
-        }
-        let qualified = self.qualify(name)?;
-        is_closure(self.globals.get(&qualified))
-            .then(|| self.active_ns().cloned())
-            .flatten()
-    }
-
-    /// The name a top-level binding actually lands under: inside a running
-    /// `\i` import a bare name goes under the import's namespace (see
-    /// [`Vm::import_ns`]); an already-namespaced name is left alone.
-    fn top_level_name(&self, name: String) -> String {
-        match &self.import_ns {
-            Some(ns) if !name.starts_with('.') => format!("{ns}.{name}"),
-            _ => name,
-        }
-    }
-
-    /// `lookup`, narrowed to the scalar-global kind.
+    /// `lookup`, narrowed to a value that is meaningful as a scalar/literal —
+    /// i.e. not a table-shaped binding (`Value::Table`/`Value::Lazy`), which
+    /// must never be substituted as a literal into a column expression (a
+    /// table name there should instead be treated as an ordinary column
+    /// reference).
     pub(crate) fn lookup_global(&self, name: &str) -> Option<&ast::Value> {
         match self.lookup(name) {
-            Some(Lookup::Global(v)) => Some(v),
-            _ => None,
-        }
-    }
-
-    /// `lookup`, narrowed to a global holding a function. Returns the shared
-    /// `Arc` rather than a borrow so the caller can go on using `&mut Vm`.
-    pub(crate) fn lookup_closure(&self, name: &str) -> Option<std::sync::Arc<ast::Function>> {
-        match self.lookup(name) {
-            Some(Lookup::Global(ast::Value::Closure(f))) => Some(f.clone()),
+            Some(Lookup::Value(v)) if !matches!(v, ast::Value::Table(_) | ast::Value::Lazy(_)) => {
+                Some(v)
+            }
             _ => None,
         }
     }
@@ -362,12 +495,12 @@ impl Vm {
     pub(crate) fn is_callable(&self, name: &str) -> bool {
         matches!(
             self.lookup(name),
-            Some(Lookup::Builtin(_)) | Some(Lookup::Global(ast::Value::Closure(_)))
+            Some(Lookup::Builtin(_)) | Some(Lookup::Value(ast::Value::Closure(_)))
         )
     }
 
-    /// Every `bind_*` below goes through this first: a builtin's name is
-    /// reserved and can never be reassigned or shadowed.
+    /// Every bind goes through this first: a builtin's name is reserved and
+    /// can never be reassigned or shadowed.
     fn check_not_builtin(&self, name: &str) -> Result<(), QplError> {
         if self.builtins.contains_key(name) {
             return Err(QplError::Runtime(format!(
@@ -377,57 +510,18 @@ impl Vm {
         Ok(())
     }
 
-    /// Bind a scalar to `name` in the active call frame, or the session
-    /// globals when there is none.
-    pub(crate) fn bind_global(&mut self, name: String, val: ast::Value) -> Result<(), QplError> {
+    /// Bind `val` (scalar, table, lazy plan, closure — any [`ast::Value`]) to
+    /// `name` in the active call frame, or the session globals when there is
+    /// none. There is one binding map per frame now, so this simply
+    /// overwrites whatever `name` previously held there, of any kind.
+    pub(crate) fn bind(&mut self, name: String, val: ast::Value) -> Result<(), QplError> {
         self.check_not_builtin(&name)?;
-        match self.scopes.last_mut() {
-            Some(scope) => {
-                scope.globals.insert(name, val);
+        match self.current_frame_mut() {
+            Some(frame) => {
+                frame.locals.insert(name, val);
             }
             None => {
-                let name = self.top_level_name(name);
                 self.globals.insert(name, val);
-            }
-        }
-        Ok(())
-    }
-
-    /// Bind an eager table to `name`, scope-aware like `bind_global`. Also
-    /// drops any scalar of the same name: `globals` is searched first by
-    /// `lookup`, so leaving one behind would hide the new table.
-    pub(crate) fn bind_table(&mut self, name: String, df: DataFrame) -> Result<(), QplError> {
-        self.check_not_builtin(&name)?;
-        match self.scopes.last_mut() {
-            Some(scope) => {
-                scope.globals.remove(&name);
-                scope.lazy_frames.remove(&name);
-                scope.tables.insert(name, df);
-            }
-            None => {
-                let name = self.top_level_name(name);
-                self.globals.remove(&name);
-                self.lazy_frames.remove(&name);
-                self.tables.insert(name, df);
-            }
-        }
-        Ok(())
-    }
-
-    /// Bind a lazy plan to `name`, scope-aware like `bind_table`.
-    pub(crate) fn bind_lazy(&mut self, name: String, lf: LazyFrame) -> Result<(), QplError> {
-        self.check_not_builtin(&name)?;
-        match self.scopes.last_mut() {
-            Some(scope) => {
-                scope.globals.remove(&name);
-                scope.tables.remove(&name);
-                scope.lazy_frames.insert(name, lf);
-            }
-            None => {
-                let name = self.top_level_name(name);
-                self.globals.remove(&name);
-                self.tables.remove(&name);
-                self.lazy_frames.insert(name, lf);
             }
         }
         Ok(())
@@ -478,57 +572,6 @@ impl Vm {
             .collect::<Vec<(String, String)>>();
         let (names, types): (Vec<String>, Vec<String>) = names.into_iter().unzip();
         df!["column" => names, "dtype" => types].map_err(|e| QplError::Runtime(e.to_string()))
-    }
-
-    /// Evaluates a constant expression using only literals and globals (no DataFrame).
-    pub fn eval_scalar(&self, expr: &ast::Expr) -> Result<ast::Value, QplError> {
-        match expr {
-            ast::Expr::Lit(v) => Ok(v.clone()),
-            // outside a table expression `` `foo `` is a symbol (a distinct value kind)
-            ast::Expr::Sym(s) => Ok(ast::Value::Sym(s.clone())),
-            // a plain global, or a niladic builtin (e.g. `.qpl.dt`) called with
-            // no arguments — resolved like any other bare name, not
-            // special-cased by name here. A niladic *user* function isn't
-            // supported in this pure/immutable context (it needs a call
-            // frame — see `resolve::call_niladic`, used by the full
-            // value-context path instead).
-            ast::Expr::ColRef(name) => match self.lookup_global(name) {
-                Some(v) => Ok(v.clone()),
-                None => match self.lookup(name) {
-                    Some(Lookup::Builtin(b)) if b.arity == 0 => b.call(&[]),
-                    _ => Err(QplError::Runtime(format!("undefined variable '{name}'"))),
-                },
-            },
-            ast::Expr::BinOp { left, op, right } => {
-                let l = self.eval_scalar(left)?;
-                let r = self.eval_scalar(right)?;
-                if l.as_vec().is_some() || r.as_vec().is_some() {
-                    vector_binop(l, r, op)
-                } else {
-                    scalar_binop(l, r, op)
-                }
-            }
-            ast::Expr::Cast { target, expr } => match target {
-                ast::CastTarget::Prim(dtype) => {
-                    scalar_cast(self.eval_scalar(expr)?, dtype, self.config.useqepoch)
-                }
-                // `` `$expr `` — intern a string into a symbol
-                ast::CastTarget::Sym => match self.eval_scalar(expr)? {
-                    ast::Value::Str(s) | ast::Value::Sym(s) => Ok(ast::Value::Sym(s)),
-                    v => Err(QplError::Runtime(format!(
-                        "cannot make a symbol from {v:?}"
-                    ))),
-                },
-                ast::CastTarget::SymPhysical(_) | ast::CastTarget::Enum(_) => {
-                    Err(QplError::Runtime(
-                        "categorical / enum casts apply to columns, not scalars".into(),
-                    ))
-                }
-            },
-            other => Err(QplError::Runtime(format!(
-                "not supported in scalar context: {other:?}"
-            ))),
-        }
     }
 
     /// Build the Polars expr for a column-context cast (`` type$expr ``) applied
@@ -615,489 +658,1505 @@ impl Vm {
         }
     }
 
-    /// Executes a compiled program and reduces the final stack to an
-    /// [`EvalResult`]. The instruction loop itself lives in [`Vm::run_program`]
-    /// so it can be reused by [`Vm::eval_frame`].
-    pub fn eval(&mut self, program: Vec<Instruction>) -> Result<EvalResult, QplError> {
+    /// Executes a compiled program and reduces its result to an
+    /// [`EvalResult`]. The instruction loop itself lives in [`Vm::run_compiled`],
+    /// which also backs `\l`/`\i`'s nested sub-program runs.
+    pub fn eval(&mut self, program: Program) -> Result<EvalResult, QplError> {
         self.interrupt.check()?;
-        let (mut stack, lazy_mode) = self.run_program(program)?;
+        let result = self.run_compiled(Arc::new(program))?;
         self.interrupt.check()?;
-        if let Some(last_item) = stack.pop() {
-            match last_item {
-                StackObj::Frame(lf) => {
-                    if lazy_mode {
-                        return Ok(EvalResult::Lazy(explain_plan(&lf)));
-                    }
-                    let df = lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?;
-                    self.interrupt.check()?;
-                    Ok(EvalResult::Table(df))
+        match result {
+            Slot::Frame { lf, lazy } => {
+                if lazy {
+                    return Ok(EvalResult::Lazy(explain_plan(&lf)));
                 }
-                StackObj::Scalar(s) => Ok(EvalResult::Scalar(s)),
-                typ => Err(QplError::Runtime(format!(
-                    "Unexpected type on stack: {}",
-                    typ.type_name()
-                ))),
+                let df = lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?;
+                self.interrupt.check()?;
+                Ok(EvalResult::Table(df))
             }
-        } else {
-            Ok(EvalResult::Stored)
+            Slot::Scalar(s) => Ok(EvalResult::Scalar(s)),
+            Slot::Noop => Ok(EvalResult::Stored),
+            other => Err(QplError::Runtime(format!(
+                "Unexpected type on stack: {}",
+                other.type_name()
+            ))),
         }
     }
 
-    /// Run a compiled table expression and hand back the still-lazy frame plus
-    /// whether it should stay lazy. Used by `resolve::eval_value` to compose a
-    /// column expression with reductions / slices without collecting early.
-    pub(crate) fn eval_frame(
-        &mut self,
-        mut program: Vec<Instruction>,
-    ) -> Result<(LazyFrame, bool), QplError> {
-        self.interrupt.check()?;
-        program.push(Instruction::Result);
-        let (mut stack, lazy_mode) = self.run_program(program)?;
-        match stack.pop() {
-            Some(StackObj::Frame(lf)) => Ok((lf, lazy_mode)),
-            _ => Err(QplError::Runtime("expected a table expression".into())),
-        }
-    }
-
-    /// The instruction loop. Builds a LazyFrame plan for every instruction and
-    /// returns the final operand stack and the `lazy` flag.
-    fn run_program(
-        &mut self,
-        program: Vec<Instruction>,
-    ) -> Result<(Vec<StackObj>, bool), QplError> {
-        let needs_i = program
-            .iter()
-            .any(|i| matches!(i, Instruction::PushIColRef));
-
-        let mut stack: Vec<StackObj> = Vec::new();
-        let mut frame: Option<LazyFrame> = None;
-        let mut keys: Vec<Expr> = Vec::new();
-        let mut proj: Vec<Expr> = Vec::new();
-
-        // `lazy_mode` means the final result stays a LazyFrame plan instead of
-        // being collected into a DataFrame.
-        let mut lazy_mode = false;
-
-        for instr in program {
-            match instr {
-                Instruction::FromSrc(tbl_source) => {
-                    match tbl_source {
-                        TableSource::InMem(name) => {
-                            let lf = match self.lookup(&name) {
-                                // reading from a lazy binding is contagious: the
-                                // result stays lazy unless explicitly collected.
-                                Some(Lookup::LazyFrame(lf)) => {
-                                    lazy_mode = true;
-                                    lf.clone()
-                                }
-                                Some(Lookup::Table(df)) => df.clone().lazy(),
-                                _ => {
-                                    return Err(QplError::Runtime(format!(
-                                        "unknown table '{name}'"
-                                    )));
-                                }
-                            };
-                            frame = Some(if needs_i {
-                                lf.with_row_index("i", None)
-                            } else {
-                                lf
-                            });
-                        }
-                        TableSource::Load(path) => {
-                            let path_str = match self.eval_scalar(&path)? {
-                                ast::Value::Str(s) | ast::Value::Sym(s) => s,
-                                other => {
-                                    return Err(QplError::Runtime(format!(
-                                        "expected a string path for load, got {other:?}"
-                                    )));
-                                }
-                            };
-                            let lf = rename_columns_snake_case(load_file(&path_str)?)?;
-                            frame = Some(if needs_i {
-                                lf.with_row_index("i", None)
-                            } else {
-                                lf
-                            });
-                        }
+    /// Runs `program` to completion on the VM's shared `stack`/registers,
+    /// above whatever's already there:
+    /// `prog`/`ip`/`cp` are saved and restored around the run, so this nests
+    /// freely — a query-context helper compiling and running a small
+    /// sub-program while a user-function call is already active (e.g.
+    /// `Vm::eval_value_expr`, or a niladic call from `LOAD_COL`) sees its own
+    /// program's code without disturbing the enclosing call's
+    /// registers. `fp` is deliberately left untouched across a *successful*
+    /// run — lookups inside the sub-program must still see the enclosing
+    /// call's locals — but is rolled back (along with the stack, to its
+    /// height before this call) on error, so a caught/retried error can never
+    /// leave a half-finished call frame or leftover values behind. (E.g.
+    /// `native_load_script`/`native_import_script` calling back into this
+    /// while a user function is already active.)
+    pub(crate) fn run_compiled(&mut self, program: Arc<Program>) -> Result<Slot, QplError> {
+        let saved_prog = self.prog.clone();
+        let saved_ip = self.ip;
+        let saved_cp = self.cp;
+        let saved_fp = self.fp;
+        let base = self.stack.len();
+        self.prog = program;
+        self.ip = 0;
+        self.cp = 0;
+        let outcome = self.run_loop();
+        self.prog = saved_prog;
+        self.ip = saved_ip;
+        self.cp = saved_cp;
+        match outcome {
+            Ok(()) => {
+                let result = match self.stack.len().checked_sub(base) {
+                    Some(0) => Slot::Noop,
+                    Some(1) => self.stack.pop().expect("checked len above"),
+                    _ => {
+                        return Err(QplError::Runtime(format!(
+                            "corrupt bytecode: program left {} value(s) on the stack, expected 0 or 1",
+                            self.stack.len() - base
+                        )));
                     }
+                };
+                Ok(result)
+            }
+            Err(e) => {
+                self.stack.truncate(base);
+                self.fp = saved_fp;
+                Err(e)
+            }
+        }
+    }
+
+    /// Runs `self.prog` from `self.ip` until it's exhausted. `CALL`/`RET`
+    /// switch `self.prog`/`self.ip`/`self.cp` mid-loop (into a closure's own
+    /// program and back) — the loop only ever cares about the *current*
+    /// `self.prog`'s length, so it transparently keeps going once control
+    /// returns to whichever program called it.
+    ///
+    /// On the *first* opcode to fail, records `(self.prog, that opcode's own
+    /// `ip`)` into [`Vm::error_site`] — before
+    /// `run_compiled` restores any register — so the top-level driver
+    /// (`repl::run_script`) can map it back to a `path:line:` prefix via
+    /// whichever `Program::lines` was actually executing: the main script's
+    /// own table for an ordinary failure, or an embedded `\l`/`\i` target's
+    /// own table if the failure happened while that sub-program (or a
+    /// namespaced import's function, which carries its *own* `Arc<Program>`)
+    /// was running. A `run_loop` nested inside this one (e.g. the native
+    /// behind `\l`/`\i`) always reaches its own failure first, so the
+    /// `is_none()` guard here keeps that innermost, most specific site.
+    fn run_loop(&mut self) -> Result<(), QplError> {
+        while self.ip < self.prog.code.len() {
+            let op_ip = self.ip;
+            if let Err(e) = self.step() {
+                if self.error_site.is_none() {
+                    self.error_site = Some((self.prog.clone(), op_ip));
                 }
-                Instruction::Sink => {
-                    self.check_write_allowed("sink")?;
-                    let path = pop1(&mut stack)?.unwrap_scalar()?;
-                    let path_str = match path {
-                        Value::Str(s) => s,
-                        _ => {
-                            return Err(QplError::Runtime(format!(
-                                "expected a string path for sink, got {path:?}"
-                            )));
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes and clears the error site recorded by [`Vm::run_loop`], if any —
+    /// called exactly once per top-level program run (successful or not) so
+    /// a stale site from an earlier statement can never leak into a later
+    /// one's error message.
+    pub(crate) fn take_error_site(&mut self) -> Option<(Arc<Program>, usize)> {
+        self.error_site.take()
+    }
+
+    /// Executes exactly one opcode at `self.prog.code[self.ip]`: decodes it via [`Op::try_from`], consuming the
+    /// operand stream in lockstep only for [`Op::Push`] — every other opcode
+    /// takes all of its inputs from `self.stack`. Calling this directly (in a
+    /// small loop, rather than via [`Vm::run_loop`]) is how a single opcode
+    /// handler can synchronously wait out a nested `CALL` it just issued
+    /// without any native Rust recursion — see the `Op::LoadCol` arm's
+    /// niladic-function-call path.
+    fn step(&mut self) -> Result<(), QplError> {
+        let byte = self.prog.code[self.ip];
+        self.ip += 1;
+        let op = Op::try_from(byte)?;
+        match op {
+            Op::Push => {
+                let operand = self.prog.operands.get(self.cp).cloned().ok_or_else(|| {
+                    QplError::Runtime("corrupt bytecode: operand stream underflow".into())
+                })?;
+                self.cp += 1;
+                match operand {
+                    Operand::Value(v) => self.stack.push(Slot::Scalar(v)),
+                    // attach the currently-running program so the closure
+                    // stays callable after this program is dropped (a
+                    // function defined on one REPL line, invoked on a
+                    // later one).
+                    Operand::Func(proto) => {
+                        let closure = Closure {
+                            params: proto.params.clone(),
+                            entry: proto.entry,
+                            program: self.prog.clone(),
+                            display: proto.display.clone(),
+                        };
+                        self.stack
+                            .push(Slot::Scalar(Value::Closure(Arc::new(closure))));
+                    }
+                    other => self.stack.push(Slot::Operand(other)),
+                }
+            }
+
+            Op::Source => {
+                let name = pop_name(&mut self.stack)?;
+                let (lf, lazy) = match self.lookup(&name) {
+                    // reading from a lazy binding is contagious: the
+                    // result stays lazy unless explicitly collected.
+                    Some(Lookup::Value(Value::Lazy(lf))) => ((**lf).clone(), true),
+                    Some(Lookup::Value(Value::Table(df))) => (df.clone().lazy(), false),
+                    _ => {
+                        return Err(QplError::Runtime(format!("unknown table '{name}'")));
+                    }
+                };
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(lf),
+                    lazy,
+                });
+            }
+
+            Op::LoadFile => {
+                let path_str = match pop1(&mut self.stack)? {
+                    Slot::Scalar(ast::Value::Str(s) | ast::Value::Sym(s)) => s,
+                    Slot::Scalar(other) => {
+                        return Err(QplError::Runtime(format!(
+                            "expected a string path for load, got {other:?}"
+                        )));
+                    }
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "expected a string path for load, got {}",
+                            other.type_name()
+                        )));
+                    }
+                };
+                let lf = rename_columns_snake_case(load_file(&path_str)?)?;
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(lf),
+                    lazy: false,
+                });
+            }
+
+            Op::RowIndex => {
+                let (lf, lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(lf.with_row_index("i", None)),
+                    lazy,
+                });
+            }
+
+            // a niladic function/builtin (e.g. `.qpl.dt`) reduces to the
+            // literal it returns — resolved like any other bare name, not
+            // specially recognised here. Checked ahead of the global
+            // shortcut below because a niladic *user* function is itself a
+            // global (a `Value::Closure`), and the point is to call it. A
+            // closure call is run to completion right here (still via
+            // `CALL`/`RET`, no Rust
+            // recursion — just a nested `step()` loop bounded by this
+            // specific call's own frame, since `LOAD_COL` needs the
+            // result's *type* immediately to give its own error text)
+            // rather than jumping and letting the surrounding `step()`
+            // loop carry on, unlike `Op::Load`/`Op::Call`.
+            Op::LoadCol => {
+                let name = pop_name(&mut self.stack)?;
+                match self.niladic_closure_or_builtin(&name) {
+                    Niladic::Builtin(b) => {
+                        let v = match (b.call)(self, vec![])? {
+                            Slot::Scalar(v) => v,
+                            other => {
+                                return Err(QplError::Runtime(format!(
+                                    "Expected Expr on stack, got {}",
+                                    other.type_name()
+                                )));
+                            }
+                        };
+                        self.stack.push(Slot::Expr(ast_val_to_expr(v)?));
+                    }
+                    Niladic::Closure(c) => {
+                        let target_fp = self.stack.len();
+                        self.begin_closure_call(c, vec![], Some(name.to_string()))?;
+                        while self.fp.is_some_and(|f| f >= target_fp) {
+                            self.step()?;
                         }
-                    };
-                    let lf = require_frame(&mut frame)?;
-                    sink_file(lf, &path_str)?
-                }
-                Instruction::Lazy => {
-                    lazy_mode = true;
-                }
-                Instruction::Collect => {
-                    lazy_mode = false;
-                }
-
-                Instruction::PushPolarsArg(arg) => {
-                    stack.push(StackObj::PolarsArg(arg));
-                }
-
-                Instruction::PushConst(val) => {
-                    stack.push(StackObj::Expr(ast_val_to_expr(val)?));
-                }
-
-                Instruction::PushColRef(name) => {
-                    // a niladic function/builtin (e.g. `.qpl.dt`) reduces to the
-                    // literal it returns — resolved like any other bare name,
-                    // not specially recognised here. Checked ahead of the global
-                    // shortcut below because a niladic *user* function is itself
-                    // a global (a `Value::Closure`), and the point is to call it.
-                    if let Some(v) = resolve::call_niladic(self, &name)? {
-                        let val = match v {
-                            resolve::EvalValue::Scalar(v) => v,
-                            resolve::EvalValue::Frame { .. } => {
+                        match pop1(&mut self.stack)? {
+                            Slot::Scalar(v) => self.stack.push(Slot::Expr(ast_val_to_expr(v)?)),
+                            Slot::Frame { .. } => {
                                 return Err(QplError::Runtime(format!(
                                     "'{name}' returns a table — it can't be used inside a column expression"
                                 )));
                             }
-                            resolve::EvalValue::Noop => {
+                            Slot::Noop => {
                                 return Err(QplError::Runtime(format!(
                                     "'{name}' returns nothing — it can't be used inside a column expression"
                                 )));
                             }
-                        };
-                        stack.push(StackObj::Expr(ast_val_to_expr(val)?));
-                    // globals shadow column names, substituting a literal into the lazy plan
-                    } else if let Some(val) = self.lookup_global(&name) {
-                        stack.push(StackObj::Expr(ast_val_to_expr(val.clone())?));
-                    } else {
-                        stack.push(StackObj::Expr(col(name.as_str())));
+                            other => {
+                                return Err(QplError::Runtime(format!(
+                                    "Expected Expr on stack, got {}",
+                                    other.type_name()
+                                )));
+                            }
+                        }
                     }
-                }
-
-                Instruction::PushIColRef => {
-                    stack.push(StackObj::Expr(col("i")));
-                }
-
-                Instruction::BinOp(op) => {
-                    let right = pop1(&mut stack)?.unwrap_expr()?;
-                    let left = pop1(&mut stack)?.unwrap_expr()?;
-                    stack.push(StackObj::Expr(apply_binop(left, right, &op)?));
-                }
-
-                Instruction::Call { func, args_count } => {
-                    // TODO support calls on lazyframes
-                    let args = popn(&mut stack, args_count)?
-                        .into_iter()
-                        .map(|o| o.unwrap_expr())
-                        .collect::<Result<Vec<_>, _>>()?;
-                    stack.push(StackObj::Expr(apply_call(&func, args)?));
-                }
-
-                Instruction::Round { decimals } => {
-                    let expr = pop1(&mut stack)?.unwrap_expr()?;
-                    stack.push(StackObj::Expr(expr.round(decimals, self.config.round_type)));
-                }
-
-                Instruction::Window {
-                    func,
-                    partition,
-                    order,
-                    rolling,
-                } => {
-                    if let Some((agg, window)) = rolling {
-                        let column = pop1(&mut stack)?.unwrap_expr()?;
-                        stack.push(StackObj::Expr(build_rolling_window(
-                            &agg, window, column, &partition, &order,
-                        )?));
-                    } else {
-                        let target = match func {
-                            WindowFn::Over => Some(pop1(&mut stack)?.unwrap_expr()?),
-                            _ => None,
-                        };
-                        stack.push(StackObj::Expr(build_window(
-                            func, target, &partition, &order,
-                        )?));
-                    }
-                }
-
-                Instruction::Case { branches } => {
-                    let values = popn(&mut stack, branches * 2 + 1)?
-                        .into_iter()
-                        .map(|obj| obj.unwrap_expr())
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let default = values.last().cloned().ok_or_else(|| {
-                        QplError::Runtime("case expression has no default".into())
-                    })?;
-                    let mut case_expr = default;
-                    for pair in values[..values.len() - 1].chunks_exact(2).rev() {
-                        case_expr = when(pair[0].clone())
-                            .then(pair[1].clone())
-                            .otherwise(case_expr);
-                    }
-                    stack.push(StackObj::Expr(case_expr));
-                }
-
-                Instruction::Alias { name } => {
-                    let expr = pop1(&mut stack)?;
-                    stack.push(match name {
-                        Some(n) => match expr {
-                            StackObj::Expr(e) => StackObj::Expr(e.alias(n.as_str())),
-                            _ => {
-                                return Err(QplError::Runtime(
-                                    "Expected expression on stack".into(),
-                                ));
-                            }
-                        },
-                        None => match expr {
-                            StackObj::Expr(e) => StackObj::Expr(e),
-                            _ => {
-                                return Err(QplError::Runtime(
-                                    "Expected expression on stack".into(),
-                                ));
-                            }
-                        },
-                    });
-                }
-                Instruction::FrameExpr(expr) => {
-                    match expr {
-                        PolarsFrameExpr::Filter(n) => {
-                            let preds = popn(&mut stack, n)?;
-                            let mut lf = require_frame(&mut frame)?;
-                            for pred in preds {
-                                lf = lf.filter(pred.unwrap_expr()?);
-                            }
-                            frame = Some(lf);
-                        }
-                        PolarsFrameExpr::Join { l, r } => {
-                            let right = pop1(&mut stack)?.unwrap_frame()?;
-                            let right_on = popn(&mut stack, r)?
-                                .into_iter()
-                                .map(|o| o.unwrap_expr())
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let left_on = popn(&mut stack, l)?
-                                .into_iter()
-                                .map(|o| o.unwrap_expr())
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let join_arg = pop1(&mut stack)?.unwrap_polars_arg()?;
-                            let left = pop1(&mut stack)?.unwrap_frame()?;
-                            match join_arg {
-                                PolarsStackArg::Join(join_type) => {
-                                    frame = Some(left.join(
-                                        right,
-                                        left_on,
-                                        right_on,
-                                        JoinArgs::new(join_type),
-                                    ));
-                                }
-                            }
-                        }
-                        PolarsFrameExpr::Sort(sort_map) => {
-                            let cols = sort_map
-                                .iter()
-                                .map(|(name, _)| name.clone())
-                                .collect::<Vec<_>>();
-                            let ascs = sort_map
-                                .iter()
-                                .map(|(_, descending)| *descending)
-                                .collect::<Vec<_>>();
-                            let lf = require_frame(&mut frame)?;
-                            let sorted_lf = lf.sort_by_exprs(
-                                cols.iter()
-                                    .map(|c| col(c.as_str()))
-                                    .collect::<Vec<_>>()
-                                    .as_slice(),
-                                SortMultipleOptions::new().with_order_descending_multi(ascs),
-                            );
-                            frame = Some(sorted_lf);
-                        }
-                        PolarsFrameExpr::Distinct => {
-                            let lf = require_frame(&mut frame)?;
-                            frame = Some(lf.unique_stable(None, UniqueKeepStrategy::First));
-                        }
-                        PolarsFrameExpr::DropNull(columns) => {
-                            let lf = require_frame(&mut frame)?;
-                            frame = Some(lf.drop_nulls(Some(cols(columns))));
-                        }
-                        PolarsFrameExpr::Limit => {
-                            let limit = match pop1(&mut stack)?.unwrap_scalar()? {
-                                Value::Int(n) => n,
-                                other => {
-                                    return Err(QplError::Runtime(format!(
-                                        "limit/take count must be an int, got {other:?}"
-                                    )));
-                                }
-                            };
-                            let lf = require_frame(&mut frame)?;
-                            frame = Some(if limit < 0 {
-                                lf.tail(limit.unsigned_abs() as IdxSize)
-                            } else {
-                                lf.limit(limit as IdxSize)
-                            });
-                        }
-                        PolarsFrameExpr::Drop(columns) => {
-                            let lf = require_frame(&mut frame)?;
-                            frame = Some(lf.drop(cols(columns)));
-                        }
-                        PolarsFrameExpr::Cols => {
-                            let df = self.schema(frame.take().unwrap())?;
-                            frame = Some(df.lazy());
-                            // `cols` fully resolves the schema; always show it as a table.
-                            lazy_mode = false;
+                    // globals shadow column names, substituting a literal
+                    // into the lazy plan.
+                    Niladic::None => {
+                        if let Some(val) = self.lookup_global(&name) {
+                            self.stack.push(Slot::Expr(ast_val_to_expr(val.clone())?));
+                        } else {
+                            self.stack.push(Slot::Expr(col(name.as_ref())));
                         }
                     }
                 }
+            }
 
-                Instruction::BuildKeys(n) => {
-                    keys = popn(&mut stack, n)?
-                        .into_iter()
-                        .map(|o| o.unwrap_expr())
-                        .collect::<Result<Vec<_>, _>>()?;
-                }
+            Op::LoadRowIdx => {
+                self.stack.push(Slot::Expr(col("i")));
+            }
 
-                Instruction::BuildProj {
-                    count,
-                    exclude,
-                    predicates,
-                } => {
-                    let expressions = popn(&mut stack, count)?
-                        .into_iter()
-                        .map(|o| o.unwrap_expr())
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let predicates = popn(&mut stack, predicates)?
-                        .into_iter()
-                        .map(|o| o.unwrap_expr())
-                        .collect::<Result<Vec<_>, _>>()?;
-                    if exclude.is_empty() {
-                        proj = expressions;
-                    } else {
-                        let predicate =
-                            predicates.into_iter().reduce(|left, right| left.and(right));
-                        // `update col: … where p` keeps the old value where `p` is
-                        // false — but a brand-new column has no old value, so it
-                        // gets null there instead of `col(name)` (which would fail
-                        // to resolve).
-                        let schema = match (&predicate, frame.as_mut()) {
-                            (Some(_), Some(lf)) => Some(
-                                lf.collect_schema()
-                                    .map_err(|e| QplError::Runtime(e.to_string()))?,
-                            ),
-                            _ => None,
-                        };
-                        proj = expressions
-                            .into_iter()
-                            .zip(exclude.iter())
-                            .map(|(expr, name)| {
-                                let expr = if keys.is_empty() {
-                                    expr
-                                } else {
-                                    expr.over(keys.clone())
-                                        .map_err(|e| QplError::Runtime(e.to_string()))?
-                                };
-                                Ok(match &predicate {
-                                    Some(predicate) => {
-                                        let old = if schema
-                                            .as_ref()
-                                            .is_none_or(|s| s.contains(name.as_str()))
-                                        {
-                                            col(name.as_str())
-                                        } else {
-                                            lit(NULL)
-                                        };
-                                        when(predicate.clone())
-                                            .then(expr)
-                                            .otherwise(old)
-                                            .alias(name)
-                                    }
-                                    None => expr,
-                                })
-                            })
-                            .collect::<Result<Vec<_>, QplError>>()?;
-                        let all_except = (all() - by_name(exclude.clone(), false, false)).as_expr();
-                        proj.insert(0, all_except);
+            // Value context: resolves a
+            // bare name — a niladic user function/builtin is called (via
+            // the same `CALL`/`RET` mechanism as an explicit `f[..]`, no
+            // Rust recursion), a `Table`/`Lazy` global becomes a `Frame`,
+            // everything else a `Scalar`; a non-niladic builtin or an
+            // undefined name is today's exact error text.
+            Op::Load => {
+                let name = pop_name(&mut self.stack)?;
+                match self.niladic_closure_or_builtin(&name) {
+                    Niladic::Builtin(b) => {
+                        let slot = (b.call)(self, vec![])?;
+                        self.stack.push(slot);
                     }
-                }
-
-                Instruction::Select => {
-                    let lf = require_frame(&mut frame)?;
-                    frame = Some(if proj.is_empty() {
-                        lf // empty projection = all columns
-                    } else {
-                        lf.select(std::mem::take(&mut proj))
-                    });
-                }
-
-                // group_by().agg(): keys become keyed columns, proj holds agg exprs
-                Instruction::SelectBy => {
-                    let lf = require_frame(&mut frame)?;
-                    frame = Some(
-                        lf.group_by(std::mem::take(&mut keys))
-                            .agg(std::mem::take(&mut proj)),
-                    );
-                }
-
-                Instruction::Cast(target) => {
-                    let expr = pop1(&mut stack)?.unwrap_expr()?;
-                    let casted = self.build_cast_expr(&target, expr, frame.as_ref())?;
-                    stack.push(StackObj::Expr(casted));
-                }
-
-                Instruction::Eval(expr) => {
-                    match resolve::eval_value(self, &expr)? {
-                        resolve::EvalValue::Scalar(val) => stack.push(StackObj::Scalar(val)),
-                        resolve::EvalValue::Frame { lf, lazy } => {
-                            if lazy {
-                                lazy_mode = true;
-                            }
-                            stack.push(StackObj::Frame(lf));
-                        }
-                        // nothing to push: `eval` then reports `Stored`
-                        resolve::EvalValue::Noop => {}
+                    Niladic::Closure(c) => {
+                        self.begin_closure_call(c, vec![], Some(name.to_string()))?;
                     }
-                }
-
-                Instruction::Result => {
-                    let lf = require_frame(&mut frame)?;
-                    stack.push(StackObj::Frame(lf));
-                    frame = None; // clear frame so we don't accidentally use it after Result
-                }
-
-                Instruction::Assign(name) => {
-                    self.check_write_allowed("assignment")?;
-                    let value = stack.pop().ok_or_else(|| {
-                        QplError::Runtime("cannot assign a no-op expression.".into())
-                    })?;
-                    match value {
-                        StackObj::Scalar(s) => {
-                            self.bind_global(name, s)?;
-                        }
-                        StackObj::Frame(lf) => {
-                            if lazy_mode {
-                                // keep the plan lazy under this name
-                                self.bind_lazy(name, lf)?;
-                            } else {
-                                let df =
-                                    lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?;
-                                self.bind_table(name, df)?;
-                            }
-                        }
-                        typ => {
+                    Niladic::None => match self.resolve_plain(&name) {
+                        Resolved::Lazy(lf) => self.stack.push(Slot::Frame { lf, lazy: true }),
+                        Resolved::Table(df) => self.stack.push(Slot::Frame {
+                            lf: Box::new(df.lazy()),
+                            lazy: false,
+                        }),
+                        Resolved::Scalar(v) => self.stack.push(Slot::Scalar(v)),
+                        Resolved::BuiltinNonNiladic => {
                             return Err(QplError::Runtime(format!(
-                                "Cannot assign '{}' to type {}: expected a table or scalar on stack",
-                                name,
-                                typ.type_name()
+                                "'{name}' is a built-in function — call it with '{name}[..]'"
+                            )));
+                        }
+                        Resolved::Undefined => {
+                            return Err(QplError::Runtime(format!(
+                                "undefined name '{name}' (not a variable, table or lazy frame)"
+                            )));
+                        }
+                    },
+                }
+            }
+
+            // Value context: like
+            // `Load`, but never auto-calls a niladic closure/builtin — the
+            // call-target position (`f[x]`, `x[i]`). A callable name is
+            // deferred (pushed back as the raw `Operand::Name`) for
+            // `Op::Index`/`Op::Call` to resolve; anything else resolves
+            // exactly like `Load`'s non-niladic-call path.
+            Op::LoadFn => {
+                let name = pop_name(&mut self.stack)?;
+                if self.is_callable(&name) {
+                    self.stack.push(Slot::Operand(Operand::Name(name)));
+                } else {
+                    match self.resolve_plain(&name) {
+                        Resolved::Lazy(lf) => self.stack.push(Slot::Frame { lf, lazy: true }),
+                        Resolved::Table(df) => self.stack.push(Slot::Frame {
+                            lf: Box::new(df.lazy()),
+                            lazy: false,
+                        }),
+                        Resolved::Scalar(v) => self.stack.push(Slot::Scalar(v)),
+                        Resolved::BuiltinNonNiladic => {
+                            return Err(QplError::Runtime(format!(
+                                "'{name}' is a built-in function — call it with '{name}[..]'"
+                            )));
+                        }
+                        Resolved::Undefined => {
+                            return Err(QplError::Runtime(format!(
+                                "undefined name '{name}' (not a variable, table or lazy frame)"
                             )));
                         }
                     }
                 }
             }
+
+            // Value context: `enlist` /
+            // `?` roll (`Operand::Native`, unconditional keywords) or a
+            // name (resolved at run time: a bound closure/builtin wins,
+            // else a shadowable keyword, else a generic column verb — see
+            // `ops::call_by_name`) or a closure literal already on the
+            // stack (an anonymous function applied in place). A closure
+            // call doesn't push a result here — see `Vm::call_value` —
+            // it jumps into the callee's own bytecode; `Op::Ret` pushes
+            // the result once the callee returns.
+            Op::Call => {
+                let callee = pop1(&mut self.stack)?;
+                let n = pop_count(&mut self.stack)?;
+                let args = popn(&mut self.stack, n)?;
+                self.call_value(callee, args)?;
+            }
+
+            // Value context: `` n#expr ``
+            // head/tail slicing.
+            Op::Take => {
+                let target = pop1(&mut self.stack)?;
+                let n = match pop1(&mut self.stack)?.unwrap_scalar()? {
+                    Value::Int(n) => n,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "take count must be an int, got {other:?}"
+                        )));
+                    }
+                };
+                let result = match target {
+                    Slot::Frame { lf, lazy } => {
+                        let lf = if n >= 0 {
+                            lf.limit(n as IdxSize)
+                        } else {
+                            let k = -n;
+                            lf.slice(-k, k as IdxSize)
+                        };
+                        Slot::Frame {
+                            lf: Box::new(lf),
+                            lazy,
+                        }
+                    }
+                    other => Slot::Scalar(ops::take_list(ops::slot_to_scalar_value(other)?, n)?),
+                };
+                self.stack.push(result);
+            }
+
+            // Value context: a callable
+            // target (from `LoadFn`, or a closure literal) calls;
+            // otherwise positional list indexing (an atom index picks an
+            // element, an int-vector index picks a sub-list).
+            Op::Index => {
+                let n = pop_count(&mut self.stack)?;
+                let idx_args = popn(&mut self.stack, n)?;
+                let target = pop1(&mut self.stack)?;
+                match target {
+                    Slot::Operand(Operand::Name(_)) | Slot::Scalar(Value::Closure(_)) => {
+                        self.call_value(target, idx_args)?;
+                    }
+                    other => {
+                        let list = ops::slot_to_list_value(other)?;
+                        let idx = idx_args
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| QplError::Runtime("index needs an argument".into()))?;
+                        let (idxs, atom) = match idx.unwrap_scalar()? {
+                            Value::Int(n) => (vec![n], true),
+                            v @ Value::IntVec(_) => (
+                                v.as_vec()
+                                    .unwrap()
+                                    .1
+                                    .i64()
+                                    .map_err(|e| QplError::Runtime(e.to_string()))?
+                                    .into_no_null_iter()
+                                    .collect(),
+                                false,
+                            ),
+                            other => {
+                                return Err(QplError::Runtime(format!(
+                                    "index must be an int or int vector, got {other:?}"
+                                )));
+                            }
+                        };
+                        let picked = ops::index_list(list, &idxs)?;
+                        self.stack.push(Slot::Scalar(if atom {
+                            ops::scalarise(picked)?
+                        } else {
+                            picked
+                        }));
+                    }
+                }
+            }
+
+            // Value context: a one-column
+            // `select`'s materialisation to a list (`compile_value_expr`'s
+            // `Expr::Table` arm — `is_column_select`).
+            Op::Column => {
+                let (lf, _lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
+                let df = lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?;
+                self.interrupt.check()?;
+                let col = df
+                    .select_at_idx(0)
+                    .ok_or_else(|| QplError::Runtime("empty column expression".into()))?;
+                self.stack.push(Slot::Scalar(ops::column_to_value(col)?));
+            }
+
+            // `` zip `k1`k2!v1 v2 ``: each
+            // column is already a `Column` (from `Op::CastList`) or a
+            // list `Value`/`Frame` (a plain, non-cast dict value).
+            //
+            // `compile_value_expr` commits to this dict lowering at
+            // compile time (a dict literal argument has no other
+            // representation to compile to), so a user function named
+            // `zip` can only be checked for here, at run time: a bound
+            // closure/builtin named `zip` errors instead of silently
+            // falling through to the built-in constructor.
+            Op::Zip if self.is_callable("zip") => {
+                return Err(QplError::Runtime(
+                        "'zip' is shadowed by a user-defined function here — it cannot be called with a dict literal (a dict has no plain-value form to pass); call it as 'zip[<value>]' instead".into(),
+                    ));
+            }
+            Op::Zip => {
+                let n = pop_count(&mut self.stack)?;
+                let names = match pop1(&mut self.stack)?.unwrap_operand()? {
+                    Operand::Names(ns) => ns,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "Expected a Names operand, got {other:?}"
+                        )));
+                    }
+                };
+                let cols = popn(&mut self.stack, n)?;
+                let mut len: Option<usize> = None;
+                let mut series_cols = Vec::with_capacity(n);
+                for (name, slot) in names.iter().zip(cols) {
+                    let series = match slot {
+                        Slot::Column(c) => c.as_materialized_series().clone(),
+                        Slot::Scalar(v) => ops::zip_value_to_series(v, name)?,
+                        Slot::Frame { .. } => {
+                            return Err(QplError::Runtime(
+                                "expected a scalar here, got a table".into(),
+                            ));
+                        }
+                        Slot::Noop => {
+                            return Err(QplError::Runtime(
+                                "cannot use a no-op expression as a value".into(),
+                            ));
+                        }
+                        other => {
+                            return Err(QplError::Runtime(format!(
+                                "Expected Expr on stack, got {}",
+                                other.type_name()
+                            )));
+                        }
+                    };
+                    match len {
+                        None => len = Some(series.len()),
+                        Some(l) if l != series.len() => {
+                            return Err(QplError::Runtime(format!(
+                                "'zip' columns have mismatched lengths: '{name}' has {}, expected {l}",
+                                series.len()
+                            )));
+                        }
+                        _ => {}
+                    }
+                    let mut series = series;
+                    series.rename(name.as_str().into());
+                    series_cols.push(Column::from(series));
+                }
+                let df =
+                    DataFrame::new(len.expect("checked non-empty at compile time"), series_cols)
+                        .map_err(|e| QplError::Runtime(e.to_string()))?;
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(df.lazy()),
+                    lazy: false,
+                });
+            }
+
+            // `zip`'s internal cast-column lowering only: applies a top-level cast to a list
+            // value, keeping the exact resulting Series (not round-tripped
+            // through `ast::Value`, which would lose a narrow width or a
+            // categorical) — see `ops::zip_value_to_series`.
+            Op::CastList => {
+                let name = pop_name(&mut self.stack)?;
+                let target = match pop1(&mut self.stack)?.unwrap_operand()? {
+                    Operand::Cast(c) => c,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "Expected a Cast operand, got {other:?}"
+                        )));
+                    }
+                };
+                let list_val = ops::slot_to_list_value(pop1(&mut self.stack)?)?;
+                if !ops::is_list_value(&list_val) {
+                    return Err(QplError::Runtime(format!(
+                        "'zip' column '{name}' is not a list: {list_val:?}"
+                    )));
+                }
+                let lf = ops::list_to_lazy(list_val)?;
+                let casted = self.build_cast_expr(&target, col("x"), Some(&lf))?;
+                let df = lf
+                    .select([casted.alias("x")])
+                    .collect()
+                    .map_err(|e| QplError::Runtime(e.to_string()))?;
+                let column = df
+                    .column("x")
+                    .map_err(|e| QplError::Runtime(e.to_string()))?
+                    .clone();
+                self.stack.push(Slot::Column(column));
+            }
+
+            // `<list-expr> where <predicate>...`: the list half — checks `list` is
+            // list-shaped and aliases it to a one-column `x` frame for the
+            // query-context predicates the compiler emits right after
+            // this opcode.
+            Op::ListWhereFrame => {
+                let list_val = ops::slot_to_scalar_value(pop1(&mut self.stack)?)?;
+                if !ops::is_list_value(&list_val) {
+                    return Err(QplError::Runtime(format!(
+                        "'where' needs a list on the left, got {list_val:?}"
+                    )));
+                }
+                let lf = ops::list_to_lazy(list_val)?;
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(lf),
+                    lazy: false,
+                });
+            }
+
+            // `<conn> dispatch <cmd>` / `<conn> async dispatch <cmd>`
+            Op::Dispatch => {
+                let is_async = match pop1(&mut self.stack)?.unwrap_scalar()? {
+                    Value::Bool(b) => b,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "expected a boolean here, got {other:?}"
+                        )));
+                    }
+                };
+                let command = match pop1(&mut self.stack)?.unwrap_operand()? {
+                    Operand::Text(t) => t,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "Expected a Text operand, got {other:?}"
+                        )));
+                    }
+                };
+                let conn = pop1(&mut self.stack)?.unwrap_scalar()?;
+                #[cfg(feature = "ipc")]
+                {
+                    let result = ops::native_dispatch(self, conn, &command, is_async)?;
+                    self.stack.push(result);
+                }
+                #[cfg(not(feature = "ipc"))]
+                {
+                    let _ = (conn, command, is_async);
+                    return Err(QplError::Runtime(
+                            "dispatch requires the `ipc` feature (on by default; this build used `--no-default-features`)".into(),
+                        ));
+                }
+            }
+
+            // Type-dispatched: both
+            // operands `Scalar` evaluate eagerly in Rust
+            // (`ops::value_binop`); otherwise the (possibly-lifted) operands
+            // build a Polars expression, A `Frame` operand
+            // (a bare table name used as a value) is the same
+            // "expected a scalar here, got a table" error; a `Noop` operand likewise keeps its
+            // "cannot use a no-op expression as a value" text.
+            Op::BinOp => {
+                let kind = match pop1(&mut self.stack)?.unwrap_operand()? {
+                    Operand::BinOp(k) => k,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "Expected a BinOp operand, got {other:?}"
+                        )));
+                    }
+                };
+                let right = pop1(&mut self.stack)?;
+                let left = pop1(&mut self.stack)?;
+                let result = match (left, right) {
+                    (Slot::Scalar(l), Slot::Scalar(r)) => {
+                        Slot::Scalar(ops::value_binop(l, r, &kind)?)
+                    }
+                    (left, right) => {
+                        let left = expr_for_binop(left)?;
+                        let right = expr_for_binop(right)?;
+                        Slot::Expr(ops::apply_binop(left, right, &kind)?)
+                    }
+                };
+                self.stack.push(result);
+            }
+
+            Op::Verb => {
+                // TODO support calls on lazyframes
+                let verb = match pop1(&mut self.stack)?.unwrap_operand()? {
+                    Operand::Verb(v) => v,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "Expected a Verb operand, got {other:?}"
+                        )));
+                    }
+                };
+                let n = pop_count(&mut self.stack)?;
+                let args = popn(&mut self.stack, n)?
+                    .into_iter()
+                    .map(slot_to_expr)
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.stack.push(Slot::Expr(apply_call(&verb, args)?));
+            }
+
+            Op::Round => {
+                let decimals = pop_count(&mut self.stack)? as u32;
+                let expr = pop_expr(&mut self.stack)?;
+                self.stack
+                    .push(Slot::Expr(expr.round(decimals, self.config.round_type)));
+            }
+
+            Op::Window => {
+                let spec = match pop1(&mut self.stack)?.unwrap_operand()? {
+                    Operand::Window(w) => w,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "Expected a Window operand, got {other:?}"
+                        )));
+                    }
+                };
+                if let Some((agg, window)) = &spec.rolling {
+                    let column = pop_expr(&mut self.stack)?;
+                    self.stack.push(Slot::Expr(build_rolling_window(
+                        agg,
+                        *window,
+                        column,
+                        &spec.partition,
+                        &spec.order,
+                    )?));
+                } else {
+                    let target = match spec.func {
+                        WindowFn::Over => Some(pop_expr(&mut self.stack)?),
+                        _ => None,
+                    };
+                    self.stack.push(Slot::Expr(build_window(
+                        spec.func,
+                        target,
+                        &spec.partition,
+                        &spec.order,
+                    )?));
+                }
+            }
+
+            Op::Case => {
+                let branches = pop_count(&mut self.stack)?;
+                let n = branches * 2 + 1;
+                let mut values = Vec::with_capacity(n);
+                for slot in popn(&mut self.stack, n)? {
+                    values.push(match slot {
+                        Slot::Expr(e) => e,
+                        Slot::Scalar(v) => ast_val_to_expr(v)?,
+                        other => {
+                            return Err(QplError::Runtime(format!(
+                                "Expected Expr on stack, got {}",
+                                other.type_name()
+                            )));
+                        }
+                    });
+                }
+                let default = values
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| QplError::Runtime("case expression has no default".into()))?;
+                let mut case_expr = default;
+                for pair in values[..values.len() - 1].as_chunks::<2>().0.iter().rev() {
+                    case_expr = when(pair[0].clone())
+                        .then(pair[1].clone())
+                        .otherwise(case_expr);
+                }
+                self.stack.push(Slot::Expr(case_expr));
+            }
+
+            Op::Alias => {
+                let name = pop_name(&mut self.stack)?;
+                let expr = pop_expr(&mut self.stack)?;
+                self.stack.push(Slot::Expr(expr.alias(name.as_ref())));
+            }
+
+            Op::Filter => {
+                let n = pop_count(&mut self.stack)?;
+                let preds = popn(&mut self.stack, n)?
+                    .into_iter()
+                    .map(slot_to_expr)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let (mut lf, lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
+                for pred in preds {
+                    lf = lf.filter(pred);
+                }
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(lf),
+                    lazy,
+                });
+            }
+
+            Op::Sort => {
+                let sort_map = match pop1(&mut self.stack)?.unwrap_operand()? {
+                    Operand::Sort(s) => s,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "Expected a Sort operand, got {other:?}"
+                        )));
+                    }
+                };
+                let cols_v = sort_map
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>();
+                let ascs = sort_map
+                    .iter()
+                    .map(|(_, descending)| *descending)
+                    .collect::<Vec<_>>();
+                let (lf, lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
+                let sorted_lf = lf.sort_by_exprs(
+                    cols_v
+                        .iter()
+                        .map(|c| col(c.as_str()))
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    SortMultipleOptions::new().with_order_descending_multi(ascs),
+                );
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(sorted_lf),
+                    lazy,
+                });
+            }
+
+            Op::Distinct => {
+                let (lf, lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(lf.unique_stable(None, UniqueKeepStrategy::First)),
+                    lazy,
+                });
+            }
+
+            Op::DropNull => {
+                let columns = match pop1(&mut self.stack)?.unwrap_operand()? {
+                    Operand::Names(n) => n,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "Expected a Names operand, got {other:?}"
+                        )));
+                    }
+                };
+                let (lf, lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(lf.drop_nulls(Some(cols(columns.to_vec())))),
+                    lazy,
+                });
+            }
+
+            Op::Limit => {
+                let limit = match pop1(&mut self.stack)?.unwrap_scalar()? {
+                    Value::Int(n) => n,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "limit/take count must be an int, got {other:?}"
+                        )));
+                    }
+                };
+                let (lf, lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
+                let lf = if limit < 0 {
+                    lf.tail(limit.unsigned_abs() as IdxSize)
+                } else {
+                    lf.limit(limit as IdxSize)
+                };
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(lf),
+                    lazy,
+                });
+            }
+
+            Op::Drop => {
+                let columns = match pop1(&mut self.stack)?.unwrap_operand()? {
+                    Operand::Names(n) => n,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "Expected a Names operand, got {other:?}"
+                        )));
+                    }
+                };
+                let (lf, lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(lf.drop(cols(columns.to_vec()))),
+                    lazy,
+                });
+            }
+
+            Op::Cols => {
+                let (lf, _lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
+                let df = self.schema(lf)?;
+                // `cols` fully resolves the schema; always show it as a table.
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(df.lazy()),
+                    lazy: false,
+                });
+            }
+
+            Op::Sink => {
+                self.check_write_allowed("sink")?;
+                let path = pop1(&mut self.stack)?.unwrap_scalar()?;
+                let path_str = match path {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(QplError::Runtime(format!(
+                            "expected a string path for sink, got {path:?}"
+                        )));
+                    }
+                };
+                let (lf, _lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
+                sink_file(lf, &path_str)?
+            }
+
+            Op::Lazy => {
+                let (lf, _) = pop1(&mut self.stack)?.unwrap_frame()?;
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(lf),
+                    lazy: true,
+                });
+            }
+
+            Op::Collect => {
+                let (lf, _) = pop1(&mut self.stack)?.unwrap_frame()?;
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(lf),
+                    lazy: false,
+                });
+            }
+
+            Op::Join => {
+                let join_type = match pop1(&mut self.stack)?.unwrap_operand()? {
+                    Operand::Join(k) => k,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "Expected a Join operand, got {other:?}"
+                        )));
+                    }
+                };
+                let (right, right_lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
+                let right_on = pop1(&mut self.stack)?.unwrap_list()?;
+                let left_on = pop1(&mut self.stack)?.unwrap_list()?;
+                let (left, left_lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
+                let joined = left.join(right, left_on, right_on, JoinArgs::new(join_type));
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(joined),
+                    lazy: left_lazy || right_lazy,
+                });
+            }
+
+            Op::List => {
+                let n = pop_count(&mut self.stack)?;
+                let exprs = popn(&mut self.stack, n)?
+                    .into_iter()
+                    .map(slot_to_expr)
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.stack.push(Slot::List(exprs));
+            }
+
+            Op::Select => {
+                let proj = pop1(&mut self.stack)?.unwrap_list()?;
+                let (lf, lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
+                let lf = if proj.is_empty() {
+                    lf // empty projection = all columns
+                } else {
+                    lf.select(proj)
+                };
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(lf),
+                    lazy,
+                });
+            }
+
+            // group_by().agg(): keys become keyed columns, aggs are the projection
+            Op::SelectBy => {
+                let aggs = pop1(&mut self.stack)?.unwrap_list()?;
+                let keys = pop1(&mut self.stack)?.unwrap_list()?;
+                let (lf, lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(lf.group_by(keys).agg(aggs)),
+                    lazy,
+                });
+            }
+
+            Op::Update => {
+                let count = pop_count(&mut self.stack)?;
+                let predicates = pop_count(&mut self.stack)?;
+                let names = match pop1(&mut self.stack)?.unwrap_operand()? {
+                    Operand::Names(n) => n,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "Expected a Names operand, got {other:?}"
+                        )));
+                    }
+                };
+                let expressions = popn(&mut self.stack, count)?
+                    .into_iter()
+                    .map(slot_to_expr)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let keys = pop1(&mut self.stack)?.unwrap_list()?;
+                let preds = popn(&mut self.stack, predicates)?
+                    .into_iter()
+                    .map(slot_to_expr)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let (mut lf, lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
+                let predicate = preds.into_iter().reduce(|left, right| left.and(right));
+                // `update col: … where p` keeps the old value where `p` is
+                // false — but a brand-new column has no old value, so it
+                // gets null there instead of `col(name)` (which would fail
+                // to resolve).
+                let schema = match &predicate {
+                    Some(_) => Some(
+                        lf.collect_schema()
+                            .map_err(|e| QplError::Runtime(e.to_string()))?,
+                    ),
+                    None => None,
+                };
+                let mut proj = expressions
+                    .into_iter()
+                    .zip(names.iter())
+                    .map(|(expr, name)| {
+                        let expr = if keys.is_empty() {
+                            expr
+                        } else {
+                            expr.over(keys.clone())
+                                .map_err(|e| QplError::Runtime(e.to_string()))?
+                        };
+                        Ok(match &predicate {
+                            Some(predicate) => {
+                                let old =
+                                    if schema.as_ref().is_none_or(|s| s.contains(name.as_str())) {
+                                        col(name.as_str())
+                                    } else {
+                                        lit(NULL)
+                                    };
+                                when(predicate.clone())
+                                    .then(expr)
+                                    .otherwise(old)
+                                    .alias(name.as_str())
+                            }
+                            None => expr,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, QplError>>()?;
+                let all_except = (all() - by_name(names.iter().cloned(), false, false)).as_expr();
+                proj.insert(0, all_except);
+                self.stack.push(Slot::Frame {
+                    lf: Box::new(lf.select(proj)),
+                    lazy,
+                });
+            }
+
+            // Type-dispatched: an `Expr`
+            // operand builds a Polars cast expression (query context);
+            // a `Scalar` atom folds eagerly in Rust
+            // (`ops::scalar_cast_target`); a `Scalar` list or a `Frame` operand
+            // materialises through the same one-column-select path.
+            Op::Cast => {
+                let target = match pop1(&mut self.stack)?.unwrap_operand()? {
+                    Operand::Cast(c) => c,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "Expected a Cast operand, got {other:?}"
+                        )));
+                    }
+                };
+                let operand = pop1(&mut self.stack)?;
+                let result = match operand {
+                    Slot::Expr(expr) => {
+                        let probe = nearest_frame(&self.stack);
+                        Slot::Expr(self.build_cast_expr(&target, expr, probe)?)
+                    }
+                    Slot::Scalar(v) if ops::is_list_value(&v) => {
+                        let lf = ops::list_to_lazy(v)?;
+                        let casted = self.build_cast_expr(&target, col("x"), Some(&lf))?;
+                        let df = lf
+                            .select([casted.alias("r")])
+                            .collect()
+                            .map_err(|e| QplError::Runtime(e.to_string()))?;
+                        let result_col = df
+                            .column("r")
+                            .map_err(|e| QplError::Runtime(e.to_string()))?;
+                        Slot::Scalar(ops::column_to_value(result_col)?)
+                    }
+                    Slot::Scalar(v) => {
+                        Slot::Scalar(ops::scalar_cast_target(v, &target, self.config.useqepoch)?)
+                    }
+                    Slot::Frame { lf, .. } => {
+                        let lf = *lf;
+                        let name = ops::first_col_name(&lf)?;
+                        let casted =
+                            self.build_cast_expr(&target, col(name.as_str()), Some(&lf))?;
+                        let df = lf
+                            .select([casted.alias("r")])
+                            .collect()
+                            .map_err(|e| QplError::Runtime(e.to_string()))?;
+                        let result_col = df
+                            .column("r")
+                            .map_err(|e| QplError::Runtime(e.to_string()))?;
+                        Slot::Scalar(ops::column_to_value(result_col)?)
+                    }
+                    Slot::Noop => {
+                        return Err(QplError::Runtime(
+                            "cannot use a no-op expression as a value".into(),
+                        ));
+                    }
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "Expected Expr on stack, got {}",
+                            other.type_name()
+                        )));
+                    }
+                };
+                self.stack.push(result);
+            }
+
+            Op::Store => {
+                self.check_write_allowed("assignment")?;
+                let name = pop_name(&mut self.stack)?;
+                let value = self
+                    .stack
+                    .pop()
+                    .ok_or_else(|| QplError::Runtime("cannot assign a no-op expression.".into()))?;
+                match value {
+                    Slot::Scalar(s) => {
+                        self.bind(name.to_string(), s)?;
+                    }
+                    Slot::Frame { lf, lazy } => {
+                        if lazy {
+                            // keep the plan lazy under this name
+                            self.bind(name.to_string(), Value::Lazy(lf))?;
+                        } else {
+                            let df = lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?;
+                            self.bind(name.to_string(), Value::Table(df))?;
+                        }
+                    }
+                    Slot::Noop => {
+                        return Err(QplError::Runtime(
+                            "cannot assign a no-op expression.".into(),
+                        ));
+                    }
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "Cannot assign '{}' to type {}: expected a table or scalar on stack",
+                            name,
+                            other.type_name()
+                        )));
+                    }
+                }
+            }
+
+            // `(x → )` — discard a function body's non-final expression
+            // statement's value.
+            Op::Pop => {
+                pop1(&mut self.stack)?;
+            }
+
+            // `(x → )` — print a top-level expression statement's result,
+            // a lazy `Frame` prints its
+            // (optimised) plan; an eager `Frame` collects and prints the
+            // table, or — under `Vm::capture_table` (`wasm` feature) — is
+            // stashed in `Vm::last_table` instead of rendered; a `Scalar`
+            // prints via `fmt_val`; `Noop` prints nothing.
+            Op::Emit => match pop1(&mut self.stack)? {
+                Slot::Frame { lf, lazy } => {
+                    if lazy {
+                        let text = explain_plan(&lf);
+                        self.emit(&text);
+                    } else {
+                        let df = lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?;
+                        self.interrupt.check()?;
+                        #[cfg(feature = "wasm")]
+                        if self.capture_table {
+                            self.last_table = Some(df);
+                            return Ok(());
+                        }
+                        let text = df.to_string();
+                        self.emit(&text);
+                    }
+                }
+                Slot::Scalar(v) => {
+                    let text = crate::repl::fmt_val(&v);
+                    self.emit(&text);
+                }
+                Slot::Noop => {}
+                other => {
+                    return Err(QplError::Runtime(format!(
+                        "Unexpected type on stack: {}",
+                        other.type_name()
+                    )));
+                }
+            },
+
+            // `(result → result)` — return from the innermost `CALL`
+            // unwind to `fp`, restore the
+            // caller's registers, leave `result` on top for the caller.
+            Op::Ret => {
+                let result = pop1(&mut self.stack)?;
+                let fp = self.fp.expect("RET executed outside an active call frame");
+                let mut popped = self.stack.split_off(fp);
+                debug_assert_eq!(
+                    popped.len(),
+                    1,
+                    "a function body must leave only its own Slot::Call frame above fp"
+                );
+                let frame = match popped.pop() {
+                    Some(Slot::Call(f)) => f,
+                    _ => unreachable!("Vm::fp must always index a Slot::Call"),
+                };
+                self.prog = frame.ret_prog;
+                self.ip = frame.ret_ip;
+                self.cp = frame.ret_cp;
+                self.fp = frame.ret_fp;
+                self.call_depth -= 1;
+                self.stack.push(result);
+            }
+
+            // See the doc comment on `Op::Halt` in `program.rs`.
+            Op::Halt => {
+                self.ip = self.prog.code.len();
+            }
+
+            // `(target → )` — unconditional jump: a `while` looping back to its top. `self.ip` has already
+            // advanced past this opcode's own byte, so comparing it to the
+            // popped target tells backward from forward.
+            Op::Jump => {
+                let (ip, cp) = pop_target(&mut self.stack)?;
+                if (ip as usize) < self.ip {
+                    self.interrupt.check()?;
+                }
+                self.ip = ip as usize;
+                self.cp = cp as usize;
+            }
+
+            // `(cond target msg → )`: `while`'s and `?[..]`'s atom
+            // paths. Any `cond` other than a `Bool` atom is the caller's own
+            // error text, carried in `msg`.
+            Op::JumpIfFalse => {
+                let msg = match pop1(&mut self.stack)?.unwrap_operand()? {
+                    Operand::Text(t) => t,
+                    other => {
+                        return Err(QplError::Runtime(format!(
+                            "Expected a Text operand, got {other:?}"
+                        )));
+                    }
+                };
+                let (ip, cp) = pop_target(&mut self.stack)?;
+                match pop1(&mut self.stack)? {
+                    Slot::Scalar(Value::Bool(true)) => {}
+                    Slot::Scalar(Value::Bool(false)) => {
+                        self.ip = ip as usize;
+                        self.cp = cp as usize;
+                    }
+                    _ => return Err(QplError::Runtime(msg.to_string())),
+                }
+            }
+
+            // `(cond target → cond)`: peeks `cond` (never pops),
+            // jumps iff it's a `BoolVec` — value-context `?[..]`'s divert to
+            // the elementwise `CASE_VEC` tail.
+            Op::JumpIfVec => {
+                let (ip, cp) = pop_target(&mut self.stack)?;
+                if matches!(self.stack.last(), Some(Slot::Scalar(Value::BoolVec(_)))) {
+                    self.ip = ip as usize;
+                    self.cp = cp as usize;
+                }
+            }
+
+            // `(mask v1 c2 v2 … d n → Val)` — see `ops::case_vec`.
+            Op::CaseVec => {
+                let n = pop_count(&mut self.stack)?;
+                let rest = popn(&mut self.stack, n)?;
+                let mask = pop1(&mut self.stack)?.unwrap_scalar()?;
+                self.stack.push(Slot::Scalar(ops::case_vec(mask, rest)?));
+            }
+
+            // `( → Noop)`: `noop`, and a `while` statement's own
+            // value once its loop exits.
+            Op::Noop => {
+                self.stack.push(Slot::Noop);
+            }
         }
-        Ok((stack, lazy_mode))
+        Ok(())
     }
+
+    /// Whether `name` currently resolves to a *niladic* (zero-parameter)
+    /// closure or builtin — the shared precondition for `LOAD`'s and
+    /// `LOAD_COL`'s "a bare name that names a niladic function calls it"
+    /// behaviour. Returns owned data (a
+    /// cloned `Builtin`, a cloned `Arc<Closure>`) rather than a `Lookup<'_>`
+    /// so the caller is free to mutate `self` (push a call frame, run the
+    /// builtin) immediately afterwards.
+    fn niladic_closure_or_builtin(&self, name: &str) -> Niladic {
+        match self.lookup(name) {
+            Some(Lookup::Builtin(b)) if b.arity == (0..=0) => Niladic::Builtin(b.clone()),
+            Some(Lookup::Value(Value::Closure(c))) if c.params.is_empty() => {
+                Niladic::Closure(c.clone())
+            }
+            _ => Niladic::None,
+        }
+    }
+
+    /// A bare name resolved as an ordinary (non-call) value — `LOAD`'s and
+    /// `LOAD_FN`'s shared tail once a niladic call has already been ruled
+    /// out.
+    fn resolve_plain(&self, name: &str) -> Resolved {
+        match self.lookup(name) {
+            Some(Lookup::Value(Value::Lazy(lf))) => Resolved::Lazy(lf.clone()),
+            Some(Lookup::Value(Value::Table(df))) => Resolved::Table(df.clone()),
+            Some(Lookup::Value(v)) => Resolved::Scalar(v.clone()),
+            Some(Lookup::Builtin(_)) => Resolved::BuiltinNonNiladic,
+            None => Resolved::Undefined,
+        }
+    }
+
+    /// `Op::Call`'s full runtime dispatch (also used by `Op::Index` and by
+    /// `Op::Load`/`Op::LoadCol`'s niladic-call path): a native keyword calls
+    /// directly; a bound closure name or an anonymous closure value begins a
+    /// `CALL`; a name that's
+    /// neither a closure nor a builtin falls to [`ops::call_by_name`] (a
+    /// handful of shadowable keywords, else a generic column verb).
+    fn call_value(&mut self, callee: Slot, args: Vec<Slot>) -> Result<(), QplError> {
+        match callee {
+            Slot::Operand(Operand::Native(id)) => {
+                let result = match id {
+                    crate::native::NativeId::Enlist => ops::native_enlist(args)?,
+                    crate::native::NativeId::Roll => ops::native_roll(args)?,
+                    crate::native::NativeId::Cfg => self.native_cfg(args)?,
+                    crate::native::NativeId::StdoutLog => self.native_stdout_log(args)?,
+                    crate::native::NativeId::PrintText => self.native_print_text(args)?,
+                    crate::native::NativeId::LoadScript => self.native_load_script(args)?,
+                    crate::native::NativeId::ImportScript => self.native_import_script(args)?,
+                };
+                self.stack.push(result);
+            }
+            Slot::Operand(Operand::Name(name)) => {
+                enum Target {
+                    Builtin(Builtin),
+                    Closure(Arc<Closure>),
+                    Generic,
+                }
+                let target = match self.lookup(&name) {
+                    Some(Lookup::Builtin(b)) => Target::Builtin(b.clone()),
+                    Some(Lookup::Value(Value::Closure(c))) => Target::Closure(c.clone()),
+                    _ => Target::Generic,
+                };
+                match target {
+                    Target::Builtin(b) => {
+                        let result = self.call_builtin(&name, b, args)?;
+                        self.stack.push(result);
+                    }
+                    Target::Closure(c) => {
+                        self.begin_closure_call(c, args, Some(name.to_string()))?;
+                    }
+                    Target::Generic => {
+                        let result = ops::call_by_name(self, &name, args)?;
+                        self.stack.push(result);
+                    }
+                }
+            }
+            Slot::Scalar(Value::Closure(c)) => {
+                self.begin_closure_call(c, args, None)?;
+            }
+            other => {
+                return Err(QplError::Runtime(format!(
+                    "cannot call {} — not a function",
+                    other.type_name()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Arity-checks and runs a builtin (`.qpl.dt`, ...).
+    fn call_builtin(&mut self, name: &str, b: Builtin, args: Vec<Slot>) -> Result<Slot, QplError> {
+        if !b.arity.contains(&args.len()) {
+            return Err(QplError::Runtime(format!(
+                "'{name}' takes {} argument(s), got {}",
+                crate::native::arity_desc(&b.arity),
+                args.len()
+            )));
+        }
+        (b.call)(self, args)
+    }
+
+    /// `.qpl.cfg key=value ...`: compiled from
+    /// `ast::Stmt::Cfg` into `PUSH Native(Cfg); PUSH Value(Str(args)); PUSH
+    /// Count(1); CALL`. A bare `.qpl.cfg` (`args` empty) prints the current
+    /// configuration; otherwise every whitespace-separated `key=value` pair is
+    /// applied.
+    fn native_cfg(&mut self, mut args: Vec<Slot>) -> Result<Slot, QplError> {
+        let args = expect_one_str(&mut args, ".qpl.cfg")?;
+        if args.is_empty() {
+            let current = self.config.describe();
+            self.emit(&current);
+            return Ok(Slot::Noop);
+        }
+        self.check_write_allowed(".qpl.cfg")?;
+        for pair in args.split_whitespace() {
+            let (key, value) = pair.split_once('=').ok_or_else(|| {
+                QplError::Runtime(format!("expected key=value in `.qpl.cfg`, got '{pair}'"))
+            })?;
+            self.config.set(key.trim(), value.trim())?;
+        }
+        Ok(Slot::Noop)
+    }
+
+    /// `\1 <path>`: point (or, for an empty
+    /// path, detach) the stdout log — see [`Vm::set_stdout_log`].
+    fn native_stdout_log(&mut self, mut args: Vec<Slot>) -> Result<Slot, QplError> {
+        let path = expect_one_str(&mut args, "\\1")?;
+        self.set_stdout_log(&path)?;
+        Ok(Slot::Noop)
+    }
+
+    /// `\d <stmt>`: the disassembly listing is
+    /// already rendered at compile time (`compiler::compile_system`) and
+    /// carried as a plain `Str` operand — this just prints it.
+    fn native_print_text(&mut self, mut args: Vec<Slot>) -> Result<Slot, QplError> {
+        let text = expect_one_str(&mut args, "\\d")?;
+        self.emit(&text);
+        Ok(Slot::Noop)
+    }
+
+    /// `\l <path>`: run the embedded target
+    /// program flat, in the current session scope — no source, lexing or
+    /// parsing left to do at run time (see `Operand::Program`).
+    fn native_load_script(&mut self, mut args: Vec<Slot>) -> Result<Slot, QplError> {
+        let program = expect_one_program(&mut args, "\\l")?;
+        self.run_compiled(program)?;
+        Ok(Slot::Noop)
+    }
+
+    /// `\i "<path>"`: run the embedded target
+    /// program as a namespaced import — a snapshot/rollback transaction against a
+    /// pre-compiled `Operand::Program`.
+    /// Namespace *qualification* itself already happened at compile time
+    /// (`compiler::qualify_program`) when the target was compiled, so this is
+    /// purely a runtime bookkeeping transaction, not a rename.
+    fn native_import_script(&mut self, mut args: Vec<Slot>) -> Result<Slot, QplError> {
+        if args.len() != 2 {
+            return Err(QplError::Runtime(format!(
+                "\\i takes 2 argument(s), got {}",
+                args.len()
+            )));
+        }
+        let ns = match args.remove(1).unwrap_scalar()? {
+            Value::Str(s) => s,
+            other => {
+                return Err(QplError::Runtime(format!(
+                    "\\i expected a namespace string, got {other:?}"
+                )));
+            }
+        };
+        let program = expect_one_program(&mut args, "\\i")?;
+        let prefix = format!("{ns}.");
+        let snapshot = self.globals.clone();
+        self.globals.retain(|k, _| !k.starts_with(&prefix));
+        let result = self.run_compiled(program);
+        if result.is_err() {
+            self.globals = snapshot;
+        }
+        result?;
+        Ok(Slot::Noop)
+    }
+
+    /// Begins a user-function call: the
+    /// arity/depth/interrupt checks, then instead of recursing through the
+    /// native Rust call stack this pushes one [`Slot::Call`] activation record onto
+    /// `self.stack` and switches `self.prog`/`self.ip`/`self.cp` to the
+    /// closure's own entry point — the surrounding `step()` loop then simply
+    /// keeps going, now executing the callee's bytecode, until `Op::Ret`
+    /// switches the registers back. No Rust stack frame is added per call.
+    ///
+    /// `args` are already evaluated (in the *caller's* frame, before this
+    /// runs — the caller compiled/evaluated them ahead of `CALL`/`INDEX`).
+    /// `name` is `Some` only for a bare-name call target — what the arity
+    /// error and namespace resolution key off; an anonymous target
+    /// (`{[x] ..}[5]`, a parameter holding a function) has neither.
+    pub(crate) fn begin_closure_call(
+        &mut self,
+        closure: Arc<Closure>,
+        args: Vec<Slot>,
+        name: Option<String>,
+    ) -> Result<(), QplError> {
+        let label = name.clone().unwrap_or_else(|| closure.display.clone());
+        if args.len() != closure.params.len() {
+            return Err(QplError::Runtime(format!(
+                "function '{label}' takes {} argument(s), got {}",
+                closure.params.len(),
+                args.len()
+            )));
+        }
+        self.interrupt.check()?;
+        if self.call_depth >= MAX_CALL_DEPTH {
+            return Err(QplError::Runtime(format!(
+                "function recursion too deep (limit {MAX_CALL_DEPTH})"
+            )));
+        }
+        // arguments bind into the callee's own frame a lazy frame arg stays a `Value::Lazy`, any other frame
+        // collects to a `Value::Table`.
+        let mut locals = HashMap::with_capacity(closure.params.len());
+        for (p, slot) in closure.params.iter().zip(args) {
+            let v = match slot {
+                Slot::Scalar(s) => s,
+                Slot::Frame { lf, lazy } => {
+                    if lazy {
+                        Value::Lazy(lf)
+                    } else {
+                        Value::Table(
+                            (*lf)
+                                .collect()
+                                .map_err(|e| QplError::Runtime(e.to_string()))?,
+                        )
+                    }
+                }
+                Slot::Noop => {
+                    return Err(QplError::Runtime(
+                        "cannot use a no-op expression as a value".into(),
+                    ));
+                }
+                other => {
+                    return Err(QplError::Runtime(format!(
+                        "Expected Expr on stack, got {}",
+                        other.type_name()
+                    )));
+                }
+            };
+            locals.insert(p.clone(), v);
+        }
+        let frame = CallFrame {
+            ret_prog: self.prog.clone(),
+            ret_ip: self.ip,
+            ret_cp: self.cp,
+            ret_fp: self.fp,
+            locals,
+        };
+        self.fp = Some(self.stack.len());
+        self.stack.push(Slot::Call(frame));
+        self.call_depth += 1;
+        self.prog = closure.program.clone();
+        self.ip = closure.entry.0 as usize;
+        self.cp = closure.entry.1 as usize;
+        Ok(())
+    }
+}
+
+/// The result of [`Vm::niladic_closure_or_builtin`].
+enum Niladic {
+    Builtin(Builtin),
+    Closure(Arc<Closure>),
+    None,
+}
+
+/// The result of [`Vm::resolve_plain`].
+enum Resolved {
+    Lazy(Box<LazyFrame>),
+    Table(DataFrame),
+    Scalar(ast::Value),
+    BuiltinNonNiladic,
+    Undefined,
 }
 
 #[derive(Debug)]
@@ -1124,11 +2183,6 @@ pub fn run_vm(source: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-fn require_frame(f: &mut Option<LazyFrame>) -> Result<LazyFrame, QplError> {
-    f.take()
-        .ok_or_else(|| QplError::Runtime("no active frame".into()))
-}
-
 /// Does `expr`, resolved against the active `frame`'s schema, have dtype
 /// `String`? Used to decide whether a `` `date$ `` / `` `timestamp$ `` /
 /// `` `time$ `` cast should parse a string or plain-`.cast()` an already
@@ -1149,13 +2203,13 @@ fn expr_dtype_is_string(frame: Option<&LazyFrame>, expr: &Expr) -> Result<bool, 
         .is_some_and(|(_, dtype)| matches!(dtype, DataType::String)))
 }
 
-fn pop1(stack: &mut Vec<StackObj>) -> Result<StackObj, QplError> {
+fn pop1(stack: &mut Vec<Slot>) -> Result<Slot, QplError> {
     stack
         .pop()
         .ok_or_else(|| QplError::Runtime("stack underflow".into()))
 }
 
-fn popn(stack: &mut Vec<StackObj>, n: usize) -> Result<Vec<StackObj>, QplError> {
+fn popn(stack: &mut Vec<Slot>, n: usize) -> Result<Vec<Slot>, QplError> {
     if stack.len() < n {
         return Err(QplError::Runtime(format!(
             "stack underflow: need {n}, have {}",
@@ -1205,6 +2259,15 @@ pub(crate) fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
                 "a function cannot be used in a query expression".into(),
             ));
         }
+        // a table/lazy-plan global is never substituted as a literal here in
+        // the first place (see `Vm::lookup_global`) — reaching this arm would
+        // mean a table-shaped value flowed into scalar/expression position
+        // some other way.
+        v @ (ast::Value::Table(_) | ast::Value::Lazy(_)) => {
+            return Err(QplError::Runtime(format!(
+                "{v:?} cannot be used in a query expression"
+            )));
+        }
         // typed temporal vectors: same offset-rebasing as their scalar
         // counterparts, applied elementwise via Series/Expr arithmetic.
         ast::Value::DateVec(s) => (s.lit() + lit(temporal::DAYS_2000_TO_1970)).cast(DataType::Date),
@@ -1245,388 +2308,6 @@ pub(crate) fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
     })
 }
 
-const NS_PER_DAY: i64 = 86_400_000_000_000;
-const NS_PER_MIN: i64 = 60_000_000_000;
-const NS_PER_SEC: i64 = 1_000_000_000;
-const NS_PER_MS: i64 = 1_000_000;
-
-/// A temporal scalar as `(kind class, nanoseconds)` for comparison. Classes:
-/// 0 = absolute instant (`date` / `timestamp` interchange), 1 = time of day
-/// (`time` / `minute` / `second`), 2 = duration (`timespan`), 3 = month.
-/// Comparison only crosses variants within the same class.
-fn temporal_ns(v: &ast::Value) -> Option<(u8, i64)> {
-    use ast::Value::*;
-    Some(match *v {
-        Timestamp(ns) => (0, ns),
-        Date(d) => (0, d as i64 * NS_PER_DAY),
-        Time(ns) => (1, ns),
-        Minute(m) => (1, m as i64 * NS_PER_MIN),
-        Second(s) => (1, s as i64 * NS_PER_SEC),
-        Timespan(ns) => (2, ns),
-        Month(m) => (3, m as i64),
-        _ => return None,
-    })
-}
-
-/// Nanosecond magnitude of a "duration-like" temporal scalar (`time`, `minute`,
-/// `second`, `timespan`) added to / taken from a timestamp, date or time.
-fn as_ns_delta(v: &ast::Value) -> Option<i64> {
-    use ast::Value::*;
-    Some(match *v {
-        Time(ns) | Timespan(ns) => ns,
-        Minute(m) => m as i64 * NS_PER_MIN,
-        Second(s) => s as i64 * NS_PER_SEC,
-        _ => return None,
-    })
-}
-
-/// `<temporal> ± <int>` — kdb adds the integer in the operand's own resolution
-/// (`date`+n days, `month`+n months, `time`+n ms, `minute`+n min, `second`+n s,
-/// `timestamp`/`timespan`+n ns). `None` on a non-temporal `v` or on overflow.
-fn shift_temporal_by_int(v: &ast::Value, n: i64) -> Option<ast::Value> {
-    use ast::Value::*;
-    let i32c = |x: i64| i32::try_from(x).ok();
-    Some(match *v {
-        Date(d) => Date(i32c(d as i64 + n)?),
-        Month(m) => Month(i32c(m as i64 + n)?),
-        Minute(x) => Minute(i32c(x as i64 + n)?),
-        Second(x) => Second(i32c(x as i64 + n)?),
-        Time(ns) => Time(ns.checked_add(n.checked_mul(NS_PER_MS)?)?),
-        Timestamp(ns) => Timestamp(ns.checked_add(n)?),
-        Timespan(ns) => Timespan(ns.checked_add(n)?),
-        _ => return None,
-    })
-}
-
-/// All binops where at least one side is a temporal scalar. `None` lets
-/// `scalar_binop` fall through to the numeric path.
-fn temporal_binop(
-    l: &ast::Value,
-    r: &ast::Value,
-    op: &str,
-) -> Option<Result<ast::Value, QplError>> {
-    use ast::Value::*;
-    let overflow = || QplError::Runtime("temporal arithmetic overflowed".into());
-
-    // comparison — only within the same kind class
-    if matches!(op, "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=") {
-        let ((lc, a), (rc, b)) = (temporal_ns(l)?, temporal_ns(r)?);
-        if lc != rc {
-            return Some(Err(QplError::Runtime(format!(
-                "cannot compare {l:?} and {r:?}"
-            ))));
-        }
-        return Some(Ok(Bool(match op {
-            "=" => a == b,
-            "<>" | "!=" => a != b,
-            "<" => a < b,
-            ">" => a > b,
-            "<=" => a <= b,
-            _ => a >= b,
-        })));
-    }
-
-    if !matches!(op, "+" | "-" | "*") {
-        return if temporal_ns(l).is_some() || temporal_ns(r).is_some() {
-            Some(Err(QplError::Runtime(format!(
-                "cannot apply '{op}' to {l:?} and {r:?}"
-            ))))
-        } else {
-            None
-        };
-    }
-
-    // temporal ± integer (each in the operand's own unit)
-    if matches!(op, "+" | "-") {
-        if let Int(n) = r
-            && temporal_ns(l).is_some()
-        {
-            let n = if op == "-" { n.checked_neg()? } else { *n };
-            return Some(shift_temporal_by_int(l, n).ok_or_else(overflow));
-        }
-        if let Int(n) = l
-            && op == "+"
-            && temporal_ns(r).is_some()
-        {
-            return Some(shift_temporal_by_int(r, *n).ok_or_else(overflow));
-        }
-        // timestamp / date / time / timespan ± a duration-like temporal
-        if let Some(d0) = as_ns_delta(r) {
-            let d = if op == "-" { d0.checked_neg()? } else { d0 };
-            return Some(match *l {
-                Timestamp(a) => a.checked_add(d).map(Timestamp).ok_or_else(overflow),
-                Time(a) => a.checked_add(d).map(Time).ok_or_else(overflow),
-                Timespan(a) => a.checked_add(d).map(Timespan).ok_or_else(overflow),
-                Date(a) => (a as i64)
-                    .checked_mul(NS_PER_DAY)
-                    .and_then(|x| x.checked_add(d))
-                    .map(Timestamp)
-                    .ok_or_else(overflow),
-                _ => {
-                    return Some(Err(QplError::Runtime(format!(
-                        "cannot apply '{op}' to {l:?} and {r:?}"
-                    ))));
-                }
-            });
-        }
-        if op == "+" && as_ns_delta(l).is_some() && matches!(r, Timestamp(_) | Date(_)) {
-            return temporal_binop(r, l, op); // commute
-        }
-    }
-
-    let checked = |o: Option<ast::Value>| o.ok_or_else(overflow);
-    Some(match (l, r, op) {
-        (Date(a), Date(b), "-") => Ok(Int((*a - *b) as i64)),
-        (Timestamp(a), Timestamp(b), "-") => checked(a.checked_sub(*b).map(Timespan)),
-        (Month(a), Month(b), "-") => Ok(Int((*a - *b) as i64)),
-        (Timespan(a), Int(b), "*") => checked(a.checked_mul(*b).map(Timespan)),
-        (Int(a), Timespan(b), "*") => checked(b.checked_mul(*a).map(Timespan)),
-        _ => Err(QplError::Runtime(format!(
-            "cannot apply '{op}' to {l:?} and {r:?}"
-        ))),
-    })
-}
-
-fn scalar_binop(l: ast::Value, r: ast::Value, op: &str) -> Result<ast::Value, QplError> {
-    use ast::Value::*;
-
-    if (temporal_ns(&l).is_some() || temporal_ns(&r).is_some())
-        && let Some(res) = temporal_binop(&l, &r, op)
-    {
-        return res;
-    }
-
-    // promote int to float when mixed
-    let (l, r) = match (l, r) {
-        (Int(a), Float(b)) => (Float(a as f64), Float(b)),
-        (Float(a), Int(b)) => (Float(a), Float(b as f64)),
-        pair => pair,
-    };
-    Ok(match (l, r, op) {
-        (Int(a), Int(b), "+") => Int(a + b),
-        (Int(a), Int(b), "-") => Int(a - b),
-        (Int(a), Int(b), "*") => Int(a * b),
-        // q's `%` is always true (float) division, even for two ints — 10%4 is
-        // 2.5, not 2. Unlike the other int/int arms, this doesn't stay `Int`.
-        (Int(a), Int(b), "%") => Float(a as f64 / b as f64),
-        (Int(a), Int(b), "=") => Bool(a == b),
-        (Int(a), Int(b), "<") => Bool(a < b),
-        (Int(a), Int(b), ">") => Bool(a > b),
-        (Int(a), Int(b), "<=") => Bool(a <= b),
-        (Int(a), Int(b), ">=") => Bool(a >= b),
-        (Int(a), Int(b), "<>" | "!=") => Bool(a != b),
-        (Float(a), Float(b), "+") => Float(a + b),
-        (Float(a), Float(b), "-") => Float(a - b),
-        (Float(a), Float(b), "*") => Float(a * b),
-        (Float(a), Float(b), "%") => Float(a / b),
-        (Float(a), Float(b), "=") => Bool(a == b),
-        (Float(a), Float(b), "<") => Bool(a < b),
-        (Float(a), Float(b), ">") => Bool(a > b),
-        (Float(a), Float(b), "<=") => Bool(a <= b),
-        (Float(a), Float(b), ">=") => Bool(a >= b),
-        (Str(a), Str(b), "+") => Str(a + &b),
-        (Str(a) | Sym(a), Str(b) | Sym(b), "like") => Bool(like_match(&a, &b)?),
-        (l, r, op) => {
-            return Err(QplError::Runtime(format!(
-                "cannot apply '{op}' to {l:?} and {r:?}"
-            )));
-        }
-    })
-}
-
-/// `<vector> op <scalar>` / `<scalar> op <vector>` / `<vector> op <vector>` —
-/// at least one operand is a vector `Value`. Reuses the same literal→`Expr`
-/// bridge (`ast_val_to_expr`) and operator table (`apply_binop`) the table
-/// pipeline uses for column expressions, so a vector composes with a scalar
-/// exactly like a Polars column would (broadcasting a length-1 side, and
-/// applying the same dtype/temporal promotion rules Polars applies to
-/// columns) — this is the native vectorised path `scalar_binop` doesn't cover.
-fn vector_binop(l: ast::Value, r: ast::Value, op: &str) -> Result<ast::Value, QplError> {
-    let l_expr = ast_val_to_expr(l)?;
-    let r_expr = ast_val_to_expr(r)?;
-    let expr = apply_binop(l_expr, r_expr, op)?.alias("r");
-    let df = df!("_" => [0i64])?.lazy().select([expr]).collect()?;
-    resolve::column_to_value(df.column("r")?)
-}
-
-/// Scalar counterpart of `apply_binop`'s `"like"` arm: matches `text` against
-/// a q-glob `pattern` directly, with no Polars column involved.
-fn like_match(text: &str, pattern: &str) -> Result<bool, QplError> {
-    let regex_src = like_pattern_to_regex(pattern);
-    regex::Regex::new(&regex_src)
-        .map(|re| re.is_match(text))
-        .map_err(|e| QplError::Runtime(format!("invalid 'like' pattern '{pattern}': {e}")))
-}
-
-/// Casts a scalar [`Value`] to the family named by `dtype` — the same type
-/// names [`polars_dtype`] accepts. qpl scalars carry a single integer and a
-/// single float type, so every `iN`/`uN` name folds to `Int` and `f32`/`f64`
-/// to `Float`; the width only matters once the value reaches a column.
-fn scalar_cast(val: ast::Value, dtype: &str, use_qepoch: bool) -> Result<ast::Value, QplError> {
-    use ast::Value::*;
-    // shared string parse for `Str` / `Sym` sources; accepts an int- or
-    // float-looking literal
-    let as_int = |s: &str| {
-        let s = s.trim();
-        s.parse::<i64>()
-            .ok()
-            .or_else(|| s.parse::<f64>().ok().map(|f| f as i64))
-    };
-    let bad = |v: &ast::Value| QplError::Runtime(format!("cannot cast {v:?} to '{dtype}'"));
-    // temporal targets (`` `date$x ``, `"p"$"…"`, …) have their own path
-    if matches!(
-        dtype,
-        "date" | "month" | "time" | "minute" | "second" | "timestamp" | "timespan"
-    ) {
-        return scalar_temporal_cast(val, dtype, use_qepoch);
-    }
-    Ok(match dtype {
-        "i64" | "int" | "long" | "i32" | "i16" | "i8" | "u64" | "u32" | "u16" | "u8" => match val {
-            Int(n) => Int(n),
-            Float(f) => Int(f as i64),
-            Bool(b) => Int(b as i64),
-            // a temporal scalar unwraps to its kdb integer offset
-            Date(n) | Month(n) | Minute(n) | Second(n) => Int(n as i64),
-            Time(n) | Timespan(n) => Int(n),
-            // `timestamp` -> raw int crosses the epoch boundary: ns since the
-            // Unix epoch by default, ns since kdb's 2000.01.01 with `useqepoch`
-            Timestamp(n) => Int(if use_qepoch {
-                n
-            } else {
-                n + temporal::NS_2000_TO_1970
-            }),
-            Str(ref s) | Sym(ref s) => Int(as_int(s)
-                .ok_or_else(|| QplError::Runtime(format!("cannot parse '{s}' as '{dtype}'")))?),
-            ref v => return Err(bad(v)),
-        },
-        "f64" | "float" | "f32" => match val {
-            Int(n) => Float(n as f64),
-            Float(f) => Float(f),
-            Bool(b) => Float(b as i64 as f64),
-            Str(ref s) | Sym(ref s) => Float(
-                s.trim()
-                    .parse::<f64>()
-                    .map_err(|_| QplError::Runtime(format!("cannot parse '{s}' as '{dtype}'")))?,
-            ),
-            ref v => return Err(bad(v)),
-        },
-        "bool" => match val {
-            Int(n) => Bool(n != 0),
-            Float(f) => Bool(f != 0.0),
-            Bool(b) => Bool(b),
-            Str(ref s) | Sym(ref s) => match s.trim().to_ascii_lowercase().as_str() {
-                "true" | "1" => Bool(true),
-                "false" | "0" => Bool(false),
-                _ => return Err(QplError::Runtime(format!("cannot parse '{s}' as 'bool'"))),
-            },
-            ref v => return Err(bad(v)),
-        },
-        "str" | "string" => match val {
-            Int(n) => Str(n.to_string()),
-            Float(f) => Str(f.to_string()),
-            Bool(b) => Str(b.to_string()),
-            Str(s) | Sym(s) => Str(s),
-            ref v => match temporal::format_temporal(v) {
-                Some(text) => Str(text),
-                None => return Err(bad(v)),
-            },
-        },
-        _ => return Err(QplError::Runtime(format!("unknown cast type '{dtype}'"))),
-    })
-}
-
-/// `` `date$ ``, `` `month$ ``, `"p"$"…"` … — cast to a temporal scalar. A
-/// string / symbol source is parsed with [`temporal::parse_temporal`]; a
-/// temporal source is converted through its day- or nanosecond-offset; a plain
-/// `Int` is reinterpreted directly as the offset (kdb `` `date$8000 ``).
-fn scalar_temporal_cast(
-    val: ast::Value,
-    target: &str,
-    use_qepoch: bool,
-) -> Result<ast::Value, QplError> {
-    use ast::Value::*;
-
-    // string / symbol → parse, then fall through to the converters below
-    let val = match val {
-        Str(s) | Sym(s) => temporal::parse_temporal(&s)
-            .ok_or_else(|| QplError::Runtime(format!("cannot parse {s:?} as a temporal value")))?,
-        other => other,
-    };
-
-    // days since 2000.01.01 for any date-ish source
-    let to_days = |v: &ast::Value| -> Option<i32> {
-        Some(match *v {
-            Date(d) => d,
-            Timestamp(ns) => ns.div_euclid(NS_PER_DAY) as i32,
-            Month(m) => {
-                temporal::days_from_civil(2000 + m.div_euclid(12), (m.rem_euclid(12) + 1) as u32, 1)
-                    - temporal::DAYS_2000_TO_1970
-            }
-            _ => return None,
-        })
-    };
-    let bad = || QplError::Runtime(format!("cannot cast {val:?} to '{target}'"));
-
-    Ok(match target {
-        "date" => match val {
-            Date(_) => val,
-            Int(n) => Date(n as i32),
-            ref v => Date(to_days(v).ok_or_else(bad)?),
-        },
-        "month" => match val {
-            Month(_) => val,
-            Int(n) => Month(n as i32),
-            ref v => {
-                let d = to_days(v).ok_or_else(bad)?;
-                let (y, m, _) = temporal::civil_from_days(d + temporal::DAYS_2000_TO_1970);
-                Month((y - 2000) * 12 + (m as i32 - 1))
-            }
-        },
-        "timestamp" => match val {
-            Timestamp(_) => val,
-            // raw int crosses the epoch boundary: read as ns since the Unix
-            // epoch by default, ns since kdb's 2000.01.01 with `useqepoch`
-            Int(n) => Timestamp(if use_qepoch {
-                n
-            } else {
-                n - temporal::NS_2000_TO_1970
-            }),
-            ref v => Timestamp(to_days(v).ok_or_else(bad)? as i64 * NS_PER_DAY),
-        },
-        "time" => match val {
-            Time(_) => val,
-            Int(n) => Time(n),
-            Timestamp(ns) => Time(ns.rem_euclid(NS_PER_DAY)),
-            Minute(m) => Time(m as i64 * 60_000_000_000),
-            Second(s) => Time(s as i64 * 1_000_000_000),
-            _ => return Err(bad()),
-        },
-        "minute" => match val {
-            Minute(_) => val,
-            Int(n) => Minute(n as i32),
-            Time(ns) => Minute((ns / 60_000_000_000) as i32),
-            Timestamp(ns) => Minute((ns.rem_euclid(NS_PER_DAY) / 60_000_000_000) as i32),
-            Second(s) => Minute(s / 60),
-            _ => return Err(bad()),
-        },
-        "second" => match val {
-            Second(_) => val,
-            Int(n) => Second(n as i32),
-            Time(ns) => Second((ns / 1_000_000_000) as i32),
-            Timestamp(ns) => Second((ns.rem_euclid(NS_PER_DAY) / 1_000_000_000) as i32),
-            Minute(m) => Second(m * 60),
-            _ => return Err(bad()),
-        },
-        "timespan" => match val {
-            Timespan(_) => val,
-            Int(n) => Timespan(n),
-            Time(ns) => Timespan(ns),
-            _ => return Err(bad()),
-        },
-        _ => return Err(QplError::Runtime(format!("unknown cast type '{target}'"))),
-    })
-}
-
 fn polars_dtype(name: &str) -> Result<DataType, QplError> {
     Ok(match name {
         "f64" | "float" => DataType::Float64,
@@ -1644,7 +2325,7 @@ fn polars_dtype(name: &str) -> Result<DataType, QplError> {
         "long" => DataType::Int64,
         // temporal targets in column context. `month` has no Polars dtype so it
         // maps to `Date`; `minute` / `second` map to `Time` (truncation to the
-        // unit is a Phase-2 concern).
+        // unit is not implemented).
         "date" => DataType::Date,
         "month" => DataType::Date,
         "time" | "minute" | "second" => DataType::Time,
@@ -1858,103 +2539,6 @@ fn build_window(
     Ok(ranked.cast(DataType::Int64))
 }
 
-fn apply_binop(left: Expr, right: Expr, op: &str) -> Result<Expr, QplError> {
-    if op == "like" {
-        let pattern = match &right {
-            Expr::Literal(lv) => lv.extract_str(),
-            _ => None,
-        }
-        .ok_or_else(|| QplError::Runtime("'like's pattern must be a string literal".into()))?;
-        let regex = like_pattern_to_regex(pattern);
-        return Ok(left.str().contains(lit(regex), true));
-    }
-    Ok(match op {
-        "+" => left + right,
-        "-" => left - right,
-        "*" => left * right,
-        // q's `%` is always true (float) division — Polars' `/` on two integer
-        // columns truncates like Rust's own `/`, so force a float division by
-        // casting both sides first (a no-op for columns already float).
-        "%" => left.cast(DataType::Float64) / right.cast(DataType::Float64),
-        "=" => left.eq(right),
-        "!=" | "<>" => left.neq(right),
-        "<" => left.lt(right),
-        "<=" => left.lt_eq(right),
-        ">" => left.gt(right),
-        ">=" => left.gt_eq(right),
-        "&" => left.and(right),
-        "|" => left.or(right),
-        _ => return Err(QplError::Runtime(format!("unknown operator '{op}'"))),
-    })
-}
-
-/// Translates a q-style `like` glob pattern into an anchored regex.
-///
-/// q's glob syntax: `*` matches any sequence (incl. empty), `?` matches any
-/// single character, `[abc]` / `[a-z]` / `[^abc]` are character classes. A
-/// pattern character loses its special meaning inside `[...]` — including a
-/// literal `]`, which is only a class member (not the closing bracket) when
-/// it's the first character after `[` or `[^`, e.g. `[]]` matches `]`.
-fn like_pattern_to_regex(pattern: &str) -> String {
-    let chars: Vec<char> = pattern.chars().collect();
-    let n = chars.len();
-    let mut out = String::from("^(?:");
-    let mut i = 0;
-    while i < n {
-        match chars[i] {
-            '*' => {
-                out.push_str(".*");
-                i += 1;
-            }
-            '?' => {
-                out.push('.');
-                i += 1;
-            }
-            '[' => {
-                let open = i;
-                i += 1;
-                let mut class = String::new();
-                if i < n && chars[i] == '^' {
-                    class.push('^');
-                    i += 1;
-                }
-                if i < n && chars[i] == ']' {
-                    class.push_str("\\]");
-                    i += 1;
-                }
-                while i < n && chars[i] != ']' {
-                    // `\` and `[` are the only characters the regex crate
-                    // still treats specially inside a class.
-                    if chars[i] == '\\' || chars[i] == '[' {
-                        class.push('\\');
-                    }
-                    class.push(chars[i]);
-                    i += 1;
-                }
-                if i < n {
-                    i += 1; // consume closing ']'
-                    out.push('[');
-                    out.push_str(&class);
-                    out.push(']');
-                } else {
-                    // unterminated class: treat the '[' as a literal character
-                    out.push_str("\\[");
-                    i = open + 1;
-                }
-            }
-            c => {
-                if "\\.+^$|(){}".contains(c) {
-                    out.push('\\');
-                }
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    out.push_str(")$");
-    out
-}
-
 pub(crate) fn apply_call(func: &str, mut args: Vec<Expr>) -> Result<Expr, QplError> {
     if args.is_empty() {
         return Err(QplError::Runtime(format!("'{func}' called with no args")));
@@ -2022,6 +2606,7 @@ mod tests {
     use super::*;
     use crate::compiler::compile;
     use crate::lexer::tokenise;
+    use crate::ops::{NS_PER_DAY, scalar_cast};
     use crate::parser::parse;
 
     fn make_vm() -> Vm {
@@ -2032,7 +2617,7 @@ mod tests {
         ]
         .unwrap();
         let mut vm = Vm::new();
-        vm.tables.insert("t".into(), df);
+        vm.globals.insert("t".into(), Value::Table(df));
         vm
     }
 
@@ -2107,50 +2692,36 @@ mod tests {
 
     #[test]
     fn eval_int() {
-        let vm = make_vm();
-        let val = vm
-            .eval_scalar(&ast::Expr::Lit(ast::Value::Int(42)))
-            .expect("eval");
-        assert_eq!(val, ast::Value::Int(42));
+        let mut vm = make_vm();
+        match run_vm("42", &mut vm).expect("eval") {
+            EvalResult::Scalar(v) => assert_eq!(v, ast::Value::Int(42)),
+            other => panic!("expected a scalar, got {other:?}"),
+        }
     }
 
     #[test]
     fn eval_bare_symbol_is_a_symbol_value() {
-        let vm = make_vm();
-        assert_eq!(
-            vm.eval_scalar(&ast::Expr::Sym("trades".into()))
-                .expect("eval"),
-            ast::Value::Sym("trades".into()),
-        );
+        let mut vm = make_vm();
+        match run_vm("`trades", &mut vm).expect("eval") {
+            EvalResult::Scalar(v) => assert_eq!(v, ast::Value::Sym("trades".into())),
+            other => panic!("expected a scalar, got {other:?}"),
+        }
     }
 
     #[test]
     fn eval_cast_string_var_to_symbol() {
-        // `\`$o` resolves the string global `o` and interns it into a symbol
+        // `` `$o `` resolves the string global `o` and interns it into a symbol
         let mut vm = make_vm();
-        vm.globals
-            .insert("o".into(), ast::Value::Str("out.parquet".into()));
-        let expr = ast::Expr::Cast {
-            target: ast::CastTarget::Sym,
-            expr: Box::new(ast::Expr::ColRef("o".into())),
-        };
-        assert_eq!(
-            vm.eval_scalar(&expr).expect("eval"),
-            ast::Value::Sym("out.parquet".into())
-        );
-    }
-
-    fn like(text: &str, pattern: &str) -> ast::Expr {
-        ast::Expr::BinOp {
-            left: Box::new(ast::Expr::Lit(ast::Value::Str(text.into()))),
-            op: "like".into(),
-            right: Box::new(ast::Expr::Lit(ast::Value::Str(pattern.into()))),
+        run_vm("o: \"out.parquet\"", &mut vm).expect("bind o");
+        match run_vm("`$o", &mut vm).expect("eval") {
+            EvalResult::Scalar(v) => assert_eq!(v, ast::Value::Sym("out.parquet".into())),
+            other => panic!("expected a scalar, got {other:?}"),
         }
     }
 
     #[test]
     fn like_matches_per_q_glob_semantics() {
-        let vm = make_vm();
+        let mut vm = make_vm();
         let cases: &[(&str, &str, bool)] = &[
             ("quick", "qu?ck", true),    // ? = any single char
             ("quickly", "quick*", true), // * = any sequence, incl. empty
@@ -2170,20 +2741,23 @@ mod tests {
             ("a[c", "a[[]c", true),
         ];
         for (text, pattern, expect) in cases {
-            let got = vm.eval_scalar(&like(text, pattern)).expect("eval");
-            assert_eq!(got, ast::Value::Bool(*expect), "{text:?} like {pattern:?}");
+            let src = format!("\"{text}\" like \"{pattern}\"");
+            match run_vm(&src, &mut vm).expect("eval") {
+                EvalResult::Scalar(v) => {
+                    assert_eq!(v, ast::Value::Bool(*expect), "{text:?} like {pattern:?}")
+                }
+                other => panic!("expected a scalar, got {other:?}"),
+            }
         }
     }
 
     #[test]
     fn like_treats_symbol_and_string_uniformly() {
-        let vm = make_vm();
-        let expr = ast::Expr::BinOp {
-            left: Box::new(ast::Expr::Sym("quick".into())),
-            op: "like".into(),
-            right: Box::new(ast::Expr::Lit(ast::Value::Str("qu?ck".into()))),
-        };
-        assert_eq!(vm.eval_scalar(&expr).expect("eval"), ast::Value::Bool(true));
+        let mut vm = make_vm();
+        match run_vm("`quick like \"qu?ck\"", &mut vm).expect("eval") {
+            EvalResult::Scalar(v) => assert_eq!(v, ast::Value::Bool(true)),
+            other => panic!("expected a scalar, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2250,7 +2824,7 @@ mod tests {
         }
     }
 
-    // --- phase 2: per-connection read/write permission (`ipc` feature) ---
+    // --- per-connection read/write permission (`ipc` feature) ---
 
     #[cfg(feature = "ipc")]
     mod request_permission {
@@ -2388,12 +2962,9 @@ mod tests {
     #[test]
     fn eval_scalar_cast_end_to_end() {
         // the `l: int$45.3` case from the docs: a cast folds during scalar eval
-        let vm = make_vm();
-        let expr = ast::Expr::Cast {
-            target: ast::CastTarget::Prim("int".into()),
-            expr: Box::new(ast::Expr::Lit(ast::Value::Float(45.3))),
-        };
-        assert_eq!(vm.eval_scalar(&expr).unwrap(), ast::Value::Int(45));
+        let mut vm = make_vm();
+        run_vm("l: int$45.3", &mut vm).unwrap();
+        assert_eq!(vm.globals.get("l"), Some(&ast::Value::Int(45)));
     }
 
     #[test]
@@ -2571,7 +3142,7 @@ mod tests {
             "tm"  => ["09:30:00", "16:00:00", "00:00:01"],
         ]
         .unwrap();
-        vm.tables.insert("d".into(), src);
+        vm.globals.insert("d".into(), Value::Table(src));
         let df = run(
             vm,
             "select a: `date$ds, b: `timestamp$ts, c: `time$tm, e: `month$ds from d",
@@ -2600,7 +3171,7 @@ mod tests {
         // query rather than silently nulling.
         let mut vm = make_vm();
         let src = df!["ds" => ["2024-03-15", "not a date", "2024-01-02"]].unwrap();
-        vm.tables.insert("d".into(), src);
+        vm.globals.insert("d".into(), Value::Table(src));
         let prog =
             compile(&parse(tokenise("select a: `date$ds from d").unwrap()).unwrap()).unwrap();
         match vm.eval(prog) {
@@ -2629,7 +3200,7 @@ mod tests {
             )])
             .collect()
             .unwrap();
-        vm.tables.insert("d".into(), src);
+        vm.globals.insert("d".into(), Value::Table(src));
         let df = run(vm, "select a: `date$ts, b: `time$ts from d");
         assert_eq!(df.column("a").unwrap().dtype(), &DataType::Date);
         assert_eq!(df.column("b").unwrap().dtype(), &DataType::Time);
@@ -2653,6 +3224,61 @@ mod tests {
         vm.eval(prog).expect("eval");
         let val = vm.globals.get("x").expect("x exists");
         assert_eq!(val, &ast::Value::Int(42));
+    }
+
+    // --- LOAD ---
+
+    #[test]
+    fn load_of_a_bare_table_name_gives_a_frame() {
+        // `u: t` is a `ScalarAssign` (value context): `t` bare resolves
+        // through `LOAD` to a `Frame` (not an "undefined variable" error).
+        let mut vm = make_vm();
+        run_vm("u: t", &mut vm).expect("t resolves to a frame, not a scalar error");
+        assert!(matches!(vm.globals.get("u"), Some(ast::Value::Table(_))));
+    }
+
+    #[test]
+    fn load_of_a_bare_lazy_binding_stays_lazy() {
+        let mut vm = make_vm();
+        run_vm("l: lazy select from t", &mut vm).expect("bind lazy plan");
+        match run_vm("l", &mut vm).expect("load the lazy binding") {
+            EvalResult::Lazy(_) => {}
+            other => panic!("expected a lazy plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_of_a_niladic_function_calls_it() {
+        let mut vm = Vm::new();
+        run_vm("f: {[] 42}", &mut vm).expect("define f");
+        match run_vm("f", &mut vm).expect("load calls the niladic function") {
+            EvalResult::Scalar(ast::Value::Int(42)) => {}
+            other => panic!("expected Scalar(42), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_of_an_undefined_name_is_the_resolve_name_error_text() {
+        let mut vm = Vm::new();
+        let err = run_vm("nosuchname", &mut vm).expect_err("undefined name");
+        assert!(
+            err.to_string()
+                .contains("undefined name 'nosuchname' (not a variable, table or lazy frame)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn binop_mixed_fallback_still_computes_the_right_answer() {
+        // `n * fac[n-1]`-shaped expression: the multiplication compiles
+        // directly (BINOP), the call operand compiles separately — and the two
+        // compose to the right value.
+        let mut vm = Vm::new();
+        run_vm("fac: {[n] ?[n<=1; 1; n * fac[n-1]]}", &mut vm).expect("define fac");
+        match run_vm("fac[5]", &mut vm).expect("call fac") {
+            EvalResult::Scalar(ast::Value::Int(120)) => {}
+            other => panic!("expected Scalar(120), got {other:?}"),
+        }
     }
 
     // --- categorical casts ---
@@ -2996,16 +3622,16 @@ mod tests {
     #[test]
     fn isnull_and_notnull_filter_rows() {
         let mut vm = make_vm();
-        vm.tables.insert(
+        vm.globals.insert(
             "n".into(),
-            df!["x" => [Some(1i64), None, Some(3), None]].unwrap(),
+            Value::Table(df!["x" => [Some(1i64), None, Some(3), None]].unwrap()),
         );
         let df = run(vm, "select from n where isnull x");
         assert_eq!(df.height(), 2);
         let mut vm = make_vm();
-        vm.tables.insert(
+        vm.globals.insert(
             "n".into(),
-            df!["x" => [Some(1i64), None, Some(3), None]].unwrap(),
+            Value::Table(df!["x" => [Some(1i64), None, Some(3), None]].unwrap()),
         );
         let df = run(vm, "select from n where notnull x");
         assert_eq!(df.height(), 2);
@@ -3015,9 +3641,9 @@ mod tests {
     fn fill_replaces_nulls_and_dropnull_drops_rows() {
         let mk = || {
             let mut vm = make_vm();
-            vm.tables.insert(
+            vm.globals.insert(
                 "n".into(),
-                df!["x" => [Some(1i64), None, Some(3), None]].unwrap(),
+                Value::Table(df!["x" => [Some(1i64), None, Some(3), None]].unwrap()),
             );
             vm
         };
@@ -3417,21 +4043,25 @@ mod tests {
 
     fn make_join_vm() -> Vm {
         let mut vm = Vm::new();
-        vm.tables.insert(
+        vm.globals.insert(
             "trades".into(),
-            df![
-                "sym"   => ["a", "a", "b"],
-                "price" => [10i64, 20, 30],
-            ]
-            .unwrap(),
+            Value::Table(
+                df![
+                    "sym"   => ["a", "a", "b"],
+                    "price" => [10i64, 20, 30],
+                ]
+                .unwrap(),
+            ),
         );
-        vm.tables.insert(
+        vm.globals.insert(
             "quotes".into(),
-            df![
-                "sym" => ["a", "b", "c"],
-                "bid"  => [1i64, 2, 3],
-            ]
-            .unwrap(),
+            Value::Table(
+                df![
+                    "sym" => ["a", "b", "c"],
+                    "bid"  => [1i64, 2, 3],
+                ]
+                .unwrap(),
+            ),
         );
         vm
     }
@@ -3479,8 +4109,7 @@ mod tests {
             run_vm("l: lazy select from t", &mut vm),
             Ok(EvalResult::Stored)
         ));
-        assert!(vm.lazy_frames.contains_key("l"));
-        assert!(!vm.tables.contains_key("l"));
+        assert!(matches!(vm.globals.get("l"), Some(Value::Lazy(_))));
     }
 
     #[test]
@@ -3501,8 +4130,7 @@ mod tests {
             run_vm("m: collect l", &mut vm),
             Ok(EvalResult::Stored)
         ));
-        assert!(vm.tables.contains_key("m"));
-        assert!(!vm.lazy_frames.contains_key("m"));
+        assert!(matches!(vm.globals.get("m"), Some(Value::Table(_))));
         let df = run(vm, "select c2 from m");
         assert_eq!(i64s(&df, "c2"), vec![10, 20, 30, 15]);
     }
@@ -3516,8 +4144,7 @@ mod tests {
             run_vm("l: update c2: c2 * 2 from l", &mut vm),
             Ok(EvalResult::Stored)
         ));
-        assert!(vm.lazy_frames.contains_key("l"));
-        assert!(!vm.tables.contains_key("l"));
+        assert!(matches!(vm.globals.get("l"), Some(Value::Lazy(_))));
         run_vm("tm: collect l", &mut vm).unwrap();
         let df = run(vm, "select c2 from tm");
         assert_eq!(i64s(&df, "c2"), vec![20, 40, 60, 30]);
@@ -3538,7 +4165,7 @@ mod tests {
         ]
         .unwrap();
         let mut vm = Vm::new();
-        vm.tables.insert("t".into(), df);
+        vm.globals.insert("t".into(), Value::Table(df));
         vm
     }
 
@@ -3581,7 +4208,7 @@ mod tests {
         ]
         .unwrap();
         let mut vm = Vm::new();
-        vm.tables.insert("t".into(), df);
+        vm.globals.insert("t".into(), Value::Table(df));
         vm
     }
 
@@ -3633,5 +4260,1393 @@ mod tests {
         let mut vm = make_vm();
         let prog = compile(&parse(tokenise("select c1 from nope").unwrap()).unwrap()).unwrap();
         assert!(matches!(vm.eval(prog), Err(QplError::Runtime(_))));
+    }
+
+    // --- natives / verbs in value context ---
+
+    fn scalar(vm: &mut Vm, src: &str) -> Value {
+        match run_vm(src, vm).expect("run") {
+            EvalResult::Scalar(v) => v,
+            other => panic!("expected a scalar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn take_and_index_on_a_plain_list() {
+        let mut vm = Vm::new();
+        run_vm("v: 10 20 30 40", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "2#v"), ast::int_vec(vec![10, 20]));
+        assert_eq!(scalar(&mut vm, "-2#v"), ast::int_vec(vec![30, 40]));
+        assert_eq!(scalar(&mut vm, "v[1]"), Value::Int(20));
+        assert_eq!(scalar(&mut vm, "v[1 3]"), ast::int_vec(vec![20, 40]));
+    }
+
+    #[test]
+    fn take_count_must_be_an_int() {
+        let mut vm = Vm::new();
+        run_vm("v: 1 2 3", &mut vm).unwrap();
+        let err = run_vm("1.5#v", &mut vm).unwrap_err();
+        assert!(err.to_string().contains("take count must be an int"));
+    }
+
+    #[test]
+    fn index_out_of_range_is_a_runtime_error() {
+        let mut vm = Vm::new();
+        run_vm("v: 1 2 3", &mut vm).unwrap();
+        assert!(run_vm("v[10]", &mut vm).is_err());
+    }
+
+    #[test]
+    fn index_of_a_bare_name_calls_when_it_is_a_function() {
+        let mut vm = Vm::new();
+        run_vm("sq: {[x] x*x}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "sq[5]"), Value::Int(25));
+    }
+
+    #[test]
+    fn table_column_expression_collapses_to_a_list_via_column() {
+        let df = df!["price" => [1.0f64, 2.0, 3.0]].unwrap();
+        let mut vm = Vm::new();
+        vm.globals.insert("t".into(), Value::Table(df));
+        assert_eq!(
+            scalar(&mut vm, "t`price"),
+            ast::float_vec(vec![1.0, 2.0, 3.0])
+        );
+    }
+
+    #[test]
+    fn zip_builds_a_table_and_rejects_a_non_dict() {
+        let mut vm = Vm::new();
+        let result = run_vm("zip `a`b!(1 2) (3 4)", &mut vm).unwrap();
+        match result {
+            EvalResult::Table(df) => {
+                assert_eq!(i64s(&df, "a"), vec![1, 2]);
+                assert_eq!(i64s(&df, "b"), vec![3, 4]);
+            }
+            other => panic!("expected a table, got {other:?}"),
+        }
+        assert!(run_vm("zip 5", &mut Vm::new()).is_err());
+    }
+
+    #[test]
+    fn list_where_filters_a_list_and_rejects_a_non_list() {
+        let mut vm = Vm::new();
+        run_vm("v: 10 20 30 40", &mut vm).unwrap();
+        assert_eq!(
+            scalar(&mut vm, "v where x>15"),
+            ast::int_vec(vec![20, 30, 40])
+        );
+        let err = run_vm("5 where x>1", &mut Vm::new()).unwrap_err();
+        assert!(err.to_string().contains("'where' needs a list on the left"));
+    }
+
+    #[test]
+    fn a_user_function_named_like_a_verb_wins_over_the_builtin() {
+        // `sum` is an ordinary column verb, but a user-defined function of
+        // the same name shadows it.
+        let mut vm = Vm::new();
+        run_vm("sum: {[x] 999}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "sum 1 2 3"), Value::Int(999));
+    }
+
+    #[test]
+    fn a_user_function_named_til_wins_over_the_native() {
+        let mut vm = Vm::new();
+        run_vm("til: {[x] 999}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "til 5"), Value::Int(999));
+    }
+
+    #[test]
+    fn a_verb_not_shadowed_still_works() {
+        let mut vm = Vm::new();
+        assert_eq!(scalar(&mut vm, "til 3"), ast::int_vec(vec![0, 1, 2]));
+        assert_eq!(scalar(&mut vm, "sum 1 2 3"), Value::Int(6));
+    }
+
+    #[test]
+    fn enlist_cannot_be_shadowed_by_a_same_named_function() {
+        // `enlist`/`?` (roll) are `Operand::Native` — pushed by id, never
+        // looked up by name — so a same-named user function has no effect on
+        // them (unlike `til`/`sum`/... above, which resolve by name).
+        let mut vm = Vm::new();
+        run_vm("enlist: {[x] 999}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "enlist 5"), ast::int_vec(vec![5]));
+    }
+
+    #[test]
+    fn log_compiles_at_every_arity_in_bracket_form() {
+        // All arities take the same `Op::Call`
+        // path (`compiler::compile_value_expr`'s dedicated `log` arm).
+        let mut vm = Vm::new();
+        assert_eq!(scalar(&mut vm, "log[]"), Value::Str("".into()));
+        assert_eq!(scalar(&mut vm, r#"log["a"]"#), Value::Str("a".into()));
+        assert_eq!(
+            scalar(&mut vm, r#"log["a";"b";"c"]"#),
+            Value::Str("abc".into())
+        );
+    }
+
+    #[test]
+    fn a_user_function_named_log_wins_over_the_native() {
+        // `log` is a shadowable native, resolved by name in `Op::Call`'s
+        // runtime dispatch (`ops::call_by_name`) exactly like `til`/`sum` —
+        // a bound closure of the same name is tried first, at every arity.
+        let mut vm = Vm::new();
+        run_vm("log: {[x] 999}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, r#"log["hi"]"#), Value::Int(999));
+    }
+
+    #[test]
+    fn dot_qpl_dt_cannot_be_reassigned() {
+        // `.qpl.dt`/`tm`/`ts`/`dlta` are name-keyed but unshadowable (unlike
+        // `log`/`til`/...): `Vm::lookup` finds them ahead of any user
+        // binding, and `check_not_builtin` rejects an assignment outright.
+        let mut vm = Vm::new();
+        let err = run_vm(".qpl.dt: 5", &mut vm).unwrap_err().to_string();
+        assert!(
+            err.contains("'.qpl.dt' is a built-in and cannot be reassigned"),
+            "{err}"
+        );
+    }
+}
+// These assert value-context *behaviour* (bare names, calls, casts, `zip`,
+// `where`, closures, `while`/`?[..]`, interrupts, ...) as compiled to
+// bytecode and run by this module's `Vm`/`run_vm`.
+#[cfg(test)]
+mod value_context_tests {
+    use super::*;
+
+    /// Test-only helper: the eager table bound to `name` (panics if it isn't
+    /// one) — table-shaped bindings live in `vm.globals`, not a separate map.
+    fn table<'a>(vm: &'a Vm, name: &str) -> &'a DataFrame {
+        match vm.globals.get(name) {
+            Some(Value::Table(df)) => df,
+            other => panic!("'{name}' is not a table binding: {other:?}"),
+        }
+    }
+
+    fn make_vm() -> Vm {
+        let df = df![
+            "c1" => ["a", "b", "a", "c"],
+            "c2" => [10i64, 20, 30, 15],
+            "c3" => [1.0f64, 2.0, 3.0, 4.0],
+        ]
+        .unwrap();
+        let mut vm = Vm::new();
+        vm.globals.insert("t".into(), Value::Table(df));
+        vm
+    }
+
+    fn scalar(vm: &mut Vm, src: &str) -> Value {
+        match run_vm(src, vm).expect("run") {
+            EvalResult::Scalar(v) => v,
+            other => panic!(
+                "expected scalar, got a different result kind: {}",
+                kind(&other)
+            ),
+        }
+    }
+
+    fn kind(r: &EvalResult) -> &'static str {
+        match r {
+            EvalResult::Table(_) => "table",
+            EvalResult::Stored => "stored",
+            EvalResult::Scalar(_) => "scalar",
+            EvalResult::Lazy(_) => "lazy",
+        }
+    }
+
+    fn strs(v: &Value) -> Vec<String> {
+        v.vec_strings().expect("a string/symbol list")
+    }
+
+    #[test]
+    fn juxtaposed_strings_are_a_str_vec() {
+        let mut vm = make_vm();
+        assert_eq!(
+            scalar(&mut vm, r#"("string1" "string2")"#),
+            ast::str_vec(vec!["string1".into(), "string2".into()])
+        );
+        assert_eq!(
+            scalar(&mut vm, r#""a" "b" "c""#),
+            ast::str_vec(vec!["a".into(), "b".into(), "c".into()])
+        );
+        // a string vector composes as a value: bindable, indexable
+        scalar_or_stored(&mut vm, r#"v: ("a" "b" "c")"#);
+        assert_eq!(scalar(&mut vm, "v[1]"), Value::Str("b".into()));
+    }
+
+    fn scalar_or_stored(vm: &mut Vm, src: &str) {
+        run_vm(src, vm).expect("run");
+    }
+
+    #[test]
+    fn enlist_makes_a_one_element_vector_of_any_atom() {
+        let mut vm = make_vm();
+        assert_eq!(scalar(&mut vm, "enlist 23"), ast::int_vec(vec![23]));
+        assert_eq!(scalar(&mut vm, "enlist 1.5"), ast::float_vec(vec![1.5]));
+        assert_eq!(scalar(&mut vm, "enlist 1b"), ast::bool_vec(vec![true]));
+        assert_eq!(scalar(&mut vm, "enlist `a"), ast::sym_vec(vec!["a".into()]));
+        // a string is one atom, not a list of characters
+        assert_eq!(
+            scalar(&mut vm, r#"enlist "hello""#),
+            ast::str_vec(vec!["hello".into()])
+        );
+        assert_eq!(
+            scalar(&mut vm, "enlist 2024.03.15"),
+            ast::date_vec(vec![8840])
+        );
+    }
+
+    #[test]
+    fn enlist_of_a_variable_or_expression_is_evaluated_at_run_time() {
+        let mut vm = make_vm();
+        scalar_or_stored(&mut vm, "n: 5");
+        assert_eq!(scalar(&mut vm, "enlist n"), ast::int_vec(vec![5]));
+        assert_eq!(scalar(&mut vm, "enlist n + 1"), ast::int_vec(vec![6]));
+        assert_eq!(scalar(&mut vm, "enlist first t`c2"), ast::int_vec(vec![10]));
+    }
+
+    #[test]
+    fn enlist_rejects_a_list() {
+        assert!(run_vm("enlist 1 2 3", &mut make_vm()).is_err());
+    }
+
+    #[test]
+    fn roll_ints_draws_n_values_below_the_bound() {
+        let mut vm = make_vm();
+        for _ in 0..20 {
+            let v = scalar(&mut vm, "50?6");
+            let got: Vec<i64> = v
+                .as_vec()
+                .unwrap()
+                .1
+                .i64()
+                .unwrap()
+                .into_no_null_iter()
+                .collect();
+            assert_eq!(got.len(), 50);
+            assert!(got.iter().all(|n| (0..6).contains(n)), "{got:?}");
+        }
+    }
+
+    #[test]
+    fn roll_actually_varies() {
+        let mut vm = make_vm();
+        let v = scalar(&mut vm, "200?1000000");
+        let got: Vec<i64> = v
+            .as_vec()
+            .unwrap()
+            .1
+            .i64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        let distinct: std::collections::HashSet<_> = got.iter().collect();
+        assert!(
+            distinct.len() > 150,
+            "200 draws from 1e6 had only {} distinct values",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn roll_from_a_list_picks_its_elements_with_replacement() {
+        let mut vm = make_vm();
+        let v = scalar(&mut vm, "2 ? 10 20 30 40");
+        assert_eq!(v.as_vec().unwrap().1.len(), 2);
+        let v = scalar(&mut vm, "30 ? 10 20");
+        let got: Vec<i64> = v
+            .as_vec()
+            .unwrap()
+            .1
+            .i64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(got.len(), 30, "more draws than elements: replacement");
+        assert!(got.iter().all(|n| *n == 10 || *n == 20));
+        // works for any list kind, and for a column
+        let v = scalar(&mut vm, "20 ? `a`b`c");
+        assert!(
+            matches!(v, Value::SymVec(_))
+                && strs(&v)
+                    .iter()
+                    .all(|s| ["a", "b", "c"].contains(&s.as_str()))
+        );
+        let v = scalar(&mut vm, r#"20 ? ("x" "y")"#);
+        assert!(matches!(v, Value::StrVec(_)) && strs(&v).iter().all(|s| s == "x" || s == "y"));
+        let v = scalar(&mut vm, "20 ? t`c2");
+        assert!(
+            v.as_vec()
+                .unwrap()
+                .1
+                .i64()
+                .unwrap()
+                .into_no_null_iter()
+                .all(|n| [10, 20, 30, 15].contains(&n))
+        );
+    }
+
+    #[test]
+    fn roll_floats_and_zero_count() {
+        let mut vm = make_vm();
+        let v = scalar(&mut vm, "50?2.5");
+        let got: Vec<f64> = v
+            .as_vec()
+            .unwrap()
+            .1
+            .f64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(got.len(), 50);
+        assert!(got.iter().all(|f| (0.0..2.5).contains(f)));
+        assert_eq!(scalar(&mut vm, "0?5").as_vec().unwrap().1.len(), 0);
+    }
+
+    #[test]
+    fn roll_composes_with_other_expressions() {
+        let mut vm = make_vm();
+        scalar_or_stored(&mut vm, "n: 4");
+        assert_eq!(scalar(&mut vm, "count n?100"), Value::Int(4));
+        let v = scalar(&mut vm, "100 + 3?1");
+        assert_eq!(v, ast::int_vec(vec![100, 100, 100]));
+    }
+
+    #[test]
+    fn roll_rejects_bad_operands() {
+        let mut vm = make_vm();
+        for bad in ["-1?5", "3?0", "3?`a", "1.5?5"] {
+            assert!(run_vm(bad, &mut vm).is_err(), "{bad} should be an error");
+        }
+    }
+
+    #[test]
+    fn zip_gives_temporal_lists_their_native_dtype() {
+        let mut vm = make_vm();
+        scalar_or_stored(
+            &mut vm,
+            "ts: `timestamp$1700000000000000000 1700086400123456789",
+        );
+        scalar_or_stored(
+            &mut vm,
+            "t2: zip `ts`day`tm`span!(ts) (`date$ts) (`time$ts) (`timespan$5 6)",
+        );
+        let df = table(&vm, "t2");
+        let dtypes: Vec<_> = df.dtypes().iter().map(|d| d.to_string()).collect();
+        assert_eq!(dtypes, ["datetime[ns]", "date", "time", "duration[ns]"]);
+        assert_eq!(
+            df.null_count()
+                .sum_horizontal(NullStrategy::Ignore)
+                .unwrap()
+                .unwrap()
+                .u32()
+                .unwrap()
+                .get(0),
+            Some(0)
+        );
+        // and the values survive the round trip through the column
+        assert_eq!(scalar(&mut vm, "t2`day"), scalar(&mut vm, "`date$ts"));
+    }
+
+    #[test]
+    fn zip_applies_a_top_level_cast_to_the_column_keeping_its_dtype() {
+        let mut vm = make_vm();
+        scalar_or_stored(
+            &mut vm,
+            "t3: zip `a`b`c`d`e!(i8$10 20 30) (i32$1 2 3) (f32$3 ? 1.0) (`$`x`y`x) (`timestamp$1700000000000000000 1700000000000000001 1700000000000000002)",
+        );
+        let dtypes: Vec<_> = table(&vm, "t3")
+            .dtypes()
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
+        assert_eq!(dtypes, ["i8", "i32", "f32", "cat", "datetime[ns]"]);
+        // an operand may itself be a roll
+        scalar_or_stored(&mut vm, "t4: zip `a!(i8$5 ? 100)");
+        assert_eq!(table(&vm, "t4").dtypes()[0].to_string(), "i8");
+        assert_eq!(table(&vm, "t4").height(), 5);
+    }
+
+    #[test]
+    fn table_col_materialises_to_a_list() {
+        assert_eq!(
+            scalar(&mut make_vm(), "t`c3"),
+            ast::float_vec(vec![1.0, 2.0, 3.0, 4.0])
+        );
+    }
+
+    // --- functions ---
+
+    #[test]
+    fn define_and_call_a_scalar_function() {
+        let mut vm = make_vm();
+        run_vm("add: {[x,y] x+y}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "add[2;3]"), Value::Int(5));
+        run_vm("inc: {[x] x+1}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "inc 41"), Value::Int(42)); // `f x`
+        assert_eq!(scalar(&mut vm, "inc[41]"), Value::Int(42)); // `f[x]`
+    }
+
+    #[test]
+    fn function_body_locals_are_scoped_and_do_not_leak() {
+        let mut vm = make_vm();
+        vm.globals.insert("tmp".into(), Value::Int(99));
+        run_vm("sq: {[x] tmp: x*x; tmp}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "sq[9]"), Value::Int(81));
+        assert_eq!(vm.globals.get("tmp"), Some(&Value::Int(99))); // outer `tmp` untouched
+    }
+
+    #[test]
+    fn function_body_tolerates_a_stray_extra_semicolon() {
+        // regression: a doubled `;;` between statements (an easy typo, e.g.
+        // from a trailing `;` left behind after reordering lines) failed with
+        // "Unexpected token in primary: Semicolon" — the parser tried to read
+        // a whole statement starting at the second `;` instead of treating it
+        // as an empty no-op statement.
+        let mut vm = make_vm();
+        run_vm("sq: {[x] tmp: x*x;; tmp}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "sq[9]"), Value::Int(81));
+    }
+
+    #[test]
+    fn a_callee_cannot_see_its_caller_s_locals() {
+        // lexical, not dynamic, scoping: `callee` has no param/local named `a`,
+        // so it must resolve `a` against the true global (99), never against
+        // `caller`'s own `a` param — even though `caller` is still on the call
+        // stack when `callee` runs.
+        let mut vm = make_vm();
+        vm.globals.insert("a".into(), Value::Int(99));
+        run_vm("callee: {[] a}", &mut vm).unwrap();
+        run_vm("caller: {[a] callee[]}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "caller[1]"), Value::Int(99));
+    }
+
+    #[test]
+    fn conditional_recursion_terminates() {
+        let mut vm = make_vm();
+        run_vm("fac: {[n] ?[n<2;1;n*fac[n-1]]}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "fac[5]"), Value::Int(120));
+    }
+
+    #[test]
+    fn recursion_to_depth_127_succeeds_128_is_the_cap() {
+        // `CALL`/`RET` don't recurse through the native Rust call stack
+        // (they push a `Slot::Call` and jump), and neither does value-context
+        // `?[..]` (`JUMP_IF_VEC`/`JUMP_IF_FALSE`/`CASE_VEC`) — so this runs on the *default* stack, not a
+        // custom-sized thread: 128 total activations (`n` from 127 down to 0)
+        // succeed, a 129th (`count[128]`) doesn't, and the cap is purely the
+        // language-level `MAX_CALL_DEPTH` guard, not a proxy for a Rust stack
+        // overflow.
+        let mut vm = make_vm();
+        run_vm("count: {[n] ?[n=0;0;1+count[n-1]]}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "count[127]"), Value::Int(127));
+        assert!(vm.fp.is_none());
+        let err = run_vm("count[128]", &mut vm);
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("function recursion too deep (limit 128)")
+        );
+        assert!(vm.fp.is_none());
+    }
+
+    #[test]
+    fn a_while_loop_of_100k_iterations_does_not_grow_the_rust_or_vm_stack() {
+        // `while`'s backward `JUMP` re-tests
+        // the loop condition and re-runs the body without ever growing
+        // `Vm::stack` (no `Slot::Call` is pushed — the body runs in the
+        // current scope) or the native Rust call stack (no recursion at all,
+        // just `ip`/`cp` reset by `Op::Jump`) — run on the default stack,
+        // with no custom thread, to demonstrate it.
+        let mut vm = make_vm();
+        run_stored(&mut vm, "n: 0");
+        let base_depth = vm.stack.len();
+        run_stored(&mut vm, "while[n<100000; n: n+1]");
+        assert_eq!(scalar(&mut vm, "n"), Value::Int(100000));
+        assert_eq!(
+            vm.stack.len(),
+            base_depth,
+            "the VM stack must return to its starting height after the loop"
+        );
+    }
+
+    #[test]
+    fn a_nested_lambda_can_be_called_from_inside_its_defining_body() {
+        // not just returned (see `a_function_can_be_returned_stored_and_rebound`
+        // below) — invoked in place, right where it's defined.
+        let mut vm = make_vm();
+        run_vm("f: {[x] g: {[y] y*2}; g[x] + 1}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "f[10]"), Value::Int(21));
+    }
+
+    #[test]
+    fn a_niladic_function_is_usable_inside_a_select_column() {
+        // `LOAD_COL`'s niladic-call path:
+        // runs the call to completion via a nested `step()` loop (no Rust
+        // recursion) and requires the result to be a scalar, lifting it into
+        // the column expression with `lit(..)`.
+        let mut vm = make_vm();
+        run_vm("five: {[] 5}", &mut vm).unwrap();
+        match run_vm("select c2, plus5: c2 + five from t", &mut vm).expect("run") {
+            EvalResult::Table(df) => {
+                let got: Vec<i64> = df
+                    .column("plus5")
+                    .unwrap()
+                    .i64()
+                    .unwrap()
+                    .into_no_null_iter()
+                    .collect();
+                assert_eq!(got, vec![15, 25, 35, 20]);
+            }
+            other => panic!("expected a table, got {}", kind(&other)),
+        }
+        // a function that returns a table is rejected with a clear error,
+        // not a generic stack-shape one.
+        run_vm("q: {[] select from t}", &mut vm).unwrap();
+        let err = run_vm("select a: q from t", &mut vm)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'q' returns a table — it can't be used inside a column expression"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_user_defined_zip_wins_over_the_builtin_dict_constructor() {
+        // `compile_value_expr` commits to the dict-literal lowering at
+        // compile time (no VM access there to check `is_callable`), so
+        // `Op::Zip` checks for a user `zip` at run time. Calling a *non*-dict
+        // argument (`zip[5]`) goes through the ordinary call path.
+        let mut vm = make_vm();
+        run_vm("zip: {[x] x+1}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "zip[5]"), Value::Int(6));
+        let err = run_vm("zip `a`b!(1 2) (3 4)", &mut vm)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("shadowed"), "{err}");
+    }
+
+    #[test]
+    fn a_function_can_return_a_table() {
+        let mut vm = make_vm();
+        run_vm("q: {[k] select c2 from t where c1 = k}", &mut vm).unwrap();
+        match run_vm("q[`a]", &mut vm).expect("run") {
+            EvalResult::Table(df) => {
+                let got: Vec<i64> = df
+                    .column("c2")
+                    .unwrap()
+                    .i64()
+                    .unwrap()
+                    .into_no_null_iter()
+                    .collect();
+                assert_eq!(got, vec![10, 30]);
+            }
+            other => panic!("expected a table, got {}", kind(&other)),
+        }
+    }
+
+    #[test]
+    fn wrong_arity_is_a_runtime_error() {
+        let mut vm = make_vm();
+        run_vm("add: {[x,y] x+y}", &mut vm).unwrap();
+        assert!(run_vm("add[1]", &mut vm).is_err());
+    }
+
+    #[test]
+    fn unbounded_recursion_hits_the_depth_cap_and_unwinds_cleanly() {
+        // `apply_function` recurses through the native Rust call stack (compile
+        // + eval + eval_value per level), so MAX_CALL_DEPTH levels need more
+        // headroom than the default *test-thread* stack (smaller than the main
+        // thread the REPL actually runs on) reliably provides — run this one on
+        // an explicitly-sized thread rather than weakening the real guard.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut vm = make_vm();
+                run_vm("loop: {[n] loop[n+1]}", &mut vm).unwrap();
+                let err = run_vm("loop[0]", &mut vm);
+                assert!(err.is_err());
+                // every pushed call frame was popped again on the way back out
+                // through the error, even though none of those calls returned
+                // normally
+                assert!(vm.fp.is_none());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn call_frame_is_popped_after_an_error_inside_the_body() {
+        let mut vm = make_vm();
+        run_vm("boom: {[x] x + nope}", &mut vm).unwrap(); // `nope` is undefined
+        assert!(run_vm("boom[1]", &mut vm).is_err());
+        assert!(vm.fp.is_none());
+    }
+
+    #[test]
+    fn a_function_literal_applies_in_place() {
+        assert_eq!(scalar(&mut make_vm(), "{[y] y*2}[5]"), Value::Int(10));
+    }
+
+    #[test]
+    fn a_function_passed_as_an_argument_is_applied_by_the_callee() {
+        let mut vm = make_vm();
+        run_vm("apply: {[f,x] f[x]}", &mut vm).unwrap();
+        // an anonymous literal ...
+        assert_eq!(scalar(&mut vm, "apply[{[y] y*2}; 5]"), Value::Int(10));
+        // ... and a bound name, which now resolves through `globals` like any value
+        run_vm("double: {[y] y*2}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "apply[double; 21]"), Value::Int(42));
+        // the parameter is callable more than once, and nests
+        run_vm("twice: {[f,x] f[f[x]]}", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "twice[{[y] y+3}; 1]"), Value::Int(7));
+    }
+
+    #[test]
+    fn a_function_can_be_returned_stored_and_rebound() {
+        let mut vm = make_vm();
+        run_vm("mk: {[n] {[y] y+1}}", &mut vm).unwrap();
+        run_vm("g: mk[0]", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "g[41]"), Value::Int(42));
+        run_vm("h: g", &mut vm).unwrap(); // plain aliasing
+        assert_eq!(scalar(&mut vm, "h[41]"), Value::Int(42));
+    }
+
+    #[test]
+    fn a_returned_niladic_function_still_auto_invokes_on_a_bare_reference() {
+        let mut vm = make_vm();
+        run_vm("mk: {[n] {[] 99}}", &mut vm).unwrap();
+        run_vm("g: mk[0]", &mut vm).unwrap();
+        assert_eq!(scalar(&mut vm, "g"), Value::Int(99));
+        assert_eq!(scalar(&mut vm, "g[]"), Value::Int(99));
+    }
+
+    #[test]
+    fn a_function_body_sees_no_caller_locals_even_when_passed_in() {
+        // the non-capturing invariant: `f`'s body resolves `n` against the
+        // session globals, never against `outer`'s frame.
+        let mut vm = make_vm();
+        run_vm("outer: {[n] apply[{[y] y+n}; 1]}", &mut vm).unwrap();
+        run_vm("apply: {[f,x] f[x]}", &mut vm).unwrap();
+        assert!(run_vm("outer[10]", &mut vm).is_err());
+        assert!(vm.fp.is_none());
+    }
+
+    #[test]
+    fn applying_a_non_function_value_is_an_error() {
+        let mut vm = make_vm();
+        run_vm("notafn: 3", &mut vm).unwrap();
+        assert!(run_vm("notafn[1]", &mut vm).is_err());
+        assert!(run_vm("apply: {[f,x] f[x]}", &mut vm).is_ok());
+        assert!(run_vm("apply[3; 1]", &mut vm).is_err());
+        assert!(vm.fp.is_none());
+    }
+
+    #[test]
+    fn a_function_value_cannot_be_used_as_a_column() {
+        let mut vm = make_vm();
+        run_vm("myfn: {[x] x+1}", &mut vm).unwrap();
+        let err = run_vm("select a: myfn from t", &mut vm).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("cannot be used in a query expression"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_function_name_is_the_function_value_itself() {
+        let mut vm = make_vm();
+        run_vm("f: {[x] x}", &mut vm).unwrap();
+        match run_vm("f", &mut vm) {
+            Ok(crate::vm::EvalResult::Scalar(Value::Closure(f))) => {
+                assert_eq!(f.params, vec!["x".to_string()]);
+            }
+            other => panic!("expected a closure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_column_select_in_assignment_materialises_to_a_list() {
+        let mut vm = make_vm();
+        assert!(matches!(
+            run_vm("px: select c2 from t", &mut vm),
+            Ok(EvalResult::Stored)
+        ));
+        assert_eq!(
+            vm.globals.get("px"),
+            Some(&ast::int_vec(vec![10, 20, 30, 15]))
+        );
+    }
+
+    #[test]
+    fn bare_one_column_select_still_prints_a_table() {
+        assert!(matches!(
+            run_vm("select c2 from t", &mut make_vm()),
+            Ok(EvalResult::Table(_))
+        ));
+    }
+
+    #[test]
+    fn where_filters_a_column_expression() {
+        assert_eq!(
+            scalar(&mut make_vm(), "t`c2 where c2 > 15"),
+            ast::int_vec(vec![20, 30])
+        );
+    }
+
+    #[test]
+    fn list_where_filters_a_bare_list_by_its_own_elements() {
+        let mut vm = make_vm();
+        run_vm("l: 10 20 30 40 50", &mut vm).unwrap();
+        assert_eq!(
+            scalar(&mut vm, "l where x > 25"),
+            ast::int_vec(vec![30, 40, 50])
+        );
+    }
+
+    #[test]
+    fn list_where_supports_comma_separated_predicates() {
+        let mut vm = make_vm();
+        run_vm("l: 10 20 30 40 50", &mut vm).unwrap();
+        assert_eq!(
+            scalar(&mut vm, "l where x > 10, x < 50"),
+            ast::int_vec(vec![20, 30, 40])
+        );
+    }
+
+    // `` t`c2 where <pred> `` is already claimed by the *existing* column-expr
+    // `where` sugar (a table row-filter by a real column, compiled through
+    // `finish_table_ref` before list-where's own postfix check ever runs) —
+    // list-where only kicks in on an operand that sugar didn't already
+    // consume. Chaining onto its *result* works once parenthesised, since
+    // the parenthesised expression is then a plain noun for list-where to
+    // attach to.
+    #[test]
+    fn list_where_chains_onto_a_parenthesised_column_expression_result() {
+        assert_eq!(
+            scalar(&mut make_vm(), "(t`c2 where c2 > 10) where x < 30"),
+            ast::int_vec(vec![20, 15]),
+        );
+    }
+
+    #[test]
+    fn list_where_on_a_non_list_value_is_a_runtime_error() {
+        assert!(run_vm("2 where x > 1", &mut make_vm()).is_err());
+    }
+
+    #[test]
+    fn reduction_collapses_to_a_scalar_global() {
+        let mut vm = make_vm();
+        assert!(matches!(
+            run_vm("m: max t`c2", &mut vm),
+            Ok(EvalResult::Stored)
+        ));
+        assert_eq!(vm.globals.get("m"), Some(&Value::Int(30)));
+    }
+
+    #[test]
+    fn reduction_over_a_one_column_select() {
+        assert_eq!(
+            scalar(&mut make_vm(), "first select c1 from t"),
+            Value::Str("a".into())
+        );
+    }
+
+    #[test]
+    fn reducer_ignores_nulls_in_the_source_column() {
+        // regression: `max t`col` used to force an eager materialise of the
+        // raw source column before applying the reducer, which rejected any
+        // column containing nulls outright ("cannot be materialised into a
+        // list") even though the reducer itself (like plain Polars) would
+        // just skip them. Pushing the reduction into the lazy plan directly
+        // means only the *result* is checked for nulls now.
+        let mut vm = make_vm();
+        let df = df!["n" => [Some(10i64), None, Some(30)]].unwrap();
+        vm.globals.insert("nt".into(), Value::Table(df));
+        assert_eq!(scalar(&mut vm, "max nt`n"), Value::Int(30));
+        // an all-null column still errors: the reduction result is itself null
+        let df_all_null = df!["n" => [None::<i64>, None]].unwrap();
+        vm.globals
+            .insert("allnull".into(), Value::Table(df_all_null));
+        assert!(run_vm("max allnull`n", &mut vm).is_err());
+    }
+
+    #[test]
+    fn cast_then_reduce_a_column_expression() {
+        // regression: `max f64$t`c2` used to error ("not supported in scalar
+        // context") because a cast on a column expression fell into the plain
+        // scalar folder, which can't resolve a table/column expr underneath it.
+        assert_eq!(scalar(&mut make_vm(), "max f64$t`c2"), Value::Float(30.0));
+        assert_eq!(scalar(&mut make_vm(), "avg f64$t`c2"), Value::Float(18.75));
+    }
+
+    #[test]
+    fn cast_a_column_expression_without_reducing() {
+        assert_eq!(
+            scalar(&mut make_vm(), "f64$t`c2"),
+            ast::float_vec(vec![10.0, 20.0, 30.0, 15.0])
+        );
+    }
+
+    #[test]
+    fn take_head_and_tail() {
+        assert_eq!(scalar(&mut make_vm(), "2#t`c2"), ast::int_vec(vec![10, 20]));
+        assert_eq!(
+            scalar(&mut make_vm(), "-2#t`c2"),
+            ast::int_vec(vec![30, 15])
+        );
+    }
+
+    #[test]
+    fn take_count_can_be_a_bound_global() {
+        // regression: `k#…` only ever accepted a literal int for `k`; a
+        // variable count fell through to a parse error ("expected Eof/RParen,
+        // got Hash") because the take-count was baked in at parse time.
+        let mut vm = make_vm();
+        run_vm("k: 2", &mut vm).expect("run");
+        assert_eq!(scalar(&mut vm, "k#t`c2"), ast::int_vec(vec![10, 20]));
+        assert_eq!(scalar(&mut vm, "-k#t`c2"), ast::int_vec(vec![30, 15]));
+        assert!(matches!(run_vm("k#t", &mut vm), Ok(EvalResult::Table(_))));
+        assert!(matches!(
+            run_vm("(k+1)#t", &mut vm),
+            Ok(EvalResult::Table(_))
+        ));
+    }
+
+    #[test]
+    fn positional_index_with_an_int_run() {
+        assert_eq!(
+            scalar(&mut make_vm(), "(t`c2) 0 3"),
+            ast::int_vec(vec![10, 15])
+        );
+    }
+
+    #[test]
+    fn bracket_index_atom_vs_slice() {
+        let mut vm = make_vm();
+        assert!(matches!(
+            run_vm("l: 5 6 7 8 9", &mut vm),
+            Ok(EvalResult::Stored)
+        ));
+        // a single int picks an atom; an int run picks a sub-list
+        assert_eq!(scalar(&mut vm, "l[0]"), Value::Int(5));
+        assert_eq!(scalar(&mut vm, "l[1 3 4]"), ast::int_vec(vec![6, 8, 9]));
+        // works directly on a column expression, and chains
+        assert_eq!(scalar(&mut vm, "t`c2[2 1]"), ast::int_vec(vec![30, 20]));
+        assert_eq!(scalar(&mut vm, "(t`c2)[0]"), Value::Int(10));
+    }
+
+    #[test]
+    fn bare_table_name_prints_as_a_table() {
+        assert!(matches!(
+            run_vm("t", &mut make_vm()),
+            Ok(EvalResult::Table(_))
+        ));
+    }
+
+    #[test]
+    fn assigning_a_bare_table_name_copies_it() {
+        let mut vm = make_vm();
+        assert!(matches!(run_vm("t2: t", &mut vm), Ok(EvalResult::Stored)));
+        assert!(matches!(vm.globals.get("t2"), Some(Value::Table(_))));
+    }
+
+    #[test]
+    fn take_over_a_bare_table_stays_a_table() {
+        assert!(matches!(
+            run_vm("2#t", &mut make_vm()),
+            Ok(EvalResult::Table(_))
+        ));
+    }
+
+    #[test]
+    fn out_of_range_index_errors() {
+        assert!(run_vm("(t`c2) 9", &mut make_vm()).is_err());
+    }
+
+    #[test]
+    fn column_to_value_rejects_nulls() {
+        let s = Series::new("x".into(), &[Some(1i64), None, Some(3)]);
+        let col = Column::from(s);
+        assert!(crate::ops::column_to_value(&col).is_err());
+    }
+
+    fn run_err(vm: &mut Vm, src: &str) -> String {
+        match run_vm(src, vm) {
+            Err(e) => e.to_string(),
+            Ok(r) => panic!("expected an error for {src:?}, got a {} result", kind(&r)),
+        }
+    }
+
+    fn run_stored(vm: &mut Vm, src: &str) {
+        match run_vm(src, vm) {
+            Ok(EvalResult::Stored) => {}
+            Ok(r) => panic!("{src:?}: expected nothing, got a {} result", kind(&r)),
+            Err(e) => panic!("{src:?}: {e}"),
+        }
+    }
+
+    #[test]
+    fn while_counts_down_in_the_current_scope() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "x: 5");
+        run_stored(&mut vm, "while[x>2; x: x-1]");
+        assert_eq!(scalar(&mut vm, "x"), Value::Int(2));
+    }
+
+    #[test]
+    fn while_runs_its_statements_in_order_and_may_not_run_at_all() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "n: 0");
+        run_stored(&mut vm, "acc: 0");
+        // `(acc*10)+n` is order-sensitive: appending 0,1,2 gives 12
+        run_stored(&mut vm, "while[n<3; acc: (acc*10)+n; n: n+1]");
+        assert_eq!(scalar(&mut vm, "acc"), Value::Int(12));
+        run_stored(&mut vm, "while[0b; acc: 99]");
+        assert_eq!(scalar(&mut vm, "acc"), Value::Int(12));
+    }
+
+    #[test]
+    fn while_body_may_run_table_statements() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "k: 0");
+        run_stored(
+            &mut vm,
+            "while[k<2; t: select from t where c2 > 10; k: k+1]",
+        );
+        assert_eq!(table(&vm, "t").height(), 3);
+    }
+
+    #[test]
+    fn while_inside_a_function_binds_locals_only() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "s: 100");
+        run_stored(&mut vm, "g: {[n] s: 0; while[n>0; s: s+n; n: n-1]; s}");
+        assert_eq!(scalar(&mut vm, "g[4]"), Value::Int(10));
+        assert_eq!(
+            scalar(&mut vm, "s"),
+            Value::Int(100),
+            "the global is untouched"
+        );
+    }
+
+    #[test]
+    fn a_function_still_cannot_assign_a_global() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "x: 1");
+        run_stored(&mut vm, "bump: {[] x: x+1; x}");
+        assert_eq!(scalar(&mut vm, "bump[]"), Value::Int(2));
+        assert_eq!(scalar(&mut vm, "x"), Value::Int(1));
+    }
+
+    #[test]
+    fn a_non_boolean_test_is_an_error() {
+        let mut vm = make_vm();
+        assert!(run_err(&mut vm, "while[1; 2]").contains("boolean scalar"));
+        assert!(run_err(&mut vm, "while[1 2 3; 2]").contains("boolean scalar"));
+    }
+
+    #[test]
+    fn noop_prints_nothing() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "noop");
+        run_stored(&mut vm, "f: {[] noop}");
+        run_stored(&mut vm, "f[]");
+        run_stored(&mut vm, "?[0b; 1; noop]");
+        run_stored(&mut vm, "while[0b; 1]");
+    }
+
+    #[test]
+    fn a_noop_cannot_be_assigned() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "f: {[] noop}");
+        for src in ["x: noop", "x: f[]", "x: while[0b; 1]", "x: ?[1b; noop; 1]"] {
+            assert_eq!(
+                run_err(&mut vm, src),
+                "'cannot assign a no-op expression.",
+                "{src}"
+            );
+        }
+        assert!(!vm.globals.contains_key("x"));
+    }
+
+    #[test]
+    fn a_noop_cannot_be_an_operand() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "g: {[a] a}");
+        run_stored(&mut vm, "f: {[] noop}");
+        for src in ["1 + noop", "g[noop]", "sum f[]"] {
+            assert!(
+                run_err(&mut vm, src).contains("no-op expression as a value"),
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_c_stops_an_infinite_while_and_the_session_carries_on() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "x: 0");
+        let interrupt = vm.interrupt.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            interrupt.request();
+        });
+        {
+            let _running = vm.interrupt.statement();
+            let err = run_vm("while[1b; x: x+1]", &mut vm).expect_err("should be interrupted");
+            assert!(matches!(err, QplError::Interrupted), "{err}");
+        }
+        t.join().unwrap();
+        // bindings made before the interrupt stay; the next statement runs normally
+        match scalar(&mut vm, "x") {
+            Value::Int(n) => assert!(n > 0),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_c_stops_runaway_recursion() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "f: {[n] f[n+1]}");
+        vm.interrupt.request();
+        assert!(matches!(
+            run_vm("f[0]", &mut vm),
+            Err(QplError::Interrupted)
+        ));
+        let _running = vm.interrupt.statement(); // a new statement clears the stale request
+        assert_eq!(scalar(&mut vm, "1+1"), Value::Int(2));
+    }
+
+    #[test]
+    fn nested_whiles_reset_their_inner_counter() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "a: 0");
+        run_stored(&mut vm, "n: 0");
+        run_stored(
+            &mut vm,
+            "while[a<3; b: 0; while[b<2; b: b+1; n: n+1]; a: a+1]",
+        );
+        assert_eq!(scalar(&mut vm, "a"), Value::Int(3));
+        assert_eq!(scalar(&mut vm, "b"), Value::Int(2));
+        assert_eq!(
+            scalar(&mut vm, "n"),
+            Value::Int(6),
+            "inner body ran 3 x 2 times"
+        );
+    }
+
+    #[test]
+    fn the_test_is_re_evaluated_each_iteration_and_may_call_a_function() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "ok: {[v] v<3}");
+        run_stored(&mut vm, "c: 0");
+        run_stored(&mut vm, "while[ok[c]; c: c+1]");
+        assert_eq!(scalar(&mut vm, "c"), Value::Int(3));
+    }
+
+    #[test]
+    fn a_body_may_call_a_recursive_function_and_use_a_conditional() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "tri: {[n] ?[n<1; 0; n + tri[n-1]]}");
+        run_stored(&mut vm, "c: 0");
+        run_stored(&mut vm, "tot: 0");
+        run_stored(&mut vm, "while[c<4; c: c+1; tot: tot + ?[c>2; tri[c]; 0]]");
+        assert_eq!(scalar(&mut vm, "tot"), Value::Int(6 + 10));
+    }
+
+    #[test]
+    fn while_in_a_conditional_branch_only_runs_when_taken() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "c: 0");
+        run_stored(&mut vm, "?[0b; while[c<3; c: c+1]; noop]");
+        assert_eq!(scalar(&mut vm, "c"), Value::Int(0));
+        run_stored(&mut vm, "?[1b; while[c<3; c: c+1]; noop]");
+        assert_eq!(scalar(&mut vm, "c"), Value::Int(3));
+    }
+
+    #[test]
+    fn nothing_untaken_is_evaluated() {
+        let mut vm = make_vm();
+        // a body that would error is never reached when the test starts false
+        run_stored(&mut vm, "while[0b; undefined_fn[1]]");
+        // ... nor an untaken conditional branch
+        run_stored(&mut vm, "?[1b; noop; undefined_fn[1]]");
+    }
+
+    #[test]
+    fn an_error_in_the_body_stops_the_loop_and_keeps_earlier_bindings() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "c: 0");
+        assert!(run_err(&mut vm, "while[c<5; c: c+1; boom[]; c: 100]").contains("boom"));
+        assert_eq!(
+            scalar(&mut vm, "c"),
+            Value::Int(1),
+            "the first iteration got as far as `boom[]`"
+        );
+    }
+
+    #[test]
+    fn a_noop_or_table_test_is_not_a_boolean() {
+        let mut vm = make_vm();
+        assert!(run_err(&mut vm, "while[noop; 1]").contains("boolean scalar"));
+        assert!(run_err(&mut vm, "while[t; 1]").contains("boolean scalar"));
+        assert!(run_err(&mut vm, "?[noop; 1; 2]").contains("boolean scalar"));
+    }
+
+    #[test]
+    fn a_function_may_run_a_while_and_a_noop_before_its_return() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "f: {[] while[0b; 1]; noop; 7}");
+        assert_eq!(scalar(&mut vm, "f[]"), Value::Int(7));
+    }
+
+    #[test]
+    fn a_function_body_that_ends_in_while_returns_nothing() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "f: {[n] while[n>0; n: n-1]}");
+        run_stored(&mut vm, "f[3]");
+        assert_eq!(
+            run_err(&mut vm, "y: f[3]"),
+            "'cannot assign a no-op expression."
+        );
+    }
+
+    #[test]
+    fn a_while_in_a_function_reads_globals_but_leaves_them_alone() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "lim: 3");
+        run_stored(&mut vm, "f: {[] c: 0; while[c<lim; c: c+1]; c}");
+        assert_eq!(
+            scalar(&mut vm, "f[]"),
+            Value::Int(3),
+            "the test reads the global"
+        );
+        // assigning the same name in the body binds a *local* that then shadows it
+        run_stored(&mut vm, "g: {[] c: 0; while[c<lim; c: c+1; lim: 5]; c}");
+        assert_eq!(scalar(&mut vm, "g[]"), Value::Int(5));
+        assert_eq!(
+            scalar(&mut vm, "lim"),
+            Value::Int(3),
+            "the global is untouched"
+        );
+    }
+
+    #[test]
+    fn a_noop_argument_to_a_call_is_an_error_for_every_kind_of_callee() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "id: {[a] a}");
+        run_stored(&mut vm, "nil: {[] noop}");
+        for src in [
+            "id[noop]",
+            "id[nil[]]",
+            "sum noop",
+            "count noop",
+            "{[a] a}[noop]",
+        ] {
+            assert!(run_err(&mut vm, src).contains("no-op expression"), "{src}");
+        }
+    }
+
+    #[test]
+    fn a_noop_cannot_index_take_or_cast() {
+        let mut vm = make_vm();
+        for src in ["3#noop", "f64$noop", "noop[0]"] {
+            let err = run_err(&mut vm, src);
+            assert!(
+                err.contains("no-op") || err.contains("noop"),
+                "{src}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_noop_assignment_keeps_the_previous_binding() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "x: 5");
+        assert!(run_err(&mut vm, "x: noop").contains("cannot assign a no-op"));
+        assert_eq!(scalar(&mut vm, "x"), Value::Int(5));
+    }
+
+    #[test]
+    fn an_interrupt_before_a_query_stops_it_and_binds_nothing() {
+        let mut vm = make_vm();
+        vm.interrupt.request();
+        assert!(matches!(
+            run_vm("select from t", &mut vm),
+            Err(QplError::Interrupted)
+        ));
+        assert!(matches!(
+            run_vm("x: 1", &mut vm),
+            Err(QplError::Interrupted)
+        ));
+        assert!(!vm.globals.contains_key("x"));
+        let _running = vm.interrupt.statement();
+        assert_eq!(scalar(&mut vm, "1"), Value::Int(1));
+    }
+
+    #[test]
+    fn an_interrupt_inside_a_nested_call_unwinds_the_scopes() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "f: {[n] while[1b; n: n+1]; n}");
+        run_stored(&mut vm, "g: {[n] f[n]}");
+        let interrupt = vm.interrupt.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            interrupt.request();
+        });
+        {
+            let _running = vm.interrupt.statement();
+            assert!(matches!(
+                run_vm("g[0]", &mut vm),
+                Err(QplError::Interrupted)
+            ));
+        }
+        t.join().unwrap();
+        assert!(
+            vm.fp.is_none(),
+            "every call frame was popped on the way out"
+        );
+        assert_eq!(scalar(&mut vm, "1+1"), Value::Int(2));
+    }
+
+    #[test]
+    fn a_stale_interrupt_does_not_abort_the_next_statement() {
+        let mut vm = make_vm();
+        {
+            let _running = vm.interrupt.statement();
+            vm.interrupt.request(); // arrives after the last check point
+        }
+        assert_eq!(scalar(&mut vm, "1+1"), Value::Int(2));
+    }
+
+    #[test]
+    fn a_vector_condition_gives_an_elementwise_result() {
+        let mut vm = make_vm();
+        assert_eq!(
+            scalar(&mut vm, "?[1011b; 1; 0]"),
+            ast::int_vec(vec![1, 0, 1, 1])
+        );
+        assert_eq!(
+            scalar(&mut vm, "?[1011b; 1 2 3 4; 5 6 7 8]"),
+            ast::int_vec(vec![1, 6, 3, 4])
+        );
+        assert_eq!(
+            scalar(&mut vm, r#"?[1011b; "yes"; "no"]"#),
+            ast::str_vec(vec!["yes".into(), "no".into(), "yes".into(), "yes".into()])
+        );
+    }
+
+    #[test]
+    fn a_vector_condition_may_come_from_a_variable_or_a_comparison() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "x: 5 6 7 8");
+        assert_eq!(
+            scalar(&mut vm, "?[x>6; x; 0]"),
+            ast::int_vec(vec![0, 0, 7, 8])
+        );
+        run_stored(&mut vm, "f: {[m] ?[m; 1; 0]}");
+        assert_eq!(scalar(&mut vm, "f[10b]"), ast::int_vec(vec![1, 0]));
+    }
+
+    #[test]
+    fn a_vector_branch_must_match_the_condition_length() {
+        let mut vm = make_vm();
+        for src in [
+            "?[1011b; 1 2 3; 0]",
+            "?[1011b; 1; 5 6 7 8 9]",
+            "?[10b; 1 2 3 4; 0]",
+        ] {
+            let err = run_err(&mut vm, src);
+            assert!(
+                err.contains("has length") && err.contains("length of the condition"),
+                "{src}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chained_vector_conditional_takes_the_first_true_condition_per_element() {
+        let mut vm = make_vm();
+        assert_eq!(
+            scalar(&mut vm, "?[1011b; 1; 0110b; 2; 3]"),
+            ast::int_vec(vec![1, 2, 1, 1])
+        );
+        assert_eq!(
+            scalar(&mut vm, "?[0110b; 1; 0011b; 2; 3]"),
+            ast::int_vec(vec![3, 1, 1, 2])
+        );
+        // every later condition must be boolean and as long as the first
+        assert!(run_err(&mut vm, "?[1011b; 1; 01b; 2; 3]").contains("condition has length 2"));
+        assert!(run_err(&mut vm, "?[1011b; 1; 1; 2; 3]").contains("boolean scalar or vector"));
+    }
+
+    #[test]
+    fn an_atom_condition_after_a_vector_one_is_broadcast() {
+        let mut vm = make_vm();
+        assert_eq!(
+            scalar(&mut vm, "?[1011b; 1; 1b; 2; 3]"),
+            ast::int_vec(vec![1, 2, 1, 1])
+        );
+        assert_eq!(
+            scalar(&mut vm, "?[1011b; 1; 0b; 2; 3]"),
+            ast::int_vec(vec![1, 3, 1, 1])
+        );
+    }
+
+    #[test]
+    fn atom_conditions_before_a_vector_one_still_short_circuit() {
+        let mut vm = make_vm();
+        assert_eq!(
+            scalar(&mut vm, "?[0b; undefined_fn[1]; 1011b; 5; 6]"),
+            ast::int_vec(vec![5, 6, 5, 5])
+        );
+        // a true atom returns its branch as-is, whatever its length
+        assert_eq!(
+            scalar(&mut vm, "?[1b; 1 2 3; 1011b; 5; 6]"),
+            ast::int_vec(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn a_vector_conditional_keeps_symbols_symbols_and_rejects_a_text_number_mix() {
+        let mut vm = make_vm();
+        assert_eq!(
+            scalar(&mut vm, "?[1011b; `a`b`c`d; `z]"),
+            ast::sym_vec(vec!["a".into(), "z".into(), "c".into(), "d".into()])
+        );
+        assert!(run_err(&mut vm, r#"?[1011b; 1; "a"]"#).contains("mix text and non-text"));
+        assert_eq!(
+            scalar(&mut vm, "?[1011b; 1; 2.5]"),
+            ast::float_vec(vec![1.0, 2.5, 1.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn a_vector_conditional_on_an_empty_condition_is_empty() {
+        let mut vm = make_vm();
+        run_stored(&mut vm, "e: til 0");
+        match scalar(&mut vm, "?[e>0; 1; 2]") {
+            v @ Value::IntVec(_) => assert_eq!(v.as_vec().unwrap().1.len(), 0),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_noop_or_table_branch_of_a_vector_conditional_is_an_error() {
+        let mut vm = make_vm();
+        assert!(run_err(&mut vm, "?[1011b; noop; 1]").contains("no-op"));
+        assert!(run_err(&mut vm, "?[1011b; t; 1]").contains("expected a scalar"));
+    }
+
+    #[test]
+    fn while_still_needs_a_boolean_atom() {
+        let mut vm = make_vm();
+        assert!(run_err(&mut vm, "while[10b; 1]").contains("boolean scalar"));
     }
 }

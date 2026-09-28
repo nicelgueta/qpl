@@ -1,0 +1,26 @@
+an enum definition: an ordered symbol vector stored in a global
+tag each row, then turn the tags into an enum and the sym into a categorical
+shape: (3, 2)
+┌────────┬───────┐
+│ column ┆ dtype │
+│ ---    ┆ ---   │
+│ str    ┆ str   │
+╞════════╪═══════╡
+│ blevel ┆ enum  │
+│ csym   ┆ cat   │
+│ price  ┆ f64   │
+└────────┴───────┘
+shape: (8, 3)
+┌──────┬────────┬───────┐
+│ csym ┆ blevel ┆ price │
+│ ---  ┆ ---    ┆ ---   │
+│ cat  ┆ enum   ┆ f64   │
+╞══════╪════════╪═══════╡
+│ AAPL ┆ mid    ┆ 182.3 │
+│ AAPL ┆ mid    ┆ 183.1 │
+│ AAPL ┆ mid    ┆ 184.0 │
+│ MSFT ┆ high   ┆ 414.8 │
+│ …    ┆ …      ┆ …     │
+└──────┴────────┴───────┘
+sink a table by name; the path comes from a string variable
+wrote examples/data/symbols_and_enums.parquet

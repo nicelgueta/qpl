@@ -1,240 +1,121 @@
-use crate::ast::{self, Expr, Stmt};
-use crate::compiler::compile;
+use crate::ast;
+use crate::compiler::CompileCtx;
 use crate::errors::QplError;
 use crate::lexer::tokenise;
-use crate::opcodes::disassemble_instructions;
-use crate::parser::{parse, parse_expr_seq};
-use crate::resolve;
+use crate::parser::{normalize_function_body_newlines, parse, parse_program};
 use crate::temporal;
-use crate::tokens::{Token, TokenKind};
-use crate::vm::{EvalResult, Vm, run_vm};
+use crate::tokens::TokenKind;
+#[cfg(all(feature = "ipc", feature = "cli"))]
+use crate::vm::EvalResult;
+use crate::vm::Vm;
 use polars::prelude::*;
 #[cfg(feature = "cli")]
 use rustyline::{DefaultEditor, error::ReadlineError};
+use std::sync::Arc;
 
 /// Run a `.qpl` script file, printing results. Returns Err on the first failure.
+/// The *whole* file is parsed and compiled
+/// into one [`crate::program::Program`] before anything runs — a parse or
+/// compile error anywhere in it (including inside a `\l`/`\i` target, which
+/// is itself read/parsed/compiled right here) aborts before even the first
+/// statement executes.
+///
+/// `path` may equally be a `.qplc` file:
+/// detected by its magic bytes, not its extension, so it runs with no
+/// lexing, parsing or compiling at all — see [`crate::program::Program::from_bytes`].
 pub fn run_script(path: &str, vm: &mut Vm) -> Result<(), QplError> {
+    let bytes =
+        std::fs::read(path).map_err(|e| QplError::Runtime(format!("cannot read '{path}': {e}")))?;
+    if bytes.starts_with(crate::program::MAGIC) {
+        let program = crate::program::Program::from_bytes(&bytes)?;
+        return run_compiled_program(vm, Arc::new(program));
+    }
+    let src = String::from_utf8(bytes)
+        .map_err(|e| QplError::Runtime(format!("cannot read '{path}': {e}")))?;
+    run_source(vm, &src, path)
+}
+
+/// Compile `path` (source only — a `.qplc` file has nothing left to compile)
+/// into one whole-program [`crate::program::Program`], without running it.
+/// The `qpl -C` CLI flag is this function plus
+/// `Program::to_bytes`; also used by the round-trip tests in `repl::golden`.
+pub fn compile_script(path: &str) -> Result<crate::program::Program, QplError> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| QplError::Runtime(format!("cannot read '{path}': {e}")))?;
-    for (lineno, stmt) in logical_statements(&src) {
-        run_line(&stmt, vm, path, lineno)?;
-    }
-    Ok(())
+    compile_program_for(path, &src)
 }
 
-/// `\d` / `\l` / `\i` / `\1` / an ordinary statement — everything a submitted
-/// line can be *except* `\port`, which needs REPL-loop state (`PortSession`)
-/// this function doesn't have. Shared by the REPL loop (interactive input and,
-/// once a port is open, the polling loop's stdin lines) and [`run_script`], so
-/// `\l`/`\i` also work nested inside a loaded/imported script, not just typed
-/// at the prompt.
-fn run_line(src: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<(), QplError> {
-    // every top-level statement — typed, or a script line — is interruptible
+/// Parse `src` (as `path`) and compile it into a whole `Script`-mode
+/// [`crate::program::Program`] — the shared front half of [`run_source`] and
+/// [`compile_script`].
+fn compile_program_for(path: &str, src: &str) -> Result<crate::program::Program, QplError> {
+    let stmts = parse_program(src, path)?;
+    let ctx = CompileCtx::script(path);
+    crate::compiler::compile_program(stmts, ctx)
+}
+
+/// Parse, compile and run `src` as a whole `Script`-mode program against
+/// `vm` — see [`run_compiled_program`] for the run/error-reporting half.
+fn run_source(vm: &mut Vm, src: &str, path: &str) -> Result<(), QplError> {
+    let program = compile_program_for(path, src)?;
+    run_compiled_program(vm, Arc::new(program))
+}
+
+/// Run an already-compiled whole-program [`crate::program::Program`] against
+/// `vm`, reporting a runtime failure as `path:line:` (see `compiler::wrap_line_error`)
+/// via whichever `Program` was actually executing when it failed
+/// (`Vm::take_error_site`): the main program for an ordinary failure, or an
+/// embedded `\l`/`\i` target's own `Program` (which carries its own path) if
+/// the failure happened while that was running. `<main>` (the REPL) is never
+/// prefixed. One [`crate::interrupt::Interrupt::statement`] guard covers the
+/// whole run, however many statements the program contains. Shared by
+/// [`run_source`] (a freshly compiled program) and a `.qplc` file run
+/// straight from bytes (`run_script`'s magic-byte path, and `qpl -c`'s
+/// ad hoc command via [`run_command`]).
+fn run_compiled_program(
+    vm: &mut Vm,
+    program: Arc<crate::program::Program>,
+) -> Result<(), QplError> {
     let _running = vm.interrupt.statement();
-    let src = &normalize_function_body_newlines(src);
-    if let Some(inner) = src.strip_prefix("\\d").map(str::trim) {
-        let listing = disassemble(inner)?;
-        vm.emit(&listing);
-        return Ok(());
-    }
-    if let Some(target) = src.strip_prefix("\\l").map(str::trim) {
-        return run_script(&script_relative(target, path), vm);
-    }
-    if let Some(target) = src.strip_prefix("\\i").map(str::trim) {
-        return run_script_imported(&script_relative(&parse_quoted_path(target)?, path), vm);
-    }
-    if let Some(result) = system_command(src, vm) {
-        return result;
-    }
-    match_run_vm(src, vm, path, lineno)
+    let outcome = vm.run_compiled(program);
+    let site = vm.take_error_site();
+    outcome.map(|_| ()).map_err(|e| match site {
+        Some((prog, ip)) => match prog.line_at(ip) {
+            Some((p, line)) => crate::compiler::wrap_line_error(e, &p, line),
+            None => e,
+        },
+        None => e,
+    })
 }
 
-/// `\i`'s path argument is a quoted string (`\i "lib/utils.qpl"`), unlike
-/// `\l`'s bare one — the namespace derives from it (see
-/// [`namespace_from_path`]), so writing it as a string keeps that visually
-/// distinct from an ordinary namespaced identifier appearing right after
-/// `\i` on the same line.
-fn parse_quoted_path(rest: &str) -> Result<String, QplError> {
-    match tokenise(rest)?.as_slice() {
-        [
-            Token {
-                kind: TokenKind::Str(s),
-                ..
-            },
-        ] => Ok(s.clone()),
-        _ => Err(QplError::Runtime(format!(
-            "\\i expects a quoted path, e.g. \\i \"lib/utils.qpl\", got '{rest}'"
-        ))),
-    }
+/// Run `src` as an ad hoc command (`qpl -c '<command>'`): parsed/compiled/run exactly like a REPL line typed at `<main>`
+/// — errors are reported unprefixed, and `src` may hold several statements
+/// (the usual multi-line rules apply, since it goes through
+/// [`crate::parser::parse_program`] like a real script).
+pub fn run_command(src: &str, vm: &mut Vm) -> Result<(), QplError> {
+    run_source(vm, src, "<main>")
 }
 
-/// A `\l`/`\i` path written inside a script is relative to that script's own
-/// directory, so a library can pull in its neighbours wherever qpl was
-/// started from. Typed at the prompt (`from` is `"<main>"`), or absolute,
-/// it's used as written — relative to the working directory.
-fn script_relative(target: &str, from: &str) -> String {
-    let target_path = std::path::Path::new(target);
-    if from == "<main>" || target_path.is_absolute() {
-        return target.to_string();
-    }
-    match std::path::Path::new(from).parent() {
-        Some(dir) => dir.join(target_path).to_string_lossy().into_owned(),
-        None => target.to_string(),
-    }
+/// Everything a submitted line can be *except* `\port`, which needs
+/// REPL-loop state (`PortSession`) this function doesn't have. Shared by the
+/// REPL loop (interactive input and, once a port is open, the polling loop's
+/// stdin lines). `lineno` is accepted for source-compatibility with earlier
+/// callers but is no longer meaningful: [`run_source`] parses `src` itself
+/// and reports errors using its own line numbers (this is only ever called
+/// with `path == "<main>"`, where no prefix is added anyway).
+fn run_line(src: &str, vm: &mut Vm, path: &str, _lineno: usize) -> Result<(), QplError> {
+    run_source(vm, src, path)
 }
 
-/// Run a `.qpl` script (`\i <path>`) as a *namespaced import*: every table and
-/// global the script binds at its top level (functions included — a function
-/// is an ordinary global holding a `Value::Closure`) lands under
-/// `.<ns>.<name>`, where `<ns>` is derived from the file's stem (`utils.qpl`
-/// -> `.utils`); an already-namespaced name is left alone. The renaming
-/// happens at bind time (see `Vm::import_ns`), so the script can never
-/// overwrite a session name. The import is all-or-nothing: it replaces the
-/// namespace's previous contents wholesale (a re-import is a clean reload),
-/// and if any statement fails the session's bindings are restored exactly as
-/// they were before. Bare `\l` keeps loading flat into the shared session
-/// scope; this is the opt-in alternative.
-pub fn run_script_imported(path: &str, vm: &mut Vm) -> Result<(), QplError> {
-    let ns = namespace_from_path(path);
-    // cheap: tables, plans and vector values are all reference-counted
-    let snapshot = (
-        vm.tables.clone(),
-        vm.lazy_frames.clone(),
-        vm.globals.clone(),
-    );
-    let prefix = format!("{ns}.");
-    // TODO: does this mean that two imports we lose the first?
-    vm.tables.retain(|k, _| !k.starts_with(&prefix));
-    vm.lazy_frames.retain(|k, _| !k.starts_with(&prefix));
-    vm.globals.retain(|k, _| !k.starts_with(&prefix));
-
-    let outer = vm.import_ns.replace(ns);
-    let result = run_script(path, vm);
-    vm.import_ns = outer;
-
-    if result.is_err() {
-        (vm.tables, vm.lazy_frames, vm.globals) = snapshot;
-    }
-    result
-}
-
-/// Derive a namespace (`.utils`, `.my_lib`) from a `\i`-imported script's
-/// file stem: non-identifier characters become `_`, and a leading digit gets
-/// an `_` prefix so the result always lexes as a valid namespaced name.
-fn namespace_from_path(path: &str) -> String {
-    let stem = std::path::Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("ns");
-    let mut cleaned: String = stem
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if cleaned.starts_with(|c: char| c.is_ascii_digit()) {
-        cleaned.insert(0, '_');
-    }
-    format!(".{cleaned}")
-}
-
-/// Fold the physical lines of a script into logical statements.
-///
-/// A statement starts at a line with no leading indentation. Any following line
-/// indented by a tab or four (or more) spaces is a continuation of that same
-/// statement; the run of lines is joined with `\n` (which the lexer treats as
-/// whitespace, and which correctly terminates any inline `/` comment). A blank
-/// or non-indented line ends the current statement. Blank lines and lines whose
-/// first non-space character is `/` are dropped unless they are continuations.
-///
-/// Returns `(zero-based line index where the statement began, statement text)`.
-fn logical_statements(src: &str) -> Vec<(usize, String)> {
-    let mut out: Vec<(usize, String)> = Vec::new();
-    let mut buf: Vec<&str> = Vec::new();
-    let mut start = 0usize;
-
-    for (idx, raw) in src.lines().enumerate() {
-        if !buf.is_empty() && (raw.starts_with('\t') || raw.starts_with("    ")) {
-            buf.push(raw);
-            continue;
-        }
-        if !buf.is_empty() {
-            out.push((start, buf.join("\n")));
-            buf.clear();
-        }
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('/') {
-            continue;
-        }
-        buf.push(raw);
-        start = idx;
-    }
-    if !buf.is_empty() {
-        out.push((start, buf.join("\n")));
-    }
-    out
-}
-
-/// Inside a `{[..] ..}` function body, let each line stand for one statement —
-/// same rule `logical_statements` already applies at the top level, just
-/// shifted one indent level in: a line indented no deeper than the body's own
-/// first line starts a new statement (an implicit `;` is inserted before it);
-/// a line indented *more* than that continues the statement above, exactly
-/// like a top-level continuation line does. An explicit `;` for several
-/// statements on one physical line still works (and combining it with this —
-/// an already-`;`-terminated line followed by a new baseline-indent line —
-/// just yields a harmless doubled `;`, which the parser tolerates). Blank and
-/// comment-only lines pass through without affecting the baseline; the line
-/// that closes the body (`}` as its first non-space character, at any indent)
-/// is never treated as a new statement.
-///
-/// A no-op whenever `src` has no multi-line `{..}` to fold (single-line
-/// definitions, or text with no `{` at all), so every other statement shape
-/// is completely unaffected.
-fn normalize_function_body_newlines(src: &str) -> String {
-    if !src.contains('\n') || !src.contains('{') {
-        return src.to_string();
-    }
-    let mut out_lines: Vec<String> = Vec::new();
-    let mut depth: i32 = 0;
-    let mut baseline: Option<usize> = None;
-
-    for line in src.lines() {
-        let depth_at_start = depth;
-        for ch in line.chars() {
-            match ch {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-        }
-        if depth_at_start <= 0 {
-            // not yet inside a function body (the opening line itself, or
-            // anything before/after the whole `{..}` statement)
-            out_lines.push(line.to_string());
-            continue;
-        }
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.starts_with('}') {
-            out_lines.push(line.to_string());
-            continue;
-        }
-        let indent = line.len() - trimmed.len();
-        match baseline {
-            None => {
-                baseline = Some(indent);
-                out_lines.push(line.to_string());
-            }
-            Some(b) if indent <= b => out_lines.push(format!(";{line}")),
-            _ => out_lines.push(line.to_string()),
-        }
-    }
-    out_lines.join("\n")
+/// Run a `.qpl` script as a *namespaced import* — test-only compatibility
+/// shim for the many `\i`-behaviour tests below, which predate whole-program
+/// compilation and call this directly with an absolute scratch-file path
+/// rather than going through a `\i "..."` statement themselves. Namespace
+/// qualification itself is compile-time now (`compiler::qualify_program`);
+/// this just spells out the equivalent `\i` statement.
+#[cfg(test)]
+fn run_script_imported(path: &str, vm: &mut Vm) -> Result<(), QplError> {
+    run_source(vm, &format!("\\i \"{path}\""), "<main>")
 }
 
 /// Does `src` look like an unfinished statement that should keep reading?
@@ -456,25 +337,24 @@ fn handle_port_directive(rest: &str, session: &mut PortSession) -> Result<(), Qp
 /// statements (selects, updates, deletes, assignments, function defs) all
 /// work. `\`-prefixed system commands (`\d`, `\l`, `\1`, `\port` itself)
 /// are deliberately not reachable this way — they're local REPL/session
-/// administration, not part of the query language a remote client dispatches.
+/// administration, not part of the query language a remote client dispatches,
+/// so a [`crate::ast::Stmt::System`] is rejected outright. `.qpl.cfg`/bareword `log` compile and
+/// run exactly like the equivalent ordinary statement, in `CompileMode::Result`
+/// so the (only) statement's value comes back as an [`EvalResult`].
 #[cfg(all(feature = "ipc", feature = "cli"))]
 fn eval_for_dispatch(line: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
-    if let Some(args) = cfg_directive(line) {
-        apply_cfg(args, vm)?;
-        return Ok(EvalResult::Stored);
-    }
-    if let Some(arg) = log_target(line) {
-        resolve::eval_log(vm, &parse_expr_seq(tokenise(arg)?)?)?;
-        return Ok(EvalResult::Stored);
-    }
-    if line.trim_start().starts_with("log[")
-        && let Ok(Stmt::SingleVar(Expr::Call { func, args })) = parse(tokenise(line)?)
-        && func == "log"
+    let stmts = parse_program(line, "<main>")?;
+    if let Some((_, ast::Stmt::System { cmd, .. })) = stmts
+        .iter()
+        .find(|(_, s)| matches!(s, ast::Stmt::System { .. }))
     {
-        resolve::eval_log(vm, &args)?;
-        return Ok(EvalResult::Stored);
+        return Err(QplError::Runtime(format!(
+            "'\\{cmd}' is not allowed over a dispatched connection"
+        )));
     }
-    run_vm(line, vm)
+    let ctx = CompileCtx::result("<main>");
+    let program = crate::compiler::compile_program(stmts, ctx)?;
+    vm.eval(program)
 }
 
 /// REPL-loop-side state for `\port`: a stdin-reader thread (spawned once, the
@@ -611,105 +491,10 @@ pub fn load_demo_tables(vm: &mut Vm) {
         .collect()
         .expect("cast quotes.ts");
 
-    vm.tables.insert("trades".into(), trades);
-    vm.tables.insert("quotes".into(), quotes);
-}
-
-fn match_run_vm(line: &str, vm: &mut Vm, path: &str, lineno: usize) -> Result<(), QplError> {
-    match eval_line(line, vm) {
-        Ok(()) => Ok(()),
-        Err(e) if path == "<main>" || matches!(e, QplError::Interrupted) => Err(e),
-        Err(e) => Err(QplError::Runtime(format!("{}:{}: {e}", path, lineno + 1))),
-    }
-}
-
-/// Evaluate one statement and print its result. All output goes through
-/// [`Vm::emit`] so it is mirrored to the stdout log when one is configured.
-fn eval_line(line: &str, vm: &mut Vm) -> Result<(), QplError> {
-    if let Some(args) = cfg_directive(line) {
-        return apply_cfg(args, vm);
-    }
-    if let Some(arg) = log_target(line) {
-        // a `log` argument is a list of expressions; `resolve::eval_log` renders
-        // and concatenates each (via `eval_value`, not the plain scalar folder,
-        // so a reduction like `log max t`price` or a cast on a column expression
-        // works the same as it does in any other value position), then emits
-        // the result. Shared with the bracket-scoped `log[..]` call form.
-        resolve::eval_log(vm, &parse_expr_seq(tokenise(arg)?)?)?;
-        return Ok(());
-    }
-    // `log[..]` typed as a whole top-level statement — unlike every other
-    // function call, suppress the auto-printed return value so it behaves
-    // like the bareword form above (the emit already happened as a side
-    // effect). A `log[..]` embedded in a larger expression (`2 * log[..] + 2`)
-    // is unaffected: this only matches when the *entire* statement is the call.
-    if line.trim_start().starts_with("log[")
-        && let Ok(Stmt::SingleVar(Expr::Call { func, args })) = parse(tokenise(line)?)
-        && func == "log"
-    {
-        resolve::eval_log(vm, &args)?;
-        return Ok(());
-    }
-    match run_vm(line, vm)? {
-        #[cfg(feature = "wasm")]
-        EvalResult::Table(df) if vm.capture_table => vm.last_table = Some(df),
-        EvalResult::Table(df) => vm.emit(&df.to_string()),
-        EvalResult::Stored => {}
-        EvalResult::Scalar(val) => vm.emit(&fmt_val(&val)),
-        EvalResult::Lazy(plan) => vm.emit(&plan),
-    }
-    Ok(())
-}
-
-/// Recognise the stdout write: `log <expr>` (and bare `log`, which prints a
-/// blank line). Returns the argument text to evaluate as a scalar.
-fn log_target(line: &str) -> Option<&str> {
-    if line == "log" {
-        return Some("");
-    }
-    if let Some(rest) = line.strip_prefix("log ") {
-        return Some(rest.trim());
-    }
-    None
-}
-
-/// Recognise the `.qpl.cfg` config function: `.qpl.cfg key=value key=value ...`.
-/// Returns the argument text (possibly empty, for a bare `.qpl.cfg` which just
-/// prints the current settings). Not a config line → `None`.
-fn cfg_directive(line: &str) -> Option<&str> {
-    let rest = line.trim().strip_prefix(".qpl.cfg")?;
-    match rest.chars().next() {
-        None => Some(""),
-        Some(c) if c.is_whitespace() => Some(rest.trim()),
-        Some(_) => None, // e.g. `.qpl.cfgx` is not this directive
-    }
-}
-
-/// Apply `.qpl.cfg` arguments: whitespace-separated `key=value` pairs. A bare
-/// `.qpl.cfg` prints the current configuration.
-fn apply_cfg(args: &str, vm: &mut Vm) -> Result<(), QplError> {
-    if args.is_empty() {
-        let current = vm.config.describe();
-        vm.emit(&current);
-        return Ok(());
-    }
-    // changing a knob is a write to the session — a read-only IPC client
-    // may print the settings but not change them
-    vm.check_write_allowed(".qpl.cfg")?;
-    for pair in args.split_whitespace() {
-        let (key, value) = pair.split_once('=').ok_or_else(|| {
-            QplError::Runtime(format!("expected key=value in `.qpl.cfg`, got '{pair}'"))
-        })?;
-        vm.config.set(key.trim(), value.trim())?;
-    }
-    Ok(())
-}
-
-/// Handle a `\` system command. Returns `Some(result)` if `line` is one.
-/// Currently only `\1 <path>` (set the stdout log; bare `\1` detaches it).
-fn system_command(line: &str, vm: &mut Vm) -> Option<Result<(), QplError>> {
-    let path = line.strip_prefix("\\1")?.trim();
-    Some(vm.set_stdout_log(path))
+    vm.globals
+        .insert("trades".into(), ast::Value::Table(trades));
+    vm.globals
+        .insert("quotes".into(), ast::Value::Table(quotes));
 }
 
 /// kdb-style tag for a vector kind, used as the `<tag>[<n>]:` prefix.
@@ -809,9 +594,9 @@ fn fmt_vec_elems(kind: ast::VecKind, s: &polars::prelude::Series, quote_str: boo
     }
 }
 
-/// Render a value for `log`: raw text, no type prefix or quoting. Shared
-/// with `resolve::eval_log`, which does the same rendering for the
-/// bracket-scoped `log[..]` call form.
+/// Render a value for `log`: raw text, no type prefix or quoting. Shared with
+/// `ops::native_log`, which does this same rendering whichever way `log` was
+/// spelled (bareword, `log[..]`, or `run_log`'s statement-level forms).
 pub(crate) fn fmt_log_val(v: &ast::Value) -> String {
     if let Some((kind, s)) = v.as_vec() {
         return fmt_vec_elems(kind, s, false);
@@ -826,7 +611,7 @@ pub(crate) fn fmt_log_val(v: &ast::Value) -> String {
     }
 }
 
-fn fmt_val(v: &ast::Value) -> String {
+pub(crate) fn fmt_val(v: &ast::Value) -> String {
     if let Some(text) = temporal::format_temporal(v) {
         let tag = match v {
             ast::Value::Date(_) => "date",
@@ -870,29 +655,367 @@ fn fmt_repl_error(error: &QplError) -> String {
     }
 }
 
-fn disassemble(source: &str) -> Result<String, QplError> {
-    let tokens = tokenise(source)?;
-    let stmt = parse(tokens)?;
-    let prog = compile(&stmt)?;
-    Ok(disassemble_instructions(&prog).join("\n"))
+/// Golden-output tests: runs every non-excluded
+/// `examples/*.qpl` script against a fresh `Vm` and compares captured stdout
+/// plus the error text (if any) against `examples/golden/<name>.out`.
+///
+/// `UPDATE_GOLDEN=1 cargo test golden` regenerates the snapshot files. Must be
+/// run from the repo root so the scripts' relative `examples/data/...` paths
+/// resolve.
+///
+/// Excluded entirely:
+/// - `ipc_client` / `ipc_server`: need two live processes talking over a
+///   socket, not a fit for a single-process snapshot test.
+/// - `setup_data`: writes into `examples/data`, which is committed input for
+///   every other example — running it would mutate the fixtures under test.
+/// - `namespace_lib`: not meant to run standalone; it's exercised as an
+///   import by `namespaces.qpl`.
+///
+/// `lists`, `random_table`, and `temporal` use `?` (roll) or the `.qpl.dt` /
+/// `.qpl.tm` / `.qpl.ts` now-functions, so their output is different on every
+/// run. Rather than normalise the random bytes out of the snapshot (fragile,
+/// and easy to accidentally make the test pass while silently losing
+/// coverage), this harness runs them and only asserts they complete without
+/// error — the golden snapshot's job (catching an accidental change to
+/// deterministic output) doesn't apply to them anyway.
+#[cfg(test)]
+mod golden {
+    use super::{QplError, Vm, compile_script, load_demo_tables, run_compiled_program, run_script};
+    use crate::compiler::namespace_from_path;
+    use std::path::{Path, PathBuf};
+
+    /// Fully deterministic — compared byte-for-byte against a golden file.
+    const DETERMINISTIC: &[&str] = &[
+        "basics",
+        "column_expressions",
+        "config_and_round",
+        "control_flow",
+        "lazy_and_collect",
+        "lazy_join_pipeline",
+        "logging",
+        "multiline",
+        "namespaces",
+        "symbols_and_enums",
+        "window_functions",
+    ];
+
+    /// Random / now-based output — run for a clean exit only (see module doc).
+    /// `functions` is here (not deterministic) because it calls `.qpl.ts`
+    /// (wall-clock now) to demonstrate niladic functions.
+    const NONDETERMINISTIC: &[&str] = &["functions", "lists", "random_table", "temporal"];
+
+    fn golden_path(name: &str) -> PathBuf {
+        Path::new("examples/golden").join(format!("{name}.out"))
+    }
+
+    /// Run `examples/<name>.qpl` (or, for `logging`, a copy with its `\1`
+    /// target redirected to a scratch file so the test never writes into the
+    /// repo) via `run` and return everything it emitted plus the error text
+    /// of the first failing statement, if any. `run` is the strategy under
+    /// test: `run_script` for the ordinary source-file path, or
+    /// a closure that compiles the file to a `.qplc` byte string and back
+    /// before running it, to prove that round trip is behaviour-preserving.
+    fn run_example_captured_with(
+        name: &str,
+        run: impl FnOnce(&str, &mut Vm) -> Result<(), QplError>,
+    ) -> (String, Option<String>) {
+        let mut vm = Vm::new();
+        load_demo_tables(&mut vm);
+        vm.capture = Some(String::new());
+
+        let is_logging = name == "logging";
+        let path: String = if is_logging {
+            let src = std::fs::read_to_string("examples/logging.qpl").expect("read logging.qpl");
+            let log_target = std::env::temp_dir().join(format!(
+                "qpl_golden_logging_{}_{:?}.log",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let modified = src.replace("\\1 run.log", &format!("\\1 {}", log_target.display()));
+            let scratch_script = std::env::temp_dir().join(format!(
+                "qpl_golden_logging_{}_{:?}.qpl",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&scratch_script, modified).expect("write scratch logging.qpl");
+            scratch_script.to_str().unwrap().to_string()
+        } else {
+            format!("examples/{name}.qpl")
+        };
+
+        let result = run(&path, &mut vm);
+        if is_logging {
+            let _ = std::fs::remove_file(&path);
+        }
+        let out = vm.capture.take().unwrap_or_default();
+        let err = result.err().map(|e| e.to_string());
+        (out, err)
+    }
+
+    fn run_example_captured(name: &str) -> (String, Option<String>) {
+        run_example_captured_with(name, run_script)
+    }
+
+    /// `compile_script(path) -> to_bytes -> from_bytes -> run_compiled_program`
+    /// the same compile/run path `qpl -C`
+    /// followed by running the resulting `.qplc` exercises, without touching
+    /// the filesystem for the intermediate bytes.
+    fn run_compiled_roundtrip(path: &str, vm: &mut Vm) -> Result<(), QplError> {
+        let program = compile_script(path)?;
+        let bytes = program.to_bytes()?;
+        let program2 = crate::program::Program::from_bytes(&bytes)?;
+        run_compiled_program(vm, std::sync::Arc::new(program2))
+    }
+
+    /// Polars group-by (`select ... by ...`) doesn't guarantee output row
+    /// order (hash-based grouping), so a couple of the deterministic examples
+    /// still vary run-to-run in which order their *rows* come out, even
+    /// though the row *contents* are fixed. Rather than special-case those
+    /// examples out of the strict comparison, sort each contiguous run of
+    /// printed-table data rows (lines starting with the box-drawing `│` that
+    /// aren't a separator) before comparing — this still catches any change
+    /// to the actual output while ignoring row order the language doesn't
+    /// promise anyway.
+    fn normalize_table_row_order(s: &str) -> String {
+        let mut out = Vec::new();
+        let mut run: Vec<&str> = Vec::new();
+        let mut in_data_section = false;
+        let flush = |run: &mut Vec<&str>, out: &mut Vec<String>| {
+            run.sort_unstable();
+            out.extend(run.drain(..).map(str::to_string));
+        };
+        for line in s.lines() {
+            if line.starts_with('╞') {
+                in_data_section = true;
+                out.push(line.to_string());
+            } else if line.starts_with('└') {
+                flush(&mut run, &mut out);
+                in_data_section = false;
+                out.push(line.to_string());
+            } else if in_data_section && line.starts_with('│') {
+                run.push(line);
+            } else {
+                out.push(line.to_string());
+            }
+        }
+        flush(&mut run, &mut out);
+        let mut result = out.join("\n");
+        if s.ends_with('\n') {
+            result.push('\n');
+        }
+        result
+    }
+
+    fn check_or_update(name: &str, out: &str, err: &Option<String>) {
+        let mut content = out.to_string();
+        if let Some(e) = err {
+            content.push_str("=== ERROR ===\n");
+            content.push_str(e);
+            content.push('\n');
+        }
+        let content = normalize_table_row_order(&content);
+        let path = golden_path(name);
+        if std::env::var("UPDATE_GOLDEN").is_ok() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &content).unwrap();
+            return;
+        }
+        let expected = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+            panic!("missing golden file {path:?}; run with UPDATE_GOLDEN=1 to create it")
+        });
+        assert_eq!(content, expected, "golden output mismatch for '{name}'");
+    }
+
+    // Both example groups run inside *one* `#[test]` fn, not two, because
+    // `config_and_round` and `random_table` change process-wide
+    // `POLARS_FMT_*` env vars via `.qpl.cfg` (see `VmConfig::export_render_limits`)
+    // — two separate tests running in parallel threads (cargo test's default)
+    // would race on that shared state and make the deterministic comparisons
+    // flaky. Keeping everything sequential in one test sidesteps the race
+    // without touching the (documented, deliberate) global-env design.
+    #[test]
+    fn examples_match_golden_output() {
+        // Each example runs twice back-to-back — source, then the `.qplc`
+        // round trip — rather than as two
+        // separate full passes over `DETERMINISTIC`/`NONDETERMINISTIC`: a
+        // full second pass would re-run `config_and_round` a second time
+        // *after* its process-wide `POLARS_FMT_*` env var mutation already
+        // happened once, changing what every later example in that second
+        // pass sees relative to the golden file (captured from a single
+        // pass). Interleaving keeps each name's two variants observing the
+        // same global state the golden file was captured under.
+        for name in DETERMINISTIC {
+            let (out, err) = run_example_captured(name);
+            check_or_update(name, &out, &err);
+            let (out, err) = run_example_captured_with(name, run_compiled_roundtrip);
+            check_or_update(name, &out, &err);
+        }
+        for name in NONDETERMINISTIC {
+            let (_, err) = run_example_captured(name);
+            assert!(err.is_none(), "{name} failed: {err:?}");
+            let (_, err) = run_example_captured_with(name, run_compiled_roundtrip);
+            assert!(err.is_none(), "{name} (compiled) failed: {err:?}");
+        }
+    }
+
+    /// `Program::from_bytes(to_bytes(p))` disassembles identically to `p`,
+    /// for a real compiled example (not just the small hand-built programs
+    /// in `program.rs`'s own tests) — exercises every opcode/operand shape a
+    /// realistic script actually emits, including an embedded `\l`/`\i`
+    /// sub-program (`namespaces.qpl` imports `namespace_lib.qpl`).
+    #[test]
+    fn compiled_examples_disassemble_identically_after_a_qplc_round_trip() {
+        for name in DETERMINISTIC.iter().chain(NONDETERMINISTIC) {
+            let path = format!("examples/{name}.qpl");
+            let program = compile_script(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let before = crate::program::disassemble(&program);
+            let bytes = program.to_bytes().unwrap_or_else(|e| panic!("{name}: {e}"));
+            let program2 = crate::program::Program::from_bytes(&bytes)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let after = crate::program::disassemble(&program2);
+            assert_eq!(
+                before, after,
+                "{name} disassembly changed after a round trip"
+            );
+        }
+    }
+
+    /// Run `src` as a scratch script (so errors get the `path:line:` prefix
+    /// exactly as a real script would) with a fresh `Vm` (plus demo tables),
+    /// and return the error text with the scratch file's own (unpredictable,
+    /// pid/thread-based) path replaced by the stable placeholder `<script>`.
+    fn run_source_expect_err(src: &str) -> String {
+        run_source_expect_err_with(Vm::new(), src)
+    }
+
+    fn run_source_expect_err_with(mut vm: Vm, src: &str) -> String {
+        load_demo_tables(&mut vm);
+        let path = std::env::temp_dir().join(format!(
+            "qpl_golden_err_{}_{:?}.qpl",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, src).expect("write scratch script");
+        let result = run_script(path.to_str().unwrap(), &mut vm);
+        let _ = std::fs::remove_file(&path);
+        let msg = result
+            .expect_err("expected this scratch script to fail")
+            .to_string();
+        msg.replace(path.to_str().unwrap(), "<script>")
+    }
+
+    /// ~10 error-path snapshots: exact `path:line:`-prefixed
+    /// messages for the common failure modes, asserted inline rather than via
+    /// golden files since each is a single short string. These lock in
+    /// the exact error text.
+    /// `f: {[n] f[n]}` recurses through the native Rust call stack today (one
+    /// `apply_function` per level), so hitting `MAX_CALL_DEPTH` needs more
+    /// headroom than the default test-thread stack reliably provides — run on
+    /// an explicitly-sized thread, same as
+    /// `vm::tests::unbounded_recursion_hits_the_depth_cap_and_unwinds_cleanly`.
+    #[test]
+    fn error_paths_have_stable_messages() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(error_paths_have_stable_messages_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn error_paths_have_stable_messages_body() {
+        assert_eq!(
+            run_source_expect_err("select sym from nosuchtable"),
+            "'<script>:1: 'unknown table 'nosuchtable'"
+        );
+        assert_eq!(
+            run_source_expect_err("x: 1\ny: x + nosuchname"),
+            "'<script>:2: 'undefined name 'nosuchname' (not a variable, table or lazy frame)"
+        );
+        assert_eq!(
+            run_source_expect_err("f: {[a,b] a + b}\nf[1]"),
+            "'<script>:2: 'function 'f' takes 2 argument(s), got 1"
+        );
+        assert_eq!(
+            run_source_expect_err("f: {[n] f[n]}\nf[1]"),
+            "'<script>:2: 'function recursion too deep (limit 128)"
+        );
+        assert_eq!(
+            run_source_expect_err("x: noop"),
+            "'<script>:1: 'cannot assign a no-op expression."
+        );
+        assert_eq!(
+            run_source_expect_err("?[1; 1; 2]"),
+            "'<script>:1: 'a `?[..]` condition must be a boolean scalar or vector in value context"
+        );
+        assert_eq!(
+            run_source_expect_err("while[1; noop]"),
+            "'<script>:1: 'a `while` condition must be a boolean scalar in value context"
+        );
+        assert_eq!(
+            run_source_expect_err(".qpl.dt[1]"),
+            "'<script>:1: ''.qpl.dt' takes 0 argument(s), got 1"
+        );
+        // an error partway through a `\i` import rolls the whole session back
+        // to its pre-import state — the importing script's own line is what's
+        // reported, and the previously-bound name is untouched.
+        let import_lib = std::env::temp_dir().join(format!(
+            "qpl_golden_err_lib_{}_{:?}.qpl",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&import_lib, "ok: 1\nbad: nosuchname\n").unwrap();
+        let importer = format!("\\i \"{}\"\n", import_lib.to_str().unwrap());
+        let mut vm = Vm::new();
+        load_demo_tables(&mut vm);
+        let importer_path = std::env::temp_dir().join(format!(
+            "qpl_golden_err_importer_{}_{:?}.qpl",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&importer_path, &importer).unwrap();
+        let result = run_script(importer_path.to_str().unwrap(), &mut vm);
+        let err = result
+            .expect_err("import of a failing script should fail")
+            .to_string();
+        assert!(
+            err.contains("undefined name 'nosuchname'"),
+            "unexpected import error text: {err}"
+        );
+        let ns = namespace_from_path(import_lib.to_str().unwrap());
+        assert!(
+            !vm.globals.contains_key(&format!("{ns}.ok")),
+            "a failed \\i import must leave no partial namespace bindings"
+        );
+        let _ = std::fs::remove_file(&import_lib);
+        let _ = std::fs::remove_file(&importer_path);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        cfg_directive, eval_line, log_target, logical_statements, normalize_function_body_newlines,
-        wants_more,
-    };
-    use super::{eval_capture, namespace_from_path, run_line, run_script_imported};
+    use super::{eval_capture, run_line, run_script_imported, wants_more};
+    use crate::ast::Value;
+    use crate::compiler::namespace_from_path;
+    use crate::parser::{logical_statements, normalize_function_body_newlines};
     use crate::vm::{EvalResult, Vm, run_vm};
 
-    /// Run `line` through [`eval_line`] and return whatever it wrote via
+    /// Test-only helper: the eager table bound to `name` (panics if it isn't
+    /// one) — table-shaped bindings live in `vm.globals`, not a separate map.
+    fn table<'a>(vm: &'a Vm, name: &str) -> &'a polars::prelude::DataFrame {
+        match vm.globals.get(name) {
+            Some(Value::Table(df)) => df,
+            other => panic!("'{name}' is not a table binding: {other:?}"),
+        }
+    }
+
+    /// Run `line` through [`run_line`] and return whatever it wrote via
     /// `Vm::emit`, by pointing the stdout-log tee at a scratch file.
     fn logged(vm: &mut Vm, line: &str) -> String {
         let path =
             std::env::temp_dir().join(format!("qpl_repl_test_{:?}", std::thread::current().id()));
         vm.stdout_log = Some(std::fs::File::create(&path).unwrap());
-        eval_line(line, vm).expect("eval_line");
+        run_line(line, vm, "<main>", 0).expect("run_line");
         vm.stdout_log = None;
         let out = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -1009,6 +1132,138 @@ mod tests {
         assert!(vm.globals.contains_key(&format!("{ns}.z")));
     }
 
+    #[test]
+    fn d_command_prints_a_disassembly_listing() {
+        let mut vm = Vm::new();
+        let (out, err) = eval_capture("\\d 1+1", &mut vm);
+        assert!(err.is_none(), "{err:?}");
+        assert!(out.contains("BINOP"), "{out:?}");
+        assert!(out.contains("PUSH"), "{out:?}");
+    }
+
+    #[test]
+    fn embedded_l_target_survives_deleting_the_source_after_compile() {
+        // a `\l`/`\i` target is read, parsed and
+        // compiled into the *including* script's own `Program` at compile
+        // time — the source file plays no further role once that's done.
+        let dir = scratch_dir("l_embed");
+        let lib = dir.join("lib.qpl");
+        std::fs::write(&lib, "x: 41\n").unwrap();
+        let main = dir.join("main.qpl");
+        std::fs::write(&main, format!("\\l {}\ny: x + 1\n", lib.to_str().unwrap())).unwrap();
+
+        let src = std::fs::read_to_string(&main).unwrap();
+        let stmts = crate::parser::parse_program(&src, main.to_str().unwrap()).unwrap();
+        let ctx = crate::compiler::CompileCtx::script(main.to_str().unwrap());
+        let program = crate::compiler::compile_program(stmts, ctx).unwrap();
+
+        // the target no longer exists on disk once compilation is done
+        std::fs::remove_file(&lib).unwrap();
+
+        let mut vm = Vm::new();
+        vm.run_compiled(std::sync::Arc::new(program))
+            .expect("embedded program should run with no source file present");
+        assert_eq!(vm.globals.get("y"), Some(&crate::ast::Value::Int(42)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn l_cycle_is_a_compile_time_error() {
+        let dir = scratch_dir("l_cycle");
+        let a = dir.join("a.qpl");
+        let b = dir.join("b.qpl");
+        std::fs::write(&a, format!("\\l \"{}\"\n", b.to_str().unwrap())).unwrap();
+        std::fs::write(&b, format!("\\l \"{}\"\n", a.to_str().unwrap())).unwrap();
+        let mut vm = Vm::new();
+        let err = super::run_script(a.to_str().unwrap(), &mut vm).expect_err("cycle");
+        assert!(err.to_string().contains("cycle"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn i_cycle_is_a_compile_time_error() {
+        let dir = scratch_dir("i_cycle");
+        let a = dir.join("a.qpl");
+        let b = dir.join("b.qpl");
+        std::fs::write(&a, format!("\\i \"{}\"\n", b.to_str().unwrap())).unwrap();
+        std::fs::write(&b, format!("\\i \"{}\"\n", a.to_str().unwrap())).unwrap();
+        let mut vm = Vm::new();
+        let err = super::run_script(a.to_str().unwrap(), &mut vm).expect_err("cycle");
+        assert!(err.to_string().contains("cycle"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_parse_error_on_a_later_line_prevents_earlier_statements_from_running() {
+        // the whole script is parsed before anything runs, so `x` is never bound.
+        let dir = scratch_dir("parse_abort");
+        let path = dir.join("bad.qpl");
+        std::fs::write(&path, "x: 1\nsel from t\n").unwrap();
+        let mut vm = Vm::new();
+        let err = super::run_script(path.to_str().unwrap(), &mut vm).expect_err("parse error");
+        assert!(err.to_string().contains(":2:"), "{err}");
+        assert!(
+            !vm.globals.contains_key("x"),
+            "an earlier statement must not have run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_param_shadows_a_namespaced_name_of_the_same_import() {
+        // compile-time namespace qualification: inside a function
+        // body, a param of the same name as one of the file's own top-level
+        // bindings refers to the param, not `.lib.x`.
+        let dir = scratch_dir("i_param_shadow");
+        let lib = dir.join("lib.qpl");
+        std::fs::write(&lib, "x: 100\nf: {[x] x+1}\n").unwrap();
+        let mut vm = Vm::new();
+        run_script_imported(lib.to_str().unwrap(), &mut vm).expect("import");
+        run_line("r: .lib.f[1]", &mut vm, "<main>", 0)
+            .map_err(|e| e.to_string())
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(vm.globals.get("r"), Some(&crate::ast::Value::Int(2)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(all(feature = "ipc", feature = "cli"))]
+    #[test]
+    fn dispatch_supports_qpl_cfg() {
+        let mut vm = Vm::new();
+        match super::eval_for_dispatch(".qpl.cfg", &mut vm) {
+            Ok(EvalResult::Stored) => {}
+            other => panic!("expected Stored, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "ipc", feature = "cli"))]
+    #[test]
+    fn dispatch_rejects_system_commands() {
+        let mut vm = Vm::new();
+        let err = super::eval_for_dispatch("\\l some/script.qpl", &mut vm)
+            .expect_err("\\l should be rejected over a dispatched connection");
+        assert!(err.to_string().contains("dispatched"), "{err}");
+    }
+
+    #[test]
+    fn stack_height_is_unchanged_across_a_whole_script() {
+        let dir = scratch_dir("stack_height");
+        let path = dir.join("s.qpl");
+        std::fs::write(
+            &path,
+            "x: 1\nlog x\nf: {[a] a*2}\ny: f[x]\nselect from trades\nlog[\"done\"]\n.qpl.cfg\n",
+        )
+        .unwrap();
+        let mut vm = Vm::new();
+        super::load_demo_tables(&mut vm);
+        super::run_script(path.to_str().unwrap(), &mut vm).expect("script should run cleanly");
+        assert!(
+            vm.stack.is_empty(),
+            "the VM stack must be empty after a whole Script-mode program runs"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A fresh scratch directory for one test's script files.
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("qpl_{tag}_{:?}", std::thread::current().id()));
@@ -1019,15 +1274,31 @@ mod tests {
 
     #[test]
     fn i_import_never_overwrites_an_existing_session_name() {
-        // regression: only names *new* since the import started used to be
-        // namespaced, so a library assigning `thr` silently replaced the
-        // session's own `thr` and nothing landed under `.lib`.
+        // regression: a library assigning `thr` must not silently replace the
+        // session's own `thr`; it lands under `.lib`.
+        //
+        // Namespace qualification happens at compile time: a bare
+        // reference to a name the file binds at its own top level is *always*
+        // qualified, regardless of where in the file it appears relative to
+        // that binding (so a library statement can't read the
+        // session's value of a name it is about to redefine under the same
+        // top-level binding). This script therefore reads the *session's*
+        // `src` (never one of `lib`'s own top-level names) to avoid that
+        // ill-defined case, and asserts the same core guarantee: an import
+        // never touches an existing session name, and its own bindings land
+        // under `.lib.*`.
         let dir = scratch_dir("i_clobber");
         let lib = dir.join("lib.qpl");
-        std::fs::write(&lib, "thr: 99\nt: select from t where c > 1\nn: count t\n").unwrap();
+        std::fs::write(
+            &lib,
+            "thr: 99\nout: select from src where c > 1\nn: count out\n",
+        )
+        .unwrap();
         let mut vm = Vm::new();
-        vm.tables
-            .insert("t".into(), polars::df!["c" => [1i64, 2, 3]].unwrap());
+        vm.globals.insert(
+            "src".into(),
+            Value::Table(polars::df!["c" => [1i64, 2, 3]].unwrap()),
+        );
         vm.globals.insert("thr".into(), crate::ast::Value::Int(1));
         run_script_imported(lib.to_str().unwrap(), &mut vm).expect("import");
 
@@ -1036,9 +1307,8 @@ mod tests {
             vm.globals.get(".lib.thr"),
             Some(&crate::ast::Value::Int(99))
         );
-        assert_eq!(vm.tables["t"].height(), 3, "session table untouched");
-        assert_eq!(vm.tables[".lib.t"].height(), 2);
-        // the script's later `count t` saw its *own* `t`, not the session's
+        assert_eq!(table(&vm, "src").height(), 3, "session table untouched");
+        assert_eq!(table(&vm, ".lib.out").height(), 2);
         assert_eq!(vm.globals.get(".lib.n"), Some(&crate::ast::Value::Int(2)));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1080,7 +1350,6 @@ mod tests {
         assert_eq!(vm.globals.get("thr"), Some(&crate::ast::Value::Int(1)));
         // the previous import's contents survive a failed re-import
         assert_eq!(vm.globals.get(".bad.old"), Some(&crate::ast::Value::Int(7)));
-        assert!(vm.import_ns.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1131,11 +1400,12 @@ mod tests {
 
     #[test]
     fn script_relative_leaves_prompt_and_absolute_paths_alone() {
-        assert_eq!(super::script_relative("a.qpl", "<main>"), "a.qpl");
-        assert_eq!(super::script_relative("/x/a.qpl", "lib/b.qpl"), "/x/a.qpl");
-        assert_eq!(super::script_relative("a.qpl", "b.qpl"), "a.qpl");
+        use crate::compiler::script_relative;
+        assert_eq!(script_relative("a.qpl", "<main>"), "a.qpl");
+        assert_eq!(script_relative("/x/a.qpl", "lib/b.qpl"), "/x/a.qpl");
+        assert_eq!(script_relative("a.qpl", "b.qpl"), "a.qpl");
         assert_eq!(
-            super::script_relative("a.qpl", "lib/b.qpl"),
+            script_relative("a.qpl", "lib/b.qpl"),
             std::path::Path::new("lib").join("a.qpl").to_string_lossy()
         );
     }
@@ -1170,12 +1440,12 @@ mod tests {
     #[test]
     fn log_evaluates_a_reduction_directly() {
         // regression: `log max t`price` (with or without the parens the README
-        // recommends for a call/reduction) used to fail — `eval_scalar` cannot
-        // resolve a table/column expression, only a plain scalar fold.
+        // recommends for a call/reduction) must evaluate the
+        // table/column expression, not just a plain scalar fold.
         let mut vm = Vm::new();
-        vm.tables.insert(
+        vm.globals.insert(
             "t".into(),
-            polars::df!["price" => [1.0f64, 2.0, 3.0]].unwrap(),
+            Value::Table(polars::df!["price" => [1.0f64, 2.0, 3.0]].unwrap()),
         );
         assert_eq!(logged(&mut vm, "log (max t`price)"), "3");
     }
@@ -1191,10 +1461,17 @@ mod tests {
         // regression: `log` only ever existed as a whole-line REPL directive
         // (`repl::log_target`), so it was unreachable from inside a function
         // body — `{[s] log s}` failed with "unknown function 'log'". `log[..]`
-        // now compiles through the ordinary `Expr::Call` path (`resolve::eval_log`),
-        // so it works there too.
+        // now compiles through the ordinary `Expr::Call` path
+        // (`compiler::compile_value_expr`'s `log` arm, `ops::native_log`), so
+        // it works there too.
         let mut vm = Vm::new();
-        eval_line(r#"info: {[s] log[str$"tag" " - " s]}"#, &mut vm).expect("define info");
+        run_line(
+            r#"info: {[s] log[str$"tag" " - " s]}"#,
+            &mut vm,
+            "<main>",
+            0,
+        )
+        .expect("define info");
         // `info` returns whatever `log` wrote (its only/last statement), so a
         // bare call at top level also echoes that return value like any other
         // function call — only a standalone `log[..]` statement suppresses it.
@@ -1210,6 +1487,27 @@ mod tests {
         // only prints what it logged, matching the bareword `log ..` form.
         let mut vm = Vm::new();
         assert_eq!(logged(&mut vm, r#"log["only once"]"#), "only once");
+    }
+
+    #[test]
+    fn log_bracket_call_supports_zero_one_and_three_args() {
+        // every arity compiles the same way (`compiler::compile_value_expr`'s `log`
+        // arm) and behaves identically as a top-level statement.
+        let mut vm = Vm::new();
+        assert_eq!(logged(&mut vm, "log[]"), "");
+        assert_eq!(logged(&mut vm, r#"log["solo"]"#), "solo");
+        assert_eq!(logged(&mut vm, r#"log["a";"b";"c"]"#), "abc");
+    }
+
+    #[test]
+    fn log_bareword_supports_zero_one_and_three_args() {
+        let mut vm = Vm::new();
+        assert_eq!(logged(&mut vm, "log"), "");
+        assert_eq!(logged(&mut vm, r#"log "solo""#), "solo");
+        // the bareword form takes a single expression, so three values are
+        // written as one string-concatenation expression rather than three
+        // comma/semicolon-separated arguments (that's `log[..]`'s job above).
+        assert_eq!(logged(&mut vm, r#"log "a" "b" "c""#), "abc");
     }
 
     #[cfg(feature = "ipc")]
@@ -1246,8 +1544,10 @@ mod tests {
     #[test]
     fn dispatch_runs_an_ordinary_statement() {
         let mut vm = Vm::new();
-        vm.tables
-            .insert("t".into(), polars::df!["c" => [1i64, 2, 3]].unwrap());
+        vm.globals.insert(
+            "t".into(),
+            Value::Table(polars::df!["c" => [1i64, 2, 3]].unwrap()),
+        );
         match super::eval_for_dispatch("select c from t where c > 1", &mut vm) {
             Ok(crate::vm::EvalResult::Table(df)) => assert_eq!(df.height(), 2),
             other => panic!("expected a table, got {other:?}"),
@@ -1286,51 +1586,6 @@ mod tests {
         assert!(!wants_more("\\l some/script.qpl"));
         // `.qpl.cfg` is a single-line directive, never "more"
         assert!(!wants_more(".qpl.cfg maxrow=5 maxcol=3"));
-    }
-
-    #[test]
-    fn cfg_directive_recognises_the_config_function() {
-        assert_eq!(
-            cfg_directive(".qpl.cfg maxcol=8 maxrow=20"),
-            Some("maxcol=8 maxrow=20")
-        );
-        assert_eq!(
-            cfg_directive("  .qpl.cfg  round_type=HALF_UP "),
-            Some("round_type=HALF_UP")
-        );
-        assert_eq!(cfg_directive(".qpl.cfg"), Some(""));
-        assert_eq!(cfg_directive(".qpl.cfgx maxcol=1"), None);
-        assert_eq!(cfg_directive("select from t"), None);
-    }
-
-    #[test]
-    fn log_target_keyword() {
-        assert_eq!(log_target(r#"log "hi""#), Some(r#""hi""#));
-        assert_eq!(log_target("log x + 1"), Some("x + 1"));
-    }
-
-    #[test]
-    fn log_target_bare_is_blank_line() {
-        assert_eq!(log_target("log"), Some(""));
-    }
-
-    /// `log` is the only spelling that writes to stdout. A leading digit is
-    /// always an ordinary expression, so arithmetic and row-count queries
-    /// alike reach the VM untouched.
-    #[test]
-    fn log_target_ignores_leading_digits() {
-        assert_eq!(log_target("1"), None);
-        assert_eq!(log_target(r#"1 "hi""#), None);
-        assert_eq!(log_target("1 + 1"), None);
-        assert_eq!(log_target("1 limit select from trades"), None);
-        assert_eq!(log_target("1 # select from trades"), None);
-        assert_eq!(log_target("10 limit select from trades"), None);
-    }
-
-    #[test]
-    fn log_target_ignores_ordinary_statements() {
-        assert_eq!(log_target("select from trades"), None);
-        assert_eq!(log_target("t: select from trades"), None);
     }
 
     #[test]
@@ -1540,7 +1795,7 @@ mod tests {
             assert!(err.is_none(), "{buf:?}: {err:?}");
             buf.clear();
         }
-        assert_eq!(vm.tables["t"].shape(), (3, 2));
+        assert_eq!(table(&vm, "t").shape(), (3, 2));
     }
 
     /// A `log` write happens before the statement's own failure, so it has to

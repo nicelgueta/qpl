@@ -1,0 +1,78 @@
+partition aggregate broadcast back to every row (SQL: max(price) OVER (PARTITION BY sym))
+shape: (8, 3)
+┌──────┬───────┬───────┐
+│ sym  ┆ price ┆ top   │
+│ ---  ┆ ---   ┆ ---   │
+│ str  ┆ f64   ┆ f64   │
+╞══════╪═══════╪═══════╡
+│ AAPL ┆ 182.3 ┆ 184.0 │
+│ AAPL ┆ 183.1 ┆ 184.0 │
+│ AAPL ┆ 184.0 ┆ 184.0 │
+│ MSFT ┆ 414.8 ┆ 416.0 │
+│ …    ┆ …     ┆ …     │
+└──────┴───────┴───────┘
+`over` binds tighter than arithmetic, so no parens needed here
+shape: (8, 3)
+┌──────┬───────┬─────────┐
+│ sym  ┆ price ┆ off_top │
+│ ---  ┆ ---   ┆ ---     │
+│ str  ┆ f64   ┆ f64     │
+╞══════╪═══════╪═════════╡
+│ AAPL ┆ 182.3 ┆ 1.7     │
+│ AAPL ┆ 183.1 ┆ 0.9     │
+│ AAPL ┆ 184.0 ┆ 0.0     │
+│ MSFT ┆ 414.8 ┆ 1.2     │
+│ …    ┆ …     ┆ …       │
+└──────┴───────┴─────────┘
+ranking verbs: rn (row_number), rank (ties share low rank + gap), drank (dense_rank, no gap)
+shape: (8, 6)
+┌──────┬──────┬───────┬─────┬─────┬──────┐
+│ sym  ┆ side ┆ price ┆ rn  ┆ rnk ┆ drnk │
+│ ---  ┆ ---  ┆ ---   ┆ --- ┆ --- ┆ ---  │
+│ str  ┆ str  ┆ f64   ┆ i64 ┆ i64 ┆ i64  │
+╞══════╪══════╪═══════╪═════╪═════╪══════╡
+│ AAPL ┆ buy  ┆ 182.3 ┆ 1   ┆ 1   ┆ 1    │
+│ AAPL ┆ sell ┆ 183.1 ┆ 2   ┆ 2   ┆ 2    │
+│ AAPL ┆ sell ┆ 184.0 ┆ 3   ┆ 2   ┆ 2    │
+│ MSFT ┆ sell ┆ 414.8 ┆ 1   ┆ 3   ┆ 2    │
+│ …    ┆ …    ┆ …     ┆ …   ┆ …   ┆ …    │
+└──────┴──────┴───────┴─────┴─────┴──────┘
+multi-key order with independent directions: side ascending, then price descending
+shape: (8, 4)
+┌──────┬──────┬───────┬──────┐
+│ sym  ┆ side ┆ price ┆ seat │
+│ ---  ┆ ---  ┆ ---   ┆ ---  │
+│ str  ┆ str  ┆ f64   ┆ i64  │
+╞══════╪══════╪═══════╪══════╡
+│ AAPL ┆ buy  ┆ 182.3 ┆ 1    │
+│ AAPL ┆ sell ┆ 183.1 ┆ 3    │
+│ AAPL ┆ sell ┆ 184.0 ┆ 2    │
+│ MSFT ┆ sell ┆ 414.8 ┆ 3    │
+│ …    ┆ …    ┆ …     ┆ …    │
+└──────┴──────┴───────┴──────┘
+running total (cumsum), previous row (shift/lag), and the change from it (diff)
+shape: (8, 5)
+┌──────┬───────┬───────┬───────┬──────┐
+│ sym  ┆ price ┆ run   ┆ prev  ┆ chg  │
+│ ---  ┆ ---   ┆ ---   ┆ ---   ┆ ---  │
+│ str  ┆ f64   ┆ f64   ┆ f64   ┆ f64  │
+╞══════╪═══════╪═══════╪═══════╪══════╡
+│ AAPL ┆ 182.3 ┆ 182.3 ┆ null  ┆ null │
+│ AAPL ┆ 183.1 ┆ 365.4 ┆ 182.3 ┆ 0.8  │
+│ AAPL ┆ 184.0 ┆ 549.4 ┆ 183.1 ┆ 0.9  │
+│ MSFT ┆ 414.8 ┆ 414.8 ┆ null  ┆ null │
+│ …    ┆ …     ┆ …     ┆ …     ┆ …    │
+└──────┴───────┴───────┴───────┴──────┘
+a trailing `rolling <n>` turns the aggregate into a fixed n-row moving window
+shape: (8, 4)
+┌──────┬───────┬────────┬───────┐
+│ sym  ┆ price ┆ ma3    ┆ mx3   │
+│ ---  ┆ ---   ┆ ---    ┆ ---   │
+│ str  ┆ f64   ┆ f64    ┆ f64   │
+╞══════╪═══════╪════════╪═══════╡
+│ AAPL ┆ 182.3 ┆ null   ┆ null  │
+│ AAPL ┆ 183.1 ┆ 182.7  ┆ 183.1 │
+│ AAPL ┆ 184.0 ┆ 183.55 ┆ 184.0 │
+│ MSFT ┆ 414.8 ┆ null   ┆ null  │
+│ …    ┆ …     ┆ …      ┆ …     │
+└──────┴───────┴────────┴───────┘

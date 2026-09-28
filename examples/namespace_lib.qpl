@@ -1,8 +1,12 @@
 / ─────────────────────────────────────────────────────────────────────────────
 / A tiny "library" script meant to be imported, not run directly. `\i` (at
-/ the prompt or nested in a script — see examples/README.md) runs a script like `\l`, then moves every
-/ table/global/function it newly bound at its top level under `.namespace_lib.*`
-/ (the file's stem), so it doesn't collide with names already in the session.
+/ the prompt or nested in a script — see examples/README.md) compiles and runs
+/ a script like `\l`, except every table/global/function it binds at its top
+/ level is qualified under `.namespace_lib.*` (the file's stem) at compile
+/ time, so it doesn't collide with names already in the session. Because the
+/ qualification is compile-time, a library can't do `t: select from t where
+/ ...` to read a session-level `t` and rebind it: a bare `t` here would always
+/ mean `.namespace_lib.t`, even on the statement that first defines it.
 / ─────────────────────────────────────────────────────────────────────────────
 
 double: {[x] x*2}

@@ -1,0 +1,17 @@
+a function imported under .namespace_lib.* — call it like any other function
+42
+an imported global
+hello from namespace_lib
+an imported table
+shape: (8, 2)
+┌──────┬───────┐
+│ sym  ┆ price │
+│ ---  ┆ ---   │
+│ str  ┆ f64   │
+╞══════╪═══════╡
+│ AAPL ┆ 182.3 │
+│ AAPL ┆ 183.1 │
+│ AAPL ┆ 184.0 │
+│ MSFT ┆ 414.8 │
+│ …    ┆ …     │
+└──────┴───────┘

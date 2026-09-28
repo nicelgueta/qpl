@@ -1,0 +1,30 @@
+same join, but against a filtered subquery on the right
+LEFT JOIN:
+LEFT PLAN ON: [col("sym")]
+  Parquet SCAN [examples/data/trades.parquet]
+  PROJECT 2/5 COLUMNS
+  ESTIMATED ROWS: 8
+RIGHT PLAN ON: [col("sym")]
+  Parquet SCAN [examples/data/quotes.parquet]
+  PROJECT 2/6 COLUMNS
+  SELECTION: col("bid") > 0.0
+  ESTIMATED ROWS: 5
+END LEFT JOIN
+SORT BY [descending: [true, false]] [col("traded"), col("sym")]
+  AGGREGATE[maintain_order: false]
+    [col("notional").sum().alias("traded"), col("spread").mean().alias("avg_spread"), col("price").count().alias("n")] BY [col("sym"), col("side"), col("band")]
+    FROM
+    SELECT [col("sym"), col("side"), when(col("spread") > 0.4).then("wide").otherwise("tight").alias("band"), col("notional"), col("spread"), col("price")]
+      SELECT [col("sym"), col("side"), (col("ask") - col("bid")).alias("spread"), (col("price") * col("size").cast(Float64)).alias("notional"), col("price")]
+        simple π 6/6 ["sym", "side", "price", "size", ... 2 other columns]
+          LEFT JOIN:
+          LEFT PLAN ON: [col("sym")]
+            Parquet SCAN [examples/data/trades.parquet]
+            PROJECT 4/5 COLUMNS
+            ESTIMATED ROWS: 8
+          RIGHT PLAN ON: [col("sym")]
+            Parquet SCAN [examples/data/quotes.parquet]
+            PROJECT 3/6 COLUMNS
+            ESTIMATED ROWS: 5
+          END LEFT JOIN
+created parquet file: 'examples/data/market_summary.parquet'

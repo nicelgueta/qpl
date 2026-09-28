@@ -90,6 +90,8 @@ table instead of the CLI output. It all runs client-side as compiled wasm in a W
 qpl --load-demo     # REPL with demo `trades` and `quotes` tables
 qpl script.qpl      # run a script
 qpl -i script.qpl   # run a script, then stay in the REPL with its state
+qpl -c 'select avg price by sym from trades' --load-demo   # run one command and exit
+qpl -C script.qpl   # compile to script.qplc; `qpl script.qplc` then runs it with no parsing
 ```
 
 ```q
@@ -528,7 +530,13 @@ A binding the imported script already namespaced itself is left alone rather
 than double-prefixed. A function's *body* can still call another top-level
 helper from the same script by its bare, unqualified name (`info` calling
 `_log`, say) — that unqualified call resolves against the called function's
-own namespace first, so a session name can't hijack it.
+own namespace first, so a session name can't hijack it. This qualification
+happens when the imported script is *compiled*, not while it runs: a bare
+name the script binds at its own top level always means its own namespaced
+binding, everywhere in the script, even in a statement that runs before that
+binding's own statement does. So a library can't write `t: select from t
+where ...` to read a session-level `t` and rebind it under its own name —
+inside the script, a bare `t` never sees the session's.
 
 An import is all-or-nothing: if the script fails, the session is restored as
 it was, and a re-import is a clean reload of the namespace. Inside a script,
@@ -610,34 +618,49 @@ operator's own input.
 
 ```
 qpl) \d select avg price by sym from trades where size > 100
-0000: FROM_SRC InMem("trades")
-0001: PUSH_COL_REF size
-0002: PUSH_CONST Int(100)
-0003: BIN_OP >
-0004: FRAME_EXPR Filter(1)
-0005: PUSH_COL_REF sym
-0006: ALIAS Some("sym")
-0007: BUILD_KEYS 1
-0008: PUSH_COL_REF price
-0009: CALL avg 1
-0010: ALIAS Some("price")
-0011: BUILD_PROJ 1
-0012: SELECT_BY
-0013: RESULT
+0000  PUSH       Name(trades)
+0001  SOURCE
+0002  PUSH       Name(size)
+0003  LOAD_COL
+0004  PUSH       Value(Int(100))
+0005  PUSH       BinOp(Gt)
+0006  BINOP
+0007  PUSH       Count(1)
+0008  FILTER
+0009  PUSH       Name(sym)
+0010  LOAD_COL
+0011  PUSH       Name(sym)
+0012  ALIAS
+0013  PUSH       Count(1)
+0014  LIST
+0015  PUSH       Name(price)
+0016  LOAD_COL
+0017  PUSH       Count(1)
+0018  PUSH       Verb(avg)
+0019  VERB
+0020  PUSH       Name(price)
+0021  ALIAS
+0022  PUSH       Count(1)
+0023  LIST
+0024  SELECT_BY
 ```
 
 ## Architecture
 
 ```
-source -> lexer -> tokens -> parser -> AST -> compiler -> instructions -> VM (Polars LazyFrame) -> DataFrame
+source -> lexer -> tokens -> parser -> AST -> compiler -> bytecode program -> VM (Polars LazyFrame) -> DataFrame
 ```
+
+A script compiles to one bytecode program and runs in a single pass — a
+syntax error anywhere in the file is caught before the first statement runs.
+A REPL line or an IPC request is the same thing on a smaller scale.
 
 | Module | Role |
 |---|---|
 | `lexer` | tokenise source text |
-| `parser` | build the typed AST |
-| `compiler` | emit stack-machine instructions |
-| `vm` | execute them, building and collecting a `LazyFrame` |
+| `parser` | build the typed AST — a whole file at once for a script |
+| `compiler` | emit a one-byte-per-instruction bytecode program |
+| `vm` | execute it, building and collecting a `LazyFrame` |
 | `repl` | interactive loop and script runner |
 
 The interpreter is a library (`src/lib.rs`); the `qpl` binary (`cli` feature,

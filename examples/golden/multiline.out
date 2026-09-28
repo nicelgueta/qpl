@@ -1,0 +1,23 @@
+a select broken across lines for readability
+shape: (6, 5)
+┌──────┬──────┬──────────┬────────┬──────────┐
+│ sym  ┆ side ┆ tot_size ┆ apx    ┆ value    │
+│ ---  ┆ ---  ┆ ---      ┆ ---    ┆ ---      │
+│ str  ┆ str  ┆ i64      ┆ f64    ┆ f64      │
+╞══════╪══════╪══════════╪════════╪══════════╡
+│ AAPL ┆ buy  ┆ 100      ┆ 182.3  ┆ 18230.0  │
+│ AAPL ┆ sell ┆ 750      ┆ 183.55 ┆ 137775.0 │
+│ MSFT ┆ buy  ┆ 380      ┆ 415.6  ┆ 158016.0 │
+│ MSFT ┆ sell ┆ 200      ┆ 414.8  ┆ 82960.0  │
+│ …    ┆ …    ┆ …        ┆ …      ┆ …        │
+└──────┴──────┴──────────┴────────┴──────────┘
+back to a one-liner - the blank line above closed the statement
+shape: (2, 2)
+┌──────┬──────────┐
+│ sym  ┆ tot_size │
+│ ---  ┆ ---      │
+│ str  ┆ i64      │
+╞══════╪══════════╡
+│ AAPL ┆ 750      │
+│ MSFT ┆ 380      │
+└──────┴──────────┘

@@ -3,6 +3,7 @@ use polars::prelude::JoinType;
 use crate::ast::*;
 use crate::builtins::BuiltIn;
 use crate::errors::QplError;
+use crate::lexer::tokenise;
 use crate::tokens::{Token, TokenKind};
 
 /// Words that can't be bound as a variable or parameter name: `while[..]` and
@@ -69,7 +70,7 @@ impl Parser {
         }
     }
     fn eat(&mut self, kind: &TokenKind) -> Result<(), QplError> {
-        if &self.peek() == &kind {
+        if self.peek() == kind {
             self.i += 1;
             Ok(())
         } else {
@@ -171,11 +172,13 @@ impl Parser {
         }
     }
 
-    /// `{[p1,p2] stmt; stmt; last-expr}` — a function literal, folded straight
-    /// into an `Expr::Lit(Value::Closure(..))`. The param list is optional
-    /// (`{[] ..}` / `{ .. }` are niladic). Statements are `;`-separated, each a
-    /// full `parse_stmt` (so locals may be assigned); the body must be
-    /// non-empty and end in an expression (its return value).
+    /// `{[p1,p2] stmt; stmt; last-expr}` — a function literal, parsed straight
+    /// into an `Expr::Lambda`, compiled to bytecode (`PUSH Func(proto)` plus
+    /// the body appended after the enclosing program's main code — see
+    /// `compiler::compile_value_expr`) rather than kept as raw AST. The param
+    /// list is optional (`{[] ..}` / `{ .. }` are niladic). Statements are
+    /// `;`-separated, each a full `parse_stmt` (so locals may be assigned);
+    /// the body must be non-empty and end in an expression (its return value).
     fn parse_func_lit(&mut self) -> Result<Expr, QplError> {
         self.eat(&TokenKind::LBrace)?;
         let mut params = Vec::new();
@@ -226,9 +229,7 @@ impl Parser {
                 "a function body must end with an expression, not an assignment".into(),
             ));
         }
-        Ok(Expr::Lit(Value::Closure(std::sync::Arc::new(
-            crate::ast::Function { params, body },
-        ))))
+        Ok(Expr::Lambda(crate::ast::Function { params, body }))
     }
 
     fn parse_body(&mut self) -> Result<Stmt, QplError> {
@@ -604,24 +605,25 @@ impl Parser {
         // `` `w!hopen <addr> `` — a write-mode IPC connection handle (bare
         // `hopen` is read-only by default). Reuses the same bang-modifier
         // convention as `` u8!`$col ``/`` `c!01b t ``; `w` is the only
-        // accepted modifier. Lowered to `Call { func: "whopen", .. }` so
-        // `resolve::eval_value` needs no new AST node for it.
-        if let (Expr::Sym(w), TokenKind::Bang) = (&left, self.peek()) {
-            if w == "w" {
-                self.next(); // consume '!'
-                return match self.parse_expr_inner(windows)? {
-                    Expr::Call { func, args } if func == "hopen" => self.finish_window(
-                        Expr::Call {
-                            func: "whopen".into(),
-                            args,
-                        },
-                        windows,
-                    ),
-                    other => Err(QplError::Parse(format!(
-                        "expected 'hopen' after `w!, got {other:?}"
-                    ))),
-                };
-            }
+        // accepted modifier. Lowered to `Call { func: "whopen", .. }` so no new
+        // AST node is needed for it — `Op::Call`'s runtime dispatch
+        // (`ops::call_by_name`) already resolves it by name.
+        if let (Expr::Sym(w), TokenKind::Bang) = (&left, self.peek())
+            && w == "w"
+        {
+            self.next(); // consume '!'
+            return match self.parse_expr_inner(windows)? {
+                Expr::Call { func, args } if func == "hopen" => self.finish_window(
+                    Expr::Call {
+                        func: "whopen".into(),
+                        args,
+                    },
+                    windows,
+                ),
+                other => Err(QplError::Parse(format!(
+                    "expected 'hopen' after `w!, got {other:?}"
+                ))),
+            };
         }
 
         // infix dyadic verbs: `<param> verb <expr>` (q-style). `param` is `left`;
@@ -629,9 +631,10 @@ impl Parser {
         // so the value never swallows a window. The parser only records
         // `Call { func, args: [value, param] }`; `round` is lowered in the
         // compiler, the rest dispatch through `apply_dyadic` in the VM — except
-        // `til`, a value-context list constructor handled by `resolve::eval_value`
-        // before it would ever reach that column-context dispatch (so `args`
-        // there means `[high, low]`, not `[column, param]`).
+        // `til`, a value-context list constructor compiled directly
+        // (`compiler::compile_value_expr`) before it would ever reach that
+        // column-context dispatch (so `args` there means `[high, low]`, not
+        // `[column, param]`).
         if let TokenKind::Name(n) = self.peek()
             && matches!(
                 n.as_str(),
@@ -962,7 +965,9 @@ impl Parser {
         }
         let default = Box::new(terms.pop().unwrap());
         let branches = terms
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| (pair[0].clone(), pair[1].clone()))
             .collect();
         Ok(Expr::Case { branches, default })
@@ -1240,14 +1245,14 @@ impl Parser {
                 };
                 continue;
             }
-            if parenthesised || !matches!(e, Expr::ColRef(_)) {
-                if let Some(idx) = self.try_parse_int_run() {
-                    e = Expr::Index {
-                        expr: Box::new(e),
-                        idx: Box::new(idx),
-                    };
-                    continue;
-                }
+            if (parenthesised || !matches!(e, Expr::ColRef(_)))
+                && let Some(idx) = self.try_parse_int_run()
+            {
+                e = Expr::Index {
+                    expr: Box::new(e),
+                    idx: Box::new(idx),
+                };
+                continue;
             }
             break;
         }
@@ -1347,7 +1352,7 @@ impl Parser {
 
     /// If the next token starts a table expression (`select …`, `collect …`,
     /// `lazy …`, …), parse the whole thing as one, wrapped in `Expr::Table` —
-    /// `resolve::eval_value` already applies a cast, or hands a frame to a
+    /// `compiler::compile_value_expr` already applies a cast, or hands a frame to a
     /// called function's parameter, exactly like it does for a bare
     /// `` trades`price `` or `f[t]` with `t` a table name; the only thing
     /// missing was a parser path to *reach* those, since none of these
@@ -1459,7 +1464,7 @@ impl Parser {
             TokenKind::Temporal(v) => Ok(Expr::Lit(v)),
             TokenKind::Name(n) if n == "i" => Ok(Expr::IColRef),
             // `enlist <value>` — the one-element list of an atom. A literal
-            // folds here; anything else is applied at run time (`resolve::eval_value`).
+            // folds here; anything else is applied at run time (`ops::native_enlist`).
             TokenKind::Name(n) if n == "enlist" => Ok(enlist(self.parse_value()?)),
             // in expression position `distinct` is the column verb (alias of
             // `n_unique`); in table position `parse_table_expr` claims it first
@@ -1473,7 +1478,7 @@ impl Parser {
             }
             // Every other bare name — including `.qpl.dt`/`.qpl.tm`/`.qpl.ts`/`.qpl.dlta`
             // and any other namespaced name — is an ordinary variable/table/function
-            // reference, resolved by lookup (see `Vm::lookup`, `resolve::call_niladic`).
+            // reference, resolved by lookup (see `Vm::lookup`, the niladic-call path).
             TokenKind::Name(n) => Ok(Expr::ColRef(n)),
             TokenKind::Op(op) if op == "?" => self.parse_case(),
             // leading `-`: a negative literal (`-45.3`) or unary negation of the
@@ -1498,7 +1503,7 @@ impl Parser {
 
 /// `<left> <op> <right>`. `?` (roll: `3?6`, `2?10 20 30`) isn't a scalar
 /// operator, so it lowers to `Call { func: "?", args: [right, left] }` —
-/// value context only, evaluated by `resolve::eval_value` like `til`.
+/// value context only, compiled directly (`compiler::compile_value_expr`) like `til`.
 fn binop(left: Expr, op: String, right: Expr) -> Expr {
     if op == "?" {
         return Expr::Call {
@@ -1591,6 +1596,203 @@ pub fn parse_expr_seq(tokens: Vec<Token>) -> Result<Vec<Expr>, QplError> {
         exprs.push(parser.parse_expr_no_call()?);
     }
     Ok(exprs)
+}
+
+/// Fold the physical lines of a script into logical statements.
+/// [`parse_program`] is the sole caller for script-shaped input; the REPL calls
+/// this indirectly through `parse_program` for one submitted line.
+///
+/// A statement starts at a line with no leading indentation. Any following
+/// line indented by a tab or four (or more) spaces is a continuation of that
+/// same statement; the run of lines is joined with `\n` (which the lexer
+/// treats as whitespace, and which correctly terminates any inline `/`
+/// comment). A blank or non-indented line ends the current statement. Blank
+/// lines and lines whose first non-space character is `/` are dropped unless
+/// they are continuations.
+///
+/// Returns `(zero-based line index where the statement began, statement text)`.
+pub fn logical_statements(src: &str) -> Vec<(u32, String)> {
+    let mut out: Vec<(u32, String)> = Vec::new();
+    let mut buf: Vec<&str> = Vec::new();
+    let mut start = 0u32;
+
+    for (idx, raw) in src.lines().enumerate() {
+        if !buf.is_empty() && (raw.starts_with('\t') || raw.starts_with("    ")) {
+            buf.push(raw);
+            continue;
+        }
+        if !buf.is_empty() {
+            out.push((start, buf.join("\n")));
+            buf.clear();
+        }
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('/') {
+            continue;
+        }
+        buf.push(raw);
+        start = idx as u32;
+    }
+    if !buf.is_empty() {
+        out.push((start, buf.join("\n")));
+    }
+    out
+}
+
+/// Inside a `{[..] ..}` function body, let each line stand for one statement —
+/// same rule `logical_statements` already applies at the top level, just
+/// shifted one indent level in: a line indented no deeper than the body's own
+/// first line starts a new statement (an implicit `;` is inserted before it);
+/// a line indented *more* than that continues the statement above, exactly
+/// like a top-level continuation line does. An explicit `;` for several
+/// statements on one physical line still works (and combining it with this —
+/// an already-`;`-terminated line followed by a new baseline-indent line —
+/// just yields a harmless doubled `;`, which the parser tolerates). Blank and
+/// comment-only lines pass through without affecting the baseline; the line
+/// that closes the body (`}` as its first non-space character, at any indent)
+/// is never treated as a new statement.
+///
+/// A no-op whenever `src` has no multi-line `{..}` to fold (single-line
+/// definitions, or text with no `{` at all), so every other statement shape
+/// is completely unaffected.
+pub fn normalize_function_body_newlines(src: &str) -> String {
+    if !src.contains('\n') || !src.contains('{') {
+        return src.to_string();
+    }
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut baseline: Option<usize> = None;
+
+    for line in src.lines() {
+        let depth_at_start = depth;
+        for ch in line.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth_at_start <= 0 {
+            // not yet inside a function body (the opening line itself, or
+            // anything before/after the whole `{..}` statement)
+            out_lines.push(line.to_string());
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.starts_with('}') {
+            out_lines.push(line.to_string());
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        match baseline {
+            None => {
+                baseline = Some(indent);
+                out_lines.push(line.to_string());
+            }
+            Some(b) if indent <= b => out_lines.push(format!(";{line}")),
+            _ => out_lines.push(line.to_string()),
+        }
+    }
+    out_lines.join("\n")
+}
+
+/// `\i`'s path argument is a quoted string (`\i "lib/utils.qpl"`), unlike
+/// `\l`'s bare one — the namespace derives from it, so writing it as a string
+/// keeps that visually distinct from an ordinary namespaced identifier
+/// appearing right after `\i` on the same line.
+fn parse_quoted_path(rest: &str) -> Result<String, QplError> {
+    match tokenise(rest)?.as_slice() {
+        [
+            Token {
+                kind: TokenKind::Str(s),
+                ..
+            },
+        ] => Ok(s.clone()),
+        _ => Err(QplError::Runtime(format!(
+            "\\i expects a quoted path, e.g. \\i \"lib/utils.qpl\", got '{rest}'"
+        ))),
+    }
+}
+
+/// Recognise the stdout write: `log <expr>` (and bare `log`, which prints a
+/// blank line). Returns the argument text to evaluate as a scalar.
+fn log_target(line: &str) -> Option<&str> {
+    if line == "log" {
+        return Some("");
+    }
+    if let Some(rest) = line.strip_prefix("log ") {
+        return Some(rest.trim());
+    }
+    None
+}
+
+/// Recognise the `.qpl.cfg` config function: `.qpl.cfg key=value key=value ...`.
+/// Returns the argument text (possibly empty, for a bare `.qpl.cfg` which just
+/// prints the current settings). Not a config line → `None`.
+fn cfg_directive(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix(".qpl.cfg")?;
+    match rest.chars().next() {
+        None => Some(""),
+        Some(c) if c.is_whitespace() => Some(rest.trim()),
+        Some(_) => None, // e.g. `.qpl.cfgx` is not this directive
+    }
+}
+
+/// Parse one already-normalized top-level statement's source text into a
+/// [`Stmt`], recognising the string-level forms (`\`-system commands,
+/// `.qpl.cfg`, bareword `log`) that never reach the token stream, before
+/// falling back to the ordinary token-based grammar.
+fn parse_top_level_stmt(src: &str) -> Result<Stmt, QplError> {
+    if let Some(inner) = src.strip_prefix("\\d").map(str::trim) {
+        return Ok(Stmt::System {
+            cmd: 'd',
+            arg: inner.to_string(),
+        });
+    }
+    if let Some(target) = src.strip_prefix("\\l").map(str::trim) {
+        return Ok(Stmt::System {
+            cmd: 'l',
+            arg: target.to_string(),
+        });
+    }
+    if let Some(target) = src.strip_prefix("\\i").map(str::trim) {
+        return Ok(Stmt::System {
+            cmd: 'i',
+            arg: parse_quoted_path(target)?,
+        });
+    }
+    if let Some(path) = src.strip_prefix("\\1").map(str::trim) {
+        return Ok(Stmt::System {
+            cmd: '1',
+            arg: path.to_string(),
+        });
+    }
+    if let Some(args) = cfg_directive(src) {
+        return Ok(Stmt::Cfg(args.to_string()));
+    }
+    if let Some(arg) = log_target(src) {
+        return Ok(Stmt::Log(parse_expr_seq(tokenise(arg)?)?));
+    }
+    parse(tokenise(src)?)
+}
+
+/// Parse a whole script (or one submitted REPL line) into its logical
+/// top-level statements, each paired with its 0-based source line. This is the parser's whole-program entry point:
+/// `compiler::compile_program` consumes its output and never sees raw
+/// source text — every `\`-command / `.qpl.cfg` / bareword-`log` recognition
+/// happens here.
+/// A parse error anywhere aborts the whole parse (and carries a `path:line:`
+/// prefix, exactly like a runtime error at that line — see
+/// `compiler::wrap_line_error`), which is why a parse error anywhere in
+/// a script aborts before any statement runs.
+pub fn parse_program(src: &str, path: &str) -> Result<Vec<(u32, Stmt)>, QplError> {
+    let mut out = Vec::new();
+    for (lineno, raw) in logical_statements(src) {
+        let normalized = normalize_function_body_newlines(&raw);
+        let stmt = parse_top_level_stmt(&normalized)
+            .map_err(|e| crate::compiler::wrap_line_error(e, path, lineno))?;
+        out.push((lineno, stmt));
+    }
+    Ok(out)
 }
 
 /// The token(s) just before a `$` in a cast expression, already parsed into
@@ -1898,7 +2100,7 @@ mod tests {
         // regression: `f[lazy load out]` failed with "Unexpected token in
         // primary: Lazy" — a bracket-call argument only ever tried an
         // ordinary `parse_expr()`, which has no `parse_primary` case for
-        // `select`/`lazy`/`collect`/etc. `resolve::eval_value` already hands
+        // `select`/`lazy`/`collect`/etc. `compiler::compile_value_expr` already hands
         // a frame to a called function's parameter fine (it's the same path
         // `` f[trades] `` uses) — this only needed a parser change.
         match p("f[lazy load out]") {
@@ -2043,6 +2245,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 is just a sample float literal here, not a PI stand-in
     fn select_float_literal() {
         let s = sel("select 3.14 from t");
         assert_eq!(s.cols, vec![col(Expr::Lit(Value::Float(3.14)))]);
@@ -2388,10 +2591,10 @@ mod tests {
     // --- functions ---
 
     /// The `Function` behind `p(source)`, which must be `name: {[..] ..}`.
-    fn closure_of(source: &str) -> std::sync::Arc<crate::ast::Function> {
+    fn closure_of(source: &str) -> crate::ast::Function {
         match p(source) {
             Stmt::ScalarAssign {
-                expr: Expr::Lit(Value::Closure(f)),
+                expr: Expr::Lambda(f),
                 ..
             } => f,
             other => panic!("expected a closure assignment, got {other:?}"),
@@ -2403,7 +2606,7 @@ mod tests {
         match p("f: {[x,y] t: x*y; t+1}") {
             Stmt::ScalarAssign {
                 name,
-                expr: Expr::Lit(Value::Closure(f)),
+                expr: Expr::Lambda(f),
             } => {
                 assert_eq!(name, "f");
                 assert_eq!(f.params, vec!["x".to_string(), "y".to_string()]);
@@ -2427,16 +2630,13 @@ mod tests {
         // as a call argument (higher-order use) ...
         match p("apply[{[y] y*2}; 5]") {
             Stmt::SingleVar(Expr::Apply { args, .. }) => {
-                assert!(matches!(args[0], Expr::Lit(Value::Closure(_))));
+                assert!(matches!(args[0], Expr::Lambda(_)));
                 assert!(matches!(args[1], Expr::Lit(Value::Int(5))));
             }
             other => panic!("expected an Apply, got {other:?}"),
         }
         // ... and as a bare expression
-        assert!(matches!(
-            p("{[x] x+1}"),
-            Stmt::SingleVar(Expr::Lit(Value::Closure(_)))
-        ));
+        assert!(matches!(p("{[x] x+1}"), Stmt::SingleVar(Expr::Lambda(_))));
     }
 
     #[test]
@@ -2694,11 +2894,9 @@ mod tests {
     #[test]
     fn angle_bracket_pairs_do_not_parse_as_load_or_sink() {
         assert!(parse(tokenise("t: << \"x.parquet\"").unwrap()).is_err());
-        match p("t >> \"out.parquet\"") {
-            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink { .. })) => {
-                panic!("`>>` should not be recognised as sink")
-            }
-            _ => {}
+        if let Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink { .. })) = p("t >> \"out.parquet\"")
+        {
+            panic!("`>>` should not be recognised as sink")
         }
     }
 
@@ -2834,7 +3032,7 @@ mod tests {
     fn cast_of_a_select_statement_parses() {
         // regression: `` `date$select ts from t `` failed with "Unexpected
         // token in primary: Select" — a cast's RHS didn't know how to start a
-        // table expression, even though `resolve::eval_value`'s `Expr::Cast`
+        // table expression, even though `compiler::compile_value_expr`'s `Expr::Cast`
         // arm already handles a frame/materialised-list operand fine.
         match p("d: `date$select ts from t where high = 20") {
             Stmt::ScalarAssign {
@@ -3192,5 +3390,109 @@ mod tests {
         p("noop2: 1");
         p("nooper[1]");
         p(".ns.while: 1");
+    }
+
+    // ── string-level statement recognition ─────────────────────────
+
+    #[test]
+    fn cfg_directive_recognises_the_config_function() {
+        assert_eq!(
+            cfg_directive(".qpl.cfg maxcol=8 maxrow=20"),
+            Some("maxcol=8 maxrow=20")
+        );
+        assert_eq!(
+            cfg_directive("  .qpl.cfg  round_type=HALF_UP "),
+            Some("round_type=HALF_UP")
+        );
+        assert_eq!(cfg_directive(".qpl.cfg"), Some(""));
+        assert_eq!(cfg_directive(".qpl.cfgx maxcol=1"), None);
+        assert_eq!(cfg_directive("select from t"), None);
+    }
+
+    #[test]
+    fn log_target_keyword() {
+        assert_eq!(log_target(r#"log "hi""#), Some(r#""hi""#));
+        assert_eq!(log_target("log x + 1"), Some("x + 1"));
+    }
+
+    #[test]
+    fn log_target_bare_is_blank_line() {
+        assert_eq!(log_target("log"), Some(""));
+    }
+
+    /// `log` is the only spelling that writes to stdout. A leading digit is
+    /// always an ordinary expression, so arithmetic and row-count queries
+    /// alike reach the VM untouched.
+    #[test]
+    fn log_target_ignores_leading_digits() {
+        assert_eq!(log_target("1"), None);
+        assert_eq!(log_target(r#"1 "hi""#), None);
+        assert_eq!(log_target("1 + 1"), None);
+        assert_eq!(log_target("1 limit select from trades"), None);
+        assert_eq!(log_target("1 # select from trades"), None);
+        assert_eq!(log_target("10 limit select from trades"), None);
+    }
+
+    #[test]
+    fn log_target_ignores_ordinary_statements() {
+        assert_eq!(log_target("select from trades"), None);
+        assert_eq!(log_target("t: select from trades"), None);
+    }
+
+    #[test]
+    fn parse_top_level_recognises_system_commands() {
+        assert_eq!(
+            parse_top_level_stmt("\\d select from t").unwrap(),
+            Stmt::System {
+                cmd: 'd',
+                arg: "select from t".to_string()
+            }
+        );
+        assert_eq!(
+            parse_top_level_stmt("\\l lib.qpl").unwrap(),
+            Stmt::System {
+                cmd: 'l',
+                arg: "lib.qpl".to_string()
+            }
+        );
+        assert_eq!(
+            parse_top_level_stmt("\\i \"lib.qpl\"").unwrap(),
+            Stmt::System {
+                cmd: 'i',
+                arg: "lib.qpl".to_string()
+            }
+        );
+        assert_eq!(
+            parse_top_level_stmt("\\1 run.log").unwrap(),
+            Stmt::System {
+                cmd: '1',
+                arg: "run.log".to_string()
+            }
+        );
+        assert!(
+            parse_top_level_stmt("\\i lib.qpl").is_err(),
+            "unquoted \\i path"
+        );
+    }
+
+    #[test]
+    fn parse_program_tracks_zero_based_line_numbers() {
+        let src = "x: 1\n\ny: 2\n    + 1\nz: 3\n";
+        let stmts = parse_program(src, "<main>").expect("parse_program");
+        let lines: Vec<u32> = stmts.iter().map(|(l, _)| *l).collect();
+        assert_eq!(lines, vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn parse_program_reports_a_parse_error_with_a_path_line_prefix() {
+        let err = parse_program("x: 1\nsel from t\n", "script.qpl")
+            .expect_err("second line is a syntax error");
+        assert!(err.to_string().contains("script.qpl:2:"), "{err}");
+    }
+
+    #[test]
+    fn parse_program_never_prefixes_main() {
+        let err = parse_program("sel from t", "<main>").expect_err("syntax error");
+        assert!(!err.to_string().contains("<main>:"), "{err}");
     }
 }

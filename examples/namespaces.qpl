@@ -1,8 +1,11 @@
 / ─────────────────────────────────────────────────────────────────────────────
-/ Namespaces & imports: `\i <path>` runs a script like `\l`, then moves every
-/ table/global/function it newly bound at its top level under `.<file-stem>.*`
-/ (the file's stem) — see examples/namespace_lib.qpl and the README's
-/ "Namespaces & imports" section.
+/ Namespaces & imports: `\i <path>` compiles and runs a script like `\l`, except
+/ every table/global/function it binds at its top level is qualified under
+/ `.<file-stem>.*` (the file's stem) — see examples/namespace_lib.qpl and the
+/ README's "Namespaces & imports" section. The qualification happens when the
+/ imported script is compiled, not at run time: a bare name the file binds at
+/ its own top level always refers to its own (namespaced) binding, throughout
+/ the file, even in a statement that runs before that binding's statement does.
 /
 / Run from the repo root:
 /   cargo run -- --load-demo examples/namespaces.qpl

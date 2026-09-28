@@ -1,0 +1,16 @@
+run started
+size threshold: 150
+double is 300 (as text)
+big trades:
+shape: (4, 3)
+┌──────┬───────┬──────┐
+│ sym  ┆ price ┆ size │
+│ ---  ┆ ---   ┆ ---  │
+│ str  ┆ f64   ┆ i64  │
+╞══════╪═══════╪══════╡
+│ AAPL ┆ 183.1 ┆ 250  │
+│ AAPL ┆ 184.0 ┆ 500  │
+│ MSFT ┆ 414.8 ┆ 200  │
+│ MSFT ┆ 416.0 ┆ 300  │
+└──────┴───────┴──────┘
+run finished (this line is terminal-only)

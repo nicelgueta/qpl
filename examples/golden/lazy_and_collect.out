@@ -1,0 +1,30 @@
+`lazy` as the first token stores the query PLAN under a name, not a table - nothing touches the file yet
+extend the plan by re-assigning the binding - still lazy, still no execution
+reading a lazy binding without collecting just prints its (optimised) plan
+SELECT [col("sym"), col("side"), col("price"), col("size"), (col("price") * col("size").cast(Float64)).alias("notional")]
+  Parquet SCAN [examples/data/trades.parquet]
+  PROJECT 4/5 COLUMNS
+  SELECTION: col("size") > 100
+  ESTIMATED ROWS: 8
+`collect` runs the plan once and binds the result as a normal in-memory table
+shape: (1, 2)
+┌──────┬──────────┐
+│ sym  ┆ notional │
+│ ---  ┆ ---      │
+│ str  ┆ f64      │
+╞══════╪══════════╡
+│ MSFT ┆ 124800.0 │
+└──────┴──────────┘
+`cols` always resolves to a table, even on a lazy binding
+shape: (5, 2)
+┌──────────┬───────┐
+│ column   ┆ dtype │
+│ ---      ┆ ---   │
+│ str      ┆ str   │
+╞══════════╪═══════╡
+│ notional ┆ f64   │
+│ side     ┆ str   │
+│ size     ┆ i64   │
+│ sym      ┆ str   │
+│ …        ┆ …     │
+└──────────┴───────┘

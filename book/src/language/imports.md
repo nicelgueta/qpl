@@ -31,8 +31,12 @@ file and line:
 ```
 
 Run from the command line, a failed script exits with status 1 (130 if it was
-interrupted with Ctrl-C). Statements that ran before the failure keep their
-effects: there is no rollback.
+interrupted with Ctrl-C). Statements that ran before a *runtime* failure keep
+their effects: there is no rollback. A *parse or compile* error is different:
+the whole file (and any `\l`/`\i` target it reaches, however deeply nested)
+is read and compiled before the first statement runs, so a syntax mistake
+anywhere in the file — even on the very last line — means nothing in it runs
+at all, not even the statements before the mistake.
 
 `\l` takes a bare path, with no quotes, and works nested inside another
 script as well as at the prompt, so a top-level `main.qpl` can `\l` its setup
@@ -112,13 +116,28 @@ i64: 3
 The bare names `double`, `greeting` and `big` never exist. Only the
 namespaced versions do.
 
-That holds even when your session already has a name the library uses. A
-library line `thr: 99` binds `.utils.thr` and leaves your own `thr` alone;
-`trades: select from trades where size > 200` reads your `trades` and binds
-`.utils.trades`. Inside the script, a bare name means the library's own
-binding once it has one, and falls back to the session's otherwise, so the
-script reads naturally from top to bottom. Nothing an import does can
-overwrite a bare name in your session.
+That holds even when your session already has a name the library uses: a
+library line `thr: 99` binds `.utils.thr` and leaves your own `thr` alone.
+Nothing an import does can overwrite a bare name in your session.
+
+The reverse isn't true, though, and it's worth being deliberate about:
+**inside the imported script, a bare name it binds anywhere at its own top
+level always means its own namespaced binding — never the session's — even
+on the statement that defines it.** This is decided once, when the script is
+compiled, by scanning its whole top level for assignment targets; it isn't a
+"falls back to the session if not yet bound" rule. So a library line like
+
+```qpl
+trades: select from trades where size > 200
+```
+
+does *not* read your session's `trades` and bind `.utils.trades` from it —
+the bare `trades` on the right already means `.utils.trades`, which doesn't
+exist yet at that point in the script, so this fails with an undefined-name
+error instead. A library that wants to build on the caller's table needs a
+name of its own for it, e.g. `filtered: select from trades where size > 200`
+(reading the session's `trades`, since `trades` isn't one of this script's
+own top-level bindings, and writing `.utils.filtered`).
 
 Two details of the syntax:
 
@@ -151,13 +170,16 @@ info: {[s] _log["INFO"; s]}
 warn: {[s] _log["WARN"; s]}
 ```
 
-This still works after `\i "lib/lg.qpl"`. When `.lg.info` runs, a bare name
-in its body is looked up in its own namespace first (after its parameters
-and locals), so `_log` resolves to `.lg._log`, and only then in the session.
-A session name can't hijack a library's helper: bind your own `_log`
-afterwards and `.lg.info` still calls the library's. The same rule covers
-scalars and tables the library defines, and it carries through any number of
-levels of sibling-calls-sibling:
+This still works after `\i "lib/lg.qpl"`. The qualification happens once,
+when `lib/lg.qpl` is *compiled*: every bare reference to one of the file's
+own top-level names, anywhere in the file including inside a function body
+(as long as it isn't shadowed by that function's own parameters/locals), is
+rewritten to the qualified form before the function's body is ever compiled
+to bytecode. So `_log` inside `info`'s body is baked in as `.lg._log`, not
+looked up dynamically each call — a session name can't hijack a library's
+helper (bind your own `_log` afterwards and `.lg.info` still calls the
+library's), and the same rule covers scalars and tables the library defines,
+and carries through any number of levels of sibling-calls-sibling:
 
 ```qpl
 qpl) \i "lib/lg.qpl"
@@ -172,10 +194,10 @@ qpl) .lg.info["service started"]
 its message back as a result; see
 [Logging](logging.md#inside-a-function-body).)
 
-Because the namespace comes from the name the function was *called through*,
-call imported functions by their qualified name. Copying one into a plain
-variable first, `f: .lg.info`, then calling `f[..]`, loses the namespace, and
-the unqualified `_log` inside it no longer resolves.
+Because the qualification is baked into the function's compiled body, not
+looked up again at call time, this survives being copied around: `f: .lg.info`
+then calling `f[..]` still resolves `_log` to `.lg._log`, the same as calling
+`.lg.info[..]` directly.
 
 ## Imports that import
 
@@ -214,8 +236,13 @@ lines already printed.
 
 ## Things to watch
 
-- **Call imported functions by their qualified name.** As described above,
-  the namespace comes from the name a function is called through.
+- **A library can't read a session value under the name it means to define.**
+  Since qualification is decided once, at compile time, from the whole file's
+  top level, a bare name the file binds *anywhere* at its top level always
+  means its own namespaced binding throughout the file — including in the
+  very statement that defines it. `t: select from t where ...` in a library
+  can't read the caller's `t`; give the result a name the library doesn't
+  otherwise bind.
 - **Private isn't enforced.** An `_` prefix on a library's helper names is a
   convention only; `.lg._log` is as reachable as `.lg.info`.
 - **Not everywhere.** Like every `\` command, `\l` and `\i` can't be sent

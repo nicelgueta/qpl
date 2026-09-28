@@ -159,8 +159,36 @@ fn round_type_name(mode: RoundMode) -> &'static str {
 mod tests {
     use super::*;
 
+    /// `VmConfig::set` mirrors `maxcol`/`maxrow`/`tblwidth`/`strlen` into
+    /// process-wide `POLARS_FMT_*` env vars (see the `not on wasm` doc comment
+    /// above) — process env is shared by every test in this binary, so a test
+    /// that changes them must put them back, or it silently changes how every
+    /// `DataFrame::to_string()` in the rest of the run is truncated (this bit
+    /// the golden-output tests in `repl::golden`, which depend on the
+    /// untouched defaults).
+    fn saved_env(keys: &[&str]) -> Vec<(String, Option<String>)> {
+        keys.iter()
+            .map(|k| (k.to_string(), std::env::var(k).ok()))
+            .collect()
+    }
+
+    fn restore_env(saved: Vec<(String, Option<String>)>) {
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(&k, v) },
+                None => unsafe { std::env::remove_var(&k) },
+            }
+        }
+    }
+
     #[test]
     fn config_set_rejects_unknown_key_and_bad_value() {
+        let saved = saved_env(&[
+            "POLARS_FMT_MAX_COLS",
+            "POLARS_FMT_MAX_ROWS",
+            "POLARS_TABLE_WIDTH",
+            "POLARS_FMT_STR_LEN",
+        ]);
         let mut cfg = VmConfig::default();
         assert!(cfg.set("nope", "1").is_err());
         assert!(cfg.set("maxrow", "abc").is_err());
@@ -179,5 +207,6 @@ mod tests {
         assert_eq!(cfg.strlen, -1);
         assert_eq!(VmConfig::default().tblwidth, -1);
         assert_eq!(VmConfig::default().strlen, 30);
+        restore_env(saved);
     }
 }

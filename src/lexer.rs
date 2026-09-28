@@ -493,6 +493,7 @@ mod tests {
     // --- floats ---
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 is just a sample float literal here, not a PI stand-in
     fn float_basic() {
         assert_eq!(kinds("3.14"), vec![TokenKind::Float(3.14)]);
     }
