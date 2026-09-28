@@ -21,7 +21,7 @@ struct Cli {
 
     /// Compile a script to bytecode and exit (writes <script-stem>.qplc next
     /// to it, or -o's path) — doesn't run it
-    #[arg(short = 'C', long = "compile", value_name = "SCRIPT", conflicts_with_all = ["file", "interactive", "command"])]
+    #[arg(short = 'C', long = "compile", value_name = "SCRIPT", conflicts_with_all = ["file", "interactive", "command", "disassemble"])]
     compile: Option<String>,
 
     /// Output path for a compiled script (requires -C)
@@ -34,8 +34,13 @@ struct Cli {
     output: Option<String>,
 
     /// Run a qpl command and exit, like `python -c` / `sh -c`
-    #[arg(short = 'c', long = "command", value_name = "CMD", conflicts_with_all = ["file", "interactive", "compile"])]
+    #[arg(short = 'c', long = "command", value_name = "CMD", conflicts_with_all = ["file", "interactive", "compile", "disassemble"])]
     command: Option<String>,
+
+    /// Print a `.qplc` file's bytecode (or a `.qpl` script's, compiled on the
+    /// fly) as text and exit — doesn't run it
+    #[arg(short = 'd', long = "disassemble", value_name = "FILE", conflicts_with_all = ["file", "interactive"])]
+    disassemble: Option<String>,
 }
 
 fn main() {
@@ -45,6 +50,22 @@ fn main() {
         if let Err(e) = compile_to_qplc(script, cli.output.as_deref()) {
             eprintln!("{e}");
             std::process::exit(1);
+        }
+        return;
+    }
+
+    if let Some(path) = cli.disassemble.as_deref() {
+        match repl::disassemble_file(path) {
+            Ok(lines) => {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                // a closed pipe (`| head`) just ends the dump
+                let _ = lines.iter().try_for_each(|l| writeln!(out, "{l}"));
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
         }
         return;
     }

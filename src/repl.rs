@@ -35,6 +35,19 @@ pub fn run_script(path: &str, vm: &mut Vm) -> Result<(), QplError> {
     run_source(vm, &src, path)
 }
 
+/// Disassemble `path` — a `.qplc` file (detected by magic bytes) or a `.qpl`
+/// source file, compiled but not run. Backs `qpl -d`.
+pub fn disassemble_file(path: &str) -> Result<Vec<String>, QplError> {
+    let bytes =
+        std::fs::read(path).map_err(|e| QplError::Runtime(format!("cannot read '{path}': {e}")))?;
+    let program = if bytes.starts_with(crate::program::MAGIC) {
+        crate::program::Program::from_bytes(&bytes)?
+    } else {
+        compile_script(path)?
+    };
+    Ok(crate::program::disassemble(&program))
+}
+
 /// Compile `path` (source only — a `.qplc` file has nothing left to compile)
 /// into one whole-program [`crate::program::Program`], without running it.
 /// The `qpl -C` CLI flag is this function plus
