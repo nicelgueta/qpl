@@ -24,3 +24,7 @@ cp -a book/book/. "$dest/"
 
 echo "Copied book/book/ -> $dest"
 cd "$site_dir" && git status --short -- qpl
+git add qpl
+git commit -m "QPL book update"
+git push
+echo "Deployed new book to site"
