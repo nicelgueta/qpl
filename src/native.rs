@@ -8,6 +8,7 @@
 //! - `ops::call_by_name` (`til`, `log`, `hopen`, ...): only reached when no
 //!   user function or table entry matches, so a user function wins.
 //!
+//! 
 //! Adding an entry to [`builtins`] needs no lexer/parser/compiler change.
 
 use std::collections::HashMap;
