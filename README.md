@@ -15,10 +15,11 @@ qpl borrows a handful of ideas from q (terse right-to-left expressions,
 `select … by … from` queries, dotted temporal literals) but it isn't q, a q
 dialect, or an attempt at compatibility with kdb+. It's its own language, and
 in most respects a very different one: a different type system, a different
-execution model built around lazy Polars plans, and missing plenty of syntax and fea. Don't expect q code to run unchanged.
+execution model built around lazy Polars plans, and missing plenty of syntax and features that q actually has. Don't expect q code to run unchanged.
 
 📖 **[Read the book][book]** for the full guided tour. This README is the
 short version, and each section links to the chapter covering it properly.
+
 
 ## What it looks like
 
