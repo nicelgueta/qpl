@@ -707,6 +707,17 @@ wasm`. [The full story](tools/wasm/README.md).
 
 - Drop the Polars patch from the WASM build, once upstream builds for
   `wasm32-unknown-unknown` unaided.
+- A basic standard library of commonly needed functions, shipped with qpl.
+- A `--read-only` CLI flag. `sink` and logging become write actions, which
+  fail with `Cannot perform write action in read-only session` when the flag
+  is set.
+- A permissioned Rust extension framework, so qpl stays safe to hand to an
+  agent as it grows. A proc macro exposes a Rust function to qpl and declares
+  it a **read** or **write** action, and `--read-only` switches off every
+  write action, built-in or extension, so a read-only session can't change state
+  whatever it calls. Permissioning is part of the language, not a sandbox
+  bolted on around it. Python extensions may be considered later.
+- Decide whether to support null as a first-class value in the language.
 - More of the language. Gaps are noted in the [book][book] beside the feature
   they belong to.
 
