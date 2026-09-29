@@ -1,8 +1,6 @@
-//! Type-dispatched value/column semantics shared by the `BINOP` and `CAST`
-//! opcodes: binary operators and casts over scalars/vectors (evaluated
-//! eagerly, in Rust) and over Polars column expressions. Moved out of `vm.rs`
-//! so the opcode dispatch loop stays a thin `match` delegating here, per the
-//! plan's "one evaluator, `ops.rs` holds the type-dispatched semantics" goal.
+//! Type-dispatched semantics for the VM's opcodes: binary operators and casts
+//! over scalars, vectors and Polars expressions, list helpers, and the
+//! value-context natives. Keeps `vm.rs`'s dispatch arms thin.
 
 use crate::ast::{self, CastTarget, Value};
 use crate::errors::QplError;
@@ -21,10 +19,9 @@ const NS_PER_MIN: i64 = 60_000_000_000;
 const NS_PER_SEC: i64 = 1_000_000_000;
 const NS_PER_MS: i64 = 1_000_000;
 
-/// A temporal scalar as `(kind class, nanoseconds)` for comparison. Classes:
-/// 0 = absolute instant (`date` / `timestamp` interchange), 1 = time of day
-/// (`time` / `minute` / `second`), 2 = duration (`timespan`), 3 = month.
-/// Comparison only crosses variants within the same class.
+/// A temporal scalar as `(class, ns)` for comparison. Classes: 0 = instant
+/// (date/timestamp), 1 = time of day, 2 = duration, 3 = month. Only values
+/// in the same class compare.
 fn temporal_ns(v: &ast::Value) -> Option<(u8, i64)> {
     use ast::Value::*;
     Some(match *v {
@@ -39,8 +36,7 @@ fn temporal_ns(v: &ast::Value) -> Option<(u8, i64)> {
     })
 }
 
-/// Nanosecond magnitude of a "duration-like" temporal scalar (`time`, `minute`,
-/// `second`, `timespan`) added to / taken from a timestamp, date or time.
+/// Nanoseconds of a duration-like scalar (`time`/`minute`/`second`/`timespan`).
 fn as_ns_delta(v: &ast::Value) -> Option<i64> {
     use ast::Value::*;
     Some(match *v {
@@ -51,9 +47,9 @@ fn as_ns_delta(v: &ast::Value) -> Option<i64> {
     })
 }
 
-/// `<temporal> ± <int>` — kdb adds the integer in the operand's own resolution
-/// (`date`+n days, `month`+n months, `time`+n ms, `minute`+n min, `second`+n s,
-/// `timestamp`/`timespan`+n ns). `None` on a non-temporal `v` or on overflow.
+/// `<temporal> ± <int>` in the operand's own unit (date: days, month: months,
+/// time: ms, minute, second, timestamp/timespan: ns). `None` if not temporal
+/// or on overflow.
 fn shift_temporal_by_int(v: &ast::Value, n: i64) -> Option<ast::Value> {
     use ast::Value::*;
     let i32c = |x: i64| i32::try_from(x).ok();
@@ -69,8 +65,7 @@ fn shift_temporal_by_int(v: &ast::Value, n: i64) -> Option<ast::Value> {
     })
 }
 
-/// All binops where at least one side is a temporal scalar. `None` lets
-/// `scalar_binop` fall through to the numeric path.
+/// Binops with a temporal scalar on either side; `None` falls through to numeric.
 fn temporal_binop(
     l: &ast::Value,
     r: &ast::Value,
@@ -177,8 +172,7 @@ pub(crate) fn scalar_binop(l: ast::Value, r: ast::Value, op: &str) -> Result<ast
         (Int(a), Int(b), "+") => Int(a + b),
         (Int(a), Int(b), "-") => Int(a - b),
         (Int(a), Int(b), "*") => Int(a * b),
-        // q's `%` is always true (float) division, even for two ints — 10%4 is
-        // 2.5, not 2. Unlike the other int/int arms, this doesn't stay `Int`.
+        // `%` is always float division, even for two ints (10%4 = 2.5)
         (Int(a), Int(b), "%") => Float(a as f64 / b as f64),
         (Int(a), Int(b), "=") => Bool(a == b),
         (Int(a), Int(b), "<") => Bool(a < b),
@@ -205,13 +199,8 @@ pub(crate) fn scalar_binop(l: ast::Value, r: ast::Value, op: &str) -> Result<ast
     })
 }
 
-/// `<vector> op <scalar>` / `<scalar> op <vector>` / `<vector> op <vector>` —
-/// at least one operand is a vector `Value`. Reuses the same literal→`Expr`
-/// bridge (`ast_val_to_expr`) and operator table (`apply_binop`) the table
-/// pipeline uses for column expressions, so a vector composes with a scalar
-/// exactly like a Polars column would (broadcasting a length-1 side, and
-/// applying the same dtype/temporal promotion rules Polars applies to
-/// columns) — this is the native vectorised path `scalar_binop` doesn't cover.
+/// A binop with a vector on at least one side, via the same Polars expression
+/// path as columns, so broadcasting and dtype promotion match.
 pub(crate) fn vector_binop(l: ast::Value, r: ast::Value, op: &str) -> Result<ast::Value, QplError> {
     let l_expr = crate::vm::ast_val_to_expr(l)?;
     let r_expr = crate::vm::ast_val_to_expr(r)?;
@@ -220,9 +209,8 @@ pub(crate) fn vector_binop(l: ast::Value, r: ast::Value, op: &str) -> Result<ast
     column_to_value(df.column("r")?)
 }
 
-/// Combines [`scalar_binop`] / [`vector_binop`]'s dispatch (by whether either
-/// side is a vector `Value`) with the `BinOpKind` → canonical-string bridge —
-/// the `BINOP` opcode's "both operands are `Scalar`" path.
+/// The `BINOP` opcode's two-scalar path, dispatching to [`scalar_binop`] or
+/// [`vector_binop`].
 pub(crate) fn value_binop(l: Value, r: Value, op: &BinOpKind) -> Result<Value, QplError> {
     let op_str = op.as_str();
     if l.as_vec().is_some() || r.as_vec().is_some() {
@@ -232,8 +220,7 @@ pub(crate) fn value_binop(l: Value, r: Value, op: &BinOpKind) -> Result<Value, Q
     }
 }
 
-/// Scalar counterpart of `apply_binop`'s `"like"` arm: matches `text` against
-/// a q-glob `pattern` directly, with no Polars column involved.
+/// `like` on a scalar string: match `text` against a q glob `pattern`.
 pub(crate) fn like_match(text: &str, pattern: &str) -> Result<bool, QplError> {
     let regex_src = like_pattern_to_regex(pattern);
     regex::Regex::new(&regex_src)
@@ -241,19 +228,16 @@ pub(crate) fn like_match(text: &str, pattern: &str) -> Result<bool, QplError> {
         .map_err(|e| QplError::Runtime(format!("invalid 'like' pattern '{pattern}': {e}")))
 }
 
-/// Casts a scalar [`Value`] to the family named by `dtype` — the same type
-/// names [`crate::vm`]'s `polars_dtype` accepts. qpl scalars carry a single
-/// integer and a single float type, so every `iN`/`uN` name folds to `Int` and
-/// `f32`/`f64` to `Float`; the width only matters once the value reaches a
-/// column.
+/// Cast a scalar to `dtype`. Scalars have one int and one float type, so
+/// `iN`/`uN` fold to `Int` and `f32`/`f64` to `Float`; width only matters in
+/// a column.
 pub(crate) fn scalar_cast(
     val: ast::Value,
     dtype: &str,
     use_qepoch: bool,
 ) -> Result<ast::Value, QplError> {
     use ast::Value::*;
-    // shared string parse for `Str` / `Sym` sources; accepts an int- or
-    // float-looking literal
+    // parse a `Str`/`Sym` source as an int- or float-looking literal
     let as_int = |s: &str| {
         let s = s.trim();
         s.parse::<i64>()
@@ -276,8 +260,7 @@ pub(crate) fn scalar_cast(
             // a temporal scalar unwraps to its kdb integer offset
             Date(n) | Month(n) | Minute(n) | Second(n) => Int(n as i64),
             Time(n) | Timespan(n) => Int(n),
-            // `timestamp` -> raw int crosses the epoch boundary: ns since the
-            // Unix epoch by default, ns since kdb's 2000.01.01 with `useqepoch`
+            // ns since the Unix epoch, or since 2000.01.01 with `useqepoch`
             Timestamp(n) => Int(if use_qepoch {
                 n
             } else {
@@ -323,10 +306,9 @@ pub(crate) fn scalar_cast(
     })
 }
 
-/// `` `date$ ``, `` `month$ ``, `"p"$"…"` … — cast to a temporal scalar. A
-/// string / symbol source is parsed with [`temporal::parse_temporal`]; a
-/// temporal source is converted through its day- or nanosecond-offset; a plain
-/// `Int` is reinterpreted directly as the offset (kdb `` `date$8000 ``).
+/// Cast to a temporal scalar. Strings/symbols are parsed, temporals converted
+/// through their offset, and a plain `Int` taken as the offset directly
+/// (`` `date$8000 ``).
 fn scalar_temporal_cast(
     val: ast::Value,
     target: &str,
@@ -372,8 +354,7 @@ fn scalar_temporal_cast(
         },
         "timestamp" => match val {
             Timestamp(_) => val,
-            // raw int crosses the epoch boundary: read as ns since the Unix
-            // epoch by default, ns since kdb's 2000.01.01 with `useqepoch`
+            // ns since the Unix epoch, or since 2000.01.01 with `useqepoch`
             Int(n) => Timestamp(if use_qepoch {
                 n
             } else {
@@ -415,10 +396,8 @@ fn scalar_temporal_cast(
     })
 }
 
-/// The `CAST` opcode's "operand is an atomic `Scalar`" path: dispatches on the
-/// [`CastTarget`]: a primitive target folds through [`scalar_cast`]; `` `$ ``
-/// interns a string/symbol; a categorical/enum target is a column-only cast
-/// and errors on a scalar.
+/// The `CAST` opcode's scalar path. Categorical/enum targets are column-only
+/// and error here.
 pub(crate) fn scalar_cast_target(
     val: Value,
     target: &CastTarget,
@@ -454,9 +433,7 @@ pub(crate) fn apply_binop(left: Expr, right: Expr, op: &BinOpKind) -> Result<Exp
         Add => left + right,
         Sub => left - right,
         Mul => left * right,
-        // q's `%` is always true (float) division — Polars' `/` on two integer
-        // columns truncates like Rust's own `/`, so force a float division by
-        // casting both sides first (a no-op for columns already float).
+        // `%` is always float division; Polars truncates int/int, so cast first
         Div => left.cast(DataType::Float64) / right.cast(DataType::Float64),
         Eq => left.eq(right),
         Neq => left.neq(right),
@@ -471,13 +448,9 @@ pub(crate) fn apply_binop(left: Expr, right: Expr, op: &BinOpKind) -> Result<Exp
     })
 }
 
-/// Translates a q-style `like` glob pattern into an anchored regex.
-///
-/// q's glob syntax: `*` matches any sequence (incl. empty), `?` matches any
-/// single character, `[abc]` / `[a-z]` / `[^abc]` are character classes. A
-/// pattern character loses its special meaning inside `[...]` — including a
-/// literal `]`, which is only a class member (not the closing bracket) when
-/// it's the first character after `[` or `[^`, e.g. `[]]` matches `]`.
+/// Translate a q `like` glob into an anchored regex: `*` any run, `?` one
+/// char, `[abc]`/`[a-z]`/`[^abc]` classes. Inside a class nothing is special,
+/// and `]` right after `[` or `[^` is a member (`[]]` matches `]`).
 fn like_pattern_to_regex(pattern: &str) -> String {
     let chars: Vec<char> = pattern.chars().collect();
     let n = chars.len();
@@ -506,8 +479,7 @@ fn like_pattern_to_regex(pattern: &str) -> String {
                     i += 1;
                 }
                 while i < n && chars[i] != ']' {
-                    // `\` and `[` are the only characters the regex crate
-                    // still treats specially inside a class.
+                    // the only chars still special inside a regex class
                     if chars[i] == '\\' || chars[i] == '[' {
                         class.push('\\');
                     }
@@ -520,7 +492,7 @@ fn like_pattern_to_regex(pattern: &str) -> String {
                     out.push_str(&class);
                     out.push(']');
                 } else {
-                    // unterminated class: treat the '[' as a literal character
+                    // unterminated class: a literal `[`
                     out.push_str("\\[");
                     i = open + 1;
                 }
@@ -538,8 +510,7 @@ fn like_pattern_to_regex(pattern: &str) -> String {
     out
 }
 
-// --- list / column helpers shared by the opcodes
-// (`vm.rs`'s `Op::Take`/`Op::Index`/`Op::Call`/`Op::Zip`/...) ---
+// --- list / column helpers ---
 
 /// Verbs that collapse a column to a single value.
 pub(crate) fn is_reducer(f: &str) -> bool {
@@ -596,11 +567,8 @@ pub(crate) fn list_to_lazy(list: Value) -> Result<LazyFrame, QplError> {
     Ok(df!("_" => [0i64]).map_err(rt)?.lazy().select([expr]))
 }
 
-/// Materialise one collected column into a qpl list `Value`. Rejects
-/// null-containing columns and dtypes with no list representation. A temporal
-/// column materialises to its matching typed vector (`DateVec`,
-/// `TimestampVec`, …), carrying the same kdb integer offset its scalar
-/// counterpart does.
+/// Materialise a collected column as a list `Value`. Rejects nulls and dtypes
+/// with no list form; temporal columns keep kdb offsets like their scalars.
 pub(crate) fn column_to_value(col: &Column) -> Result<Value, QplError> {
     if col.null_count() > 0 {
         return Err(QplError::Runtime(format!(
@@ -640,8 +608,7 @@ pub(crate) fn column_to_value(col: &Column) -> Result<Value, QplError> {
                     .collect(),
             )
         }
-        // normalise to nanoseconds first — a column loaded from a file may be
-        // ms / us resolution, not ns
+        // normalise to ns: a loaded column may be ms/us
         DataType::Datetime(_, _) => {
             let c = col
                 .cast(&DataType::Datetime(TimeUnit::Nanoseconds, None))
@@ -681,7 +648,7 @@ pub(crate) fn column_to_value(col: &Column) -> Result<Value, QplError> {
     })
 }
 
-/// A one-element list collapses to the corresponding scalar.
+/// Collapse a one-element list to its scalar.
 pub(crate) fn scalarise(v: Value) -> Result<Value, QplError> {
     let (kind, s) = v.as_vec().ok_or_else(|| {
         QplError::Runtime(format!(
@@ -762,13 +729,10 @@ fn gather(s: &Series, idx: &[i64]) -> Result<Series, QplError> {
 
 // --- value-context call/verb dispatch ---
 //
-// These are the runtime bodies of the opcodes `vm.rs` uses for value
-// context (`Op::Call`, `Op::Take`, `Op::Index`, `Op::Zip`, `Op::CastList`,
-// `Op::Dispatch`): each takes already-popped `Slot`s (the opcode handler in
-// `vm.rs` does all the stack bookkeeping) so the semantics live in one place.
+// Bodies of the value-context opcodes (`Call`, `Take`, `Index`, `Zip`,
+// `CastList`, `Dispatch`); the `vm.rs` handlers do the stack bookkeeping.
 
-/// [`Slot`] -> a concrete scalar/list `Value`; the exact error
-/// wording for a `Frame` / `Noop` operand.
+/// A slot as a scalar/list `Value`, erroring on a `Frame` or `Noop`.
 pub(crate) fn slot_to_scalar_value(slot: Slot) -> Result<Value, QplError> {
     match slot {
         Slot::Scalar(v) => Ok(v),
@@ -785,8 +749,7 @@ pub(crate) fn slot_to_scalar_value(slot: Slot) -> Result<Value, QplError> {
     }
 }
 
-/// [`Slot`] -> a concrete list `Value`, materialising a single-column `Frame`
-/// (rejecting a wider one).
+/// A slot as a list `Value`; a one-column `Frame` is materialised.
 pub(crate) fn slot_to_list_value(slot: Slot) -> Result<Value, QplError> {
     match slot {
         Slot::Noop => Err(QplError::Runtime(
@@ -809,16 +772,11 @@ pub(crate) fn slot_to_list_value(slot: Slot) -> Result<Value, QplError> {
     }
 }
 
-/// The elementwise form of value-context `?[..]`: `mask` is the boolean
-/// vector condition that first diverted execution here (`Op::JumpIfVec`);
-/// `rest` is every remaining condition, branch value and the default, in the
-/// order they were pushed (`v1, c2, v2, …, ck, vk, d` — see
-/// `compiler::compile_case_value`), already evaluated eagerly since each is
-/// an ordinary compiled sub-expression rather than a thunk. Same semantics,
-/// arm order and error text as the scalar `?[..]` path:
-/// an atom operand broadcasts, a vector operand must match `mask`'s length,
-/// the first true condition wins per element, only value operands (not
-/// conditions) are checked for a text/non-text mix.
+/// Elementwise value-context `?[..]`, reached via `Op::JumpIfVec` once the
+/// first condition (`mask`) is a vector. `rest` is `v1, c2, v2, ..., d`, all
+/// already evaluated. Atoms broadcast, vectors must match `mask`'s length,
+/// the first true condition wins per element, and branch values can't mix
+/// text and non-text.
 pub(crate) fn case_vec(mask: Value, rest: Vec<Slot>) -> Result<Value, QplError> {
     const COND_MSG: &str =
         "a `?[..]` condition must be a boolean scalar or vector in value context";
@@ -910,13 +868,7 @@ pub(crate) fn case_vec(mask: Value, rest: Vec<Slot>) -> Result<Value, QplError> 
     })
 }
 
-/// [`Slot`] -> the lazy frame a column verb (`sum`, `shift`, `round`, …)
-/// reduces/maps over, minus the "stay
-/// lazy" fast path for an unmaterialised `` table`col `` (the compiler now
-/// always collapses a one-column select to a `Scalar` list ahead of time —
-/// see `compile_value_expr`'s `Expr::Table` arm — so this only ever sees a
-/// `Frame` or an already-materialised list; a harmless extra round trip
-/// through `list_to_lazy`, not a behaviour change).
+/// The lazy frame a column verb (`sum`, `shift`, ...) operates on.
 fn slot_to_source_lf(slot: Slot) -> Result<LazyFrame, QplError> {
     match slot {
         Slot::Frame { lf, .. } => Ok(*lf),
@@ -931,9 +883,8 @@ fn slot_to_source_lf(slot: Slot) -> Result<LazyFrame, QplError> {
     }
 }
 
-/// `sum trades\`price`, `2 shift px`, `2 round px`, `cumsum px`, … in value
-/// context — the generic-verb tail of `Op::Call`'s dispatch (`call_by_name`).
-/// operand-for-operand the generic call path.
+/// A column verb in value context (``sum t`price``, `2 shift px`, ...): the
+/// fallback of `call_by_name`.
 pub(crate) fn value_verb(vm: &mut Vm, name: &str, args: Vec<Slot>) -> Result<Slot, QplError> {
     let mut args = args.into_iter();
     let source = args
@@ -973,7 +924,7 @@ pub(crate) fn value_verb(vm: &mut Vm, name: &str, args: Vec<Slot>) -> Result<Slo
     }
 }
 
-/// `til n` → `0 .. n-1`; `lo til hi` → `lo .. hi-1`, operating on already-evaluated `Slot`s.
+/// `til n` → `0..n-1`; `lo til hi` → `lo..hi-1`.
 pub(crate) fn native_til(args: Vec<Slot>) -> Result<Slot, QplError> {
     let vals = args
         .into_iter()
@@ -1009,8 +960,7 @@ pub(crate) fn native_enlist(args: Vec<Slot>) -> Result<Slot, QplError> {
     })
 }
 
-/// `<n>?<x>`. `args` is `[x, n]` (right
-/// operand first, matching `til`'s convention).
+/// `<n>?<x>`. `args` is `[x, n]` (right operand first, like `til`).
 pub(crate) fn native_roll(args: Vec<Slot>) -> Result<Slot, QplError> {
     let mut args = args.into_iter();
     let x = args
@@ -1060,9 +1010,7 @@ pub(crate) fn native_roll(args: Vec<Slot>) -> Result<Slot, QplError> {
     Ok(Slot::Scalar(rolled))
 }
 
-/// Render each argument via `repl::fmt_log_val` and concatenate, then write
-/// through [`Vm::emit`], minus the
-/// AST-evaluation step (already done by the compiled `Op::Call` args).
+/// Render and concatenate the arguments, then write via [`Vm::emit`].
 pub(crate) fn native_log(vm: &mut Vm, args: Vec<Slot>) -> Result<Slot, QplError> {
     let mut text = String::new();
     for a in args {
@@ -1073,10 +1021,8 @@ pub(crate) fn native_log(vm: &mut Vm, args: Vec<Slot>) -> Result<Slot, QplError>
     Ok(Slot::Scalar(Value::Str(text)))
 }
 
-/// One `zip` column's Series, once already reduced to a list `Value` (a
-/// top-level cast is handled separately by `Op::CastList`, which keeps the
-/// column's exact width instead of round-tripping through `Value`) — the
-/// non-cast tail of `zip`'s column conversion.
+/// One `zip` column from a list `Value`. (A top-level cast goes through
+/// `Op::CastList` instead, which keeps the exact width.)
 pub(crate) fn zip_value_to_series(v: Value, name: &str) -> Result<Series, QplError> {
     let (kind, s) = v
         .as_vec()
@@ -1097,10 +1043,9 @@ pub(crate) fn zip_value_to_series(v: Value, name: &str) -> Result<Series, QplErr
     Ok(s.clone())
 }
 
-/// The runtime body of `Op::Call`'s "name resolves to something other than a
-/// bound closure/builtin" path: `hopen`/`whopen`/`await`/`log`/`til` (in that
-/// order) then the generic column verb (`value_verb`). `vm.is_callable(name)` — checked by the caller
-/// first — is what lets a user function shadow any of these.
+/// `Op::Call` fallback for a name that isn't a closure or builtin:
+/// `hopen`/`whopen`/`await`/`log`/`til`, then a generic column verb. The
+/// caller checks `is_callable` first, which is why a user function wins.
 pub(crate) fn call_by_name(vm: &mut Vm, name: &str, args: Vec<Slot>) -> Result<Slot, QplError> {
     match name {
         #[cfg(feature = "ipc")]
@@ -1175,8 +1120,7 @@ pub(crate) fn native_await(vm: &mut Vm, args: Vec<Slot>) -> Result<Slot, QplErro
     eval_result_to_slot(reply?)
 }
 
-/// `<conn> dispatch <cmd>` / `<conn> async dispatch <cmd>` — the `Op::Dispatch`
-/// body.
+/// `<conn> [async] dispatch <cmd>`: the `Op::Dispatch` body.
 #[cfg(feature = "ipc")]
 pub(crate) fn native_dispatch(
     vm: &mut Vm,

@@ -39,9 +39,12 @@ columnar execution, predicate pushdown, or a parquet reader. Published
 benchmarks put Polars a little behind DuckDB and comfortably ahead of
 everything else in the space, which is more than good enough for what I need.
 
-For the front end I borrowed heavily from kdb+/q. I'd been lightly exposed to
-q at work, wanted a proper excuse to learn it, and wanted to write some Rust.
-qpl is what came out of those three things colliding.
+For the front end I took inspiration from kdb+/q. I'd been lightly exposed to
+q at work, liked how terse it was, and wanted to write some Rust. qpl is what
+came out of those things colliding. It borrows a few of q's ideas where they
+fit, but it was never meant to be q, or compatible with it, and it departs
+from q wherever something else suited a Polars-backed scripting language
+better.
 
 ## What it looks like
 
@@ -77,8 +80,7 @@ And in qpl, where the whole thing is a single statement:
 select tot: sum price * size, avg_spread: avg ask - bid, n: count price
     by csym: `$sym, side, band: ?[size >= 1000; `large; size >= 250; `mid; `small]
     from load "trades.parquet" `sym lj load "quotes.parquet" `sym where price > 0
-    order tot desc
-    sink "summary.parquet"
+    order tot desc sink "summary.parquet"
 ```
 
 Don't try to read that yet. Every piece of it is introduced properly over the

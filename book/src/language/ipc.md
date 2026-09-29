@@ -46,9 +46,23 @@ qpl) \port 5001        / start serving
 qpl) \port             / stop
 ```
 
-This only works in the interactive REPL, which is why the example uses
-`qpl -i`. A script on its own exits as soon as it finishes, before anything
-could connect, so there has to be a prompt keeping the process alive.
+`\port` is an ordinary statement, so it works just as well inside a script.
+A script that opens a port doesn't exit when it reaches its last line. It
+carries on serving, still reading statements from the terminal, until stdin
+closes (Ctrl-D). That makes a server a one-file affair:
+
+```qpl
+/ server.qpl — run with: qpl server.qpl
+trades: load "data/trades.parquet"
+\port 5001
+```
+
+While a port is open, typed statements are still accepted alongside
+incoming requests. The prompt changes to show the address being served,
+`qpl [127.0.0.1:5001])`, and there's no line editing (history, arrow keys).
+Because the process lives exactly as long as stdin does, a
+server started with stdin redirected from `/dev/null`, as a background job
+often is, exits straight away. Give it a stdin that stays open instead.
 
 Every request that arrives is evaluated exactly as though someone had typed
 it at the server's own prompt. Assignments change the server's session,
@@ -100,9 +114,9 @@ conn dispatch t: select from u
 A client that can run arbitrary statements on a server can also modify it, so
 qpl defaults to the cautious option. A bare `hopen` gives a **read-only**
 connection, and the server refuses anything that would write to its session:
-assignments, `sink`, and changing a [`.qpl.cfg`](config.md) setting (a bare
-`.qpl.cfg`, which only prints them, is fine). Queries of every kind still
-work.
+assignments, `sink`, and changing a [`.qpl.cfg`](config.md) setting. Queries
+of every kind still work. (A bare `.qpl.cfg` is allowed too, but it prints
+the settings on the *server's* console. The client just gets `true` back.)
 
 ```qpl
 ro: hopen 5001                          / read-only, the default

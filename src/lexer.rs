@@ -27,7 +27,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 i += 1;
             }
             '/' => {
-                // q-style comment - single slash
+                // `/` comment to end of line
                 while i < n && chars[i] != '\n' {
                     i += 1;
                 }
@@ -76,8 +76,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     continue;
                 }
 
-                // this looks like a symbol vector
-                // this should be a list of symbols separated by backticks, e.g. `a`b`c
+                // a symbol vector: `a`b`c
                 let mut symbols = Vec::new();
                 let mut j = s;
                 while j < n {
@@ -88,7 +87,6 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     let sym: String = chars[k..j].iter().collect();
                     symbols.push(sym);
 
-                    // check if next is a backtick, if so, continue, else break
                     if j < n && chars[j] == '`' {
                         j += 1; // skip the backtick
                     } else {
@@ -103,7 +101,6 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
             }
             '0'..='9' => {
                 let mut j = i;
-                // consume all leading digits first
                 while j < n && chars[j].is_ascii_digit() {
                     j += 1;
                 }
@@ -120,10 +117,9 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     tokens.push(Token { kind, pos: start });
                     continue;
                 }
-                // temporal literal: a run of digits / `.` / `:` / `D` that
-                // `parse_temporal` accepts (`2024.03.15`, `12:30`, `0D12:30:00.0`,
-                // `2024.03.15D09:30:00.000`, `2024.03m`). Falls through to the
-                // float / int paths below when the shape doesn't match.
+                // a temporal literal if `parse_temporal` accepts the run
+                // (`2024.03.15`, `12:30`, `0D12:30:00.0`, `2024.03m`);
+                // otherwise fall through to float/int
                 if j < n && matches!(chars[j], '.' | ':' | 'D') {
                     let mut k = j;
                     while k < n
@@ -143,14 +139,13 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         i = k;
                         continue;
                     }
-                    // it looked temporal (`:` / `D` / a second `.`) but didn't
-                    // parse — a clearer error than letting the float path choke
+                    // looked temporal but didn't parse: a clearer error than
+                    // the float path would give
                     let dots = slice.bytes().filter(|&b| b == b'.').count();
                     if slice.contains([':', 'D']) || dots >= 2 {
                         return Err(QplError::Lex(format!("invalid temporal literal '{slice}'")));
                     }
                 }
-                // float: decimal point after integer digits
                 let mut is_float = false;
                 if j < n && chars[j] == '.' {
                     is_float = true;
@@ -159,11 +154,9 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         j += 1;
                     }
                 }
-                // scientific-notation suffix: `e5`, `E-2`, `e+3`. A negative
-                // exponent (or a `.` mantissa) makes it a float; a bare
-                // non-negative exponent folds to an `Int` (`10e5` == `1000000`)
-                // so it composes with everything that expects a plain int
-                // literal (e.g. `n limit`) without also having to accept a float.
+                // scientific notation. A non-negative exponent on an integer
+                // mantissa stays an `Int` (`10e5` == 1000000) so it works
+                // wherever an int is expected; otherwise it's a float.
                 let mut int_exp: Option<u32> = None;
                 if j < n && matches!(chars[j], 'e' | 'E') {
                     let mut k = j + 1;
@@ -224,7 +217,6 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     i = j;
                     continue;
                 }
-                // integer
                 let int_str: String = chars[i..j].iter().collect();
                 let int_val: i64 = int_str
                     .parse()
@@ -259,15 +251,8 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 i += 1;
             }
             '.' => {
-                // a namespaced identifier: `.ns.name` (`.qpl.dt`, `.qpl.cfg`,
-                // `.utils.helper` for a `\i`-imported script's bindings, …),
-                // any number of `.segment`s. No new token/AST node — it's a
-                // plain `Name`, so it flows through every existing
-                // identifier path (variable/table lookup, bareword calls,
-                // assignment targets) unchanged. (`.qpl.cfg` as a bare REPL
-                // directive is still handled at the string level in repl.rs
-                // and never reaches here; this only matters when `.qpl.cfg`
-                // appears inside an expression, which it doesn't today.)
+                // a namespaced identifier `.ns.name` (`.qpl.dt`,
+                // `.utils.helper`), lexed as a plain `Name`
                 let mut k = i + 1;
                 if k < n && is_name_start(chars[k]) {
                     k += 1;
@@ -313,7 +298,7 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                 i += 1;
             }
             '&' | '|' => {
-                // logical and / or; single-char, no run-glomming
+                // logical and / or
                 tokens.push(Token {
                     kind: TokenKind::Op(chars[i].to_string()),
                     pos: start,
@@ -387,8 +372,8 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     i = j;
                     continue;
                 }
-                // only `<= >= <>` are real multi-char operators; never glom a
-                // following `+ - * $` etc. onto an operator (`int$-1`, `a%-b`)
+                // only `<=`, `>=`, `<>` are multi-char; don't glom a following
+                // operator on (`int$-1`, `a%-b`)
                 while j < n && "=<>".contains(chars[j]) {
                     j += 1;
                 }
@@ -407,7 +392,6 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                     }
                     let name: String = chars[i..j].iter().collect();
                     let kind = match name.as_str() {
-                        // key words
                         "select" => TokenKind::Select,
                         "by" => TokenKind::By,
                         "from" => TokenKind::From,

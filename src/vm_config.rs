@@ -1,29 +1,24 @@
-//! Interpreter configuration set at run time via `.qpl.cfg`. To add a knob:
-//! give it a field + default here and a match arm in [`VmConfig::set`] —
-//! nothing else in the pipeline needs to change.
+//! Session settings set with `.qpl.cfg`. A new knob is a field, a default,
+//! and a match arm in [`VmConfig::set`].
 
 use crate::errors::QplError;
 use polars_ops::prelude::RoundMode;
 
 #[derive(Debug, Clone)]
 pub struct VmConfig {
-    /// max columns physically printed when rendering a table (`maxcol`)
+    /// max columns printed when rendering a table
     pub maxcol: usize,
-    /// max rows physically printed when rendering a table (`maxrow`)
+    /// max rows printed when rendering a table
     pub maxrow: usize,
-    /// rounding mode used by the `round` column function (`round_type`)
+    /// rounding mode for `round`
     pub round_type: RoundMode,
-    /// max characters wide a printed table may be, `-1` = unlimited (`tblwidth`)
+    /// max printed table width in characters; `-1` = unlimited
     pub tblwidth: i64,
-    /// max characters shown per cell before truncating with an ellipsis,
-    /// `-1` = unlimited (`strlen`)
+    /// max characters shown per cell; `-1` = unlimited
     pub strlen: i64,
-    /// when `true`, a raw integer crossing the `Int`/`timestamp` boundary
-    /// (`` `timestamp$n ``, `` `long$ts ``) is read/written as ns since kdb's
-    /// `2000.01.01` epoch, matching the internal [`crate::ast::Value::Timestamp`]
-    /// representation; when `false` (the default) it's ns since the Unix epoch
-    /// (`1970.01.01`), matching what a whole-column `` `timestamp$ `` cast
-    /// already does under Polars and what non-kdb users expect (`useqepoch`)
+    /// Epoch for raw integers crossing the timestamp boundary (`` `timestamp$n ``,
+    /// `` `long$ts ``): kdb's 2000.01.01 if `true`, else the Unix epoch
+    /// (matching Polars' column casts).
     pub useqepoch: bool,
 }
 
@@ -42,7 +37,7 @@ impl Default for VmConfig {
 }
 
 impl VmConfig {
-    /// Apply one `key=value` assignment. Unknown keys / bad values are errors.
+    /// Apply one `key=value`. Unknown keys and bad values are errors.
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), QplError> {
         match key {
             "maxcol" => self.maxcol = parse_cfg_usize(key, value)?,
@@ -61,14 +56,9 @@ impl VmConfig {
         Ok(())
     }
 
-    /// The row/col/width/strlen limits are read by Polars from the environment
-    /// at render time, so mirror the just-set knob into it.
-    ///
-    /// Not on wasm: a browser has no process environment (`std::env::set_var`
-    /// panics there), and Polars has nothing to read the limits from — the knob
-    /// is still stored (and shown by a bare `.qpl.cfg`) but the text `eval`
-    /// prints stays at Polars' defaults. `evalArrow` returns the whole table,
-    /// so a wasm host does its own truncation.
+    /// Polars reads the display limits from the environment at render time,
+    /// so mirror the knob there. Not on wasm, which has no process environment
+    /// (`set_var` panics); the value is still stored.
     #[cfg(not(target_family = "wasm"))]
     fn export_render_limits(&self, key: &str) {
         match key {
@@ -81,10 +71,8 @@ impl VmConfig {
             "tblwidth" => unsafe {
                 std::env::set_var("POLARS_TABLE_WIDTH", self.tblwidth.to_string())
             },
-            // Polars' formatter takes a negative POLARS_FMT_STR_LEN literally as
-            // usize::MAX and then overflows adding padding to it (fmt.rs), unlike
-            // POLARS_TABLE_WIDTH which clamps negatives to u16::MAX itself — so
-            // `-1` (unlimited) is translated to a large-but-safe finite value here.
+            // Polars overflows on a negative POLARS_FMT_STR_LEN (unlike
+            // POLARS_TABLE_WIDTH), so map `-1` to a large finite value.
             "strlen" => unsafe {
                 let v = if self.strlen < 0 {
                     i32::MAX as i64
@@ -100,7 +88,7 @@ impl VmConfig {
     #[cfg(target_family = "wasm")]
     fn export_render_limits(&self, _key: &str) {}
 
-    /// One `key=value` line per knob — printed by a bare `.qpl.cfg`.
+    /// One `key=value` line per knob, for a bare `.qpl.cfg`.
     pub fn describe(&self) -> String {
         format!(
             "maxcol={}\nmaxrow={}\nround_type={}\ntblwidth={}\nstrlen={}\nuseqepoch={}",
@@ -159,13 +147,9 @@ fn round_type_name(mode: RoundMode) -> &'static str {
 mod tests {
     use super::*;
 
-    /// `VmConfig::set` mirrors `maxcol`/`maxrow`/`tblwidth`/`strlen` into
-    /// process-wide `POLARS_FMT_*` env vars (see the `not on wasm` doc comment
-    /// above) — process env is shared by every test in this binary, so a test
-    /// that changes them must put them back, or it silently changes how every
-    /// `DataFrame::to_string()` in the rest of the run is truncated (this bit
-    /// the golden-output tests in `repl::golden`, which depend on the
-    /// untouched defaults).
+    /// `set` writes process-wide `POLARS_FMT_*` env vars shared by every test
+    /// in this binary, so a test that changes them must restore them (the
+    /// golden-output tests depend on the defaults).
     fn saved_env(keys: &[&str]) -> Vec<(String, Option<String>)> {
         keys.iter()
             .map(|k| (k.to_string(), std::env::var(k).ok()))

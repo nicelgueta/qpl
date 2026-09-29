@@ -1,15 +1,23 @@
 / ─────────────────────────────────────────────────────────────────────────────
-/ IPC server half. Requires the `ipc` feature (off by default).
+/ IPC server half. Requires the `ipc` feature (on by default).
 /
-/ This script alone just sets up the demo tables — the actual `\port` command
-/ has to be typed at the REPL prompt (or piped after this script runs), since
-/ opening a port only makes sense in a long-lived interactive session. Run:
+/ `\port` is an ordinary statement, so a script can open one directly — the
+/ process keeps serving requests after this script's last statement, exactly
+/ as if `-i` had dropped it into the REPL. Run:
 /
-/   cargo run --features ipc -- -i --load-demo examples/ipc_server.qpl
-/   qpl) \port 5001
+/   cargo run --load-demo -- examples/ipc_server.qpl
 /
 / Then, in another terminal, run examples/ipc_client.qpl against it.
-/ `\port` (no argument) closes the listener again.
+/ A bare `\port` (no argument) closes the listener again; typed at the REPL
+/ prompt this also works the same way, mid-session.
 / ─────────────────────────────────────────────────────────────────────────────
 
-log "demo tables `trades` / `quotes` are ready — now run: \\port 5001"
+/ `\port`'s argument is an ordinary value-context expression, not just a
+/ literal — it can be a variable, arithmetic, or (as here) a conditional that
+/ picks the port at runtime. String equality has no scalar `=` (that's `like`,
+/ an exact match with no wildcards in the pattern — see the "Operator
+/ reference" in README.md), which is why this compares with `like`, not `=`.
+env: "test"
+port: ?[env like "test"; 5001; 5002]
+log "demo tables `trades` / `quotes` are ready — opening \\port " str$port
+\port port

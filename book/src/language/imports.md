@@ -133,7 +133,7 @@ trades: select from trades where size > 200
 
 does *not* read your session's `trades` and bind `.utils.trades` from it —
 the bare `trades` on the right already means `.utils.trades`, which doesn't
-exist yet at that point in the script, so this fails with an undefined-name
+exist yet at that point in the script, so this fails with an "unknown table"
 error instead. A library that wants to build on the caller's table needs a
 name of its own for it, e.g. `filtered: select from trades where size > 200`
 (reading the session's `trades`, since `trades` isn't one of this script's
@@ -159,9 +159,9 @@ that script. It also works in a script started with `qpl script.qpl` or
 
 ## Functions that call their siblings
 
-The import renames a script's top-level bindings. It doesn't rewrite the
-*bodies* of the functions it moves. A library function that calls another
-helper from the same file still says `helper`, not `.utils.helper`:
+You don't have to write the namespace into a library's own source. A
+library function that calls another helper from the same file just says
+`helper`, not `.utils.helper`:
 
 ```qpl
 / lib/lg.qpl

@@ -1,7 +1,7 @@
 use clap::{ArgAction::SetTrue, Parser};
 use qpl::{repl, vm};
 
-// Matches Polars' own official builds — see the `mimalloc` entry in Cargo.toml.
+// matches Polars' official builds (see `mimalloc` in Cargo.toml)
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -95,23 +95,23 @@ fn main() {
             if let Err(e) = repl::run_script(path, &mut vm) {
                 eprintln!("{e}");
                 let interrupted = matches!(e, qpl::errors::QplError::Interrupted);
-                // `-i` after an interrupted script still drops into the REPL
-                if !(interrupted && cli.interactive) {
+                // `-i`, or a script that left a `\port` open, carries on
+                // into the REPL/serve loop even after an error
+                if !(cli.interactive || repl::port_open(&vm)) {
                     std::process::exit(if interrupted { 130 } else { 1 });
                 }
             }
-            if cli.interactive {
+            // a script that opened `\port` keeps serving, like `-i`
+            if cli.interactive || repl::port_open(&vm) {
                 repl::start(&mut vm);
             }
         }
     }
 }
 
-/// `qpl -C script.qpl [-o out.qplc]`: compile `script` to a `.qplc` file and
-/// exit without running it. Writes to a temp file in the same location as
-/// the final output and renames it into place, so a compile error partway
-/// through never leaves a truncated/corrupt artifact where the real output
-/// was expected.
+/// `qpl -C script.qpl [-o out.qplc]`: compile without running. Writes a temp
+/// file and renames it into place, so a failed compile never leaves a
+/// partial artifact.
 fn compile_to_qplc(script: &str, output: Option<&str>) -> Result<(), String> {
     let program = repl::compile_script(script).map_err(|e| e.to_string())?;
     let bytes = program.to_bytes().map_err(|e| e.to_string())?;
@@ -136,9 +136,9 @@ fn compile_to_qplc(script: &str, output: Option<&str>) -> Result<(), String> {
     write_result
 }
 
-/// Ctrl-C while a statement runs asks it to stop at its next check point; a
-/// second Ctrl-C (or one with nothing running) exits, as an unhandled SIGINT
-/// would. Inside `readline` the terminal is in raw mode, so none of this fires.
+/// First Ctrl-C asks the running statement to stop at its next check point;
+/// a second (or one with nothing running) exits. Doesn't fire inside
+/// `readline`, where the terminal is in raw mode.
 fn install_ctrl_c(vm: &vm::Vm) {
     let interrupt = vm.interrupt.clone();
     let _ = ctrlc::set_handler(move || match interrupt.on_ctrl_c() {
@@ -151,20 +151,10 @@ fn install_ctrl_c(vm: &vm::Vm) {
 
 #[cfg(test)]
 mod tests {
-    //! CLI behaviour tests: spawn the actual
-    //! built binary rather than calling `main` in-process, since the thing
-    //! under test is clap's argument handling (conflicts, `requires`) and
-    //! process exit codes — both only observable from outside.
-    //!
-    //! `env!("CARGO_BIN_EXE_qpl")` (the usual way to locate a sibling
-    //! binary's freshly-built path from a test) isn't available here: it's
-    //! only set for *other* targets in the package that depend on this bin,
-    //! not for the bin's own unit tests. Instead `qpl_bin_path` derives
-    //! `target/<profile>/qpl` from this test binary's own
-    //! `std::env::current_exe()` (which sits at
-    //! `target/<profile>/deps/qpl-<hash>`), building it on demand
-    //! (`cargo build --quiet`, once per test process) if it isn't there yet —
-    //! robust to `cargo test` being run without a preceding `cargo build`.
+    //! CLI tests that spawn the built binary, since clap's argument handling
+    //! and exit codes are only observable from outside. `CARGO_BIN_EXE_qpl`
+    //! isn't set for a bin's own unit tests, so `qpl_bin_path` derives
+    //! `target/<profile>/qpl` from `current_exe()`, building it if missing.
     use std::io::Write;
     use std::process::Command;
 
@@ -388,8 +378,7 @@ mod tests {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn qpl");
-        // running a bad file with no `file` positional consumed doesn't start
-        // an interactive loop, but close stdin defensively in case it would.
+        // close stdin in case an interactive loop starts
         drop(child.stdin.take());
         let out = child.wait_with_output().expect("wait");
         assert!(!out.status.success());
@@ -404,8 +393,7 @@ mod tests {
         assert!(!out.status.success());
     }
 
-    /// Fast, no-process-spawn checks of clap's wiring itself (`conflicts_with_all`/
-    /// `requires`), complementing the slower end-to-end spawns above.
+    /// In-process checks of clap's `conflicts_with_all`/`requires` wiring.
     #[test]
     fn clap_conflicts_are_wired_as_specified() {
         use clap::Parser;
@@ -443,9 +431,7 @@ mod tests {
         );
     }
 
-    // Kept for completeness alongside the process-spawning tests above:
-    // exercises the same temp-file-then-rename write path `compile_to_qplc`
-    // uses, in-process, without needing a real qpl script.
+    // the temp-file-then-rename write path, in-process
     #[test]
     fn compile_to_qplc_writes_via_a_temp_file_and_renames_into_place() {
         let mut script = tempfile_like("direct.qpl");

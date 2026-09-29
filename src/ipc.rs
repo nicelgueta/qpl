@@ -1,23 +1,14 @@
-//! IPC: `hopen` / `dispatch` / `async dispatch` / `await` on the client side,
-//! `\port` on the server side. `ipc` feature only.
+//! IPC: `hopen`/`dispatch`/`async dispatch`/`await` (client) and `\port`
+//! (server). `ipc` feature only.
 //!
-//! Transport is a single REQ/REP pair per connection (`zeromq`, pure Rust, no
-//! libzmq dependency). Everything async is confined to one dedicated OS
-//! thread per connection (client) or one thread for the whole listener
-//! (server) — the rest of the VM stays fully synchronous, single-threaded,
-//! and untouched: a connection's worker thread only ever exchanges owned
-//! `String`/`Vec<u8>` values over `std::sync::mpsc` channels, never a
-//! reference into `Vm`.
+//! One zeromq REQ/REP pair per connection (pure Rust, no libzmq). Async code
+//! is confined to one thread per client connection and one for the listener;
+//! they exchange only owned `String`/`Vec<u8>` values with the main thread
+//! over `mpsc`, never a reference into `Vm`.
 //!
-//! Wire format: a dispatched *command* is shipped as plain UTF-8 source text
-//! (see `Expr::Dispatch`, which reconstructs it from tokens at parse time) —
-//! the server tokenises/parses/evaluates it exactly like a REPL line. The
-//! *response* mirrors `vm::EvalResult`: a one-byte tag followed by an
-//! encoding specific to that variant (tables go over as Parquet bytes, reusing
-//! the same format `load`/`sink` already use — no new Polars feature needed;
-//! scalars use the shared [`crate::codec`] tag+payload encoding for
-//! `ast::Value`, also used by `.qplc` bytecode files — see `encode_scalar`
-//! for the one wire-only wrinkle, an unrepresentable value's placeholder text).
+//! A command travels as source text and is evaluated like a REPL line. The
+//! response mirrors `vm::EvalResult`: a tag byte, then Parquet bytes for a
+//! table or a [`crate::codec`] value for a scalar.
 
 use std::io::Cursor;
 use std::sync::mpsc;
@@ -34,11 +25,8 @@ fn rt<E: std::fmt::Display>(e: E) -> QplError {
     QplError::Runtime(e.to_string())
 }
 
-/// The inner message, without `QplError::Display`'s per-variant decoration
-/// (e.g. `Runtime`'s own leading `'`) — encoded on the wire and reconstructed
-/// as a plain `Runtime` error on the other side (the original variant doesn't
-/// survive the trip, matching every other cross-boundary error in this
-/// codebase, which already collapses to `Runtime` via the `rt`/`map_err(rt)` idiom).
+/// The error's bare message, sent on the wire and rebuilt as a `Runtime`
+/// error on the other side.
 fn error_message(e: &QplError) -> String {
     match e {
         QplError::Lex(m) | QplError::Parse(m) | QplError::Compile(m) | QplError::Runtime(m) => {
@@ -59,9 +47,7 @@ fn to_tcp_uri(addr: &str) -> String {
     }
 }
 
-/// Render a `PeerIdentity` (an opaque per-socket UUID) as a short hex tag for
-/// the connect/disconnect log lines — just enough to tell two concurrently
-/// connected clients apart, not a meaningful identity on its own.
+/// A short hex tag for a peer, to tell clients apart in connect/disconnect logs.
 fn short_peer_id(id: &zeromq::util::PeerIdentity) -> String {
     id.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
@@ -77,12 +63,9 @@ fn build_runtime() -> Result<tokio::runtime::Runtime, QplError> {
 // client: hopen / dispatch / async dispatch / await
 // ---------------------------------------------------------------------------
 
-/// Per-connection permission, decided by the client at `hopen` time and
-/// enforced by the server on every request dispatched from that connection —
-/// never on the server's own local/interactive input (see
-/// `vm::Vm::with_request_permission`). Bare `hopen` is `Read` (the default);
-/// `` `w!hopen `` asks for `Write`. Carried on the wire as a single tag byte
-/// prepended to the command text (`tag`/`from_tag`).
+/// A connection's permission, chosen by the client (`hopen` = `Read`,
+/// `` `w!hopen `` = `Write`) and enforced by the server per request. Sent as a
+/// tag byte before the command text. Never applies to local input.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HandleMode {
     Read,
@@ -110,20 +93,15 @@ type ReplyTx = mpsc::Sender<Result<EvalResult, QplError>>;
 pub type ReplyRx = mpsc::Receiver<Result<EvalResult, QplError>>;
 type ConnRequest = (String, ReplyTx);
 
-/// A connection opened by `hopen`. Cheap to store (just a channel handle) —
-/// the actual `ReqSocket` lives on the dedicated worker thread spawned by
-/// `hopen`, which processes one request at a time for the connection's
-/// lifetime, matching REQ's strict lock-step request/reply protocol.
+/// A `hopen` connection: a channel to its worker thread, which owns the
+/// `ReqSocket` and handles one request at a time (as REQ requires).
 pub struct ClientConn {
     tx: mpsc::Sender<ConnRequest>,
     pub mode: HandleMode,
 }
 
-/// `hopen <addr>` — connect and spawn the connection's worker thread. Blocks
-/// until the connection either succeeds or fails, so a bad address/unreachable
-/// host is reported immediately rather than on the first `dispatch`. `mode`
-/// (from the client's `hopen` / `` `w!hopen `` spelling) is tagged onto every
-/// request this connection ever sends, for the server to enforce.
+/// `hopen <addr>`: connect and spawn the worker thread. Blocks until the
+/// connection succeeds or fails, so a bad address is reported immediately.
 pub fn hopen(addr: &str, mode: HandleMode) -> Result<ClientConn, QplError> {
     let uri = to_tcp_uri(addr);
     let (tx, rx) = mpsc::channel::<ConnRequest>();
@@ -177,10 +155,8 @@ async fn dispatch_once(
     decode_response(&bytes)
 }
 
-/// Enqueue `command` on `conn`'s worker thread and return the reply channel —
-/// shared by sync and async dispatch. Sync dispatch blocks on `reply_rx.recv()`
-/// immediately; async dispatch stashes `reply_rx` in `Vm.pending` and returns
-/// right away, to be collected later by `await`.
+/// Queue `command` on `conn`'s worker and return the reply channel. Sync
+/// dispatch waits on it; async stores it for `await`.
 pub fn enqueue(conn: &ClientConn, command: String) -> Result<ReplyRx, QplError> {
     let (reply_tx, reply_rx) = mpsc::channel();
     conn.tx
@@ -189,10 +165,8 @@ pub fn enqueue(conn: &ClientConn, command: String) -> Result<ReplyRx, QplError> 
     Ok(reply_rx)
 }
 
-/// Wait for a reply, waking every 50 ms to honour Ctrl-C. On interrupt the
-/// receiver is simply dropped by a sync caller: the connection worker ignores
-/// the failed `send`, having already finished the REQ/REP round trip, so the
-/// handle stays usable.
+/// Wait for a reply, waking every 50 ms to check for Ctrl-C. An abandoned
+/// reply is discarded by the worker, so the connection stays usable.
 fn recv_interruptible(rx: &ReplyRx, interrupt: &Interrupt) -> Result<EvalResult, QplError> {
     loop {
         interrupt.check()?;
@@ -217,8 +191,8 @@ pub fn dispatch_blocking(
     recv_interruptible(&enqueue(conn, command)?, interrupt)
 }
 
-/// `await`: block on a reply channel previously stashed by an async dispatch.
-/// Borrows the receiver so an interrupted wait can be retried.
+/// `await`: wait on an async dispatch's reply channel. Borrows it so an
+/// interrupted wait can be retried.
 pub fn await_reply(rx: &ReplyRx, interrupt: &Interrupt) -> Result<EvalResult, QplError> {
     recv_interruptible(rx, interrupt)
 }
@@ -227,17 +201,29 @@ pub fn await_reply(rx: &ReplyRx, interrupt: &Interrupt) -> Result<EvalResult, Qp
 // server: `\port`
 // ---------------------------------------------------------------------------
 
-/// One request received on the listening socket, forwarded to the main
-/// thread (which owns the one and only `Vm`) for evaluation. `mode` is that
-/// connection's permission (decoded from the wire tag `dispatch_once`
-/// prepends), applied only for the duration of this one request. `reply_tx`
-/// is how the encoded response bytes get back to the listener thread to send.
+/// A request forwarded from the listener to the main thread: the
+/// connection's mode, the command text, and where to send the encoded reply.
 pub type PortRequest = (HandleMode, String, mpsc::Sender<Vec<u8>>);
 
-/// A running `\port` listener. Dropping it (or calling `close`) signals the
-/// listener thread to stop accepting new requests and joins it — any request
-/// already being processed is allowed to finish first (REP can't abandon an
-/// in-flight reply mid-flight anyway).
+/// An open `\port` listener, owned by `Vm`: the listener thread, the channel
+/// requests arrive on, and the port (for display).
+pub struct PortState {
+    pub handle: ServerHandle,
+    pub rx: mpsc::Receiver<PortRequest>,
+    pub port: u16,
+}
+
+impl PortState {
+    /// Bind and start a listener on `port`.
+    pub fn open(port: u16) -> Result<Self, QplError> {
+        let (tx, rx) = mpsc::channel();
+        let handle = start_server(port, tx)?;
+        Ok(Self { handle, rx, port })
+    }
+}
+
+/// A running listener. Dropping it (or `close`) stops accepting requests and
+/// joins the thread; a request already in flight finishes first.
 pub struct ServerHandle {
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
@@ -265,8 +251,8 @@ impl Drop for ServerHandle {
     }
 }
 
-/// `\port <n>` — bind and start the listener thread. Blocks until the bind
-/// either succeeds or fails, so a busy port is reported immediately.
+/// Bind and start the listener thread. Blocks until the bind succeeds or
+/// fails, so a busy port is reported immediately.
 pub fn start_server(
     port: u16,
     main_tx: mpsc::Sender<PortRequest>,
@@ -285,8 +271,7 @@ pub fn start_server(
         rt.block_on(async move {
             use zeromq::Socket;
             let mut rep = zeromq::RepSocket::new();
-            // registered before `bind` so no `Accepted` event can be missed —
-            // this is just an mpsc channel handle, nothing to race with the bind.
+            // registered before `bind` so no `Accepted` event is missed
             let mut events = rep.monitor();
             if let Err(e) = rep.bind(&format!("tcp://127.0.0.1:{port}")).await {
                 let _ = ready_tx.send(Err(e.to_string()));
@@ -297,15 +282,9 @@ pub fn start_server(
                 use zeromq::{SocketRecv, SocketSend};
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
-                    // TCP-level accept/close on the listening socket — printed
-                    // for operator visibility only, no effect on `Vm` state
-                    // (that's `HandleMode`, decided per request, not per socket).
-                    // Caveat: `Accepted` fires reliably, but this version of the
-                    // `zeromq` crate only emits `Disconnected` when a peer's
-                    // stream ends with a protocol-level error — a clean close
-                    // (the common case: the client process just exits) is
-                    // dropped silently a layer down (`FairQueue::poll_next`,
-                    // the `Poll::Ready(None)` arm) without notifying `monitor()`.
+                    // accept/close events, logged for the operator only.
+                    // This zeromq version emits `Disconnected` only on a
+                    // protocol error, so a clean client exit goes unlogged.
                     Ok(event) = events.recv() => {
                         match event {
                             zeromq::SocketEvent::Accepted(endpoint, peer_id) => {
@@ -333,10 +312,8 @@ pub fn start_server(
                             },
                             None => continue,
                         };
-                        // hand off to the main thread and block this (otherwise
-                        // idle) listener thread for the reply — fine, since REP
-                        // can't accept another request until this one replies
-                        // anyway.
+                        // hand off to the main thread and wait; REP can't take
+                        // another request until this one replies anyway
                         let (reply_tx, reply_rx) = mpsc::channel();
                         if main_tx.send((mode, command, reply_tx)).is_err() {
                             break;
@@ -371,10 +348,8 @@ const TAG_LAZY: u8 = 2;
 const TAG_SCALAR: u8 = 3;
 const TAG_TABLE: u8 = 4;
 
-/// Encode a dispatched command's outcome for the wire. Called on the server,
-/// right after evaluating the command — errors are encoded too (rather than
-/// left to the transport), so the client always gets a reply and can surface
-/// a remote error exactly like a local one.
+/// Encode a command's outcome for the wire. Errors are encoded too, so the
+/// client always gets a reply.
 pub fn encode_result(result: &Result<EvalResult, QplError>) -> Vec<u8> {
     match result {
         Err(e) => {
@@ -396,9 +371,7 @@ pub fn encode_result(result: &Result<EvalResult, QplError>) -> Vec<u8> {
         Ok(EvalResult::Table(df)) => {
             let mut out = vec![TAG_TABLE];
             let mut df = df.clone();
-            // Parquet-in-memory: reuses the same writer `sink`/`load` already
-            // link (see the `parquet` polars feature in Cargo.toml) instead of
-            // adding a dedicated wire-serialisation format.
+            // Parquet in memory, reusing the writer `sink` already links
             if ParquetWriter::new(&mut out).finish(&mut df).is_err() {
                 return encode_result(&Err(QplError::Runtime(
                     "failed to serialise table for dispatch".into(),
@@ -434,15 +407,8 @@ fn decode_response(bytes: &[u8]) -> Result<EvalResult, QplError> {
     }
 }
 
-/// Wire-encode a scalar `Value` for `encode_result`'s `TAG_SCALAR` payload,
-/// using the shared [`crate::codec`]. A connection/future handle, a closure, or a table/lazy value that
-/// somehow ends up wrapped in a *scalar* response (table results normally go
-/// through `encode_result`'s dedicated `EvalResult::Table` Parquet path
-/// instead) has no lossless encoding — `codec::encode_value` errors on those,
-/// and this falls back to the same `"<unrepresentable>"` placeholder string
-/// the wire format has always used for them, rather than propagating the
-/// error (nothing on the other end of a dispatch could act on a decode
-/// failure any more usefully than on the placeholder text).
+/// Encode a scalar response. Values with no codec encoding (handles,
+/// closures, frames) are sent as the text `"<unrepresentable>"`.
 fn encode_scalar(v: &ast::Value, out: &mut Vec<u8>) {
     if crate::codec::encode_value(v, out).is_err() {
         crate::codec::encode_value(&ast::Value::Str("<unrepresentable>".into()), out)
@@ -535,10 +501,8 @@ mod tests {
 
     // --- end-to-end: a real listener + a real hopen'd connection over TCP ---
 
-    /// Runs a tiny "server": for every request the listener forwards, replies
-    /// with `respond(command)`'s encoded result. Mimics the REPL's polling
-    /// loop (`PortSession::poll` + `eval_for_dispatch`) without needing the
-    /// REPL itself.
+    /// A stub server replying with `respond(command)` for every request,
+    /// standing in for the REPL's polling loop.
     fn spawn_stub_server(
         port: u16,
         respond: impl Fn(&str) -> Result<EvalResult, QplError> + Send + 'static,
@@ -624,11 +588,8 @@ mod tests {
         server.close();
     }
 
-    /// The wire mode tag (prepended by `dispatch_once`) must actually reach the
-    /// listener thread's decoding, not just get ignored by a stub that skips
-    /// straight to `respond` — this is the one piece `spawn_stub_server`-based
-    /// tests above don't exercise, since their `respond` closures never look at
-    /// the connection's mode.
+    /// The mode tag must reach the listener's decoding (the stub-server tests
+    /// never look at it).
     #[test]
     fn mode_tag_round_trips_through_the_real_listener() {
         let (tx, rx) = mpsc::channel::<PortRequest>();
@@ -690,7 +651,7 @@ mod tests {
             started.elapsed() < std::time::Duration::from_millis(350),
             "returned before the server replied"
         );
-        // the abandoned reply is drained by the worker; the next round trip is in step
+        // the worker drains the abandoned reply; the next round trip is in step
         match dispatch_blocking(&conn, "fast".into(), &Interrupt::default()) {
             Ok(EvalResult::Scalar(ast::Value::Str(s))) => assert_eq!(s, "fast"),
             other => panic!("expected the reply to `fast`, got {other:?}"),

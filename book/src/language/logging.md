@@ -41,10 +41,10 @@ test6 that
 A bare `log` prints an empty line.
 
 `log` is the only thing that writes to stdout. kdb spells this `1 x`, after
-the Unix stdout file descriptor, and qpl used to accept that too — but a
-statement beginning with a digit is genuinely ambiguous, since `1 + 1` is
-also a perfectly good expression, and the shorthand caused more confusion
-than it saved keystrokes. It's gone.
+the Unix stdout file descriptor, but qpl doesn't: a statement beginning with
+a digit is genuinely ambiguous, since `1 + 1` is also a perfectly good
+expression, and the shorthand would cause more confusion than it saves
+keystrokes.
 
 ## A parsing note
 

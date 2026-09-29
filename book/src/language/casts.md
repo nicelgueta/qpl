@@ -131,5 +131,4 @@ i64: 41
 ```
 
 Parentheses settle it. This is the single most common source of surprise for
-people arriving from left-to-right languages, and casts are usually where it
-bites first, because a cast is often the innermost thing in an expression.
+people arriving from left-to-right languages.

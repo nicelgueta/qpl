@@ -45,8 +45,8 @@ select neg_mv: -price from trades
 ## A word about evaluation order
 
 This is worth internalising early, because it applies to every expression in
-the language, not just the operators above: qpl evaluates right to left,
-following q, rather than the left-to-right order most languages use. With `+`
+the language, not just the operators above: qpl evaluates right to left
+(an idea borrowed from q) rather than the left-to-right order most languages use. With `+`
 or `*` that's invisible, but with anything that doesn't commute it changes the
 answer.
 
@@ -141,8 +141,8 @@ its test is always a single boolean atom.
 
 ## Pattern matching
 
-`like` tests text against a glob pattern, following
-[q's rules](https://code.kx.com/q/ref/like/):
+`like` tests text against a glob pattern, using the same syntax as
+[q's `like`](https://code.kx.com/q/ref/like/):
 
 ```qpl
 qpl) select sym, price from trades where sym like "A*"
@@ -177,9 +177,9 @@ its own: `[*]`, `[?]`, `[[]`, `[]]`. Glob syntax has no backslash escape.
 
 ## Verbs that take a parameter
 
-A family of operations needs a parameter as well as a column. In q these are
-written with the parameter on the *left*, which reads oddly for about five
-minutes and then starts to feel natural:
+A family of operations needs a parameter as well as a column. As in q, these
+are written with the parameter on the *left*, which reads oddly for about
+five minutes and then starts to feel natural:
 
 ```qpl
 qpl) select p95: 0.95 quantile price by sym from trades
@@ -277,7 +277,7 @@ output depends on row order:
 for carrying values forward or backward over nulls.
 
 Like the row-relative verbs above, these are at their most useful with `over`
-and an explicit ordering, which the [next chapter but one](window-functions.md)
+and an explicit ordering, which [Window functions](window-functions.md)
 covers. On their own they run down the table in its current order.
 
 ## Casting

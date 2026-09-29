@@ -1,8 +1,8 @@
 / ─────────────────────────────────────────────────────────────────────────────
-/ IPC client half. Requires the `ipc` feature (off by default) and a server
+/ IPC client half. Requires the `ipc` feature (on by default) and a server
 / already listening — see examples/ipc_server.qpl. Run:
 /
-/   cargo run --features ipc -- examples/ipc_client.qpl
+/   cargo run -- examples/ipc_client.qpl
 / ─────────────────────────────────────────────────────────────────────────────
 
 conn: hopen 5001

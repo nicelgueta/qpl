@@ -15,23 +15,15 @@ pub fn compile(stmt: &Stmt) -> Result<Program, QplError> {
     Ok(out)
 }
 
-/// Drains `out.pending_closures`: each
-/// function literal seen while compiling the statement/expression gets its
-/// body appended here, after everything compiled so far, and its placeholder
-/// `Operand::Func` (pushed with a dummy `(0,0)` entry at the literal's own
-/// site) patched with the entry point now that it's known. A body may itself
-/// contain nested lambdas, which get queued the same way and drained by the
-/// same loop (LIFO order doesn't matter — every entry ends up correctly
-/// resolved once the queue is empty). Both places that build a `Program`
-/// from scratch — [`compile`] and the whole-program compiler — call this
-/// once, after all of their statements are compiled.
+/// Append each queued function body after the code compiled so far and patch
+/// its placeholder `Operand::Func` with the real entry point. Bodies may queue
+/// nested lambdas; the loop runs until the queue is empty. Called once per
+/// `Program` built from scratch.
 pub(crate) fn finish_pending(out: &mut Program) -> Result<(), QplError> {
     if out.pending_closures.is_empty() {
         return Ok(());
     }
-    // execution must never fall off the end of the statement's own code
-    // straight into an appended body — `CALL` reaches a body only via its
-    // recorded entry point (see `Op::Halt`'s doc comment).
+    // never fall off the statement's code into an appended body
     out.emit(Op::Halt);
     while let Some(pending) = out.pending_closures.pop() {
         let entry = (out.code.len() as u32, out.operands.len() as u32);
@@ -45,11 +37,8 @@ pub(crate) fn finish_pending(out: &mut Program) -> Result<(), QplError> {
     Ok(())
 }
 
-/// A function body's bytecode: leading
-/// statements run for their side effects (an assignment is already net-zero
-/// on the stack via `STORE`; a bare expression statement is popped), and the
-/// final statement (guaranteed by the parser to be an expression) supplies
-/// the return value, followed by `RET`.
+/// A function body: leading statements for effect, then the final
+/// expression's value and `RET`.
 fn compile_function_body(body: &[Stmt], out: &mut Program) -> Result<(), QplError> {
     let (last, head) = body
         .split_last()
@@ -60,19 +49,13 @@ fn compile_function_body(body: &[Stmt], out: &mut Program) -> Result<(), QplErro
     match last {
         Stmt::SingleVar(expr) => compile_value_expr(expr, out)?,
         Stmt::RetTable(te) => compile_tbl_expr(te, out)?,
-        // the parser rejects a body ending in an assignment before this is
-        // ever reached (`parse_func_lit`), so this is unreachable via normal
-        // parsing — kept as a real error, not a panic, in case a future
-        // caller ever constructs a `Function` AST node directly.
+        // unreachable: the parser rejects a body ending in an assignment
         Stmt::Assign { .. } | Stmt::ScalarAssign { .. } => {
             return Err(QplError::Compile(
                 "a function body must end with an expression".into(),
             ));
         }
-        // `Log`/`Cfg`/`System` are only ever produced by
-        // `parser::parse_top_level_stmt`, never
-        // by the ordinary statement grammar `parse_func_lit` uses for a
-        // function body — unreachable via normal parsing.
+        // unreachable: these only come from top-level parsing
         Stmt::Log(_) | Stmt::Cfg(_) | Stmt::System { .. } => {
             return Err(QplError::Compile(
                 "a `log`/`.qpl.cfg`/`\\`-command statement cannot end a function body".into(),
@@ -85,18 +68,14 @@ fn compile_function_body(body: &[Stmt], out: &mut Program) -> Result<(), QplErro
 
 fn compile_stmt(stmt: &Stmt, out: &mut Program) -> Result<(), QplError> {
     match stmt {
-        // `compile_tbl_expr` always leaves the resulting `Frame` on top of the
-        // stack (or nothing, for the terminal `sink` builtin) — there is no
-        // separate "materialise the result" instruction to append.
+        // leaves the `Frame` on the stack (nothing for a terminal `sink`)
         Stmt::RetTable(tbl_expr) => compile_tbl_expr(tbl_expr, out),
-        // assignment: compile the body; workspace binding is handled by the VM
         Stmt::Assign { name, body, .. } => {
             compile_stmt(body, out)?;
             out.push_operand(Operand::Name(name.as_str().into()));
             out.emit(Op::Store);
             Ok(())
         }
-        // scalar assigns are evaluated by the REPL before reaching the compiler
         Stmt::ScalarAssign { name, expr } => {
             compile_value_expr(expr, out)?;
             out.push_operand(Operand::Name(name.as_str().into()));
@@ -107,25 +86,17 @@ fn compile_stmt(stmt: &Stmt, out: &mut Program) -> Result<(), QplError> {
             compile_value_expr(expr, out)?;
             Ok(())
         }
-        // Only ever produced at the top level (`parser::parse_top_level_stmt`)
-        // and handled there by `compile_program_stmt`, never reached through
-        // this single-statement entry point.
+        // top-level only; handled by `compile_program_stmt`
         Stmt::Log(_) | Stmt::Cfg(_) | Stmt::System { .. } => Err(QplError::Compile(
             "a `log`/`.qpl.cfg`/`\\`-command statement is only valid at the top level".into(),
         )),
     }
 }
 
-/// Compile a table expression. Always leaves exactly one `Frame` on top of
-/// the stack (`sink` excepted — it's terminal and consumes it). Wraps the
-/// recursive [`compile_tbl_expr_inner`] with a single post-pass: if this
-/// (sub)tree references the virtual column `i` anywhere, a `RowIndex`
-/// instruction is inserted right after every `Source`/`LoadFile` it compiled
-/// to — computed once here, at compile time. Safe to splice a
-/// single-byte opcode into `code` at any point: `Op::Push` is the only
-/// opcode that consumes anything from `operands`, and it does so by a
-/// separate counter (`cp`) advanced only when it executes — inserting a
-/// no-operand opcode like `RowIndex` never desynchronises the two streams.
+/// Compile a table expression, leaving one `Frame` on the stack (`sink`
+/// consumes it). If the tree references the virtual column `i`, a `RowIndex`
+/// is inserted after each `Source`/`LoadFile`. Inserting a no-operand opcode
+/// is safe since only `Push` reads the operand stream.
 pub(crate) fn compile_tbl_expr(tbl_expr: &TableExpr, out: &mut Program) -> Result<(), QplError> {
     let start = out.code.len();
     compile_tbl_expr_inner(tbl_expr, out)?;
@@ -216,8 +187,7 @@ fn compile_builtin(builtin: &BuiltIn, out: &mut Program) -> Result<(), QplError>
             Ok(())
         }
         BuiltIn::Lazy(tbl_expr) => {
-            // The frame must already be on the stack for `Lazy` to flip its
-            // flag, so the body is compiled first.
+            // the frame must be on the stack before `Lazy` flags it
             compile_tbl_expr_inner(tbl_expr.as_ref(), out)?;
             out.emit(Op::Lazy);
             Ok(())
@@ -252,9 +222,7 @@ fn compile_select(sel: &SelectStmt, out: &mut Program) -> Result<(), QplError> {
             .iter()
             .map(delete_column_name)
             .collect::<Result<Vec<_>, _>>()?;
-        // `Update` always expects a (possibly empty) keys `List` below its
-        // predicates — `delete` has neither `by` nor a projected predicate,
-        // so both are zero/empty.
+        // `Update` expects a keys `List` (empty here) below its predicates
         out.push_operand(Operand::Count(0));
         out.emit(Op::List);
         emit_update(out, 0, &columns, 0);
@@ -271,8 +239,8 @@ fn compile_select(sel: &SelectStmt, out: &mut Program) -> Result<(), QplError> {
         } else {
             0
         };
-        // Always emit a `List` for the keys — empty when there is no `by` —
-        // so `Update` has a fixed stack shape regardless.
+        // always emit a keys `List`, empty without `by`, so `Update`'s stack
+        // shape is fixed
         let key_count = sel.by.as_ref().map_or(0, Vec::len);
         if let Some(keys) = &sel.by {
             for alias in keys {
@@ -302,7 +270,7 @@ fn compile_select(sel: &SelectStmt, out: &mut Program) -> Result<(), QplError> {
         return Ok(());
     }
 
-    // Join phrase - done first so that the join is applied before any where clause filters
+    // join first, so `where` filters the joined rows
     if let Some((join_src, left_on, right_on, join_type)) = &sel.join {
         compile_tbl_expr_inner(&sel.from, out)?;
         let left_count = if let Value::SymVec(_) = left_on {
@@ -339,11 +307,10 @@ fn compile_select(sel: &SelectStmt, out: &mut Program) -> Result<(), QplError> {
         out.push_operand(Operand::Join(join_type.clone()));
         out.emit(Op::Join);
     } else {
-        // From phrase
         compile_tbl_expr_inner(&sel.from, out)?;
     }
 
-    // Where phrase: each subphrase is a successive filter (spec: evaluated left-to-right)
+    // each predicate is a successive filter, left to right
     if let Some(preds) = &sel.where_ {
         let n = preds.len();
         for expr in preds {
@@ -353,7 +320,6 @@ fn compile_select(sel: &SelectStmt, out: &mut Program) -> Result<(), QplError> {
         out.emit(Op::Filter);
     }
 
-    // By phrase
     let has_by = sel.by.is_some();
     let by_names: Vec<String> = sel.by.as_ref().map_or(vec![], |keys| {
         keys.iter()
@@ -372,9 +338,8 @@ fn compile_select(sel: &SelectStmt, out: &mut Program) -> Result<(), QplError> {
         out.emit(Op::List);
     }
 
-    // Select phrase — `group_by(keys).agg(proj)` already carries the key
-    // columns through, so re-projecting a column under the same name as a
-    // `by` key would hand Polars two columns with one name; skip it.
+    // `group_by(keys).agg(proj)` already carries the keys, so skip a
+    // projection that repeats a key under the same name
     let mut proj_count = 0;
     for alias in &sel.cols {
         let name = alias.name.clone().or_else(|| implicit_alias(&alias.expr));
@@ -400,10 +365,8 @@ fn compile_select(sel: &SelectStmt, out: &mut Program) -> Result<(), QplError> {
     Ok(())
 }
 
-/// Emit `UPDATE`'s three trailing operands (count, predicates, names — pushed
-/// in that order so `Op::Update` pops them count-first, matching the order
-/// they were pushed) after the exprs/list/preds/frame are already on the
-/// stack.
+/// Emit `UPDATE`'s trailing operands (count, predicates, names) once the
+/// exprs/list/preds/frame are on the stack.
 fn emit_update(out: &mut Program, count: usize, names: &[String], predicates: usize) {
     out.push_operand(Operand::Names(names.to_vec().into()));
     out.push_operand(Operand::Count(predicates as u32));
@@ -411,7 +374,7 @@ fn emit_update(out: &mut Program, count: usize, names: &[String], predicates: us
     out.emit(Op::Update);
 }
 
-/// `Alias{name: None}` emits nothing — the expression is left as-is.
+/// `None` emits nothing.
 fn emit_alias(out: &mut Program, name: Option<String>) {
     if let Some(name) = name {
         out.push_operand(Operand::Name(name.as_str().into()));
@@ -428,27 +391,19 @@ fn delete_column_name(alias: &crate::ast::Alias) -> Result<String, QplError> {
     }
 }
 
-/// A one-column `select` with no `by` — a *column expression* that
-/// materialises to a list rather than a frame.
+/// A one-column `select` without `by`: a column expression that becomes a list.
 pub(crate) fn is_column_select(te: &TableExpr) -> bool {
     matches!(te, TableExpr::Select(sel)
         if sel.cols.len() == 1 && sel.by.is_none() && !sel.update && !sel.delete)
 }
 
-/// Lower a value-context expression.
-/// Every node kind compiles straight to
-/// bytecode. `Lit`/`Sym` push a literal,
-/// `ColRef` resolves a bare name (`LOAD`), `BinOp`/`Cast` recurse into their
-/// own operand(s) then emit the matching opcode — so e.g. `n * fac[n-1]`
-/// compiles the multiplication directly and only defers the `fac[..]` call to
-/// run time (`Op::Call`'s dispatch). A bare `Dict`/`IColRef`/`Window` (never
-/// meaningful outside a `zip`/select) or a `Call` of an arity nothing
-/// recognises is a compile-time error (see the `other =>` arm below).
+/// Lower a value-context expression. Calls whose target isn't known until
+/// run time go through `Op::Call`. A bare `Dict`/`IColRef`/`Window`, or a
+/// call of an unsupported arity, is a compile error.
 pub(crate) fn compile_value_expr(node: &Expr, out: &mut Program) -> Result<(), QplError> {
     match node {
         Expr::Lit(v) => out.push_operand(Operand::Value(v.clone())),
-        // unlike `compile_expr` (query context, where a bare symbol is a
-        // string literal), a symbol in value context is its own value kind.
+        // a symbol is its own value here (in a query it's a string literal)
         Expr::Sym(s) => out.push_operand(Operand::Value(Value::Sym(s.clone()))),
         Expr::ColRef(name) => {
             out.push_operand(Operand::Name(name.as_str().into()));
@@ -466,8 +421,7 @@ pub(crate) fn compile_value_expr(node: &Expr, out: &mut Program) -> Result<(), Q
             out.emit(Op::Cast);
         }
 
-        // `enlist <value>` — an unconditional keyword: checked ahead of everything else so nothing can shadow
-        // it.
+        // `enlist x`: by id, so nothing can shadow it
         Expr::Call { func, args } if func == "enlist" && args.len() == 1 => {
             compile_value_expr(&args[0], out)?;
             out.push_operand(Operand::Count(1));
@@ -475,7 +429,7 @@ pub(crate) fn compile_value_expr(node: &Expr, out: &mut Program) -> Result<(), Q
             out.emit(Op::Call);
         }
 
-        // `3?6` / `2?10 20 30` — roll. Also unconditional.
+        // `3?6` / `2?10 20 30`: roll, also by id
         Expr::Call { func, args } if func == "?" && args.len() == 2 => {
             compile_value_expr(&args[0], out)?;
             compile_value_expr(&args[1], out)?;
@@ -484,12 +438,8 @@ pub(crate) fn compile_value_expr(node: &Expr, out: &mut Program) -> Result<(), Q
             out.emit(Op::Call);
         }
 
-        // `log a b c` / `log[..]` — writes the concatenated rendering of its
-        // (possibly zero) arguments through `Vm::emit` and returns the text.
-        // Checked ahead of the generic 1..=2-arg `Call` arm so every arity
-        // takes the same path; `Op::Call`'s runtime dispatch
-        // (`ops::call_by_name`) still tries a bound closure/builtin named
-        // `log` first, so a user function of that name keeps shadowing it.
+        // `log a b c` / `log[..]`: any arity. Dispatched by name at run time,
+        // so a user function called `log` still wins.
         Expr::Call { func, args } if func == "log" => {
             for arg in args {
                 compile_value_expr(arg, out)?;
@@ -499,11 +449,8 @@ pub(crate) fn compile_value_expr(node: &Expr, out: &mut Program) -> Result<(), Q
             out.emit(Op::Call);
         }
 
-        // `zip \`k1\`k2!v1 v2` — a dict of named lists. A top-level cast on a
-        // column value keeps its exact width via `CastList`; a non-dict argument or an empty dict
-        // falls back to (respectively) a generic verb call / a runtime error.
-        // A user function named `zip` is not consulted here when the
-        // argument is syntactically a dict literal.
+        // `` zip `k1`k2!v1 v2 ``. A top-level cast on a column keeps its exact
+        // width via `CastList`. A dict literal always means the builtin `zip`.
         Expr::Call { func, args } if func == "zip" && args.len() == 1 => match &args[0] {
             Expr::Dict(pairs) if !pairs.is_empty() => {
                 for (name, expr) in pairs {
@@ -535,8 +482,7 @@ pub(crate) fn compile_value_expr(node: &Expr, out: &mut Program) -> Result<(), Q
             }
         },
 
-        // A one-column `select` / `` table`col `` collapses to a list; any
-        // other table expression stays a frame.
+        // a one-column select becomes a list; anything else stays a frame
         Expr::Table(te) => {
             compile_tbl_expr(te, out)?;
             if is_column_select(te) {
@@ -544,17 +490,15 @@ pub(crate) fn compile_value_expr(node: &Expr, out: &mut Program) -> Result<(), Q
             }
         }
 
-        // `<n>#<expr>` — head/tail slice of a frame or list.
+        // `<n>#<expr>`
         Expr::Take { n, expr } => {
             compile_value_expr(n, out)?;
             compile_value_expr(expr, out)?;
             out.emit(Op::Take);
         }
 
-        // `f[x]` where `f` is (syntactically) a bare name or a closure
-        // literal applied in place — resolved to a call vs. positional
-        // indexing at run time, since only `Op::LoadFn`/`vm.is_callable` know
-        // which. Anything else is unambiguously positional indexing.
+        // `f[x]` on a bare name or lambda: call or index, decided at run time.
+        // Anything else is positional indexing.
         Expr::Index { expr, idx } => {
             match expr.as_ref() {
                 Expr::ColRef(name) => {
@@ -568,11 +512,8 @@ pub(crate) fn compile_value_expr(node: &Expr, out: &mut Program) -> Result<(), Q
             out.emit(Op::Index);
         }
 
-        // `{[p..] body}` — a function literal: push a placeholder `Func` operand now (the literal's
-        // position in the operand stream is fixed by execution order), queue
-        // the body to be compiled and appended after the enclosing program's
-        // main code once it's fully compiled, and patch this operand with the
-        // real entry point then (see `finish_pending`).
+        // push a placeholder `Func` now and queue the body; `finish_pending`
+        // patches in the entry point
         Expr::Lambda(func) => {
             let display = format!("{{[{}] ..}}", func.params.join(","));
             let operand_index = out.operands.len();
@@ -589,16 +530,8 @@ pub(crate) fn compile_value_expr(node: &Expr, out: &mut Program) -> Result<(), Q
             });
         }
 
-        // `f[a;b]` / `f[]` — apply a function to a (possibly empty)
-        // semicolon-separated argument list.
-        // `func` resolves at run time exactly like `Op::Index`'s callable
-        // target: `LOAD_FN` for a bare name (deferred if callable), otherwise
-        // compiled as an ordinary value expression (a param holding a
-        // function, another call's result, an anonymous literal applied in
-        // place, …). Args are compiled — and thus evaluated — before `func`
-        // is resolved, matching `f[x]`'s existing `Index` lowering
-        // (arguments are evaluated in the caller's frame, before the callee
-        // is resolved).
+        // `f[a;b]` / `f[]`. Args are evaluated first, in the caller's frame,
+        // then `func` is resolved like `Index`'s callable target.
         Expr::Apply { func, args } => {
             for arg in args {
                 compile_value_expr(arg, out)?;
@@ -614,7 +547,7 @@ pub(crate) fn compile_value_expr(node: &Expr, out: &mut Program) -> Result<(), Q
             out.emit(Op::Call);
         }
 
-        // `<conn> dispatch <cmd>` / `<conn> async dispatch <cmd>`.
+        // `<conn> [async] dispatch <cmd>`
         Expr::Dispatch {
             conn,
             command,
@@ -626,7 +559,7 @@ pub(crate) fn compile_value_expr(node: &Expr, out: &mut Program) -> Result<(), Q
             out.emit(Op::Dispatch);
         }
 
-        // `<list-expr> where <predicate>...`.
+        // `<list> where <predicate>...`
         Expr::ListWhere { list, where_ } => {
             compile_value_expr(list, out)?;
             out.emit(Op::ListWhereFrame);
@@ -638,19 +571,12 @@ pub(crate) fn compile_value_expr(node: &Expr, out: &mut Program) -> Result<(), Q
             out.emit(Op::Column);
         }
 
-        // A generic call: `sum trades\`price`, `2 shift px`, `2 round px`,
-        // `til 5`, `log a b`, `hopen 5001`, a user-function call by bare name
-        // (`f x`), … `Op::Call`'s runtime dispatch (`ops::call_by_name`)
-        // decides between a bound closure/builtin, a handful of shadowable
-        // keywords, and a generic column verb.
+        // a generic call (`sum t`c`, `2 shift px`, `til 5`, `f x`, ...),
+        // resolved at run time by `ops::call_by_name`
         Expr::Call { func, args } if (1..=2).contains(&args.len()) => {
-            // the verb's source (`args[0]`) stays an uncollapsed `Frame` when
-            // it's a `` table`col `` / one-column `select` — collapsing it to
-            // a list first (as the ordinary `Expr::Table` arm would) forces
-            // an eager materialise of the *raw* column ahead of the reducer,
-            // which would reject a column with nulls a reducer would simply
-            // skip (`ops::value_verb` does the reduction inside the lazy
-            // plan directly).
+            // keep a `` t`col `` source as a frame so the verb reduces inside
+            // the lazy plan; materialising it first would reject nulls a
+            // reducer skips
             match &args[0] {
                 Expr::Table(te) => compile_tbl_expr(te, out)?,
                 other => compile_value_expr(other, out)?,
@@ -663,19 +589,14 @@ pub(crate) fn compile_value_expr(node: &Expr, out: &mut Program) -> Result<(), Q
             out.emit(Op::Call);
         }
 
-        // `?[c1;v1;…;d]` in value context. See `compile_case_value`'s doc comment for the shape.
+        // `?[c1;v1;...;d]` (see `compile_case_value`)
         Expr::Case { branches, default } => compile_case_value(branches, default, out)?,
 
-        // `while[test; s1; ...; sn]`. See `compile_while`.
         Expr::While { cond, body } => compile_while(cond, body, out)?,
 
-        // `noop`: nothing.
         Expr::Noop => out.emit(Op::Noop),
 
-        // A bare `Dict`/`IColRef`/`Window` (never meaningful outside a
-        // `zip`/select) or a `Call` of an arity nothing above recognises —
-        // was never supported outside a select/`zip`, raised here at
-        // compile time.
+        // a bare `Dict`/`IColRef`/`Window`, or an unsupported call arity
         other => {
             return Err(QplError::Runtime(format!(
                 "not supported in scalar context: {other:?}"
@@ -685,17 +606,11 @@ pub(crate) fn compile_value_expr(node: &Expr, out: &mut Program) -> Result<(), Q
     Ok(())
 }
 
-/// Lower value-context `?[c1;v1;c2;v2;…;d]`.
-/// Each branch condition is checked in
-/// turn: a boolean *atom* short-circuits (only the taken branch's bytecode
-/// ever runs, which is what makes `?[n<2;1;n*fac[n-1]]`-style conditional
-/// recursion terminate); the first boolean *vector* condition diverts to a
-/// per-`k` tail that evaluates every remaining condition/branch/default
-/// eagerly and folds them with `CASE_VEC` (`ops::case_vec`'s
-/// semantics, unchanged). Each branch compiles two mutually-exclusive
-/// runtime paths (the atom path and the vector-diversion tail) — only one
-/// ever executes per branch per run, so recompiling `val` into both is not a
-/// double evaluation, just a shared code shape.
+/// Lower value-context `?[c1;v1;c2;v2;...;d]`. An atom condition
+/// short-circuits (only the taken branch runs, so recursion terminates). The
+/// first vector condition diverts to a tail that evaluates everything
+/// remaining and folds it with `CASE_VEC`. Each branch value is compiled into
+/// both paths, but only one runs.
 ///
 /// ```text
 /// c1; PUSH Lvec1; JUMP_IF_VEC; PUSH Lnext1; PUSH msg; JUMP_IF_FALSE
@@ -727,14 +642,14 @@ fn compile_case_value(
         out.push_operand(Operand::Text(COND_MSG.into()));
         out.emit(Op::JumpIfFalse);
 
-        // atom-true path: this branch's value is the whole expression's result
+        // atom true: this branch's value is the result
         compile_value_expr(val, out)?;
         let end_idx = out.operands.len();
         out.push_operand(Operand::Target { ip: 0, cp: 0 }); // Lend, patched once known
         out.emit(Op::Jump);
         end_patches.push(end_idx);
 
-        // Lvec_k: the mask is still on the stack (JUMP_IF_VEC only peeked it)
+        // Lvec_k: the mask is still on the stack (JUMP_IF_VEC only peeks)
         patch_target(out, vec_idx);
         compile_value_expr(val, out)?; // v_k
         let mut count: u32 = 1;
@@ -752,10 +667,10 @@ fn compile_case_value(
         out.emit(Op::Jump);
         end_patches.push(end_idx);
 
-        // Lnext_k: the next branch's own condition starts right here
+        // Lnext_k
         patch_target(out, next_idx);
     }
-    // every branch's condition was a false atom
+    // every condition was a false atom
     compile_value_expr(default, out)?;
 
     let end_ip = out.code.len() as u32;
@@ -769,10 +684,8 @@ fn compile_case_value(
     Ok(())
 }
 
-/// Back-patch a placeholder `Operand::Target` at `idx` (pushed with a dummy
-/// `(0, 0)` when the jump was first emitted, before its destination's
-/// position was known) to the *current* end of `out` — i.e. call this
-/// exactly when `out`'s next byte/operand is the label's own destination.
+/// Back-patch the placeholder `Operand::Target` at `idx` to the current end
+/// of `out`. Call it exactly at the label's destination.
 fn patch_target(out: &mut Program, idx: usize) {
     out.operands[idx] = Operand::Target {
         ip: out.code.len() as u32,
@@ -780,13 +693,9 @@ fn patch_target(out: &mut Program, idx: usize) {
     };
 }
 
-/// Lower `while[test; s1; ...; sn]`:
-/// re-tests `cond` before each iteration; the body's statements run in the
-/// *current* scope (no call frame — an assignment binds wherever the loop
-/// itself sits: globals at the top level, locals inside a function body).
-/// The loop's own value is always `Noop`. The backward jump to `top` is
-/// already known when emitted (no back-patch needed); only the exit jump
-/// (`end_idx`, taken when `cond` is `false`) is a forward reference.
+/// Lower `while[test; s1; ...]`: re-test before each iteration, run the body
+/// in the current scope, and yield `Noop`. Only the exit jump needs
+/// back-patching.
 fn compile_while(cond: &Expr, body: &[Stmt], out: &mut Program) -> Result<(), QplError> {
     const WHILE_MSG: &str = "a `while` condition must be a boolean scalar in value context";
     let top_ip = out.code.len() as u32;
@@ -812,13 +721,9 @@ fn compile_while(cond: &Expr, body: &[Stmt], out: &mut Program) -> Result<(), Qp
     Ok(())
 }
 
-/// Compile one statement purely for its side effect, leaving the stack no
-/// taller than before it ran: an assignment nets to zero via `STORE`
-/// already; an expression statement's value is discarded with `POP`. Shared
-/// by a function body's non-final statements (`compile_function_body`) and a
-/// `while` body's statements (`compile_while`) — both run a list of
-/// statements purely for effect, only the *last* one's handling differs
-/// (a function body's last statement supplies the return value instead).
+/// Compile a statement for effect only, leaving the stack as it was (`STORE`
+/// nets to zero; an expression is `POP`ped). Used by function and `while`
+/// bodies.
 fn compile_stmt_for_effect(st: &Stmt, out: &mut Program) -> Result<(), QplError> {
     match st {
         Stmt::Assign { .. } | Stmt::ScalarAssign { .. } => compile_stmt(st, out),
@@ -854,9 +759,8 @@ fn compile_expr(node: &Expr, out: &mut Program) -> Result<(), QplError> {
             out.push_operand(Operand::BinOp(BinOpKind::from_op_str(op)));
             out.emit(Op::BinOp);
         }
-        // `<precision> round <col>` — parser hands us args = [value, precision].
-        // Precision must be a literal (it becomes part of the instruction); the
-        // rounding mode is resolved from VM config at run time.
+        // `<precision> round <col>`: args = [value, precision]. Precision must
+        // be a literal; the rounding mode is read from config at run time.
         Expr::Call { func, args } if func == "round" => {
             let [value, precision] = args.as_slice() else {
                 return Err(QplError::Compile(
@@ -908,9 +812,8 @@ fn compile_expr(node: &Expr, out: &mut Program) -> Result<(), QplError> {
                     "`over` needs at least one partition symbol".into(),
                 ));
             }
-            // `<agg> <col> <n>!rolling over ...` — push the *raw* column and carry
-            // the aggregate name in the operand; the VM applies the rolling
-            // reduction instead of the plain aggregate.
+            // `... rolling n`: push the raw column and carry the aggregate in
+            // the operand, so the VM applies a rolling reduction
             if let Some(window) = rolling {
                 let (agg, column) = match func.as_ref() {
                     Expr::Call { func: agg, args } if args.len() == 1 => (agg.clone(), &args[0]),
@@ -932,9 +835,8 @@ fn compile_expr(node: &Expr, out: &mut Program) -> Result<(), QplError> {
                 out.emit(Op::Window);
                 return Ok(());
             }
-            // bare ranking verbs (`rn` / `rank` / `drank`) synthesise their own
-            // expression from the window order; everything else is a column
-            // expression applied per partition.
+            // ranking verbs build their own expression from the window order;
+            // anything else is applied per partition
             let ranking = match func.as_ref() {
                 Expr::ColRef(name) => match name.as_str() {
                     "rn" => Some(WindowFn::RowNumber),
@@ -970,8 +872,7 @@ fn compile_expr(node: &Expr, out: &mut Program) -> Result<(), QplError> {
                 "Dict expressions are not supported in select statements (yet)".into(),
             ));
         }
-        // column expressions / slices / indexing are value-context only —
-        // compiled by `compile_value_expr`, never lowered into a projection.
+        // value context only (see `compile_value_expr`)
         Expr::Table(_) => return Err(QplError::Compile(
             "a `table`col` / `select` column expression cannot appear inside a select projection"
                 .into(),
@@ -1015,7 +916,7 @@ fn compile_expr(node: &Expr, out: &mut Program) -> Result<(), QplError> {
     Ok(())
 }
 
-// Per spec: implicit alias is the leftmost column name in the expression, else "x".
+// implicit alias: the leftmost column name in the expression, else "x"
 fn implicit_alias(node: &Expr) -> Option<String> {
     match leftmost_leaf(node) {
         Expr::ColRef(name) if name != "i" => Some(name.clone()),
@@ -1039,32 +940,23 @@ fn leftmost_leaf(node: &Expr) -> &Expr {
 
 // ── Whole-program compilation ───────────────
 //
-// A script (or one REPL
-// submission) is parsed in full by `parser::parse_program` before any of it
-// compiles or runs; `compile_program` below turns that list of top-level
-// statements into a single `Program`, resolving `\l`/`\i` targets (read,
-// parsed and compiled right here, recursively) and namespace qualification
-// (`qualify_program`) at compile time.
+// `compile_program` turns a parsed script (or REPL submission) into one
+// `Program`, compiling `\l`/`\i` targets recursively and qualifying
+// namespaces along the way.
 
-/// Whether a whole-program compile prints each top-level statement's result
-/// (`Script`, used for a real script and for one REPL/`\port` submission) or
-/// leaves only the *last* statement's value on the stack for the caller to
-/// interpret as an [`crate::vm::EvalResult`] (`Result`, used by the IPC
-/// server's `eval_for_dispatch` and by tests that want a single expression's
-/// value back without printing).
+/// `Script` prints each top-level statement's result (scripts, REPL lines).
+/// `Result` leaves only the last value on the stack for an
+/// [`crate::vm::EvalResult`] (IPC requests, tests).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CompileMode {
     Script,
     Result,
 }
 
-/// Compile-time context threaded through [`compile_program`] and its
-/// recursive `\l`/`\i` embedding. `script_path` is what `\l`/`\i`'s relative
-/// paths resolve against and what `Program::lines` records for error
-/// messages; `ns` is `Some(".lib")` while compiling a script reached via
-/// `\i "lib.qpl"` (namespace qualification); `including` is the chain
-/// of canonicalized paths currently being compiled, for `\l`/`\i` cycle
-/// detection.
+/// Context for [`compile_program`] and its recursive `\l`/`\i` embedding:
+/// the path that relative includes and line numbers use, the active
+/// namespace (`Some(".lib")` inside `\i "lib.qpl"`), and the chain of
+/// canonical paths being compiled, for cycle detection.
 #[derive(Clone)]
 pub struct CompileCtx {
     pub mode: CompileMode,
@@ -1074,8 +966,7 @@ pub struct CompileCtx {
 }
 
 impl CompileCtx {
-    /// A top-level script or REPL/`\port` submission: prints each statement's
-    /// result, no active namespace.
+    /// A script or REPL submission: prints each result, no namespace.
     pub fn script(path: &str) -> Self {
         Self {
             mode: CompileMode::Script,
@@ -1085,9 +976,7 @@ impl CompileCtx {
         }
     }
 
-    /// A single-expression evaluation (the IPC server, tests): only the last
-    /// statement's value survives, for the caller to turn into an
-    /// [`crate::vm::EvalResult`].
+    /// Keeps only the last statement's value (IPC server, tests).
     pub fn result(path: &str) -> Self {
         Self {
             mode: CompileMode::Result,
@@ -1098,23 +987,16 @@ impl CompileCtx {
     }
 }
 
-/// Best-effort canonical form of `path`, for `\l`/`\i` cycle detection —
-/// falls back to `path` itself (e.g. for `"<main>"`, or a file that doesn't
-/// exist yet) since cycle detection only needs *some* stable key, not a real
-/// filesystem round-trip.
+/// A stable key for cycle detection: the canonical path, or `path` itself if
+/// it can't be canonicalised (e.g. `"<main>"`).
 fn canonical_path(path: &str) -> String {
     std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string())
 }
 
-/// Wrap `e` with a `path:line:` prefix: a script/import path
-/// gets `"{path}:{line+1}: {e}"` re-wrapped as a fresh [`QplError::Runtime`]
-/// (so `{e}`'s own `Display` — itself already prefixed with `'` for a
-/// `Runtime`/`Interrupted` error, or `"ParseError: "`/`"CompileError: "` for
-/// the others — appears verbatim after the prefix, matching every existing
-/// golden/error-path test byte-for-byte); `"<main>"` (typed at the REPL) and
-/// an `Interrupted` error are never wrapped.
+/// Prefix `e` with `path:line:` as a `Runtime` error. Errors from `"<main>"`
+/// (the REPL) and `Interrupted` are left alone.
 pub fn wrap_line_error(e: QplError, path: &str, line: u32) -> QplError {
     if path == "<main>" || matches!(e, QplError::Interrupted) {
         return e;
@@ -1122,10 +1004,8 @@ pub fn wrap_line_error(e: QplError, path: &str, line: u32) -> QplError {
     QplError::Runtime(format!("{path}:{}: {e}", line + 1))
 }
 
-/// A `\l`/`\i` path written inside a script is relative to that script's own
-/// directory, so a library can pull in its neighbours wherever qpl was
-/// started from. Typed at the prompt (`from` is `"<main>"`), or absolute,
-/// it's used as written — relative to the working directory.
+/// A `\l`/`\i` path inside a script is relative to that script's directory.
+/// At the prompt (`"<main>"`), or if absolute, it's used as written.
 pub(crate) fn script_relative(target: &str, from: &str) -> String {
     let target_path = std::path::Path::new(target);
     if from == "<main>" || target_path.is_absolute() {
@@ -1137,9 +1017,8 @@ pub(crate) fn script_relative(target: &str, from: &str) -> String {
     }
 }
 
-/// Derive a namespace (`.utils`, `.my_lib`) from a `\i`-imported script's
-/// file stem: non-identifier characters become `_`, and a leading digit gets
-/// an `_` prefix so the result always lexes as a valid namespaced name.
+/// A namespace from a file stem (`.utils`, `.my_lib`): non-identifier chars
+/// become `_`, and a leading digit gets an `_` prefix.
 pub(crate) fn namespace_from_path(path: &str) -> String {
     let stem = std::path::Path::new(path)
         .file_stem()
@@ -1162,12 +1041,10 @@ pub(crate) fn namespace_from_path(path: &str) -> String {
     format!(".{cleaned}")
 }
 
-/// Compile a whole program: `stmts` (as returned by
-/// [`crate::parser::parse_program`]) into one [`Program`], per `ctx.mode`
-/// Namespace-qualifies the whole statement list first, then compiles each statement in turn, recording a
-/// [`LineEntry`] at its starting `ip` so a runtime failure anywhere in it
-/// (including inside a function defined by it, appended later in the same
-/// `Program`) can be reported at the right source line.
+/// Compile parsed top-level statements into one [`Program`]: qualify
+/// namespaces, then compile each statement, recording a [`LineEntry`] so
+/// runtime errors (including inside functions it defines) report the right
+/// line.
 pub fn compile_program(stmts: Vec<(u32, Stmt)>, ctx: CompileCtx) -> Result<Program, QplError> {
     let mut stmts = stmts;
     if let Some(ns) = ctx.ns.clone() {
@@ -1196,22 +1073,15 @@ pub fn compile_program(stmts: Vec<(u32, Stmt)>, ctx: CompileCtx) -> Result<Progr
     Ok(out)
 }
 
-/// Is `expr` exactly a `log[..]` call — checked purely syntactically (not
-/// whether `log` is actually bound/shadowed).
-/// A top-level bracketed `log[..]` statement: its return value is never printed, since the write to stdout
-/// already happened as a side effect.
+/// Whether `expr` is syntactically a `log[..]` call. Its result isn't printed
+/// at the top level, since the write already happened.
 fn is_bracket_log_call(expr: &Expr) -> bool {
     matches!(expr, Expr::Call { func, .. } if func == "log")
 }
 
-/// Compile one top-level statement, finishing it with `STORE` (already
-/// internal to `compile_stmt` for `Assign`/`ScalarAssign`), `EMIT`, or `POP`
-/// — except when `leave_value` (the final statement of a
-/// `CompileMode::Result` program), which leaves an expression statement's
-/// value on the stack instead of `EMIT`-ing it (an assignment still just
-/// `STORE`s: its net stack effect is already zero, which is exactly what
-/// `Vm::run_compiled` reduces to `EvalResult::Stored`, so no special case is
-/// needed there for either mode).
+/// Compile one top-level statement, ending in `STORE`, `EMIT` or `POP`. With
+/// `leave_value` (the last statement in `Result` mode) an expression's value
+/// stays on the stack instead.
 fn compile_program_stmt(
     stmt: &Stmt,
     out: &mut Program,
@@ -1219,11 +1089,7 @@ fn compile_program_stmt(
     leave_value: bool,
 ) -> Result<(), QplError> {
     match stmt {
-        // `sink` is the one `TableExpr` shape that's terminal: it consumes
-        // the frame (writes it to a file) and leaves *nothing* on the stack
-        // (`Op::Sink`, unlike every other frame op, pushes no result) — so
-        // unlike an ordinary table-producing statement there is no value
-        // here for `EMIT` to print (or for `leave_value` to preserve).
+        // `sink` consumes the frame and leaves nothing to print
         Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Sink { .. })) => {
             compile_stmt(stmt, out)?;
         }
@@ -1266,7 +1132,8 @@ fn compile_program_stmt(
         Stmt::System { cmd, arg } => {
             if ctx.mode == CompileMode::Result {
                 return Err(QplError::Compile(format!(
-                    "'\\{cmd}' is not available here"
+                    "'\\{}' is not available here",
+                    crate::ast::system_cmd_name(*cmd)
                 )));
             }
             compile_system(*cmd, arg, out, ctx)?;
@@ -1276,8 +1143,7 @@ fn compile_program_stmt(
     Ok(())
 }
 
-/// Compile a `\`-system command (`Stmt::System`) into a native call that
-/// leaves a `Noop` on the stack (popped by the caller, `compile_program_stmt`).
+/// Compile a `\` command into a native call that leaves a `Noop`.
 fn compile_system(
     cmd: char,
     arg: &str,
@@ -1302,11 +1168,8 @@ fn compile_system(
             out.emit(Op::Call);
         }
         'l' => {
-            // `\l` loads flat into whatever scope is *currently* compiling —
-            // the top level (no namespace) ordinarily, but the enclosing
-            // namespace when this `\l` itself sits inside an `\i`-imported
-            // script (the namespace applies to the whole imported script,
-            // nested `\l`s included).
+            // `\l` loads flat into the scope being compiled, so inside an
+            // `\i` import it lands in that namespace
             let resolved = script_relative(arg, &ctx.script_path);
             let sub = compile_included_script(&resolved, ctx.ns.clone(), ctx)?;
             out.push_operand(Operand::Program(Arc::new(sub)));
@@ -1324,6 +1187,28 @@ fn compile_system(
             out.push_operand(Operand::Native(NativeId::ImportScript));
             out.emit(Op::Call);
         }
+        'p' => {
+            // `\port [<expr>]`: bare `\port` closes (an empty `Str`, like
+            // `.qpl.cfg`); otherwise the argument is an ordinary expression
+            // (`\port p`, `\port base+1`). See `Vm::native_port`.
+            if arg.is_empty() {
+                out.push_operand(Operand::Value(Value::Str(String::new())));
+            } else {
+                let toks = crate::lexer::tokenise(arg)?;
+                let expr = match crate::parser::parse(toks)? {
+                    Stmt::SingleVar(expr) => expr,
+                    _ => {
+                        return Err(QplError::Compile(format!(
+                            "\\port expects an expression, got '{arg}'"
+                        )));
+                    }
+                };
+                compile_value_expr(&expr, out)?;
+            }
+            out.push_operand(Operand::Count(1));
+            out.push_operand(Operand::Native(NativeId::Port));
+            out.emit(Op::Call);
+        }
         other => {
             return Err(QplError::Compile(format!(
                 "unknown system command '\\{other}'"
@@ -1333,10 +1218,8 @@ fn compile_system(
     Ok(())
 }
 
-/// Read, parse and compile a `\l`/`\i` target at compile time, detecting
-/// an inclusion cycle before ever reading the file a second time: `path` is
-/// canonicalized and checked against `ctx.including` (the chain of scripts
-/// currently being compiled, root first).
+/// Read, parse and compile a `\l`/`\i` target, erroring if its canonical path
+/// is already in `ctx.including`.
 fn compile_included_script(
     path: &str,
     ns: Option<String>,
@@ -1367,12 +1250,9 @@ fn compile_included_script(
 
 // ── Compile-time namespace qualification ─────────────────────────────
 
-/// The names a `\i`-imported file binds at its own top level (functions
-/// included — a function is an ordinary global holding a `Value::Closure`).
-/// Every bare reference to one of these, anywhere in the file (including
-/// inside function bodies, unless shadowed by a param/local there), gets
-/// qualified to `.ns.name`; an already-namespaced name (`.other.x`) is
-/// skipped.
+/// The names a `\i`-imported file binds at top level (functions included).
+/// Bare references to these are qualified to `.ns.name` throughout the file
+/// unless shadowed; already-namespaced names are skipped.
 fn collect_top_level_names(stmts: &[(u32, Stmt)], out: &mut HashSet<String>) {
     for (_, s) in stmts {
         if let Stmt::Assign { name, .. } | Stmt::ScalarAssign { name, .. } = s
@@ -1383,14 +1263,10 @@ fn collect_top_level_names(stmts: &[(u32, Stmt)], out: &mut HashSet<String>) {
     }
 }
 
-/// The full set of names that end up namespaced under the current `ns`: this
-/// file's own top-level assignments, plus — recursively — any `\l` target's
-/// own top-level assignments (a bare `\l` inherits whatever namespace is
-/// already active, see `compile_system`'s `'l'` arm, so its bindings are part
-/// of the *same* namespace and must be qualifiable from anywhere in the
-/// including file, even from a reference written before the `\l` line).
-/// `\i` targets are never walked here — each gets its own fresh namespace,
-/// entirely separate from `ns`.
+/// Every name namespaced under the current `ns`: this file's top-level
+/// assignments plus, recursively, those of any `\l` target (which shares the
+/// namespace, so references before the `\l` line qualify too). `\i` targets
+/// get their own namespace and aren't walked.
 fn collect_ns_names(stmts: &[(u32, Stmt)], script_path: &str) -> Result<HashSet<String>, QplError> {
     let mut out = HashSet::new();
     collect_ns_names_into(stmts, script_path, &mut out)?;
@@ -1415,10 +1291,8 @@ fn collect_ns_names_into(
     Ok(())
 }
 
-/// Qualify one top-level statement: its own assignment target (if it has
-/// one) gets renamed to `.ns.name`, and every bare reference anywhere inside
-/// it (there is no enclosing function at the top level, so `locals` is
-/// empty) gets qualified per [`qualify_name`].
+/// Qualify one top-level statement: its assignment target and every bare
+/// reference inside it.
 fn qualify_top_level(stmt: &mut Stmt, ns: &str, names: &HashSet<String>) {
     let empty = HashSet::new();
     qualify_stmt_refs(stmt, ns, names, &empty);
@@ -1429,9 +1303,8 @@ fn qualify_top_level(stmt: &mut Stmt, ns: &str, names: &HashSet<String>) {
     }
 }
 
-/// Qualify `name` in place iff it names a top-level binding of the imported
-/// file (`names`) and isn't shadowed by a param/local of the enclosing
-/// function (`locals`) An already-namespaced name is left alone.
+/// Qualify `name` in place if it's one of the file's top-level `names` and not
+/// shadowed by `locals`. Namespaced names are left alone.
 fn qualify_name(name: &mut String, ns: &str, names: &HashSet<String>, locals: &HashSet<String>) {
     if !name.starts_with('.') && !locals.contains(name.as_str()) && names.contains(name.as_str()) {
         *name = format!("{ns}.{name}");
@@ -1499,9 +1372,7 @@ fn qualify_select(
         }
     }
     if let Some((te, _left_keys, _right_keys, _kind)) = &mut sel.join {
-        // the join keys are column-name symbols (like `Sort`'s column list),
-        // never variable references, so only the joined table expression
-        // itself needs qualifying.
+        // join keys are column names, not variables
         qualify_table_expr(te, ns, names, locals);
     }
 }
@@ -1591,13 +1462,9 @@ fn qualify_expr(e: &mut Expr, ns: &str, names: &HashSet<String>, locals: &HashSe
     }
 }
 
-/// Qualify a function literal's body against its *own* fresh scope: params
-/// plus every name the body itself assigns (at any depth, excluding a nested
-/// lambda's own body — a lambda never captures an enclosing scope, see
-/// `ast::Function`'s doc comment) are locals, so a reference to one of them
-/// is never rewritten even if it happens to share a name with the imported
-/// file's own top-level binding (the explicit "a param shadowing a
-/// namespaced name" case from the plan's test list).
+/// Qualify a function body in its own scope: params and every name the body
+/// assigns (outside nested lambdas) are locals and never rewritten, even if
+/// they match a top-level name.
 fn qualify_function(f: &mut Function, ns: &str, names: &HashSet<String>) {
     let mut locals: HashSet<String> = f.params.iter().cloned().collect();
     collect_locals(&f.body, &mut locals);
@@ -1633,10 +1500,8 @@ fn collect_locals_stmt(st: &Stmt, out: &mut HashSet<String>) {
     }
 }
 
-/// Only `While`'s body (which shares its enclosing function's scope) and
-/// nested sub-expressions can introduce further assignments; a `Lambda` gets
-/// its own fresh scope (see [`qualify_function`]) so it's never descended
-/// into here.
+/// Assignments inside `While` bodies share the function's scope; a nested
+/// `Lambda` has its own scope and isn't descended into.
 fn collect_locals_expr(e: &Expr, out: &mut HashSet<String>) {
     match e {
         Expr::While { cond, body } => {
@@ -1780,9 +1645,7 @@ mod tests {
 
     #[test]
     fn select_icol_inserts_row_index_after_source() {
-        // i is virtual, never a real column name → implicit alias is "x".
-        // The query references `i`, so the compiler inserts a `RowIndex`
-        // right after the `Source`.
+        // `i` gets the implicit alias "x", and a `RowIndex` follows the `Source`
         assert_eq!(
             dis("select i from t"),
             vec![
@@ -1890,27 +1753,20 @@ mod tests {
 
     #[test]
     fn func_def_compiles_directly_as_a_literal_value() {
-        // a closure literal parses to `Expr::Lambda` (see ast.rs), compiled
-        // to `PUSH Func(proto)`, with the body appended after the main 3-instruction
-        // sequence (`PUSH Func; PUSH Name(f); STORE`).
+        // the body is appended after the main code (`PUSH Func; PUSH Name(f); STORE`)
         let lines = dis("f: {[x,y] x+y}");
         assert!(lines[0].contains("PUSH       Func({[x,y] ..})"));
         assert_eq!(lines[1], "0001  PUSH       Name(f)");
         assert_eq!(lines[2], "0002  STORE");
-        // the body (x+y; RET) is appended after the 3 main instructions.
         assert!(has_op(&lines, "RET"));
         assert!(lines.len() > 3);
-        // a statement that defines a closure ends its own main code with a
-        // `HALT` before the appended body, so execution never falls off the
-        // end of `STORE` straight into it (see `Op::Halt`'s doc comment).
+        // `HALT` ends the main code so it never falls into the body
         assert_eq!(lines[3], "0003  HALT");
     }
 
     #[test]
     fn apply_with_two_args_compiles_to_load_fn_and_call() {
-        // `f[a;b]`: args are compiled first,
-        // then the callee (`LOAD_FN` for a bare name, deferring to `CALL`'s
-        // own runtime dispatch), then `CALL`.
+        // args first, then the callee (`LOAD_FN`), then `CALL`
         let lines = dis("f[1;2]");
         assert_eq!(
             lines,
@@ -1961,17 +1817,13 @@ mod tests {
 
     #[test]
     fn from_compiles_a_nested_select() {
-        // the outer select's own `select`/`from` compiles around whatever
-        // instructions the inner select compiles to.
         let lines = dis("select from select price from trades");
         assert_eq!(lines.iter().filter(|l| l.ends_with("  SELECT")).count(), 2);
     }
 
     #[test]
     fn join_right_side_compiles_a_parenthesised_table_expr() {
-        // a parenthesised join RHS recurses through compile_tbl_expr, so
-        // `(distinct quotes)` compiles its own DISTINCT before the join is
-        // built, same as any other nested table expression.
+        // a parenthesised join RHS compiles like any nested table expression
         let lines = dis("select price from trades `sym lj (distinct quotes) `sym");
         assert!(has_op(&lines, "DISTINCT"));
         assert!(has_op(&lines, "JOIN"));
@@ -2032,8 +1884,7 @@ mod tests {
 
     #[test]
     fn window_ranking_verb_emits_only_the_window_instruction() {
-        // a bare ranking verb (`rn`) synthesises its own expression from the
-        // window order, so nothing but the operand precedes WINDOW itself.
+        // a ranking verb needs nothing but the operand before WINDOW
         let lines = dis("select r: rn over `s order `px desc from t");
         assert_eq!(lines[0], "0000  PUSH       Name(t)");
         assert_eq!(lines[1], "0001  SOURCE");
@@ -2071,12 +1922,9 @@ mod tests {
 
     #[test]
     fn by_key_reprojected_by_name_is_deduped() {
-        // `group_by(keys).agg(proj)` already carries the key columns through;
-        // re-projecting `sym` under its own name would hand Polars two columns
-        // named `sym`, so the compiler drops it from the projection phase.
+        // a projection repeating a `by` key is dropped (group_by carries it)
         let lines = dis("select sym, price, ret: 1 diff price by sym from trades");
-        // projection list should build only 2 columns (price, ret), not 3;
-        // the operand right before the trailing SELECT_BY's LIST is that count.
+        // the count before SELECT_BY's LIST is 2 (price, ret), not 3
         let list_idx = lines
             .iter()
             .rposition(|l| l.ends_with("  LIST"))
@@ -2084,11 +1932,10 @@ mod tests {
         assert!(lines[list_idx - 1].contains("Count(2)"));
     }
 
-    // --- full example from spec ---
+    // --- full example ---
 
     #[test]
     fn full_query() {
-        // select dbl: c3*2 by c1 from t where c2>15
         let lines = dis("select dbl: c3*2 by c1 from t where c2>15");
         assert!(last_is(&lines, "SELECT_BY"));
         assert!(has_op(&lines, "FILTER"));
@@ -2152,9 +1999,8 @@ mod tests {
 
     #[test]
     fn binop_falls_back_only_for_its_call_operand() {
-        // `n * fac[n-1]` compiles the multiplication directly; `fac[n-1]`
-        // parses as `Index` (a single bracketed argument, no `;`), which
-        // compiles to `LOAD_FN`/`INDEX`, since `fac` might be callable.
+        // `fac[n-1]` is an `Index`, compiled to `LOAD_FN`/`INDEX` since `fac`
+        // might be callable
         let lines = dis("x: n * fac[n-1]");
         assert_eq!(lines[0], "0000  PUSH       Name(n)");
         assert_eq!(lines[1], "0001  LOAD");
@@ -2180,8 +2026,7 @@ mod tests {
 
     #[test]
     fn enlist_compiles_to_a_native_call() {
-        // a literal `enlist 5` is constant-folded by the parser, so use a
-        // non-literal operand to see the actual lowering.
+        // the parser constant-folds `enlist 5`, so use a variable
         let lines = dis("x: enlist n");
         assert_eq!(
             lines,
@@ -2216,9 +2061,7 @@ mod tests {
 
     #[test]
     fn generic_call_compiles_a_name_operand_not_ast() {
-        // `til 5` — `til` has no dedicated opcode: `Op::Call` resolves it by
-        // name at run time (`ops::call_by_name`), so a user function named
-        // `til` can shadow it (see the precedence test in `vm.rs`).
+        // `til` is resolved by name at run time, so a user function can shadow it
         let lines = dis("x: til 5");
         assert_eq!(
             lines,
@@ -2251,8 +2094,7 @@ mod tests {
 
     #[test]
     fn index_of_a_non_callable_expression_skips_load_fn() {
-        // `(1 2 3)[1]` — the target isn't a bare name, so there's nothing to
-        // defer: it compiles straight through, no `LOAD_FN`.
+        // not a bare name, so no `LOAD_FN`
         let lines = dis("x: (1 2 3)[1]");
         assert!(!has_op(&lines, "LOAD_FN"));
         assert!(last_is(&lines, "STORE"));
@@ -2269,8 +2111,7 @@ mod tests {
 
     #[test]
     fn multi_column_table_expression_stays_a_frame() {
-        // `` t`c1`c2 `` selects two columns — not a column expression, so no
-        // trailing `COLUMN`.
+        // two columns: not a column expression, so no `COLUMN`
         let lines = dis("x: t`c1`c2");
         assert!(!has_op(&lines, "COLUMN"));
     }
@@ -2306,8 +2147,6 @@ mod tests {
 
     #[test]
     fn case_value_context_compiles_to_jumps_not_eval() {
-        // value-context `?[..]` is jump-based bytecode sharing the VM's
-        // ordinary stack.
         let lines = dis("x: ?[1b; 2; 3]");
         assert!(!has_op(&lines, "EVAL"));
         assert!(has_op(&lines, "JUMP_IF_VEC"));
@@ -2344,8 +2183,7 @@ mod tests {
 
     #[test]
     fn while_compiles_to_jumps_not_eval() {
-        // `while` is jump-based too: the loop is a backward `JUMP`, the test a
-        // `JUMP_IF_FALSE`, and its own value a `NOOP`.
+        // backward `JUMP`, `JUMP_IF_FALSE` test, `NOOP` result
         let lines = dis("while[c>0; c: c-1]");
         assert!(!has_op(&lines, "EVAL"));
         assert!(has_op(&lines, "JUMP_IF_FALSE"));

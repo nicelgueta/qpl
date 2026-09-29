@@ -13,16 +13,10 @@ use polars::prelude::*;
 use rustyline::{DefaultEditor, error::ReadlineError};
 use std::sync::Arc;
 
-/// Run a `.qpl` script file, printing results. Returns Err on the first failure.
-/// The *whole* file is parsed and compiled
-/// into one [`crate::program::Program`] before anything runs — a parse or
-/// compile error anywhere in it (including inside a `\l`/`\i` target, which
-/// is itself read/parsed/compiled right here) aborts before even the first
-/// statement executes.
-///
-/// `path` may equally be a `.qplc` file:
-/// detected by its magic bytes, not its extension, so it runs with no
-/// lexing, parsing or compiling at all — see [`crate::program::Program::from_bytes`].
+/// Run a script, printing results. The whole file (and any `\l`/`\i` target)
+/// is parsed and compiled before anything runs, so a parse or compile error
+/// anywhere aborts up front. A `.qplc` file (sniffed by magic bytes) skips
+/// straight to running.
 pub fn run_script(path: &str, vm: &mut Vm) -> Result<(), QplError> {
     let bytes =
         std::fs::read(path).map_err(|e| QplError::Runtime(format!("cannot read '{path}': {e}")))?;
@@ -35,8 +29,18 @@ pub fn run_script(path: &str, vm: &mut Vm) -> Result<(), QplError> {
     run_source(vm, &src, path)
 }
 
-/// Disassemble `path` — a `.qplc` file (detected by magic bytes) or a `.qpl`
-/// source file, compiled but not run. Backs `qpl -d`.
+/// Whether a `\port` listener is open, so `main.rs` keeps serving after a
+/// script ends even without `-i`. Always `false` without `ipc`.
+#[cfg(feature = "ipc")]
+pub fn port_open(vm: &Vm) -> bool {
+    vm.port.is_some()
+}
+#[cfg(not(feature = "ipc"))]
+pub fn port_open(_vm: &Vm) -> bool {
+    false
+}
+
+/// Disassemble a `.qplc` or `.qpl` file without running it (`qpl -d`).
 pub fn disassemble_file(path: &str) -> Result<Vec<String>, QplError> {
     let bytes =
         std::fs::read(path).map_err(|e| QplError::Runtime(format!("cannot read '{path}': {e}")))?;
@@ -48,43 +52,31 @@ pub fn disassemble_file(path: &str) -> Result<Vec<String>, QplError> {
     Ok(crate::program::disassemble(&program))
 }
 
-/// Compile `path` (source only — a `.qplc` file has nothing left to compile)
-/// into one whole-program [`crate::program::Program`], without running it.
-/// The `qpl -C` CLI flag is this function plus
-/// `Program::to_bytes`; also used by the round-trip tests in `repl::golden`.
+/// Compile a source file into a [`crate::program::Program`] without running it
+/// (`qpl -C`, and the golden round-trip tests).
 pub fn compile_script(path: &str) -> Result<crate::program::Program, QplError> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| QplError::Runtime(format!("cannot read '{path}': {e}")))?;
     compile_program_for(path, &src)
 }
 
-/// Parse `src` (as `path`) and compile it into a whole `Script`-mode
-/// [`crate::program::Program`] — the shared front half of [`run_source`] and
-/// [`compile_script`].
+/// Parse and compile `src` as a `Script`-mode program.
 fn compile_program_for(path: &str, src: &str) -> Result<crate::program::Program, QplError> {
     let stmts = parse_program(src, path)?;
     let ctx = CompileCtx::script(path);
     crate::compiler::compile_program(stmts, ctx)
 }
 
-/// Parse, compile and run `src` as a whole `Script`-mode program against
-/// `vm` — see [`run_compiled_program`] for the run/error-reporting half.
+/// Parse, compile and run `src` as a `Script`-mode program.
 fn run_source(vm: &mut Vm, src: &str, path: &str) -> Result<(), QplError> {
     let program = compile_program_for(path, src)?;
     run_compiled_program(vm, Arc::new(program))
 }
 
-/// Run an already-compiled whole-program [`crate::program::Program`] against
-/// `vm`, reporting a runtime failure as `path:line:` (see `compiler::wrap_line_error`)
-/// via whichever `Program` was actually executing when it failed
-/// (`Vm::take_error_site`): the main program for an ordinary failure, or an
-/// embedded `\l`/`\i` target's own `Program` (which carries its own path) if
-/// the failure happened while that was running. `<main>` (the REPL) is never
-/// prefixed. One [`crate::interrupt::Interrupt::statement`] guard covers the
-/// whole run, however many statements the program contains. Shared by
-/// [`run_source`] (a freshly compiled program) and a `.qplc` file run
-/// straight from bytes (`run_script`'s magic-byte path, and `qpl -c`'s
-/// ad hoc command via [`run_command`]).
+/// Run a compiled program, prefixing a runtime error with `path:line:` from
+/// whichever program was executing (the main one or an embedded `\l`/`\i`
+/// target). `<main>` is never prefixed. One interrupt guard covers the whole
+/// run.
 fn run_compiled_program(
     vm: &mut Vm,
     program: Arc<crate::program::Program>,
@@ -101,45 +93,31 @@ fn run_compiled_program(
     })
 }
 
-/// Run `src` as an ad hoc command (`qpl -c '<command>'`): parsed/compiled/run exactly like a REPL line typed at `<main>`
-/// — errors are reported unprefixed, and `src` may hold several statements
-/// (the usual multi-line rules apply, since it goes through
-/// [`crate::parser::parse_program`] like a real script).
+/// `qpl -c '<command>'`: run like a REPL line at `<main>` (unprefixed errors;
+/// several statements allowed).
 pub fn run_command(src: &str, vm: &mut Vm) -> Result<(), QplError> {
     run_source(vm, src, "<main>")
 }
 
-/// Everything a submitted line can be *except* `\port`, which needs
-/// REPL-loop state (`PortSession`) this function doesn't have. Shared by the
-/// REPL loop (interactive input and, once a port is open, the polling loop's
-/// stdin lines). `lineno` is accepted for source-compatibility with earlier
-/// callers but is no longer meaningful: [`run_source`] parses `src` itself
-/// and reports errors using its own line numbers (this is only ever called
-/// with `path == "<main>"`, where no prefix is added anyway).
+/// Run one submitted line. (`_lineno` is unused: `run_source` reports its own
+/// line numbers, and `<main>` gets no prefix anyway.)
 fn run_line(src: &str, vm: &mut Vm, path: &str, _lineno: usize) -> Result<(), QplError> {
     run_source(vm, src, path)
 }
 
-/// Run a `.qpl` script as a *namespaced import* — test-only compatibility
-/// shim for the many `\i`-behaviour tests below, which predate whole-program
-/// compilation and call this directly with an absolute scratch-file path
-/// rather than going through a `\i "..."` statement themselves. Namespace
-/// qualification itself is compile-time now (`compiler::qualify_program`);
-/// this just spells out the equivalent `\i` statement.
+/// Import `path` as a namespace by running the equivalent `\i` statement;
+/// used by the `\i` tests below.
 #[cfg(test)]
 fn run_script_imported(path: &str, vm: &mut Vm) -> Result<(), QplError> {
     run_source(vm, &format!("\\i \"{path}\""), "<main>")
 }
 
-/// Does `src` look like an unfinished statement that should keep reading?
-/// True while `(`/`[` are unbalanced, on a trailing `,`, on a lex error (e.g. an
-/// unterminated string), or when the parse fails specifically because input ran
-/// out (so a genuine syntax error still surfaces immediately). `\` commands are
-/// always single-line.
+/// Whether `src` is an unfinished statement: unbalanced `(`/`[`, a trailing
+/// `,`, an unterminated string, or a parse that ran out of input. `\`
+/// commands are always single-line.
 pub fn wants_more(src: &str) -> bool {
-    // nothing but blank / comment lines is a complete no-op (see `eval_capture`),
-    // not an unfinished statement — otherwise a host that feeds a script line
-    // by line glues a leading comment onto the statement after it
+    // blank/comment-only input is complete, not unfinished (otherwise a host
+    // feeding lines one at a time glues a comment onto the next statement)
     if src
         .lines()
         .all(|l| l.trim().is_empty() || l.trim_start().starts_with('/'))
@@ -150,16 +128,12 @@ pub fn wants_more(src: &str) -> bool {
     if trimmed.starts_with('\\') || trimmed.starts_with(".qpl.cfg") {
         return false;
     }
-    // decide completeness against the same text `run_line` will actually
-    // execute (see `normalize_function_body_newlines`) — otherwise a function
-    // body relying on the implicit per-line statement rule looks like a
-    // "complete but wrong" statement (missing `;`) the moment its second line
-    // is typed, and the REPL submits it before the closing `}` even arrives.
+    // judge the text `run_line` will actually run, so a multi-line function
+    // body isn't submitted before its closing `}`
     let src = &normalize_function_body_newlines(src);
     let toks = match tokenise(src) {
         Ok(toks) => toks,
-        // an unterminated string may be finished on the next line; every other
-        // lex error is terminal, so stop reading and let it surface.
+        // only an unterminated string can be finished on the next line
         Err(QplError::Lex(msg)) => return msg.contains("Unterminated"),
         Err(_) => return false,
     };
@@ -176,9 +150,7 @@ pub fn wants_more(src: &str) -> bool {
     }
     match parse(toks) {
         Ok(_) => false,
-        // input ran out mid-expression: either a specific token was expected
-        // ("expected RParen, got Eof") or any primary was ("Unexpected token in
-        // primary: Eof", e.g. a trailing operator or a dict literal missing values)
+        // input ran out mid-expression
         Err(QplError::Parse(msg)) => msg.contains("got Eof") || msg.ends_with("primary: Eof"),
         Err(_) => false,
     }
@@ -189,31 +161,44 @@ pub fn start(vm: &mut Vm) {
     let mut rl = DefaultEditor::new().expect("failed to create line editor");
 
     println!(
-        "qpl v{} (Quick Polars Language) REPL - \\d disassemble, \\l <path> run a script, \\i \"<path>\" import as a namespace, \\1 <path> log stdout",
+        "qpl v{} (Quick Polars Language) REPL - \\d disassemble, \\l <path> run a script, \\i \"<path>\" import as a namespace, \\1 <path> log stdout, \\port <n> open a listener",
         env!("CARGO_PKG_VERSION")
     );
 
     let mut buf: Vec<String> = Vec::new();
+    // a script run with `-i` (or that left a port open) may have opened a
+    // port already
     #[cfg(feature = "ipc")]
-    let mut port_session: Option<PortSession> = None;
+    let mut port_session: Option<PortSession> = if vm.port.is_some() {
+        Some(PortSession::new())
+    } else {
+        None
+    };
 
     loop {
-        // Once `\port` has been used at least once, service both stdin and
-        // any open listener by polling instead of a blocking `readline()` —
-        // that's what lets a request arriving over the socket interleave with
-        // whatever the operator is typing. This does mean losing rustyline's
-        // line-editing/history from that point on for the rest of the
-        // session; there's no clean way to hand stdin back to rustyline once
-        // another thread owns reading it.
+        // While a port is open, poll stdin and the listener instead of a
+        // blocking `readline()`, so requests interleave with typed input. This
+        // gives up rustyline's line editing for the rest of the session: stdin
+        // can't be handed back once another thread reads it.
         #[cfg(feature = "ipc")]
         if let Some(session) = port_session.as_mut() {
-            match session.poll() {
-                PortEvent::Line(line) => process_submitted(&line, vm),
+            // no `readline()` here, so print the prompt by hand, once per
+            // read cycle
+            if session.needs_prompt {
+                print_port_prompt(vm);
+                session.needs_prompt = false;
+            }
+            match session.poll(vm) {
+                PortEvent::Line(line) => {
+                    process_submitted(&line, vm);
+                    session.needs_prompt = true;
+                }
                 PortEvent::Request(mode, command, reply_tx) => {
                     let _running = vm.interrupt.statement();
                     let result =
                         vm.with_request_permission(mode, |vm| eval_for_dispatch(&command, vm));
                     let _ = reply_tx.send(crate::ipc::encode_result(&result));
+                    session.needs_prompt = true;
                 }
                 PortEvent::StdinClosed => break,
             }
@@ -232,7 +217,7 @@ pub fn start(vm: &mut Vm) {
                 } else if !blank {
                     buf.push(line);
                 }
-                // (a blank line while buf is non-empty force-submits)
+                // a blank line with a partial statement force-submits
                 let src = buf.join("\n");
                 if !blank && wants_more(&src) {
                     continue;
@@ -243,15 +228,12 @@ pub fn start(vm: &mut Vm) {
                     continue;
                 }
                 let _ = rl.add_history_entry(&src);
-                #[cfg(feature = "ipc")]
-                if let Some(rest) = src.strip_prefix("\\port").map(str::trim) {
-                    let session = port_session.get_or_insert_with(PortSession::new);
-                    if let Err(e) = handle_port_directive(rest, session) {
-                        eprintln!("{}", fmt_repl_error(&e));
-                    }
-                    continue;
-                }
                 process_submitted(&src, vm);
+                // switch to polling if that statement opened a port
+                #[cfg(feature = "ipc")]
+                if vm.port.is_some() && port_session.is_none() {
+                    port_session = Some(PortSession::new());
+                }
             }
             Err(ReadlineError::Interrupted) => {
                 // abandon a partial statement, or exit at an empty prompt
@@ -269,10 +251,7 @@ pub fn start(vm: &mut Vm) {
     }
 }
 
-/// Everything a submitted REPL line can be *except* `\port`, which needs
-/// REPL-loop state (`PortSession`) this function doesn't have — see
-/// [`run_line`]. Shared by both the normal (rustyline) input path and, once a
-/// port has been opened, the polling loop's stdin lines.
+/// Run one submitted REPL line, printing any error.
 #[cfg(feature = "cli")]
 fn process_submitted(src: &str, vm: &mut Vm) {
     if let Err(e) = run_line(src, vm, "<main>", 0) {
@@ -280,15 +259,11 @@ fn process_submitted(src: &str, vm: &mut Vm) {
     }
 }
 
-/// Evaluate one submitted line with its output captured instead of printed —
-/// the non-terminal equivalent of [`process_submitted`], used by the wasm REPL.
-/// Returns `(output, error)`: `output` is exactly what the CLI would have
-/// printed to stdout (including anything emitted before a failure), and `error`
-/// is the message the CLI would have put on stderr, if the line failed.
+/// Run one line with output captured instead of printed (the wasm REPL).
+/// Returns `(output, error)`: what the CLI would print to stdout (including
+/// anything before a failure) and to stderr.
 pub fn eval_capture(src: &str, vm: &mut Vm) -> (String, Option<String>) {
-    // the terminal REPL drops blank and comment-only lines before they reach
-    // `run_line` (they tokenise to nothing, which doesn't parse); a host that
-    // submits a script line by line gets the same treatment here
+    // drop blank/comment-only lines, as the terminal REPL does
     if src
         .lines()
         .all(|l| l.trim().is_empty() || l.trim_start().starts_with('/'))
@@ -303,9 +278,8 @@ pub fn eval_capture(src: &str, vm: &mut Vm) -> (String, Option<String>) {
     (out, err)
 }
 
-/// What [`eval_capture_table`] returns: the text output and error exactly as
-/// [`eval_capture`] would give them, plus the result table itself when the
-/// statement produced one (in which case it is *not* also in `output`).
+/// [`eval_capture_table`]'s result: output and error as [`eval_capture`] gives
+/// them, plus the result table if there was one (then not in `output`).
 #[cfg(feature = "wasm")]
 pub struct TableEval {
     pub output: String,
@@ -313,9 +287,8 @@ pub struct TableEval {
     pub table: Option<polars::prelude::DataFrame>,
 }
 
-/// Like [`eval_capture`], but a table result comes back as a `DataFrame` —
-/// untruncated, with its types — rather than as display text. Non-table results
-/// (scalars, lists, plans) still land in `output`.
+/// Like [`eval_capture`], but a table result comes back as an untruncated
+/// `DataFrame` instead of text.
 #[cfg(feature = "wasm")]
 pub fn eval_capture_table(src: &str, vm: &mut Vm) -> TableEval {
     let outer_table = std::mem::replace(&mut vm.capture_table, true);
@@ -329,31 +302,9 @@ pub fn eval_capture_table(src: &str, vm: &mut Vm) -> TableEval {
     }
 }
 
-/// `\port <n>` opens a listener (closing any previously open one first);
-/// bare `\port` closes it. Only reachable from `start()` — `\port` doesn't
-/// exist for script mode (`run_script` never calls this), per its being
-/// meaningless outside a long-lived interactive session.
-#[cfg(all(feature = "ipc", feature = "cli"))]
-fn handle_port_directive(rest: &str, session: &mut PortSession) -> Result<(), QplError> {
-    session.close_port();
-    if rest.is_empty() {
-        return Ok(());
-    }
-    let port: u16 = rest
-        .parse()
-        .map_err(|_| QplError::Runtime(format!("\\port: expected a port number, got '{rest}'")))?;
-    session.open_port(port)
-}
-
-/// Evaluate one command received over `\port`, treating it exactly like a
-/// REPL line — `.qpl.cfg` directives, `log` writes, and ordinary
-/// statements (selects, updates, deletes, assignments, function defs) all
-/// work. `\`-prefixed system commands (`\d`, `\l`, `\1`, `\port` itself)
-/// are deliberately not reachable this way — they're local REPL/session
-/// administration, not part of the query language a remote client dispatches,
-/// so a [`crate::ast::Stmt::System`] is rejected outright. `.qpl.cfg`/bareword `log` compile and
-/// run exactly like the equivalent ordinary statement, in `CompileMode::Result`
-/// so the (only) statement's value comes back as an [`EvalResult`].
+/// Evaluate a command received over `\port` like a REPL line, in `Result`
+/// mode so its value comes back as an [`EvalResult`]. `\` commands are
+/// rejected: they're local session administration.
 #[cfg(all(feature = "ipc", feature = "cli"))]
 fn eval_for_dispatch(line: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
     let stmts = parse_program(line, "<main>")?;
@@ -362,7 +313,8 @@ fn eval_for_dispatch(line: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
         .find(|(_, s)| matches!(s, ast::Stmt::System { .. }))
     {
         return Err(QplError::Runtime(format!(
-            "'\\{cmd}' is not allowed over a dispatched connection"
+            "'\\{}' is not allowed over a dispatched connection",
+            ast::system_cmd_name(*cmd)
         )));
     }
     let ctx = CompileCtx::result("<main>");
@@ -370,16 +322,13 @@ fn eval_for_dispatch(line: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
     vm.eval(program)
 }
 
-/// REPL-loop-side state for `\port`: a stdin-reader thread (spawned once, the
-/// first time `\port` is used) feeding lines to the polling loop in `start()`,
-/// plus whichever listener is currently open, if any.
+/// Run-loop state while serving: the stdin-reader thread (spawned the first
+/// time a port opens) and whether a prompt is owed. The listener itself lives
+/// on `Vm::port`.
 #[cfg(all(feature = "ipc", feature = "cli"))]
 struct PortSession {
     stdin_rx: std::sync::mpsc::Receiver<String>,
-    port: Option<(
-        crate::ipc::ServerHandle,
-        std::sync::mpsc::Receiver<crate::ipc::PortRequest>,
-    )>,
+    needs_prompt: bool,
 }
 
 #[cfg(all(feature = "ipc", feature = "cli"))]
@@ -412,33 +361,21 @@ impl PortSession {
         });
         Self {
             stdin_rx: rx,
-            port: None,
+            needs_prompt: true,
         }
     }
 
-    fn open_port(&mut self, port: u16) -> Result<(), QplError> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = crate::ipc::start_server(port, tx)?;
-        self.port = Some((handle, rx));
-        Ok(())
-    }
-
-    fn close_port(&mut self) {
-        if let Some((handle, _)) = self.port.take() {
-            handle.close();
-        }
-    }
-
-    /// Block until either a stdin line or a socket request is available.
-    fn poll(&mut self) -> PortEvent {
+    /// Wait for a stdin line or a request. `vm.port` is re-read each time since
+    /// `\port` can close or reopen it at any point.
+    fn poll(&mut self, vm: &mut Vm) -> PortEvent {
         loop {
             match self.stdin_rx.try_recv() {
                 Ok(line) => return PortEvent::Line(line),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => return PortEvent::StdinClosed,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
-            if let Some((_, rx)) = &self.port
-                && let Ok((mode, command, reply_tx)) = rx.try_recv()
+            if let Some(state) = &vm.port
+                && let Ok((mode, command, reply_tx)) = state.rx.try_recv()
             {
                 return PortEvent::Request(mode, command, reply_tx);
             }
@@ -447,10 +384,20 @@ impl PortSession {
     }
 }
 
-/// Rebase a kdb-style timestamp literal (as accepted by [`temporal::parse_temporal`])
-/// to ns-since-Unix-epoch, for building a Polars `Datetime` demo column in Rust —
-/// the same rebasing [`crate::vm::ast_val_to_expr`] applies to a `Timestamp` literal
-/// at query time.
+/// The polling loop's prompt: `qpl [127.0.0.1:<port>]) ` while a port is open,
+/// `qpl) ` after it closes (polling continues either way). Flushed by hand
+/// since no line editor draws it.
+#[cfg(all(feature = "ipc", feature = "cli"))]
+fn print_port_prompt(vm: &Vm) {
+    use std::io::Write;
+    match &vm.port {
+        Some(state) => print!("qpl [127.0.0.1:{}] ) ", state.port),
+        None => print!("qpl) "),
+    }
+    let _ = std::io::stdout().flush();
+}
+
+/// A kdb timestamp literal as ns since the Unix epoch, for the demo `ts` column.
 fn demo_ts(literal: &str) -> i64 {
     match temporal::parse_temporal(literal) {
         Some(ast::Value::Timestamp(ns)) => ns + temporal::NS_2000_TO_1970,
@@ -464,7 +411,7 @@ pub fn load_demo_tables(vm: &mut Vm) {
         "price" => [182.3f64, 183.1, 415.2, 416.0, 140.5, 141.2, 184.0, 414.8],
         "size"  => [100i64, 250, 80, 300, 150, 90, 500, 200],
         "side"  => ["buy","sell","buy","buy","sell","buy","sell","sell"],
-        // one trading morning, 2024.03.15 — used by the temporal examples
+        // one trading morning, 2024.03.15
         "ts"    => [
             demo_ts("2024.03.15D09:30:00.000000000"),
             demo_ts("2024.03.15D09:31:15.000000000"),
@@ -529,8 +476,7 @@ fn vec_tag(kind: ast::VecKind) -> &'static str {
     }
 }
 
-/// The scalar `Value` a raw temporal-vector element (its kdb integer offset)
-/// corresponds to, so it can be rendered through `temporal::format_temporal`.
+/// The scalar for a raw temporal-vector element, for formatting.
 fn temporal_scalar_of(kind: ast::VecKind, n: i64) -> ast::Value {
     use ast::VecKind::*;
     match kind {
@@ -545,8 +491,8 @@ fn temporal_scalar_of(kind: ast::VecKind, n: i64) -> ast::Value {
     }
 }
 
-/// Space-separated rendering of a vector `Value`'s elements. `quote_str`
-/// selects the pretty (`"a" "b"`) vs. raw (`log`, `a b`) string form.
+/// A vector's elements, space-separated. `quote_str` picks `"a" "b"` over
+/// raw `a b`.
 fn fmt_vec_elems(kind: ast::VecKind, s: &polars::prelude::Series, quote_str: bool) -> String {
     use ast::VecKind::*;
     let ca_str = || s.str().expect("SymVec/StrVec backed by a string Series");
@@ -607,9 +553,7 @@ fn fmt_vec_elems(kind: ast::VecKind, s: &polars::prelude::Series, quote_str: boo
     }
 }
 
-/// Render a value for `log`: raw text, no type prefix or quoting. Shared with
-/// `ops::native_log`, which does this same rendering whichever way `log` was
-/// spelled (bareword, `log[..]`, or `run_log`'s statement-level forms).
+/// Render a value for `log`: raw text, no type prefix or quoting.
 pub(crate) fn fmt_log_val(v: &ast::Value) -> String {
     if let Some((kind, s)) = v.as_vec() {
         return fmt_vec_elems(kind, s, false);
@@ -652,8 +596,7 @@ pub(crate) fn fmt_val(v: &ast::Value) -> String {
         ast::Value::Sym(s) => format!("sym: `{s}"),
         ast::Value::Bool(b) => format!("bool: {b}"),
         ast::Value::Closure(f) => format!("func: {{[{}] ..}}", f.params.join(",")),
-        // temporal variants are handled by the early return above; this keeps
-        // the match total without a panic path if a new `Value` is added
+        // temporals returned early; this just keeps the match total
         other => temporal::format_temporal(other).unwrap_or_else(|| format!("{other:?}")),
     }
 }
@@ -668,29 +611,15 @@ fn fmt_repl_error(error: &QplError) -> String {
     }
 }
 
-/// Golden-output tests: runs every non-excluded
-/// `examples/*.qpl` script against a fresh `Vm` and compares captured stdout
-/// plus the error text (if any) against `examples/golden/<name>.out`.
+/// Golden-output tests: run each `examples/*.qpl` against a fresh `Vm` and
+/// compare stdout plus any error with `examples/golden/<name>.out`.
+/// `UPDATE_GOLDEN=1 cargo test golden` regenerates them (run from the repo
+/// root).
 ///
-/// `UPDATE_GOLDEN=1 cargo test golden` regenerates the snapshot files. Must be
-/// run from the repo root so the scripts' relative `examples/data/...` paths
-/// resolve.
-///
-/// Excluded entirely:
-/// - `ipc_client` / `ipc_server`: need two live processes talking over a
-///   socket, not a fit for a single-process snapshot test.
-/// - `setup_data`: writes into `examples/data`, which is committed input for
-///   every other example — running it would mutate the fixtures under test.
-/// - `namespace_lib`: not meant to run standalone; it's exercised as an
-///   import by `namespaces.qpl`.
-///
-/// `lists`, `random_table`, and `temporal` use `?` (roll) or the `.qpl.dt` /
-/// `.qpl.tm` / `.qpl.ts` now-functions, so their output is different on every
-/// run. Rather than normalise the random bytes out of the snapshot (fragile,
-/// and easy to accidentally make the test pass while silently losing
-/// coverage), this harness runs them and only asserts they complete without
-/// error — the golden snapshot's job (catching an accidental change to
-/// deterministic output) doesn't apply to them anyway.
+/// Not run: `ipc_client`/`ipc_server` (need two processes), `setup_data`
+/// (writes the committed fixtures), `namespace_lib` (imported by
+/// `namespaces.qpl`). Examples with random or clock-based output are only
+/// checked for a clean exit.
 #[cfg(test)]
 mod golden {
     use super::{QplError, Vm, compile_script, load_demo_tables, run_compiled_program, run_script};
@@ -712,22 +641,17 @@ mod golden {
         "window_functions",
     ];
 
-    /// Random / now-based output — run for a clean exit only (see module doc).
-    /// `functions` is here (not deterministic) because it calls `.qpl.ts`
-    /// (wall-clock now) to demonstrate niladic functions.
+    /// Random or clock-based output (`functions` calls `.qpl.ts`): checked for
+    /// a clean exit only.
     const NONDETERMINISTIC: &[&str] = &["functions", "lists", "random_table", "temporal"];
 
     fn golden_path(name: &str) -> PathBuf {
         Path::new("examples/golden").join(format!("{name}.out"))
     }
 
-    /// Run `examples/<name>.qpl` (or, for `logging`, a copy with its `\1`
-    /// target redirected to a scratch file so the test never writes into the
-    /// repo) via `run` and return everything it emitted plus the error text
-    /// of the first failing statement, if any. `run` is the strategy under
-    /// test: `run_script` for the ordinary source-file path, or
-    /// a closure that compiles the file to a `.qplc` byte string and back
-    /// before running it, to prove that round trip is behaviour-preserving.
+    /// Run `examples/<name>.qpl` via `run` and return its output plus the first
+    /// error, if any. `logging`'s `\1` target is redirected to a scratch file.
+    /// `run` is either `run_script` or a `.qplc` round trip.
     fn run_example_captured_with(
         name: &str,
         run: impl FnOnce(&str, &mut Vm) -> Result<(), QplError>,
@@ -769,10 +693,8 @@ mod golden {
         run_example_captured_with(name, run_script)
     }
 
-    /// `compile_script(path) -> to_bytes -> from_bytes -> run_compiled_program`
-    /// the same compile/run path `qpl -C`
-    /// followed by running the resulting `.qplc` exercises, without touching
-    /// the filesystem for the intermediate bytes.
+    /// `compile_script -> to_bytes -> from_bytes -> run`, as `qpl -C` then
+    /// running the `.qplc` would, in memory.
     fn run_compiled_roundtrip(path: &str, vm: &mut Vm) -> Result<(), QplError> {
         let program = compile_script(path)?;
         let bytes = program.to_bytes()?;
@@ -780,15 +702,8 @@ mod golden {
         run_compiled_program(vm, std::sync::Arc::new(program2))
     }
 
-    /// Polars group-by (`select ... by ...`) doesn't guarantee output row
-    /// order (hash-based grouping), so a couple of the deterministic examples
-    /// still vary run-to-run in which order their *rows* come out, even
-    /// though the row *contents* are fixed. Rather than special-case those
-    /// examples out of the strict comparison, sort each contiguous run of
-    /// printed-table data rows (lines starting with the box-drawing `│` that
-    /// aren't a separator) before comparing — this still catches any change
-    /// to the actual output while ignoring row order the language doesn't
-    /// promise anyway.
+    /// Group-by row order isn't guaranteed, so sort each run of table rows
+    /// before comparing.
     fn normalize_table_row_order(s: &str) -> String {
         let mut out = Vec::new();
         let mut run: Vec<&str> = Vec::new();
@@ -839,24 +754,13 @@ mod golden {
         assert_eq!(content, expected, "golden output mismatch for '{name}'");
     }
 
-    // Both example groups run inside *one* `#[test]` fn, not two, because
-    // `config_and_round` and `random_table` change process-wide
-    // `POLARS_FMT_*` env vars via `.qpl.cfg` (see `VmConfig::export_render_limits`)
-    // — two separate tests running in parallel threads (cargo test's default)
-    // would race on that shared state and make the deterministic comparisons
-    // flaky. Keeping everything sequential in one test sidesteps the race
-    // without touching the (documented, deliberate) global-env design.
+    // One test, not two: some examples set process-wide `POLARS_FMT_*` env
+    // vars, and parallel tests would race on them.
     #[test]
     fn examples_match_golden_output() {
-        // Each example runs twice back-to-back — source, then the `.qplc`
-        // round trip — rather than as two
-        // separate full passes over `DETERMINISTIC`/`NONDETERMINISTIC`: a
-        // full second pass would re-run `config_and_round` a second time
-        // *after* its process-wide `POLARS_FMT_*` env var mutation already
-        // happened once, changing what every later example in that second
-        // pass sees relative to the golden file (captured from a single
-        // pass). Interleaving keeps each name's two variants observing the
-        // same global state the golden file was captured under.
+        // run source then `.qplc` per example (rather than two full passes),
+        // so both see the same env-var state the golden files were captured
+        // under
         for name in DETERMINISTIC {
             let (out, err) = run_example_captured(name);
             check_or_update(name, &out, &err);
@@ -893,10 +797,8 @@ mod golden {
         }
     }
 
-    /// Run `src` as a scratch script (so errors get the `path:line:` prefix
-    /// exactly as a real script would) with a fresh `Vm` (plus demo tables),
-    /// and return the error text with the scratch file's own (unpredictable,
-    /// pid/thread-based) path replaced by the stable placeholder `<script>`.
+    /// Run `src` as a scratch script (so errors get a `path:line:` prefix) with
+    /// demo tables, returning the error with the path replaced by `<script>`.
     fn run_source_expect_err(src: &str) -> String {
         run_source_expect_err_with(Vm::new(), src)
     }
@@ -917,15 +819,8 @@ mod golden {
         msg.replace(path.to_str().unwrap(), "<script>")
     }
 
-    /// ~10 error-path snapshots: exact `path:line:`-prefixed
-    /// messages for the common failure modes, asserted inline rather than via
-    /// golden files since each is a single short string. These lock in
-    /// the exact error text.
-    /// `f: {[n] f[n]}` recurses through the native Rust call stack today (one
-    /// `apply_function` per level), so hitting `MAX_CALL_DEPTH` needs more
-    /// headroom than the default test-thread stack reliably provides — run on
-    /// an explicitly-sized thread, same as
-    /// `vm::tests::unbounded_recursion_hits_the_depth_cap_and_unwinds_cleanly`.
+    /// Exact `path:line:`-prefixed error text for common failures. Runs on an
+    /// 8 MB stack thread for the recursion-depth case.
     #[test]
     fn error_paths_have_stable_messages() {
         std::thread::Builder::new()
@@ -969,9 +864,7 @@ mod golden {
             run_source_expect_err(".qpl.dt[1]"),
             "'<script>:1: ''.qpl.dt' takes 0 argument(s), got 1"
         );
-        // an error partway through a `\i` import rolls the whole session back
-        // to its pre-import state — the importing script's own line is what's
-        // reported, and the previously-bound name is untouched.
+        // a failing `\i` rolls the session back; the importing line is reported
         let import_lib = std::env::temp_dir().join(format!(
             "qpl_golden_err_lib_{}_{:?}.qpl",
             std::process::id(),
@@ -1013,8 +906,7 @@ mod tests {
     use crate::parser::{logical_statements, normalize_function_body_newlines};
     use crate::vm::{EvalResult, Vm, run_vm};
 
-    /// Test-only helper: the eager table bound to `name` (panics if it isn't
-    /// one) — table-shaped bindings live in `vm.globals`, not a separate map.
+    /// The eager table bound to `name` (panics otherwise).
     fn table<'a>(vm: &'a Vm, name: &str) -> &'a polars::prelude::DataFrame {
         match vm.globals.get(name) {
             Some(Value::Table(df)) => df,
@@ -1022,8 +914,7 @@ mod tests {
         }
     }
 
-    /// Run `line` through [`run_line`] and return whatever it wrote via
-    /// `Vm::emit`, by pointing the stdout-log tee at a scratch file.
+    /// Run `line` and return what it wrote via `Vm::emit` (teed to a scratch file).
     fn logged(vm: &mut Vm, line: &str) -> String {
         let path =
             std::env::temp_dir().join(format!("qpl_repl_test_{:?}", std::thread::current().id()));
@@ -1069,10 +960,8 @@ mod tests {
 
     #[test]
     fn i_import_lets_a_namespaced_function_call_an_unqualified_sibling() {
-        // regression: `\i` renames a script's top-level bindings to `.ns.*`
-        // but doesn't rewrite cross-references *inside* their bodies, so a
-        // function calling another top-level helper by its bare name used to
-        // break after import with "'<helper>' is not a function".
+        // a library function calling a sibling by bare name still works after
+        // import
         let path = std::env::temp_dir().join(format!(
             "qpl_i_sibling_test_{:?}.qpl",
             std::thread::current().id()
@@ -1093,8 +982,7 @@ mod tests {
 
     #[test]
     fn i_import_does_not_double_namespace_an_already_namespaced_binding() {
-        // a script that itself `\i`s another script leaves that nested import's
-        // already-namespaced bindings alone rather than re-prefixing them.
+        // a nested import's already-namespaced bindings aren't re-prefixed
         let mut vm = Vm::new();
         vm.globals
             .insert(".inner.x".into(), crate::ast::Value::Int(1));
@@ -1132,7 +1020,7 @@ mod tests {
             "{err:?}"
         );
 
-        // quoted works, both at the REPL and (via run_script -> run_line) nested in a script
+        // a quoted path works at the REPL and nested in a script
         run_line(
             &format!("\\i \"{}\"", path.to_str().unwrap()),
             &mut vm,
@@ -1156,9 +1044,8 @@ mod tests {
 
     #[test]
     fn embedded_l_target_survives_deleting_the_source_after_compile() {
-        // a `\l`/`\i` target is read, parsed and
-        // compiled into the *including* script's own `Program` at compile
-        // time — the source file plays no further role once that's done.
+        // an included file is compiled into the including `Program`, so the
+        // source isn't needed afterwards
         let dir = scratch_dir("l_embed");
         let lib = dir.join("lib.qpl");
         std::fs::write(&lib, "x: 41\n").unwrap();
@@ -1170,7 +1057,7 @@ mod tests {
         let ctx = crate::compiler::CompileCtx::script(main.to_str().unwrap());
         let program = crate::compiler::compile_program(stmts, ctx).unwrap();
 
-        // the target no longer exists on disk once compilation is done
+        // the target is gone once compilation is done
         std::fs::remove_file(&lib).unwrap();
 
         let mut vm = Vm::new();
@@ -1208,7 +1095,7 @@ mod tests {
 
     #[test]
     fn a_parse_error_on_a_later_line_prevents_earlier_statements_from_running() {
-        // the whole script is parsed before anything runs, so `x` is never bound.
+        // the whole script parses before anything runs, so `x` is never bound
         let dir = scratch_dir("parse_abort");
         let path = dir.join("bad.qpl");
         std::fs::write(&path, "x: 1\nsel from t\n").unwrap();
@@ -1224,9 +1111,8 @@ mod tests {
 
     #[test]
     fn a_param_shadows_a_namespaced_name_of_the_same_import() {
-        // compile-time namespace qualification: inside a function
-        // body, a param of the same name as one of the file's own top-level
-        // bindings refers to the param, not `.lib.x`.
+        // inside a function, a param named like a top-level binding refers to
+        // the param, not `.lib.x`
         let dir = scratch_dir("i_param_shadow");
         let lib = dir.join("lib.qpl");
         std::fs::write(&lib, "x: 100\nf: {[x] x+1}\n").unwrap();
@@ -1287,19 +1173,9 @@ mod tests {
 
     #[test]
     fn i_import_never_overwrites_an_existing_session_name() {
-        // regression: a library assigning `thr` must not silently replace the
-        // session's own `thr`; it lands under `.lib`.
-        //
-        // Namespace qualification happens at compile time: a bare
-        // reference to a name the file binds at its own top level is *always*
-        // qualified, regardless of where in the file it appears relative to
-        // that binding (so a library statement can't read the
-        // session's value of a name it is about to redefine under the same
-        // top-level binding). This script therefore reads the *session's*
-        // `src` (never one of `lib`'s own top-level names) to avoid that
-        // ill-defined case, and asserts the same core guarantee: an import
-        // never touches an existing session name, and its own bindings land
-        // under `.lib.*`.
+        // an import never touches an existing session name; its bindings land
+        // under `.lib.*`. (The library reads the session's `src`, since a name
+        // the file binds at top level always means its own binding.)
         let dir = scratch_dir("i_clobber");
         let lib = dir.join("lib.qpl");
         std::fs::write(
@@ -1328,9 +1204,8 @@ mod tests {
 
     #[test]
     fn i_import_sibling_is_not_hijacked_by_a_session_name() {
-        // regression: the namespaced fallback used to run only after the
-        // session's own bindings, so a session `_log` bound after the import
-        // replaced the library's `_log` inside `.lg.info`.
+        // a session `_log` bound after the import doesn't replace the
+        // library's `_log` inside `.lg.info`
         let dir = scratch_dir("i_hijack");
         let lib = dir.join("lg.qpl");
         std::fs::write(&lib, "_log: {[s] s}\ninfo: {[s] _log[s]}\n").unwrap();
@@ -1347,8 +1222,7 @@ mod tests {
 
     #[test]
     fn i_import_is_rolled_back_when_the_script_fails() {
-        // regression: a failing import used to leave everything bound before
-        // the failure in the session under its *bare* name.
+        // a failing import leaves nothing bound, bare or namespaced
         let dir = scratch_dir("i_rollback");
         let lib = dir.join("bad.qpl");
         std::fs::write(&lib, "good: 1\nthr: 5\noops: nosuchname + 1\n").unwrap();
@@ -1385,8 +1259,7 @@ mod tests {
 
     #[test]
     fn nested_l_and_i_paths_are_relative_to_the_including_script() {
-        // regression: `\l`/`\i` inside a script resolved against the working
-        // directory, not the script's own location.
+        // `\l`/`\i` inside a script resolve relative to the script
         let dir = scratch_dir("i_relpath");
         std::fs::create_dir_all(dir.join("lib")).unwrap();
         std::fs::write(dir.join("lib/helpers.qpl"), "twice: {[x] x*2}\n").unwrap();
@@ -1426,8 +1299,7 @@ mod tests {
     #[cfg(feature = "ipc")]
     #[test]
     fn read_handle_can_print_but_not_change_config() {
-        // regression: `.qpl.cfg key=value` bypassed the read-only gate, so a
-        // read handle could change e.g. `round_type`, which changes answers.
+        // `.qpl.cfg key=value` is refused on a read handle (it can change answers)
         use crate::ipc::HandleMode;
         let mut vm = Vm::new();
         vm.with_request_permission(HandleMode::Read, |vm| {
@@ -1452,9 +1324,7 @@ mod tests {
 
     #[test]
     fn log_evaluates_a_reduction_directly() {
-        // regression: `log max t`price` (with or without the parens the README
-        // recommends for a call/reduction) must evaluate the
-        // table/column expression, not just a plain scalar fold.
+        // `log` evaluates a table/column expression, with or without parens
         let mut vm = Vm::new();
         vm.globals.insert(
             "t".into(),
@@ -1471,12 +1341,7 @@ mod tests {
 
     #[test]
     fn log_bracket_call_is_usable_inside_a_function_body() {
-        // regression: `log` only ever existed as a whole-line REPL directive
-        // (`repl::log_target`), so it was unreachable from inside a function
-        // body — `{[s] log s}` failed with "unknown function 'log'". `log[..]`
-        // now compiles through the ordinary `Expr::Call` path
-        // (`compiler::compile_value_expr`'s `log` arm, `ops::native_log`), so
-        // it works there too.
+        // `log[..]` works inside a function body
         let mut vm = Vm::new();
         run_line(
             r#"info: {[s] log[str$"tag" " - " s]}"#,
@@ -1485,9 +1350,8 @@ mod tests {
             0,
         )
         .expect("define info");
-        // `info` returns whatever `log` wrote (its only/last statement), so a
-        // bare call at top level also echoes that return value like any other
-        // function call — only a standalone `log[..]` statement suppresses it.
+        // `info` returns what `log` wrote, so a bare call echoes it like any
+        // function result; only a standalone `log[..]` statement doesn't
         assert_eq!(
             logged(&mut vm, r#"info["hi"]"#),
             "tag - hi\nstr: \"tag - hi\""
@@ -1496,16 +1360,14 @@ mod tests {
 
     #[test]
     fn log_bracket_call_as_a_bare_statement_does_not_echo_its_return_value() {
-        // unlike an ordinary function call, a standalone `log[..]` statement
-        // only prints what it logged, matching the bareword `log ..` form.
+        // a standalone `log[..]` only prints what it logged
         let mut vm = Vm::new();
         assert_eq!(logged(&mut vm, r#"log["only once"]"#), "only once");
     }
 
     #[test]
     fn log_bracket_call_supports_zero_one_and_three_args() {
-        // every arity compiles the same way (`compiler::compile_value_expr`'s `log`
-        // arm) and behaves identically as a top-level statement.
+        // every arity behaves the same as a top-level statement
         let mut vm = Vm::new();
         assert_eq!(logged(&mut vm, "log[]"), "");
         assert_eq!(logged(&mut vm, r#"log["solo"]"#), "solo");
@@ -1517,19 +1379,14 @@ mod tests {
         let mut vm = Vm::new();
         assert_eq!(logged(&mut vm, "log"), "");
         assert_eq!(logged(&mut vm, r#"log "solo""#), "solo");
-        // the bareword form takes a single expression, so three values are
-        // written as one string-concatenation expression rather than three
-        // comma/semicolon-separated arguments (that's `log[..]`'s job above).
+        // bareword `log` concatenates juxtaposed values
         assert_eq!(logged(&mut vm, r#"log "a" "b" "c""#), "abc");
     }
 
     #[cfg(feature = "ipc")]
     #[test]
     fn dispatch_evaluates_an_expression_starting_with_a_digit() {
-        // regression: `render_tokens` renders `1+1` as `1 + 1`, which a
-        // stdout-write shorthand keyed on a leading "1 " used to misread as a
-        // directive rather than as the literal 1. `log` is now the only
-        // spelling that writes, so dispatched text like this is unambiguous.
+        // dispatched text renders `1+1` as `1 + 1`, which must stay arithmetic
         let mut vm = Vm::new();
         match super::eval_for_dispatch("1 + 1", &mut vm) {
             Ok(crate::vm::EvalResult::Scalar(crate::ast::Value::Int(2))) => {}
@@ -1567,6 +1424,65 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ipc")]
+    #[test]
+    fn dispatch_rejects_port_with_its_full_name() {
+        // `\port`'s `cmd` is 'p', but the error must say "port"
+        let mut vm = Vm::new();
+        let err = super::eval_for_dispatch("\\port 5999", &mut vm).unwrap_err();
+        assert!(
+            matches!(&err, crate::errors::QplError::Runtime(m) if m.contains("'\\port' is not allowed over a dispatched connection")),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(feature = "ipc")]
+    #[test]
+    fn port_opens_and_closes_identically_from_a_script() {
+        // a script can open and close a port
+        let mut vm = Vm::new();
+        run_line("\\port 51573", &mut vm, "<main>", 0).expect("open");
+        assert!(vm.port.is_some());
+        run_line("\\port", &mut vm, "<main>", 0).expect("close");
+        assert!(vm.port.is_none());
+    }
+
+    #[cfg(feature = "ipc")]
+    #[test]
+    fn port_argument_is_an_expression_not_just_a_literal() {
+        // `\port`'s argument is an ordinary expression, here a conditional.
+        // (`like` without wildcards is an exact string match.)
+        let mut vm = Vm::new();
+        run_line(r#"s: "test""#, &mut vm, "<main>", 0).expect("assign s");
+        run_line(
+            r#"\port ?[s like "test"; 51574; 51575]"#,
+            &mut vm,
+            "<main>",
+            0,
+        )
+        .expect("open via conditional");
+        assert!(vm.port.is_some());
+
+        // prove it listens on the chosen port by servicing one real request,
+        // as `repl::start`'s polling loop would
+        let state = vm.port.as_ref().unwrap();
+        let client = std::thread::spawn(|| {
+            let conn = crate::ipc::hopen("51574", crate::ipc::HandleMode::Read).expect("hopen");
+            crate::ipc::dispatch_blocking(
+                &conn,
+                "1 + 1".into(),
+                &crate::interrupt::Interrupt::default(),
+            )
+        });
+        let (mode, command, reply_tx) = state.rx.recv().expect("one request");
+        let result = vm.with_request_permission(mode, |vm| super::eval_for_dispatch(&command, vm));
+        let _ = reply_tx.send(crate::ipc::encode_result(&result));
+        match client.join().expect("client thread") {
+            Ok(EvalResult::Scalar(Value::Int(2))) => {}
+            other => panic!("expected Scalar(2), got {other:?}"),
+        }
+    }
+
     #[test]
     fn wants_more_detects_unfinished_input() {
         // complete
@@ -1582,22 +1498,21 @@ mod tests {
         assert!(wants_more("select price from"));
         // unterminated string
         assert!(wants_more("log \"oops"));
-        // a trailing operator / a dict literal still missing values: parse ran out in a primary
+        // a trailing operator: parse ran out
         assert!(wants_more("x: 1 +"));
         assert!(wants_more("zip `a`b!"));
         assert!(wants_more("zip `a`b!(1 2 3)"));
         assert!(!wants_more("zip `a`b!(1 2 3) (4 5 6)"));
-        // a real syntax error is NOT "more" — surface it now
+        // a real syntax error surfaces now
         assert!(!wants_more("selct from trades"));
-        // blank / comment-only input is finished (a no-op), not unfinished
+        // blank/comment-only input is complete
         assert!(!wants_more("/ just a comment"));
         assert!(!wants_more(""));
-        // a terminal lex error must not hang the prompt waiting for input
+        // a terminal lex error doesn't wait for more input
         assert!(!wants_more("select from t where a = 1 @"));
         // `\` commands are always single-line
         assert!(!wants_more("\\d select a: ?[c>1;`x"));
         assert!(!wants_more("\\l some/script.qpl"));
-        // `.qpl.cfg` is a single-line directive, never "more"
         assert!(!wants_more(".qpl.cfg maxrow=5 maxcol=3"));
     }
 
@@ -1694,9 +1609,7 @@ mod tests {
 
     #[test]
     fn function_body_deeper_indent_stays_a_continuation() {
-        // `by`/`from`/`order` are more deeply indented than the `select`
-        // above them, so they extend that one statement rather than starting
-        // new ones.
+        // deeper-indented `by`/`from` lines continue the `select`
         let src = "f: {[x]\n    select tot: sum x\n        by sym\n        from t\n    }";
         assert_eq!(
             normalize_function_body_newlines(src),
@@ -1706,8 +1619,7 @@ mod tests {
 
     #[test]
     fn function_body_explicit_semicolon_still_works_and_a_redundant_one_is_harmless() {
-        // an already-`;`-terminated line followed by a new baseline-indent
-        // line just doubles up (`;;`), which the parser tolerates.
+        // a `;`-terminated line then a baseline line gives a harmless `;;`
         let src = "f: {[x]\n    a: x+1;\n    a\n    }";
         assert_eq!(
             normalize_function_body_newlines(src),
@@ -1738,9 +1650,8 @@ mod tests {
 
     #[test]
     fn multiline_function_body_runs_without_explicit_semicolons() {
-        // the original report: a function body written one statement per
-        // line, indented, with no `;` at all — should behave exactly like
-        // the semicolon-separated single-line form.
+        // a body written one statement per line with no `;` behaves like the
+        // single-line form
         let mut vm = Vm::new();
         let src = "f: {[x]\n    a: x+1\n    b: a*2\n    b\n    }";
         run_line(src, &mut vm, "<main>", 0).expect("run_line");
@@ -1750,9 +1661,8 @@ mod tests {
         }
     }
 
-    /// `eval_capture` must return exactly what the CLI would have printed —
-    /// including output emitted *before* a statement failed — and must leave
-    /// the VM's capture state as it found it.
+    /// `eval_capture` returns exactly what the CLI would print, including output
+    /// before a failure, and restores the VM's capture state.
     #[test]
     fn eval_capture_returns_output_and_error_separately() {
         let mut vm = Vm::new();
@@ -1768,9 +1678,8 @@ mod tests {
         assert!(vm.capture.is_none(), "capture buffer outlived the call");
     }
 
-    /// Blank and comment-only submissions are no-ops, as at the terminal REPL —
-    /// a host feeding a script line by line submits them too. A comment above
-    /// code in the same submission still runs the code.
+    /// Blank and comment-only submissions are no-ops; a comment above code in
+    /// the same submission still runs the code.
     #[test]
     fn eval_capture_ignores_blank_and_comment_only_input() {
         let mut vm = Vm::new();
@@ -1787,9 +1696,8 @@ mod tests {
         assert_eq!(eval_capture("x", &mut vm), ("i64: 5\n".to_string(), None));
     }
 
-    /// The example script, fed the way the terminal REPL feeds it (line by
-    /// line, accumulating while `wants_more`, blank/comment lines included)
-    /// — what a wasm host driving `eval`/`wantsMore` does.
+    /// The example script fed line by line, as a wasm host using
+    /// `eval`/`wantsMore` would.
     #[test]
     fn a_multiline_script_runs_when_fed_line_by_line_with_wants_more() {
         let src = "n: 3\n\n/ note\nt: zip `a`b!\n    (til n)\n    (n ? 5)\n\nt\n";
@@ -1811,8 +1719,7 @@ mod tests {
         assert_eq!(table(&vm, "t").shape(), (3, 2));
     }
 
-    /// A `log` write happens before the statement's own failure, so it has to
-    /// survive in the captured output rather than being discarded with it.
+    /// A `log` write before a failure survives in the captured output.
     #[test]
     fn eval_capture_keeps_output_emitted_before_a_failure() {
         let mut vm = Vm::new();
@@ -1906,8 +1813,8 @@ mod tests {
 
     #[test]
     fn an_interrupt_in_a_loaded_script_keeps_its_variant() {
-        // `\l` runs the script under its own path, which normally wraps a
-        // failure as `path:line: ..` text — an interrupt must stay an interrupt.
+        // `\l` would wrap a failure as `path:line: ..`; an interrupt must stay
+        // an interrupt
         let path = std::env::temp_dir().join(format!(
             "qpl_interrupt_nested_{:?}.qpl",
             std::thread::current().id()

@@ -17,8 +17,8 @@ belongs in a README next to the script rather than inside it.
 
 ## The one consequence
 
-Giving `/` to comments means it isn't available for division, so qpl follows
-q and uses `%` instead:
+Giving `/` to comments means it isn't available for division, so qpl borrows
+q's `%` instead:
 
 ```qpl
 qpl) 10.0 % 4

@@ -1,16 +1,11 @@
-//! Bytecode program representation.
+//! Bytecode: a [`Program`] is one byte per instruction in `code` plus a side
+//! `operands` stream that only [`Op::Push`] reads; every other opcode takes
+//! its inputs from the VM stack. `lines` maps instructions back to source
+//! lines for errors.
 //!
-//! A [`Program`] is a compiled statement: one byte per instruction in `code`,
-//! decoded via [`Op::try_from`], plus a side `operands` stream that only
-//! [`Op::Push`] reads. Every other opcode takes all of its inputs from the
-//! VM's value stack — see `vm.rs`'s `run_compiled` for the interpreter loop.
-//!
-//! [`Program::to_bytes`]/[`Program::from_bytes`] serialise this to and from a `.qplc` file: opcode/operand/`Value`
-//! tags are part of that on-disk format, so changing, reordering or removing
-//! one requires bumping [`FORMAT_VERSION`].
-//!
-//! `lines` (ip -> source line, for error messages) is populated by whole-
-//! program compilation (`compiler::compile_program`).
+//! [`Program::to_bytes`]/[`Program::from_bytes`] handle the `.qplc` format;
+//! changing any opcode, operand or value tag requires bumping
+//! [`FORMAT_VERSION`].
 
 use crate::ast::{self, CastTarget, Value};
 use crate::errors::QplError;
@@ -19,12 +14,9 @@ use polars::prelude::JoinType;
 use std::fmt;
 use std::sync::Arc;
 
-/// A function literal's compile-time shape: parameter names, its entry point
-/// `(ip, cp)` inside the enclosing [`Program`] (the body is appended after the
-/// program's main code), and the display text (`{[x,y] ..}`) used by
-/// [`Closure`]'s `Debug` impl and by error messages. Carried by
-/// [`Operand::Func`]; turned into a runtime [`Closure`] by `Op::Push`, which
-/// attaches the currently-running `Arc<Program>`.
+/// A function literal's compile-time shape: params, entry point `(ip, cp)`
+/// (bodies are appended after the program's main code), and display text
+/// (`{[x,y] ..}`). `Op::Push` turns it into a [`Closure`].
 #[derive(Debug, Clone)]
 pub struct FuncProto {
     pub params: Vec<String>,
@@ -32,12 +24,9 @@ pub struct FuncProto {
     pub display: String,
 }
 
-/// A runtime function value: [`FuncProto`]
-/// plus the `Arc<Program>` its body lives in, so a closure created on one
-/// REPL line is still callable — its own program stays alive via this `Arc` —
-/// once that line's `Program` would otherwise have been dropped. `CALL`
-/// switches the VM's `prog` register to this when invoking it; `RET` switches
-/// back. See `vm::Vm::begin_closure_call`.
+/// A runtime function value: a [`FuncProto`] plus the `Program` its body lives
+/// in, which the `Arc` keeps alive after the defining line's program is
+/// dropped. `CALL` switches `prog` to it and `RET` switches back.
 pub struct Closure {
     pub params: Vec<String>,
     pub entry: (u32, u32),
@@ -45,21 +34,16 @@ pub struct Closure {
     pub display: String,
 }
 
-/// Prints as the source shape (`{[x,y] ..}`). User-facing text (error messages,
-/// `\d`, `fmt_val`) must never dump the compiled body.
+/// Prints as `{[x,y] ..}`; user-facing text never shows the compiled body.
 impl fmt::Debug for Closure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.display)
     }
 }
 
-/// A function literal queued for compilation after the enclosing statement's
-/// main code:
-/// `Program::pending_closures` holds these; `compiler::compile`/`finish_pending`
-/// drains the queue (a body may itself queue further, nested, closures),
-/// compiling each body in turn and patching its placeholder `Operand::Func`
-/// (at `operand_index`, pushed with a dummy `(0,0)` entry when the literal
-/// was first seen) with its real entry point once known.
+/// A function literal awaiting compilation after the statement's main code.
+/// `compiler::finish_pending` compiles each body (which may queue more) and
+/// patches the placeholder `Operand::Func` at `operand_index`.
 #[derive(Debug)]
 pub(crate) struct PendingClosure {
     pub operand_index: usize,
@@ -68,8 +52,7 @@ pub(crate) struct PendingClosure {
     pub display: String,
 }
 
-/// Which window computation [`Op::Window`] performs. This is the payload
-/// of an `Operand::Window`.
+/// Which window computation [`Op::Window`] performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowFn {
     /// apply the popped aggregate/column expression per partition (`.over`)
@@ -82,9 +65,8 @@ pub enum WindowFn {
     DenseRank,
 }
 
-/// The window-function payload pushed ahead of [`Op::Window`]: which function,
-/// its partition/order clauses, and (for `<agg> <col> <n>!rolling over ...`)
-/// the rolling aggregate name and window size.
+/// The payload for [`Op::Window`]: function, partition/order clauses, and the
+/// rolling aggregate and size if any.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowSpec {
     pub func: WindowFn,
@@ -93,13 +75,9 @@ pub struct WindowSpec {
     pub rolling: Option<(String, usize)>,
 }
 
-/// A binary operator, resolved once at compile time from the parser's raw
-/// operator string. `Other` is a fallback for any string that doesn't match a
-/// known operator — unreachable via the current grammar (the parser only ever
-/// produces one of the known spellings), but kept so an operator string that
-/// somehow isn't recognised still fails at the same point, with the same
-/// "unknown operator" text, that `vm::apply_binop` produced before this enum
-/// existed, rather than becoming a `panic!` or a silent compile error.
+/// A binary operator, resolved at compile time. `Other` keeps an unrecognised
+/// spelling (unreachable from the grammar) failing with an "unknown operator"
+/// error rather than a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BinOpKind {
     Add,
@@ -138,12 +116,8 @@ impl BinOpKind {
         }
     }
 
-    /// The canonical operator spelling — the inverse of [`Self::from_op_str`]
-    /// for every known operator (an alternate spelling that collapses to the
-    /// same variant, e.g. `<>` / `!=` both -> `Neq`, comes back out as the
-    /// canonical one). Used by the value-context `BINOP` opcode's eager scalar
-    /// path (`ops::value_binop`), which dispatches on the operator
-    /// string.
+    /// The canonical spelling (inverse of [`Self::from_op_str`]; `<>` and `!=`
+    /// both give `<>`). Used by the scalar `BINOP` path.
     pub fn as_str(&self) -> &str {
         match self {
             Self::Add => "+",
@@ -164,36 +138,25 @@ impl BinOpKind {
     }
 }
 
-/// A payload pushed onto the value stack by [`Op::Push`] — the only opcode
-/// that reads the `operands` stream. Everything here is
-/// cheap to clone: `Value` clones are `Arc`/`Series`-backed, everything else
-/// is a `Copy` or an `Arc`.
+/// A value [`Op::Push`] reads from the operand stream. All cheap to clone.
 #[derive(Clone)]
 pub enum Operand {
-    /// A literal value. [`Op::Push`] turns this into `Slot::Scalar`, not
-    /// `Slot::Operand` — every other `Operand` variant becomes
-    /// `Slot::Operand` for the next opcode to interpret.
+    /// A literal value. `Push` makes this a `Slot::Scalar`; every other
+    /// variant becomes a `Slot::Operand` for the next opcode.
     Value(Value),
     /// A variable / column / table name.
     Name(Arc<str>),
     /// An arity, list length, or other small count.
     Count(u32),
-    /// A jump target / closure entry point: `(ip, cp)` into `Program::code` /
-    /// `Program::operands`.
-    /// `JUMP`/`JUMP_IF_FALSE`/`JUMP_IF_VEC`
-    /// set *both* registers, so a loop re-reads its own operands each
-    /// iteration and a skipped branch skips the operands it would have
-    /// consumed. A forward jump's target is back-patched once the label's
-    /// position is known (see `compiler::compile_while`/`compile_case_value`);
-    /// a backward jump (a `while` looping to its top) already knows both
-    /// numbers when it's emitted.
+    /// A jump target or closure entry point `(ip, cp)`. Jumps set both
+    /// registers, so a loop re-reads its operands and a skipped branch skips
+    /// them. Forward targets are back-patched once known.
     Target {
         ip: u32,
         cp: u32,
     },
     BinOp(BinOpKind),
-    /// A column verb name (`sum`, `avg`, `shift`, ...), resolved to
-    /// [`crate::vm::apply_call`] / [`crate::vm::apply_dyadic`] at run time.
+    /// A column verb name (`sum`, `avg`, `shift`, ...), resolved at run time.
     Verb(Arc<str>),
     Join(JoinType),
     /// `order`/`sort`'s (column, descending) pairs.
@@ -202,26 +165,15 @@ pub enum Operand {
     Names(Arc<[String]>),
     Cast(CastTarget),
     Window(Arc<WindowSpec>),
-    /// An unconditional value-context primitive (`enlist`, `?` roll) — see
-    /// [`NativeId`]. `Op::Call`'s callee when the call can never be shadowed
-    /// by a user function.
+    /// An unshadowable primitive, called by id (see [`NativeId`]).
     Native(NativeId),
-    /// Free text carried by an opcode that isn't a name/column/count — a
-    /// `dispatch` payload (the rest of the statement, already rendered to
-    /// source text by the parser).
+    /// Free text, e.g. a `dispatch` payload.
     Text(Arc<str>),
-    /// A function literal: `Op::Push` turns
-    /// this into `Slot::Val(Value::Closure(..))` by attaching the current
-    /// `Arc<Program>` — the only `Operand` variant `Op::Push` treats specially
-    /// (every other non-`Value` variant becomes `Slot::Operand` verbatim).
+    /// A function literal; `Push` turns it into a `Value::Closure` bound to
+    /// the running `Program`.
     Func(Arc<FuncProto>),
-    /// A `\l`/`\i` target, embedded at compile time: the target script is
-    /// read, parsed and compiled into its own `Program` when the *including*
-    /// script is compiled, so `load_script`/`import_script`
-    /// ([`crate::native::NativeId::LoadScript`] / `ImportScript`) just run it
-    /// at call time — no source, lexing or parsing left to do then. This is
-    /// also what will let a `qpl -c`-compiled artifact run with no
-    /// original source file present at all.
+    /// A `\l`/`\i` target, compiled into its own `Program` when the including
+    /// script is compiled, so running it needs no source.
     Program(Arc<Program>),
 }
 
@@ -247,12 +199,9 @@ impl fmt::Debug for Operand {
     }
 }
 
-/// One bytecode instruction. `#[repr(u8)]` with explicit discriminants: a
-/// `.qplc` files serialise these, so the numbering must never shift
-/// silently — see the `opcode_discriminants_are_pinned` test below.
-///
-/// Only [`Op::Push`] reads the operand stream; every other opcode takes all
-/// of its inputs from the value stack (mirrored in `vm.rs`'s `run_compiled`).
+/// One bytecode instruction. Discriminants are part of the `.qplc` format and
+/// must never change (see `opcode_discriminants_are_pinned`); retired
+/// numbers are never reused.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
@@ -268,10 +217,7 @@ pub enum Op {
     Case = 9,
     Alias = 10,
     Cast = 11,
-    /// Retired: used to evaluate a pushed
-    /// `Operand::Ast` node. Byte 12 is never reused —
-    /// `Op::try_from` rejects it — so a stale `.qplc` or a corrupt
-    /// stream fails cleanly instead of silently decoding as something else.
+    // 12: retired (was `Eval`, which evaluated an `Operand::Ast`); never reuse
     Store = 13,
     Sink = 14,
     Lazy = 15,
@@ -284,110 +230,68 @@ pub enum Op {
     Drop = 22,
     Cols = 23,
     Join = 24,
-    /// Builds a `Slot::List` from `n` popped exprs — replaces
-    /// `Instruction::BuildKeys` / `Instruction::BuildProj`, which differed
-    /// only in name, not behaviour.
+    /// Build a `Slot::List` from `n` popped exprs.
     List = 25,
     Select = 26,
     SelectBy = 27,
     Update = 28,
-    /// A column verb call (`sum price`, `n shift price`, ...) — replaces
-    /// `Instruction::Call`.
+    /// A column verb call (`sum price`, `n shift price`, ...).
     Verb = 29,
-    /// Value context: resolves a bare name —
-    /// a niladic closure/builtin is called, a `Table`/`Lazy` global becomes a
-    /// `Frame`, everything else a `Scalar`. See `vm::Vm::resolve_plain`,
-    /// whose semantics this opcode reuses exactly.
+    /// Value context: resolve a bare name. A niladic closure/builtin is called,
+    /// a table global becomes a `Frame`, anything else a `Scalar`.
     Load = 30,
-    /// Value context: `(f a1..an n → result)`. `f` is either
-    /// `Operand::Native` (an unconditional keyword: `enlist`, `?` roll) or
-    /// `Operand::Name` (resolved at run time — a bound closure/builtin wins,
-    /// else a handful of shadowable keywords, else a generic column verb; see
-    /// `ops::call_by_name`) or a `Scalar(Closure)` already on the stack (a
-    /// closure literal applied in place, `{[y] y*2}[x]`).
+    /// Value context: `(f a1..an n → result)`. `f` is an `Operand::Native`, an
+    /// `Operand::Name` (see `ops::call_by_name`), or a closure already on the
+    /// stack (`{[y] y*2}[x]`).
     Call = 31,
-    /// Value context: `(count x → x)` — `` n#expr `` head/tail
-    /// slicing of a frame or list.
+    /// Value context: `(count x → x)`, `n#expr` head/tail.
     Take = 32,
-    /// Value context: `(target a1..an n → x)` — a callable target
-    /// (from `Op::LoadFn`, or a closure literal) calls; otherwise positional
-    /// list indexing.
+    /// Value context: `(target a1..an n → x)`. Calls a callable target,
+    /// otherwise indexes a list by position.
     Index = 33,
-    /// Value context: `(Frame → Scalar)` — a one-column `select`'s
-    /// materialisation to a list (`compile_value_expr`'s `Expr::Table` arm).
+    /// Value context: `(Frame → Scalar)`, a one-column select as a list.
     Column = 34,
-    /// Value context: `(v1..vn names n → Frame)` — `` zip `k!v ``.
+    /// Value context: `(v1..vn names n → Frame)`, `` zip `k!v ``.
     Zip = 35,
-    /// Value context: `(conn text async → x)` — `` <conn> dispatch <cmd> ``.
-    /// `ipc` feature only; a non-ipc build gives today's error text.
+    /// Value context: `(conn text async → x)`, `<conn> dispatch <cmd>`.
+    /// Errors without the `ipc` feature.
     Dispatch = 36,
-    /// Value context: `(name → Val)` — like `Load`, but a niladic
-    /// closure/builtin is *not* auto-called (a call-target position: `f[x]`,
-    /// `x[i]` where `x` might be callable).
+    /// Value context: `(name → Val)`, like `Load` but never auto-calls a
+    /// niladic function (used in call-target position).
     LoadFn = 37,
-    /// Internal to `zip`'s compiled lowering only: `(list cast name
-    /// → Column)` — applies a top-level cast to a `zip` column's list value,
-    /// keeping its exact width/dtype (a plain value-context cast would
-    /// round-trip through `ast::Value` and lose it — see `ops::zip_value_to_series`).
+    /// `(list cast name → Column)`: a cast on a `zip` column that keeps its
+    /// exact dtype (a value-context cast would lose the width).
     CastList = 38,
-    /// Value context: `(list → Frame)` — the list half of `<list>
-    /// where <preds>`'s lowering: checks `list` is list-shaped (today's
-    /// "'where' needs a list on the left, got …" error otherwise) and aliases
-    /// it to a one-column `x` frame for the query-context predicates that follow.
+    /// Value context: `(list → Frame)`, the list half of `<list> where
+    /// <preds>`: checks it's a list and exposes it as a one-column `x` frame.
     ListWhereFrame = 39,
-    /// `(x → )` — discard the top of the stack. Used between a function
-    /// body's non-final statements: an
-    /// expression statement's value is popped and dropped; `STORE` already
-    /// has zero net stack effect and needs no `POP`.
+    /// `(x → )`: discard the top of the stack, e.g. between a function body's
+    /// statements.
     Pop = 40,
-    /// `(result → result)` — return from the innermost `CALL`: unwinds the
-    /// stack to `fp`, restores the caller's `prog`/`ip`/`cp`/`fp`, and leaves
-    /// `result` on top for the caller. See
-    /// `vm::Vm::begin_closure_call` / the `Op::Ret` arm in `run_compiled`.
+    /// `(result → result)`: return from the innermost `CALL`, restoring the
+    /// caller's registers and leaving `result` on top.
     Ret = 41,
-    /// No-op that jumps `ip` straight to the end of `code`: emitted once,
-    /// right after a statement's own code, whenever that statement defined at
-    /// least one function literal — the appended bodies that follow are only
-    /// ever reached via `CALL`'s explicit jump to their entry point, never by
-    /// falling off the end of the statement that defined them. See
-    /// `compiler::finish_pending`.
+    /// Jump to the end of `code`. Emitted after a statement that defined a
+    /// function, so execution never falls into the appended bodies.
     Halt = 42,
-    /// `(target -> )` -- unconditional jump: sets both `ip` and `cp` to the
-    /// popped `Operand::Target`.
-    /// Checks `interrupt` when the target is behind the current `ip` (a
-    /// `while` looping back to its top) -- a forward jump never checks.
+    /// `(target → )`: set `ip` and `cp`. A backward jump (a loop) checks for
+    /// Ctrl-C.
     Jump = 43,
-    /// `(cond target msg -> )` -- pops a `Bool` atom `cond`; jumps to
-    /// `target` if it's `false`, otherwise falls through. Any other `cond`
-    /// (a non-boolean scalar, a `Frame`, `Noop`, ...) is a runtime error
-    /// using the popped `Operand::Text` `msg` verbatim -- `while`'s and
-    /// `?[..]`'s atom paths push their own exact error text
-    /// here. A deviation from the plan's literal
-    /// `(cond target -> )` signature: the error text differs between
-    /// `while` and `?[..]`'s callers, so the message travels as a third
-    /// popped operand rather than being baked into the opcode.
+    /// `(cond target msg → )`: jump if `cond` is `false`; any non-boolean
+    /// `cond` is an error with text `msg` (which differs between `while` and
+    /// `?[..]`).
     JumpIfFalse = 44,
-    /// `(cond target -> cond)` -- peeks (never pops) `cond`; jumps iff it's
-    /// a `BoolVec`. Used by value-context `?[..]` to divert a
-    /// vector condition to its elementwise `CASE_VEC` tail while leaving the
-    /// mask on the stack for that tail to consume.
+    /// `(cond target → cond)`: peek `cond` and jump if it's a `BoolVec`,
+    /// diverting `?[..]` to its elementwise `CASE_VEC` tail.
     JumpIfVec = 45,
-    /// `(mask v1 c2 v2 ... d n -> Val)` -- the elementwise form of `?[..]`
-    /// every remaining condition/branch/
-    /// default has already been evaluated eagerly (they're ordinary compiled
-    /// sub-expressions, not thunks) and sits on the stack; this opcode folds
-    /// them into one `when/then/otherwise` chain and extracts the result.
-    /// Same semantics, arm order and error text as the scalar `?[..]` path -- see `ops::case_vec`.
+    /// `(mask v1 c2 v2 ... d n → Val)`: elementwise `?[..]` over already
+    /// evaluated operands (see `ops::case_vec`).
     CaseVec = 46,
-    /// `( -> Noop)` -- pushes `Slot::Noop`: `noop`'s value, and a `while`
-    /// statement's own result once its loop exits.
+    /// `( → Noop)`: `noop`'s value, and a finished `while`'s.
     Noop = 47,
-    /// `(x -> )` -- print a top-level expression statement's result as the
-    /// REPL does: a lazy `Frame` prints its plan, an
-    /// eager `Frame` collects and prints the table (or is captured into
-    /// `Vm::last_table` under `Vm::capture_table`), a `Scalar` prints via
-    /// `fmt_val`, and `Noop` prints nothing. Every top-level statement in a
-    /// `Script`-mode program ends with this, `STORE`, or `POP`.
+    /// `(x → )`: print a top-level statement's result as the REPL does (a lazy
+    /// frame's plan, an eager frame's table, a scalar, or nothing for `Noop`).
+    /// Every top-level `Script`-mode statement ends in `EMIT`, `STORE` or `POP`.
     Emit = 48,
 }
 
@@ -409,10 +313,7 @@ impl TryFrom<u8> for Op {
             9 => Case,
             10 => Alias,
             11 => Cast,
-            // 12 was `Eval`, retired (see the variant's old doc
-            // comment, kept as a comment on `Store` above) — never reused,
-            // so a stale `.qplc` fails cleanly instead of silently
-            // decoding as something else.
+            // 12 is retired (see `Op`)
             13 => Store,
             14 => Sink,
             15 => Lazy,
@@ -514,10 +415,7 @@ impl Op {
     }
 }
 
-/// Maps a byte offset in `Program::code` to the source line it came from.
-/// Unused until whole-program compilation needs `path:line:` error
-/// prefixes spanning more than one statement; kept here now so `Program`'s
-/// shape doesn't change again when that lands.
+/// Maps a code offset to its source line.
 #[derive(Debug, Clone)]
 pub struct LineEntry {
     pub ip: u32,
@@ -525,18 +423,15 @@ pub struct LineEntry {
     pub line: u32,
 }
 
-/// A compiled statement: one byte per instruction (`code`), a side operand
-/// stream only [`Op::Push`] reads (`operands`), and an (for now, always
-/// empty) source-line table.
+/// A compiled program: instructions (`code`), the operand stream only
+/// [`Op::Push`] reads (`operands`), and the source-line table.
 #[derive(Debug, Default)]
 pub struct Program {
     pub code: Vec<u8>,
     pub operands: Vec<Operand>,
     pub lines: Vec<LineEntry>,
-    /// Compile-time only: function literals seen so far whose bodies haven't
-    /// been appended yet. Never read at
-    /// run time — drained by `compiler::finish_pending` before the `Program`
-    /// is handed to the VM. Not part of the on-disk format.
+    /// Compile-time only: function literals whose bodies aren't appended yet.
+    /// Drained before the VM sees the program; not serialised.
     pub(crate) pending_closures: Vec<PendingClosure>,
 }
 
@@ -545,13 +440,8 @@ impl Program {
         Self::default()
     }
 
-    /// The `(path, line)` an opcode at `ip` belongs to, per `self.lines`
-    /// the last entry whose own `ip` is at or
-    /// before `ip` — entries are pushed in ascending `ip` order by
-    /// `compiler::compile_program`, one per top-level statement (including
-    /// each statement of an embedded `\l`/`\i` sub-`Program`, which has its
-    /// own separate table). `None` for a `Program` with no line table at all
-    /// (an ad hoc value-context helper program, never a whole script).
+    /// The `(path, line)` for the opcode at `ip`: the last line entry at or
+    /// before it. `None` if the program has no line table.
     pub fn line_at(&self, ip: usize) -> Option<(Arc<str>, u32)> {
         self.lines
             .iter()
@@ -565,17 +455,15 @@ impl Program {
         self.code.push(op as u8);
     }
 
-    /// Emit `PUSH operand` — the only way an operand ever gets appended to
-    /// `operands`, keeping the two streams in lockstep.
+    /// Emit `PUSH operand`, keeping `code` and `operands` in lockstep.
     pub fn push_operand(&mut self, operand: Operand) {
         self.code.push(Op::Push as u8);
         self.operands.push(operand);
     }
 }
 
-/// One line per instruction: `ip`, mnemonic, and for `PUSH` the operand's
-/// short form, e.g. `0007  PUSH       Name(price)` / `0008  LOAD_COL`. Used by
-/// the REPL's `\d` and by the compiler's own tests.
+/// One line per instruction, e.g. `0007  PUSH       Name(price)`. Backs `\d`,
+/// `qpl -d` and tests.
 pub fn disassemble(program: &Program) -> Vec<String> {
     let mut lines = Vec::with_capacity(program.code.len());
     let mut cp = 0usize;
@@ -602,14 +490,7 @@ pub fn disassemble(program: &Program) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// `.qplc` serialisation
-// ---------------------------------------------------------------------------
-//
-// `qpl -C script.qpl` compiles a script straight to this format, so
-// `qpl script.qplc` can run it with no lexing, parsing or compiling at all —
-// see `repl::run_script`, which sniffs the magic bytes to tell a `.qplc` file
-// from source text, and `main.rs`'s `-C`/`-o` handling. Layout, all integers
-// little-endian:
+// `.qplc` serialisation. Layout, integers little-endian:
 //
 // ```text
 // magic "QPLC" (4 bytes)
@@ -621,28 +502,19 @@ pub fn disassemble(program: &Program) -> Vec<String> {
 // u32   path-table length, then that many length-prefixed path strings
 // u32   line-entry count, then (u32 path index, u32 ip, u32 line) each
 // ```
-//
-// `Op`/`Operand`/`Value` tag values are as fixed a part of this format as the
-// bytes of a `.qpl` script's grammar are of the source format: renumbering,
-// reordering or removing one is a breaking change to every `.qplc` already
-// on disk, and must bump `FORMAT_VERSION` so a stale file fails cleanly
-// (see `from_bytes`) instead of decoding as something else.
+// ---------------------------------------------------------------------------
 use crate::codec::{self, Reader};
 use std::collections::HashMap;
 
-/// `.qplc` magic bytes — the first 4 bytes of every compiled artifact.
-/// `repl::run_script` checks these (not the file extension) to decide
-/// whether a file is source or a compiled program.
+/// The first 4 bytes of every `.qplc`; `repl::run_script` sniffs these rather
+/// than the extension.
 pub const MAGIC: &[u8; 4] = b"QPLC";
 
-/// The `.qplc` format version. Bump this whenever `Op`, `Operand`,
-/// `OperandTag`, or any `Value`/enum tag used by the codec changes shape,
-/// gains/loses/reorders a variant, or changes discriminant — see the module
-/// doc above.
-pub const FORMAT_VERSION: u16 = 1;
+/// The `.qplc` format version. Bump on any change to `Op`, `Operand`,
+/// `OperandTag`, `NativeId` or codec tags.
+pub const FORMAT_VERSION: u16 = 2;
 
-/// The one-byte tag identifying which [`Operand`] variant follows in a
-/// `.qplc` file. Explicit discriminants, part of the on-disk format.
+/// Which [`Operand`] variant follows in a `.qplc`. Part of the format.
 #[repr(u8)]
 enum OperandTag {
     Value = 0,
@@ -882,6 +754,7 @@ fn native_id_to_u8(id: NativeId) -> u8 {
         PrintText => 4,
         LoadScript => 5,
         ImportScript => 6,
+        Port => 7,
     }
 }
 
@@ -895,6 +768,7 @@ fn u8_to_native_id(b: u8) -> Result<NativeId, QplError> {
         4 => PrintText,
         5 => LoadScript,
         6 => ImportScript,
+        7 => Port,
         other => {
             return Err(rt(format!(
                 "corrupt bytecode: unknown native id tag {other}"
@@ -908,10 +782,8 @@ fn write_target(out: &mut Vec<u8>, ip: u32, cp: u32) {
     codec::push_u32(out, cp);
 }
 
-/// Bounds-check a `(ip, cp)` pair against the sizes of the program currently
-/// being read: `ip` may be `code_len` exactly (a jump/entry pointing one past
-/// the end, e.g. a `while`'s exit target), `cp` may be `operand_count`
-/// exactly for the same reason.
+/// Bounds-check `(ip, cp)`. Either may equal the length exactly (a target one
+/// past the end, like a `while`'s exit).
 fn read_target(r: &mut Reader, code_len: u32, operand_count: u32) -> Result<(u32, u32), QplError> {
     let ip = r.u32()?;
     let cp = r.u32()?;
@@ -1006,10 +878,8 @@ fn write_operand(out: &mut Vec<u8>, op: &Operand) -> Result<(), QplError> {
     Ok(())
 }
 
-/// Read one operand. `code_len`/`operand_count` are the *enclosing* program's
-/// sizes (known already — `code` and the operand count are read before the
-/// operands themselves, see `read_body`), used to bounds-check a `Target`'s
-/// or a `Func`'s entry point.
+/// Read one operand, bounds-checking any entry point against the enclosing
+/// program's sizes (read before its operands).
 fn read_operand(r: &mut Reader, code_len: u32, operand_count: u32) -> Result<Operand, QplError> {
     Ok(match OperandTag::try_from(r.u8()?)? {
         OperandTag::Value => Operand::Value(codec::decode_value(r)?),
@@ -1062,10 +932,8 @@ fn read_operand(r: &mut Reader, code_len: u32, operand_count: u32) -> Result<Ope
     })
 }
 
-/// Every opcode byte decodes, and `Op::Push` occurrences line up exactly with
-/// the number of operands provided — neither more (a `PUSH` reading past the
-/// end of the stream) nor fewer (unused trailing operands). This is the same
-/// walk `disassemble` does, but erroring instead of printing a placeholder.
+/// Every opcode byte decodes, and the number of `PUSH`es equals the number
+/// of operands exactly.
 fn validate_code_operand_lockstep(code: &[u8], operand_count: usize) -> Result<(), QplError> {
     let mut cp = 0usize;
     for &byte in code {
@@ -1087,11 +955,8 @@ fn validate_code_operand_lockstep(code: &[u8], operand_count: usize) -> Result<(
     Ok(())
 }
 
-/// Serialise `program`'s body (code, operands, line table) — everything
-/// except the file-level magic/version/qpl-version header, which only
-/// `Program::to_bytes` writes once, at the top. An embedded `\l`/`\i`
-/// sub-program (`Operand::Program`) is just another body, written recursively
-/// right here with no header of its own — see the module doc's layout.
+/// Serialise a program body (no file header). An embedded `Operand::Program`
+/// is written recursively as another body.
 fn write_body(program: &Program, out: &mut Vec<u8>) -> Result<(), QplError> {
     codec::push_u32(out, program.code.len() as u32);
     out.extend_from_slice(&program.code);
@@ -1101,8 +966,7 @@ fn write_body(program: &Program, out: &mut Vec<u8>) -> Result<(), QplError> {
         write_operand(out, op)?;
     }
 
-    // Path table: dedup so a script with many top-level statements doesn't
-    // repeat its own path once per `LineEntry`.
+    // dedup paths so each is stored once
     let mut paths: Vec<&Arc<str>> = Vec::new();
     let mut index_of: HashMap<&str, u32> = HashMap::new();
     for entry in &program.lines {
@@ -1166,14 +1030,9 @@ fn read_body(r: &mut Reader) -> Result<Program, QplError> {
 }
 
 impl Program {
-    /// Serialise this program to a `.qplc` file's bytes — magic, format
-    /// version, informational `qpl` version, then the recursive body (see the
-    /// module doc). Fails if any `Operand::Value` holds a `Table`/`Lazy`/
-    /// `Closure`/`Handle`/`Future` (`codec::encode_value` rejects those) —
-    /// none of those can legitimately reach an operand (a closure literal is
-    /// always `Operand::Func`, never a runtime `Value::Closure` baked in at
-    /// compile time), but this makes that a clean error rather than silently
-    /// writing garbage a `from_bytes` could later misinterpret.
+    /// Serialise to `.qplc` bytes. Errors if an operand holds a value with no
+    /// encoding (`Table`/`Lazy`/`Closure`/`Handle`/`Future`), which never
+    /// legitimately happens.
     pub fn to_bytes(&self) -> Result<Vec<u8>, QplError> {
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
@@ -1183,11 +1042,9 @@ impl Program {
         Ok(out)
     }
 
-    /// Deserialise a `.qplc` file's bytes back into a `Program`, ready to
-    /// hand straight to `Vm::run_compiled` — no lexing, parsing or compiling
-    /// involved. Never panics: a truncated file, an unknown opcode/operand/
-    /// value tag, an out-of-range jump target, a format-version mismatch, or
-    /// trailing garbage after the program all come back as `Err`.
+    /// Deserialise `.qplc` bytes, ready for `Vm::run_compiled`. Never panics:
+    /// truncation, unknown tags, out-of-range targets, a version mismatch or
+    /// trailing bytes all return `Err`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Program, QplError> {
         if bytes.len() < MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC {
             return Err(rt("not a qpl bytecode file (bad magic)"));
@@ -1214,8 +1071,7 @@ mod tests {
 
     #[test]
     fn opcode_discriminants_are_pinned() {
-        // `.qplc` files serialise these as raw bytes — renumbering silently would
-        // corrupt any `.qplc` compiled against an older layout.
+        // `.qplc` files store these bytes; they must never change
         assert_eq!(Op::Push as u8, 0);
         assert_eq!(Op::Source as u8, 1);
         assert_eq!(Op::LoadCol as u8, 4);
@@ -1250,8 +1106,7 @@ mod tests {
 
     #[test]
     fn try_from_rejects_the_retired_eval_byte() {
-        // byte 12 was `Op::Eval`, since deleted —
-        // it must never silently decode as some other opcode.
+        // retired byte 12 must never decode
         assert!(Op::try_from(12u8).is_err());
     }
 
@@ -1294,10 +1149,8 @@ mod tests {
 
     // -- `.qplc` serialisation --------------------------------------------
 
-    /// A small but non-trivial program: every operand kind that isn't
-    /// exercised by a golden-example round trip elsewhere (`repl.rs`'s
-    /// `golden` module) — `Sort`, `Names`, `Window`, a nested `Func`, and a
-    /// `LineEntry` table with a couple of distinct paths.
+    /// A program exercising the operand kinds the golden round trips don't:
+    /// `Sort`, `Names`, `Window`, a nested `Func`, and multiple line paths.
     fn sample_program() -> Program {
         let mut p = Program::new();
         p.lines.push(LineEntry {

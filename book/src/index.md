@@ -1,7 +1,7 @@
 # qpl — Quick Polars Language
 
-qpl is a language with two rather different parents. The syntax is
-borrowed from kdb+/q, which means it is terse to the point of looking
+qpl is a language with two rather different influences. The syntax is
+inspired by kdb+/q, which means it is terse to the point of looking
 cryptic until it suddenly doesn't. The engine underneath is
 [Polars](https://pola.rs), which means the queries you write run at a speed
 competitive with DuckDB. Nothing else is involved: qpl ships as a single
@@ -11,6 +11,14 @@ up.
 The result is a language you can type a real query into faster than you could
 describe that query to somebody else, and which will then chew through a
 parquet file considerably larger than the memory on the machine.
+
+It's worth being clear up front about what "inspired by" means. qpl borrows
+a handful of ideas from q: terse right-to-left expressions, `select … by …
+from` queries, dotted date and time literals. It is not q, not a q dialect,
+and not trying to be compatible with kdb+. Underneath the familiar-looking
+surface it is a quite different language, with its own type system, its own
+execution model built around lazy Polars plans, and some syntax
+that q doesn't have - as well as missing a lot of syntax and features that q does have.
 
 ## How this book is arranged
 
@@ -46,9 +54,11 @@ starts a comment, which is why division is written `%` rather than `/`.
 Second, expressions evaluate right to left, so `10 - 3 - 2` is `9`, not `5`.
 Neither has any deeper meaning, and after an hour you will stop noticing.
 
-If you *have* used q, most of your instincts will transfer intact, and the
-[Operator reference](language/operator-reference.md) is probably the fastest
-way in.
+If you *have* used q, some of your instincts will carry over, but don't lean
+on them too hard: plenty of things that look alike behave differently, and
+q code won't generally run unchanged. The
+[Operator reference](language/operator-reference.md) is the fastest way to
+see where qpl differs.
 
 ## Elsewhere
 

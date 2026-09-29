@@ -11,9 +11,6 @@ and rationale are documented in [README.md](README.md) and [examples/](examples/
 read those for language semantics; this file covers build/dev workflow and
 internal architecture.
 
-The interpreter went through a bytecode-VM refactor (branch `bytes`); this
-file describes the result.
-
 ## Commands
 
 ```bash
@@ -90,9 +87,8 @@ Entry points: `main.rs` parses CLI args (clap) and constructs one long-lived
 `vm::Vm`, then calls into `repl.rs`. `repl::run_script` (a file) and
 `repl::start`'s REPL loop both funnel source through `parser::parse_program`
 → `compiler::compile_program` → `Vm::run_compiled`. `vm::run_vm(source, vm)`
-— still the entry point most tests use — compiles a *single* statement
-(`parser::parse` + `compiler::compile`) in `Result` mode (§"Statements and
-results" in the plan) and reduces it to an `EvalResult` via `Vm::eval`. State
+— the entry point most tests use — compiles a *single* statement
+(`parser::parse` + `compiler::compile`) in `Result` mode and reduces it to an `EvalResult` via `Vm::eval`. State
 carries across runs because the same `Vm` (its `globals` map and registers)
 is reused.
 
@@ -102,7 +98,7 @@ is reused.
 |--------|------|
 | `lexer` | source text → `Vec<Token>` (`tokens.rs` defines `Token`) |
 | `parser` | tokens → `Stmt` / `TableExpr` / `Expr` AST (`ast.rs`); largest front-end file. `parse` compiles one statement (used by `run_vm`); `parse_program(src, path)` parses a whole file into `Vec<(line, Stmt)>` — statement splitting (`logical_statements`, `normalize_function_body_newlines`) lives here too. Owns the string-level `\` commands and `.qpl.cfg`/`log` as real `Stmt` variants (`Stmt::System`, `Stmt::Cfg`, `Stmt::Log`) rather than leaving them to `repl.rs` string-matching |
-| `ast` | AST types. `Stmt` (assignment / bare expr / `Log`/`Cfg`/`System`), `TableExpr` (`Select` vs. `BuiltIn`), `SelectStmt` (unified select/update/delete via `update`/`delete` flags), `Expr`. `Value` includes `Table(DataFrame)` and `Lazy(LazyFrame)` (there's no separate table-shaped binding map anymore) and `Closure(Arc<program::Closure>)` |
+| `ast` | AST types. `Stmt` (assignment / bare expr / `Log`/`Cfg`/`System`), `TableExpr` (`Select` vs. `BuiltIn`), `SelectStmt` (unified select/update/delete via `update`/`delete` flags), `Expr`. `Value` includes `Table(DataFrame)` and `Lazy(LazyFrame)` (tables share the one binding map) and `Closure(Arc<program::Closure>)` |
 | `builtins` | `BuiltIn` enum — non-select table operations: `cols`, `sink`, `sort`, `distinct`, `limit`, `drop`, `lazy`, `collect` |
 | `compiler` | AST → `Program`. `compile`/`compile_stmt` (single statement) and `compile_program`/`CompileCtx` (whole file: `Script` mode prints each statement, `Result` mode leaves only the last statement's value on the stack) share `compile_tbl_expr`/`compile_value_expr` for the actual codegen. Also does compile-time `\i` namespace qualification (`qualify_top_level`/`collect_ns_names`) and `\l`/`\i` cycle detection (`CompileCtx::including`) |
 | `program` | `Program` (`code`/`operands`/`lines`), `Op` (the one-byte opcode enum, stable discriminants — see "Invariants" below), `Operand` (everything `Op::Push` can push: `Name`, `Count`, `Target{ip,cp}`, `BinOp`, `Verb`, `Native`, `Sort`, `Cast`, `Window`, `Func`, `Text`, `Program`, …), `Closure`/`FuncProto`, `WindowFn`/`WindowSpec`, the disassembler (`\d`'s output), and `Program::to_bytes`/`from_bytes` — the `.qplc` bytecode-file format (`qpl -C`/`qpl script.qplc`, see the "Compiled artifacts" subsection below) |
@@ -112,15 +108,16 @@ is reused.
 | `native` | Built-in (native) functions — a `name → Builtin` map built once in `Vm::new`, resolved through `Vm::lookup` exactly like a user function, except a builtin name can never be bound over. `NativeId` (`Enlist`/`Roll`/`Cfg`/…) is for the handful of primitives the compiler references *by id* instead of by name, so they can't be shadowed at all. Adding a name-resolved native needs no lexer/parser/compiler change |
 | `vm_config` | `VmConfig` — session knobs set by `.qpl.cfg key=value` (`maxcol`, `maxrow`, `tblwidth`, `strlen`, `round_type`, `useqepoch`); a new knob is a field + a `VmConfig::set` arm and nothing else |
 | `errors` | `QplError` (Lex/Parse/Compile/Runtime variants) — the single error type threaded everywhere |
-| `repl` | The REPL loop, `run_script` (parse_program → compile_program → run_compiled for a whole file, aborting before any statement runs on a parse/compile error anywhere in it — including inside a `\l`/`\i` target; also runs a `.qplc` file straight from bytes, sniffed by magic number), `compile_script` (source → `Program`, no run — `qpl -C`), `run_command` (`qpl -c`), demo tables, result formatting. `wants_more` (interactive-loop-only: brackets/trailing-comma/parse-cut-off) decides whether to keep reading a half-typed statement. All printing goes through `Vm::emit`, which mirrors to the stdout log. `\port` (the IPC listener) is REPL-loop-only; everything else a submitted line can be goes through the same `run_source`/`eval_for_dispatch` path REPL, IPC and script-running share |
+| `repl` | The REPL loop, `run_script` (parse_program → compile_program → run_compiled for a whole file, aborting before any statement runs on a parse/compile error anywhere in it — including inside a `\l`/`\i` target; also runs a `.qplc` file straight from bytes, sniffed by magic number), `compile_script` (source → `Program`, no run — `qpl -C`), `run_command` (`qpl -c`), demo tables, result formatting. `wants_more` (interactive-loop-only: brackets/trailing-comma/parse-cut-off) decides whether to keep reading a half-typed statement. All printing goes through `Vm::emit`, which mirrors to the stdout log. `\port` is an ordinary statement (`Vm::native_port` sets `Vm::port`); `start()` switches to polling stdin and the listener once a port is open, and `main.rs` enters it after a script that left one open |
 | `wasm` | `wasm` feature only (`#[cfg(feature = "wasm")] mod wasm;` in `lib.rs`). `Repl` (a `Vm` behind `eval(line)`, driven by `repl::eval_capture` — same path the terminal REPL uses, with output captured instead of printed) and `qplLangConfig()` (Monaco tokenizer/config/completions, built at compile time from `tools/vscode/`'s JSON). Builds only against a patched Polars (stock 0.55.2 doesn't compile for `wasm32-unknown-unknown`) — [`tools/wasm/README.md`](tools/wasm/README.md) has the build steps and the patch |
 | `interrupt` | Ctrl-C flag (`Interrupt`, an `Arc` of two atomics on `Vm`). The `cli` handler in `main.rs` sets it; the interpreter polls `vm.interrupt.check()` (each backward `JUMP`, `CALL`, around Polars `collect`s, IPC waits) and returns `QplError::Interrupted`. One `interrupt.statement()` guard covers a whole `run_source` call (a full script or one REPL line), however many statements it contains |
 | `ipc` | `ipc` feature only (`#[cfg(feature = "ipc")]`, `mod ipc;` in `main.rs` is itself gated). Client (`hopen`/`dispatch`/`async dispatch`/`await`) and server (`\port`) over a plain `zeromq` REQ/REP pair — see the IPC subsection below |
 
 ### VM state and evaluation model
 
-`Vm` (in `vm.rs`) holds exactly one binding map plus a set of registers —
-there is no `tables`/`lazy_frames`/`functions` split and no `scopes` stack:
+`Vm` (in `vm.rs`) holds exactly one binding map plus a set of registers;
+tables, lazy plans and functions share the map, and call frames on the stack
+are the only scopes:
 
 - `globals: HashMap<String, ast::Value>` — every session-level binding:
   scalars, vectors, `Value::Table` (an eager binding), `Value::Lazy` (a
@@ -172,10 +169,10 @@ bare reference to one of those names (anywhere in the file, including inside
 function bodies, but not a param/local shadowing it) to its namespaced form
 before compiling it. This means a bare name that the file binds at top level
 *always* refers to the import's own binding, even in a statement that runs
-before that binding's own statement does — a library can no longer read a
+before that binding's own statement does — a library can't read a
 session-level `t` and rebind it with `t: select from t where ...`; it reads
-its own (as-yet-unbound) `.lib.t` and fails with an undefined-name error
-instead. The runtime `\i` native still does today's transaction: snapshot
+its own (as-yet-unbound) `.lib.t` and fails. The runtime `\i` native does the
+transaction: snapshot
 `globals`, drop any existing `.lib.*` keys, run the embedded program, restore
 the snapshot on error.
 
@@ -185,10 +182,8 @@ scan of the query, not a runtime flag.
 
 ### Invariants
 
-This design trades the old "keep the VM small" rule (still worth following
-in spirit — don't add surface area you don't need) for a stricter set of
-constraints that keep the bytecode itself simple to reason about and safe to
-extend:
+Don't add surface area you don't need. These constraints keep the bytecode
+simple to reason about and safe to extend:
 
 - **One evaluator.** Everything — scalar maths, calls, closures, `while`,
   `?[..]`, lists, IPC — compiles to bytecode and runs through
@@ -253,6 +248,22 @@ do it in the same change:
 Don't touch `CHANGELOG.md`/version bumps for this — those are a separate,
 maintainer-driven release step, not tied to individual language changes.
 
+**Pre-0.2: document the current design, not its history.** While the version
+is `0.1.x`, a breaking change is a revision of the original design, not a
+change users need telling about. User-facing docs (`book/`, `README.md`,
+`examples/`) describe how qpl works *now*, as if it had always worked that
+way. No "used to", "no longer", "was removed", "previously", or migration
+notes. Explaining *why* the design is the way it is is fine (e.g. "qpl
+doesn't accept kdb's `1 x` because…"). This changes from `0.2` onwards,
+when breaking changes need documenting.
+
+The same goes for code comments at any version: describe what the code does
+and why, never how it used to work ("regression: X used to…", "now an
+ordinary statement", "replaces the old…"). Keep them as short as possible;
+don't restate the code or cross-reference every caller. The one exception is
+a retired `Op` number, which keeps a one-line note of what it was (see
+"Invariants").
+
 ### IPC (`ipc` feature)
 
 On by default (drop it with `--no-default-features`); `zeromq`/`tokio` are
@@ -284,8 +295,9 @@ a table serialises via the existing Parquet writer/reader (already linked for
 dependency) — see "Compiled artifacts" below for the other consumer of that
 codec. The server side (`\port`, `repl::eval_for_dispatch`) compiles each
 incoming request as a `Result`-mode whole program and rejects `Stmt::System`
-(a `\` command) outright — those stay REPL-loop-only; `Cfg` and `Log`
-statements are still allowed remotely.
+(a `\` command) outright — those are local-only; `Cfg` and `Log`
+statements are allowed remotely (subject to the connection's read/write
+mode).
 
 ### Compiled artifacts (`qpl -C` / `qpl -c`, `.qplc`)
 
@@ -295,28 +307,27 @@ written via a temp file + rename so a failed compile never leaves a partial
 artifact); `qpl script.qplc` (or any file whose first bytes are the `"QPLC"`
 magic — `repl::run_script` sniffs this, not the extension) runs it directly
 via `Program::from_bytes` + `Vm::run_compiled`, with no lexing, parsing or
-compiling at all. `\l`/`\i` targets are already embedded sub-`Program`s
-(Phase 5), so a `.qplc` never needs its original source files — it's a fully
+compiling at all. `\l`/`\i` targets are already embedded sub-`Program`s,
+so a `.qplc` never needs its original source files — it's a fully
 self-contained artifact, not a security boundary, exactly equivalent to
 running the source. `qpl -c '<command>'` runs a short ad hoc command and
 exits (`repl::run_command`, source text through the same
 parse→compile→run path as a script, reported unprefixed like `<main>` REPL
-input); `-C`, `-c`, `-i`, and a `file` argument all conflict with each other
+input); `-C`, `-c`, `-d`, `-i`, and a `file` argument all conflict with each other
 in `main.rs`'s clap `Cli`.
 
 `Program::to_bytes`/`from_bytes` (`program.rs`) serialise `code`/`operands`/
 `lines` (recursing into an embedded `Operand::Program`), gated by a `u16
-format_version` (currently 1). **Any change to `Op`'s discriminants, to
-`Operand`'s on-disk tags, or to `codec::ValueTag`'s discriminants must bump
-`FORMAT_VERSION`** — a stale `.qplc` then fails with a clean "compiled with
+format_version` (`FORMAT_VERSION`). **Any change to `Op`'s discriminants, to
+`Operand`'s on-disk tags, to `NativeId`'s tags, or to `codec::ValueTag`'s
+discriminants must bump `FORMAT_VERSION`** — a stale `.qplc` then fails with a clean "compiled with
 an incompatible qpl" error instead of misdecoding. `from_bytes` never panics:
 a truncated file, an unknown opcode/operand/value tag, an out-of-range jump
 target, or trailing garbage all come back as `Err` (see `program.rs`'s
 `.qplc` serialisation tests). The value codec itself (`codec::encode_value`/
 `decode_value`) is lossless for everything that can appear in an
 `Operand::Value` — every scalar and vector `Value` variant, nulls included
-(a per-element validity flag, not the lossy `"<unrepresentable>"`/
-null-dropping the pre-Phase-7 IPC-only encoder used); `Table`/`Lazy`/
+(a per-element validity flag); `Table`/`Lazy`/
 `Closure`/`Handle`/`Future` have no operand encoding (a closure literal is
 always `Operand::Func`, never a baked-in runtime closure) and `to_bytes`
 errors rather than writing garbage if one somehow reached an operand.

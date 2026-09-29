@@ -10,7 +10,8 @@ statement. `.qpl.cfg` sets them, taking one or more `key=value` pairs:
 A bare `.qpl.cfg` prints the current settings, which is useful when a result
 looks unexpected and you want to check what's in effect. Both forms work in
 scripts and in the REPL. Over [IPC](ipc.md), only a write handle may change
-settings; a read-only client can still print them.
+settings. A bare `.qpl.cfg` sent from a client prints on the server's
+console, not the client's.
 
 The knobs are:
 

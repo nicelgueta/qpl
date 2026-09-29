@@ -1,7 +1,6 @@
 / ─────────────────────────────────────────────────────────────────────────────
-/ Temporal types (kdb+/q convention). Phase 1: literals, scalars, arithmetic,
-/ casts, and the `.qpl.*` now-functions. Column bucketing (`xbar`) and `within`
-/ land in Phase 2.
+/ Temporal types (kdb+/q convention): literals, scalars, arithmetic, casts,
+/ and the `.qpl.*` now-functions.
 /
 /   date       2024.03.15
 /   month      2024.03m

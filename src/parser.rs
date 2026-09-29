@@ -6,9 +6,8 @@ use crate::errors::QplError;
 use crate::lexer::tokenise;
 use crate::tokens::{Token, TokenKind};
 
-/// Words that can't be bound as a variable or parameter name: `while[..]` and
-/// `noop` are parsed straight off the token stream (see `parse_primary`), so a
-/// same-named binding would be unreachable.
+/// Names that can't be bound: `while[..]` and `noop` are parsed directly, so
+/// a binding would be unreachable.
 const RESERVED: &[&str] = &["while", "noop"];
 
 fn check_not_reserved(name: &str) -> Result<(), QplError> {
@@ -21,10 +20,8 @@ fn check_not_reserved(name: &str) -> Result<(), QplError> {
 pub struct Parser {
     tokens: Vec<Token>,
     i: usize,
-    /// Do juxtaposed string literals (`"a" "b"`) fold into one `StrVec`? On
-    /// everywhere except the top level of a `log` argument list, where
-    /// juxtaposition already means "separate items to concatenate" — there a
-    /// string vector needs parens (`log ("a" "b")`). See [`Parser::with_str_runs`].
+    /// Whether juxtaposed strings (`"a" "b"`) fold into a `StrVec`. Off at the
+    /// top level of a `log` argument list, where juxtaposition separates items.
     str_runs: bool,
 }
 
@@ -50,10 +47,8 @@ impl Parser {
             &TokenKind::Eof
         }
     }
-    /// Is the parser sat right before `` `w!hopen ``? Distinguishes the
-    /// write-mode connection modifier from the superficially similar
-    /// `` `c!01b t `` sort-map / `` `a`b!... `` table-op grammar, both of
-    /// which are also `Symbol` immediately followed by `Bang`.
+    /// Is the next thing `` `w!hopen ``? Distinguishes it from the `` `c!01b t ``
+    /// sort and `` `a`b!... `` forms, which also start `Symbol` `Bang`.
     fn is_whopen_modifier(&self) -> bool {
         matches!(self.peek(), TokenKind::Symbol(s) if s == "w")
             && self.peek2() == &TokenKind::Bang
@@ -81,7 +76,6 @@ impl Parser {
         }
     }
 
-    // main entry point
     fn parse_stmt(&mut self) -> Result<Stmt, QplError> {
         if matches!(self.peek(), TokenKind::Name(_)) && self.peek2() == &TokenKind::Colon {
             let name = if let TokenKind::Name(name) = self.next() {
@@ -91,20 +85,15 @@ impl Parser {
             };
             self.eat(&TokenKind::Colon)?;
             check_not_reserved(&name)?;
-            // `name: {[..] ..}` — binding a function literal. Ordinary scalar
-            // assignment of an ordinary value (see `Value::Closure`); it only
-            // short-circuits `parse_body` here because a leading `{` has no
-            // meaning on the table side.
+            // `name: {[..] ..}`: an ordinary assignment of a function value
             if self.peek() == &TokenKind::LBrace {
                 return Ok(Stmt::ScalarAssign {
                     name,
                     expr: self.parse_func_lit()?,
                 });
             }
-            // query keywords produce a table result; anything else is a scalar
-            // expression. `parse_body` decides between a table statement and a
-            // column expression (a one-column select → `Stmt::SingleVar`), so we
-            // just rewrap whatever it returns.
+            // query keywords give a table statement (or a column expression
+            // from `parse_body`); anything else is a scalar expression
             match self.peek() {
                 TokenKind::Select
                 | TokenKind::Update
@@ -114,10 +103,8 @@ impl Parser {
                 | TokenKind::Load
                 | TokenKind::Lazy
                 | TokenKind::Collect => self.assign_from_body(name),
-                // `\`c!01b <tbl>` (sort) / `\`a\`b drop <tbl>` (drop) are table ops
-                // keyed off the leading symbol; a bare `\`a\`b\`c` is a symbol
-                // vector value (e.g. an enum definition), and a bare `\`x` is a
-                // plain symbol — tables are referenced by name, never by symbol.
+                // `` `c!01b t `` (sort) / `` `a`b drop t `` are table ops; a bare
+                // symbol or symbol vector is a value
                 TokenKind::Symbol(_) | TokenKind::SymbolVec(_)
                     if !self.is_whopen_modifier()
                         && (matches!(
@@ -127,12 +114,11 @@ impl Parser {
                 {
                     self.assign_from_body(name)
                 }
-                // `n limit <table-expr>` is a table operation; `n#…` is always a
-                // take/slice value expression (the VM decides frame vs list).
+                // `n limit <table-expr>` is a table op; `n#...` is a value take
                 TokenKind::Int(_) if self.peek2() == &TokenKind::Limit => {
                     self.assign_from_body(name)
                 }
-                // `-n limit <table-expr>` — same, with a leading unary minus.
+                // `-n limit <table-expr>`
                 TokenKind::Op(op)
                     if op == "-"
                         && matches!(self.peek2(), TokenKind::Int(_))
@@ -140,7 +126,7 @@ impl Parser {
                 {
                     self.assign_from_body(name)
                 }
-                // `<name> limit <table-expr>` — a bound global as the count.
+                // `<name> limit <table-expr>`
                 TokenKind::Name(_) if self.peek2() == &TokenKind::Limit => {
                     self.assign_from_body(name)
                 }
@@ -154,10 +140,8 @@ impl Parser {
         }
     }
 
-    /// Parse `name: <body>` where `<body>` went through [`Parser::parse_body`].
-    /// In assignment position a one-column `select` is a *column expression*:
-    /// it materialises to a list global rather than a named table. A bare
-    /// one-column select (no `name:`) still prints as a table.
+    /// Parse `name: <body>`. Here a one-column `select` is a column expression
+    /// and binds a list; a bare one (no `name:`) still prints as a table.
     fn assign_from_body(&mut self, name: String) -> Result<Stmt, QplError> {
         match self.parse_body()? {
             Stmt::SingleVar(expr) => Ok(Stmt::ScalarAssign { name, expr }),
@@ -172,13 +156,9 @@ impl Parser {
         }
     }
 
-    /// `{[p1,p2] stmt; stmt; last-expr}` — a function literal, parsed straight
-    /// into an `Expr::Lambda`, compiled to bytecode (`PUSH Func(proto)` plus
-    /// the body appended after the enclosing program's main code — see
-    /// `compiler::compile_value_expr`) rather than kept as raw AST. The param
-    /// list is optional (`{[] ..}` / `{ .. }` are niladic). Statements are
-    /// `;`-separated, each a full `parse_stmt` (so locals may be assigned);
-    /// the body must be non-empty and end in an expression (its return value).
+    /// `{[p1,p2] stmt; stmt; last-expr}`. The param list is optional (`{[] ..}`
+    /// / `{ .. }` are niladic). Statements are `;`-separated full statements;
+    /// the body must be non-empty and end in an expression.
     fn parse_func_lit(&mut self) -> Result<Expr, QplError> {
         self.eat(&TokenKind::LBrace)?;
         let mut params = Vec::new();
@@ -197,9 +177,7 @@ impl Parser {
         }
         let mut body = Vec::new();
         while self.peek() != &TokenKind::RBrace {
-            // tolerate a stray/extra `;` (an empty statement) between real
-            // ones, rather than trying to parse a statement starting at it
-            // and failing with "Unexpected token in primary: Semicolon".
+            // skip an empty statement (stray `;`)
             if self.peek() == &TokenKind::Semicolon {
                 self.next();
                 continue;
@@ -233,7 +211,7 @@ impl Parser {
     }
 
     fn parse_body(&mut self) -> Result<Stmt, QplError> {
-        // `<name> sink <path>` — sink a table referenced by name.
+        // `<name> sink <path>`
         if matches!(self.peek(), TokenKind::Name(_)) && self.peek2() == &TokenKind::Sink {
             let name = match self.next() {
                 TokenKind::Name(n) => n,
@@ -247,19 +225,17 @@ impl Parser {
             })));
         }
 
-        // A leading `Int` only starts a *table* statement for `n limit …`;
-        // `n#…` is a take/slice value expression handled by `parse_scalar_stmt`.
+        // a leading `Int` starts a table statement only for `n limit ...`
         let leading_int = matches!(self.peek(), TokenKind::Int(_));
         let int_table = leading_int && self.peek2() == &TokenKind::Limit;
-        // `-n limit <table-expr>` — same, with a leading unary minus (tail).
+        // `-n limit <table-expr>`
         let leading_neg_int = matches!(self.peek(), TokenKind::Op(op) if op == "-")
             && matches!(self.peek2(), TokenKind::Int(_));
         let neg_int_table = leading_neg_int && self.peek3() == &TokenKind::Limit;
-        // `<name> limit <table-expr>` — same, with a bound global as the count.
+        // `<name> limit <table-expr>`
         let name_table_limit =
             matches!(self.peek(), TokenKind::Name(_)) && self.peek2() == &TokenKind::Limit;
-        // `\`c!01b <tbl>` / `\`a\`b drop <tbl>` — a table op keyed off a leading
-        // symbol. A bare `\`x` is a symbol value, not a table.
+        // `` `c!01b t `` / `` `a`b drop t ``: a table op keyed off a symbol
         let sym_table_op = !self.is_whopen_modifier()
             && matches!(self.peek(), TokenKind::Symbol(_) | TokenKind::SymbolVec(_))
             && (matches!(
@@ -273,7 +249,7 @@ impl Parser {
             || sym_table_op
         {
             let tbl_expr = self.parse_table_expr()?;
-            // postfix sink: `<table-expr> sink <path>`
+            // postfix `<table-expr> sink <path>`
             if matches!(self.peek(), TokenKind::Sink) {
                 self.next(); // consume `sink`
                 let path = self.parse_expr()?;
@@ -293,20 +269,15 @@ impl Parser {
     }
 
     fn parse_table_expr(&mut self) -> Result<TableExpr, QplError> {
-        // `<count> limit|# <table-expr>` — first/last `n` rows. `<count>` is
-        // any primary-level scalar expression (a literal, a bound global, a
-        // parenthesised expression, …), speculatively parsed and backtracked
-        // out if no `limit`/`#` follows (so e.g. a bare `select …` or table
-        // name falls through to the match below untouched).
+        // `<count> limit|# <table-expr>`. `<count>` is any primary expression,
+        // parsed speculatively and backtracked if no `limit`/`#` follows
         if let Some(te) = self.try_parse_table_limit()? {
             return Ok(te);
         }
         let peek = self.peek().clone();
         match peek {
-            // `(<table-expr>)` — the parens give the parser an explicit end
-            // point, which is what lets a join's right side (see `parse_join`)
-            // hold an arbitrary table expression without the trailing
-            // right_on symbols being ambiguous with a nested select's own join.
+            // `(<table-expr>)`: parens mark where it ends, so a join's right side
+            // can be any table expression (see `parse_join`)
             TokenKind::LParen => {
                 self.next();
                 let inner = self.parse_table_expr()?;
@@ -316,7 +287,7 @@ impl Parser {
             TokenKind::Select => Ok(TableExpr::Select(self.parse_query(false, false)?)),
             TokenKind::Update => Ok(TableExpr::Select(self.parse_query(true, false)?)),
             TokenKind::Delete => Ok(TableExpr::Select(self.parse_query(false, true)?)),
-            // a bare table name, e.g. `cols t`, `distinct t`, `\`c drop t`
+            // a bare table name
             TokenKind::Name(n) => {
                 self.next();
                 Ok(table_ref(n))
@@ -328,7 +299,7 @@ impl Parser {
                 ))))
             }
             TokenKind::Load => {
-                // standalone: load "path" → select all from the file
+                // standalone `load "path"`: select all from the file
                 self.next();
                 Ok(TableExpr::Source(TableSource::Load(Box::new(
                     self.parse_load_path()?,
@@ -354,18 +325,14 @@ impl Parser {
             TokenKind::Symbol(s) => {
                 self.next(); // consume the symbol
                 match self.peek() {
-                    // `\`tbl` / `\`tbl sink path` used to name a table — tables are
-                    // referenced by name now, so this is a plain symbol value.
+                    // tables are referenced by name; a symbol is a plain value
                     TokenKind::Eof | TokenKind::Sink => Err(QplError::Parse(format!(
                         "reference tables by name, not by symbol: write '{s}', not '`{s}'"
                     ))),
                     TokenKind::Bang => {
-                        // single symbol with a bang should actually
-                        // be a symvec with a single element
+                        // a single symbol before `!` is a one-element symbol vector
                         self.next(); // consume '!'
-                        // TODO also make the use of a dict generic not just to sort
-                        // so a sort in the compiler is pushing the map onto the stack
-                        // and calling sort
+                        // TODO: generalise dicts beyond sort (push the map, then sort)
                         let peek = self.peek().clone();
                         match peek {
                             TokenKind::BoolVec(b) => {
@@ -585,9 +552,8 @@ impl Parser {
         self.parse_expr_inner(true)
     }
 
-    /// Like [`Parser::parse_expr`] but stops at a trailing `over`: the window
-    /// binds to the whole aggregate (`(sum x) over p`), and an aggregate's own
-    /// argument (`sum price * size`) must not swallow a following `over`.
+    /// [`Parser::parse_expr`] that stops at `over`, so the window applies to the
+    /// whole aggregate (`sum price * size over p`).
     fn parse_value(&mut self) -> Result<Expr, QplError> {
         self.parse_expr_inner(false)
     }
@@ -596,18 +562,13 @@ impl Parser {
     fn parse_expr_inner(&mut self, windows: bool) -> Result<Expr, QplError> {
         let left = self.parse_noun()?;
 
-        // `u8!`$expr` (physical-width categorical) / `name::`$expr` (enum) —
-        // a modifier token between the type and the `` `$ `` cast operator
+        // `u8!`$expr` (categorical width) / `name::`$expr` (enum)
         if let Some(cast) = self.parse_modified_cast(&left, false)? {
             return self.finish_window(cast, windows);
         }
 
-        // `` `w!hopen <addr> `` — a write-mode IPC connection handle (bare
-        // `hopen` is read-only by default). Reuses the same bang-modifier
-        // convention as `` u8!`$col ``/`` `c!01b t ``; `w` is the only
-        // accepted modifier. Lowered to `Call { func: "whopen", .. }` so no new
-        // AST node is needed for it — `Op::Call`'s runtime dispatch
-        // (`ops::call_by_name`) already resolves it by name.
+        // `` `w!hopen <addr> ``: a write-mode connection, lowered to a call to
+        // `whopen` (resolved by name at run time)
         if let (Expr::Sym(w), TokenKind::Bang) = (&left, self.peek())
             && w == "w"
         {
@@ -626,15 +587,8 @@ impl Parser {
             };
         }
 
-        // infix dyadic verbs: `<param> verb <expr>` (q-style). `param` is `left`;
-        // the value is the rest of the expression. They bind tighter than `over`,
-        // so the value never swallows a window. The parser only records
-        // `Call { func, args: [value, param] }`; `round` is lowered in the
-        // compiler, the rest dispatch through `apply_dyadic` in the VM — except
-        // `til`, a value-context list constructor compiled directly
-        // (`compiler::compile_value_expr`) before it would ever reach that
-        // column-context dispatch (so `args` there means `[high, low]`, not
-        // `[column, param]`).
+        // infix dyadic verbs, `<param> verb <expr>` (q-style), recorded as
+        // `Call { func, args: [value, param] }`. They bind tighter than `over`.
         if let TokenKind::Name(n) = self.peek()
             && matches!(
                 n.as_str(),
@@ -663,9 +617,10 @@ impl Parser {
             return self.finish_window(call, windows);
         }
 
-        // bin op: left op right where right is the entire expr cos q is right to left eval
+        // binary op: the right side is the whole rest of the expression
+        // (right-to-left evaluation)
         if let TokenKind::Op(op) = self.peek().clone() {
-            // cast: type$expr  e.g. f64$qty ;  `$expr  casts to a symbol / categorical
+            // cast: `type$expr` (`f64$qty`), or `` `$expr `` to symbol/categorical
             if op == "$" {
                 let target = cast_target(&left)?;
                 self.next();
@@ -682,8 +637,7 @@ impl Parser {
             let right = self.parse_expr_inner(windows)?;
             return Ok(binop(left, op, right));
         }
-        // `like`: q-glob match, a real binary operator like `=`/`<>` — just
-        // spelled as a bareword rather than an `Op` token.
+        // `like`: a binary operator spelled as a word
         if matches!(self.peek(), TokenKind::Name(n) if n == "like") {
             self.next();
             let right = self.parse_expr_inner(windows)?;
@@ -693,12 +647,9 @@ impl Parser {
                 right: Box::new(right),
             });
         }
-        // `<conn> dispatch <rest>` / `<conn> async dispatch <rest>` — the payload
-        // is a whole statement (often a table expression, e.g. `select from t`),
-        // not a scalar `Expr`, so it can't be parsed as a normal argument; instead
-        // capture everything left in the token stream verbatim and reconstruct
-        // its source text (`render_tokens`) for the server to tokenise/parse/eval
-        // independently, exactly as if it were typed at that server's REPL.
+        // `<conn> [async] dispatch <rest>`: the payload is a whole statement,
+        // so capture the remaining tokens and render them back to source text
+        // for the server to parse
         let is_async_dispatch = matches!(self.peek(), TokenKind::Name(n) if n == "async")
             && matches!(self.peek2(), TokenKind::Name(n) if n == "dispatch");
         if is_async_dispatch || matches!(self.peek(), TokenKind::Name(n) if n == "dispatch") {
@@ -714,7 +665,6 @@ impl Parser {
                 is_async: is_async_dispatch,
             });
         }
-        // call: left(args)
         if let Expr::ColRef(name) = &left {
             if is_noun_start(self.peek()) {
                 let name = name.clone();
@@ -725,8 +675,7 @@ impl Parser {
                 };
                 return self.finish_window(call, windows);
             }
-            // `<verb> select … from …` / `<verb> distinct …` — a reduction over a
-            // column expression, e.g. `first select price from trades`.
+            // a verb over a table expression: `first select price from trades`
             if is_table_expr_start(self.peek()) {
                 let name = name.clone();
                 let arg = Expr::Table(Box::new(self.parse_table_expr()?));
@@ -740,9 +689,8 @@ impl Parser {
         self.finish_window(left, windows)
     }
 
-    /// If `windows` and the next token is `over`, wrap `left` in an
-    /// `Expr::Window` and let any arithmetic *after* the window continue
-    /// (`... over `p - salary`). Otherwise return `left` unchanged.
+    /// If `windows` and `over` follows, wrap `left` in an `Expr::Window`, then
+    /// continue any arithmetic after it (`... over `p - salary`).
     fn finish_window(&mut self, left: Expr, windows: bool) -> Result<Expr, QplError> {
         if !windows || !matches!(self.peek(), TokenKind::Over) {
             return Ok(left);
@@ -755,8 +703,7 @@ impl Parser {
         } else {
             Vec::new()
         };
-        // trailing `rolling <n>` sub-clause turns the aggregate into a fixed-size
-        // rolling window (`sum px over `sym order `ts asc rolling 3`).
+        // optional `rolling <n>`: a fixed-size rolling aggregate
         let rolling = self.parse_rolling_modifier()?;
         let win = Expr::Window {
             func: Box::new(left),
@@ -764,7 +711,7 @@ impl Parser {
             order,
             rolling,
         };
-        // `over` binds tighter than arithmetic: fold trailing binary operators.
+        // `over` binds tighter than arithmetic: fold trailing binary operators
         if let TokenKind::Op(op) = self.peek().clone()
             && op != "$"
         {
@@ -775,8 +722,7 @@ impl Parser {
         Ok(win)
     }
 
-    /// Trailing `rolling <n>` window sub-clause (after the `over` partition and
-    /// any `order`). Returns `None` when there is no `rolling` keyword.
+    /// Optional trailing `rolling <n>` (after the partition and any `order`).
     fn parse_rolling_modifier(&mut self) -> Result<Option<usize>, QplError> {
         if !matches!(self.peek(), TokenKind::Name(n) if n == "rolling") {
             return Ok(None);
@@ -801,8 +747,7 @@ impl Parser {
         }
     }
 
-    /// Window `order` sub-clause: space-separated `` `col asc|desc `` pairs
-    /// (no commas — a comma ends the clause and returns to the projection list).
+    /// Window `order`: space-separated `` `col asc|desc `` pairs (a comma ends it).
     fn parse_window_order(&mut self) -> Result<Vec<(String, bool)>, QplError> {
         let mut order = Vec::new();
         loop {
@@ -831,13 +776,9 @@ impl Parser {
         Ok(order)
     }
 
-    /// Like [`Parser::parse_expr`] but without trailing juxtaposition-as-call:
-    /// in a `log` argument list `a b` is two items, not `a(b)`. Binary ops,
-    /// casts, and noun-level postfixes (`` name`col ``, `f[a;b]` bracket
-    /// application/indexing, `list where pred`, …) still compose — go through
-    /// `parse_noun` rather than `parse_primary` directly, so only bareword
-    /// juxtaposition-as-a-call (`f x`, handled in `parse_expr_inner`) is
-    /// excluded; wrap that form of a call in parens instead.
+    /// [`Parser::parse_expr`] without juxtaposition-as-call: in a `log` argument
+    /// list `a b` is two items, not `a(b)`. Everything else still composes;
+    /// parenthesise a bareword call.
     fn parse_expr_no_call(&mut self) -> Result<Expr, QplError> {
         let left = self.parse_noun()?;
         if let Some(cast) = self.parse_modified_cast(&left, true)? {
@@ -863,10 +804,8 @@ impl Parser {
         Ok(left)
     }
 
-    /// `u8!`$expr`  → `CastTarget::SymPhysical("u8")`
-    /// `name::`$expr` → `CastTarget::Enum("name")`
-    /// `left` is whatever `parse_primary` produced before the modifier token.
-    /// Returns `Ok(None)` when there is no `!` / `::` modifier to consume.
+    /// `u8!`$expr` → `CastTarget::SymPhysical("u8")`, `name::`$expr` →
+    /// `CastTarget::Enum("name")`. `Ok(None)` if no `!`/`::` follows.
     fn parse_modified_cast(
         &mut self,
         left: &Expr,
@@ -883,7 +822,7 @@ impl Parser {
             }
             _ => return Ok(None),
         };
-        // the modifier must be followed by the `` `$ `` cast operator
+        // the modifier must be followed by `` `$ ``
         match self.next() {
             TokenKind::Symbol(s) if s.is_empty() => {}
             other => {
@@ -911,9 +850,8 @@ impl Parser {
         }))
     }
 
-    /// `while[test; s1; ...; sn]` (the `while` already consumed, sat on `[`).
-    /// Every slot is a full statement, so the body may assign; the test must be
-    /// an expression.
+    /// `while[test; s1; ...]` (sitting on `[`). Slots are full statements, but
+    /// the test must be an expression.
     fn parse_while(&mut self) -> Result<Expr, QplError> {
         self.eat(&TokenKind::LBracket)?;
         let mut slots = Vec::new();
@@ -973,12 +911,9 @@ impl Parser {
         Ok(Expr::Case { branches, default })
     }
 
-    /// operand of `lazy` / `collect`: either a bare table variable name
-    /// (`collect t`) or a full table expression (`lazy load \`x.parquet`).
+    /// The operand of `lazy`/`collect`: a table name or table expression.
     fn parse_lazy_operand(&mut self) -> Result<TableExpr, QplError> {
-        // a bare name is only a plain table reference when it's not actually
-        // the leading count of `<name>#…` / `<name> limit …` (`parse_table_expr`
-        // handles that generally, via `try_parse_table_limit`).
+        // a bare name, unless it's the count of `<name>#...` / `<name> limit ...`
         if let TokenKind::Name(name) = self.peek().clone()
             && !matches!(self.peek2(), TokenKind::Hash | TokenKind::Limit)
         {
@@ -998,11 +933,8 @@ impl Parser {
         }
     }
 
-    /// `load`'s path: a string literal, or a bound scalar global (resolved to
-    /// a path string at run time). Deliberately just one token, not a general
-    /// `parse_expr()` — `parse_tbl_src_expr`'s join-right-hand-side caller
-    /// needs to stop here so a trailing `` `sym `` join key isn't swallowed
-    /// into the path expression.
+    /// `load`'s path: a string literal or a scalar global, resolved at run
+    /// time. Just one token, so a trailing `` `sym `` join key isn't swallowed.
     fn parse_load_path(&mut self) -> Result<Expr, QplError> {
         match self.next() {
             TokenKind::Str(path) => Ok(Expr::Lit(Value::Str(path))),
@@ -1053,8 +985,7 @@ impl Parser {
         Ok(order)
     }
 
-    /// format for the join phrase is: select ... from tbl1`id`name lj|ij|rj tbl2`id`f_name
-    /// returns (join_src, left_on, right_on, join_type)
+    /// `from t1 `id lj|ij|rj t2 `id`: returns (join_src, left_on, right_on, join_type).
     fn parse_join(&mut self) -> Result<(Box<TableExpr>, Value, Value, JoinType), QplError> {
         let mut left_on = Vec::new();
         let mut right_on = Vec::new();
@@ -1084,10 +1015,8 @@ impl Parser {
                 )));
             }
         };
-        // unparenthesised: a bare name or `load "path"`, same as always — the
-        // trailing right_on symbols would otherwise be ambiguous with a nested
-        // select's own join. Wrap it in parens — `(select ...)` — to join
-        // against any other table expression.
+        // unparenthesised: a bare name or `load "path"` only, since a nested
+        // select's own join would make the right-hand keys ambiguous
         let join_src = if self.peek() == &TokenKind::LParen {
             Box::new(self.parse_table_expr()?)
         } else {
@@ -1104,27 +1033,20 @@ impl Parser {
         Ok((join_src, left_on, right_on, join_type))
     }
 
-    /// A "noun": a primary plus the value-context postfixes that bind tightest —
-    /// `` name`col `` / `` name`c1`c2 `` table references and positional indexing
-    /// (`(expr) 2 3`). Everything downstream (`parse_expr_inner`) sees the result
-    /// as an opaque operand.
+    /// A primary plus the tightest-binding postfixes: `` name`col `` /
+    /// `` name`c1`c2 `` references and positional indexing (`(expr) 2 3`).
     fn parse_noun(&mut self) -> Result<Expr, QplError> {
-        // `<n>#<operand>` — take / slice. Caught before `parse_primary` so the
-        // leading int is not read as a literal.
+        // `<n>#<operand>`, caught before the int is read as a literal
         if let Some(take) = self.try_parse_take()? {
             return Ok(take);
         }
         let mut e = self.parse_primary()?;
-        // did `parse_primary` just close a parenthesised group? `(x) 2 3` indexes
-        // even when `x` is a bare name (`x 2 3` on its own is a call).
+        // after a closing paren, `(x) 2 3` indexes even if `x` is a bare name
+        // (`x 2 3` alone is a call)
         let parenthesised = self.i > 0 && self.tokens[self.i - 1].kind == TokenKind::RParen;
 
-        // `` name`col `` / `` name`c1`c2 `` — a column / table expression.
-        // Skipped when the backtick vector is immediately followed by `!`:
-        // that's `` <name> `k1`k2!v1 v2 `` — `name` is a call target (e.g.
-        // `zip`) and the backtick vector is that call's dict-literal
-        // argument, not a table-column reference. `name` is left as a bare
-        // `ColRef` so the "call: left(args)" juxtaposition below picks it up.
+        // `` name`col `` / `` name`c1`c2 ``, unless `!` follows the symbols:
+        // then it's `` name `k1`k2!v1 v2 ``, a call with a dict argument
         let dict_arg_follows =
             matches!(self.peek(), TokenKind::Symbol(_) | TokenKind::SymbolVec(_))
                 && self.peek2() == &TokenKind::Bang;
@@ -1159,11 +1081,8 @@ impl Parser {
             }
         }
 
-        // `` `k1`k2!v1 v2 `` / `` `k!v `` — a dict literal: a symbol (vector)
-        // key immediately followed by `!`, then one value noun per key. `` `w! ``
-        // is excluded here (even though it's a single-symbol key like any
-        // other) so it falls through to the whopen bang-modifier handled in
-        // `parse_expr_inner` — see the comment there.
+        // a dict literal `` `k1`k2!v1 v2 ``, one value noun per key. `` `w! `` is
+        // left for the `w!hopen` modifier in `parse_expr_inner`.
         let dict_keys: Option<Vec<String>> = match &e {
             Expr::Sym(s) if s != "w" => Some(vec![s.clone()]),
             Expr::Lit(v) if matches!(v.as_vec(), Some((VecKind::Sym, _))) => {
@@ -1182,20 +1101,14 @@ impl Parser {
             e = Expr::Dict(pairs);
         }
 
-        // positional index. Two forms, both chainable:
-        //   `<list>[<i>]` / `<list>[<i j k>]`  — bracket index, works on a bare name
-        //   `(<expr>) 2 3`                     — juxtaposed int run, not after a
-        //                                        bare name (that stays a call site)
+        // positional index, chainable:
+        //   `<list>[<i>]` / `<list>[<i j k>]` (works on a bare name)
+        //   `(<expr>) 2 3` (not after a bare name, which is a call)
         loop {
             if matches!(self.peek(), TokenKind::LBracket) {
-                // `log[...]` — the bracket-scoped spelling of the bareword
-                // `log a b c` stdout-write, so it can be delimited inside a
-                // larger expression or a function body instead of always
-                // running to the end of the line. Parsed like `parse_expr_seq`
-                // (juxtaposed items, each a full `parse_expr_no_call`, `;`
-                // between them optional) rather than the generic `f[a;b]`
-                // call grammar below, which requires a separator and would
-                // reject `log[str$.qpl.ts " - INFO " s]` after its first item.
+                // `log[...]`: the bracketed `log`, usable inside an expression
+                // or function body. Items are juxtaposed (`;` optional), unlike
+                // `f[a;b]`, so `log[str$.qpl.ts " - INFO " s]` works.
                 if matches!(&e, Expr::ColRef(n) if n == "log") {
                     self.next(); // `[`
                     let mut args = Vec::new();
@@ -1213,9 +1126,8 @@ impl Parser {
                     continue;
                 }
                 self.next(); // `[`
-                // `f[]` / `f[a;b]` → `Expr::Apply`; a single expression with no
-                // `;` stays `Expr::Index` (list index, or a monadic function
-                // call resolved at run time).
+                // `f[]` / `f[a;b]` → `Apply`; a single expression stays `Index`
+                // (a list index or a one-argument call, decided at run time)
                 if self.peek() == &TokenKind::RBracket {
                     self.next();
                     e = Expr::Apply {
@@ -1257,17 +1169,10 @@ impl Parser {
             break;
         }
 
-        // `<list-expr> where <predicate>[, <predicate>...]` — elementwise
-        // filter on a list value, predicates written against `x` (a plain
-        // column reference into the list's own materialisation). Distinct
-        // from the `` name`col `` + `where` sugar in `finish_table_ref`,
-        // which is already fully consumed by the time we get here, so a
-        // single `where` is never double-handled. A *second* chained `where`
-        // (`` t`price where size>100 where x>50 ``) is not reliably
-        // supported: with no operator precedence in this grammar, the
-        // trailing `where` attaches to whichever noun it immediately follows
-        // inside the first predicate, not necessarily to the outer clause —
-        // parenthesise instead: `` (t`price where size>100) where x>50 ``.
+        // `<list> where <pred>, ...`: filter a list by its own values (`x`).
+        // (The `` name`col where `` form is handled in `finish_table_ref`.)
+        // A second chained `where` doesn't reliably attach to the outer
+        // clause; parenthesise: `` (t`price where size>100) where x>50 ``.
         if self.peek() == &TokenKind::Where {
             self.next();
             let where_ = self
@@ -1281,8 +1186,7 @@ impl Parser {
         Ok(e)
     }
 
-    /// `` name`col … `` — build the one/many-column select and fold a trailing
-    /// `where` (only valid in this sugar) into it.
+    /// `` name`col ... ``: build the select and fold in a trailing `where`.
     fn finish_table_ref(&mut self, table: String, cols: Vec<Alias>) -> Result<Expr, QplError> {
         let where_ = if self.peek() == &TokenKind::Where {
             self.next();
@@ -1302,9 +1206,8 @@ impl Parser {
         }))))
     }
 
-    /// `<count> limit|# <table-expr>` — returns `None` when this doesn't turn
-    /// out to be that shape (restoring the parser position exactly). See
-    /// [`Parser::try_parse_take`] for the value-context sibling of this.
+    /// `<count> limit|# <table-expr>`, or `None` (position restored). See
+    /// [`Parser::try_parse_take`] for the value-context form.
     fn try_parse_table_limit(&mut self) -> Result<Option<TableExpr>, QplError> {
         let checkpoint = self.i;
         let count = match self.parse_primary() {
@@ -1325,11 +1228,8 @@ impl Parser {
         ))))
     }
 
-    /// `<count>#<operand>` — returns `None` when this doesn't turn out to be
-    /// that shape. `<count>` is any primary-level scalar expression (a
-    /// literal, a negative literal, a bound global, a parenthesised
-    /// expression, …), not just a literal int — speculatively parsed and
-    /// backtracked out if no `#` follows.
+    /// `<count>#<operand>`, or `None`. `<count>` is any primary expression,
+    /// parsed speculatively and backtracked if no `#` follows.
     fn try_parse_take(&mut self) -> Result<Option<Expr>, QplError> {
         let checkpoint = self.i;
         let n = match self.parse_primary() {
@@ -1350,16 +1250,10 @@ impl Parser {
         }))
     }
 
-    /// If the next token starts a table expression (`select …`, `collect …`,
-    /// `lazy …`, …), parse the whole thing as one, wrapped in `Expr::Table` —
-    /// `compiler::compile_value_expr` already applies a cast, or hands a frame to a
-    /// called function's parameter, exactly like it does for a bare
-    /// `` trades`price `` or `f[t]` with `t` a table name; the only thing
-    /// missing was a parser path to *reach* those, since none of these
-    /// keywords are a valid `parse_primary`. Used for a cast's RHS
-    /// (`` `date$select ts from t ``) and for a bracket-call argument
-    /// (`f[lazy load "x.csv"]`). Returns `None` for an ordinary scalar/noun
-    /// operand, so the caller falls back to its normal expression parse.
+    /// If a table expression starts here (`select ...`, `lazy ...`, ...), parse
+    /// it as an `Expr::Table`. Used for a cast's operand
+    /// (`` `date$select ts from t ``) and bracket-call arguments
+    /// (`f[lazy load "x.csv"]`). `None` otherwise.
     fn try_parse_table_operand(&mut self) -> Result<Option<Expr>, QplError> {
         if matches!(
             self.peek(),
@@ -1377,9 +1271,8 @@ impl Parser {
         Ok(None)
     }
 
-    /// One argument inside `f[..]` / `f[a;b;..]`: a table expression when one
-    /// starts here (see `try_parse_table_operand`), otherwise an ordinary
-    /// expression.
+    /// One `f[..]` argument: a table expression if one starts here, else an
+    /// ordinary expression.
     fn parse_call_arg(&mut self) -> Result<Expr, QplError> {
         self.with_str_runs(true, |p| match p.try_parse_table_operand()? {
             Some(e) => Ok(e),
@@ -1387,10 +1280,8 @@ impl Parser {
         })
     }
 
-    /// Runs `f` with string-run folding set to `on`, restoring the previous
-    /// setting afterwards (also on error) — a bracket or paren group is its
-    /// own context, so `log ("a" "b")` / `log[f["a" "b"]]` fold even though the
-    /// enclosing `log` argument list doesn't.
+    /// Run `f` with string-run folding set to `on`, then restore it. Brackets
+    /// and parens are their own context, so `log ("a" "b")` folds.
     fn with_str_runs<T>(&mut self, on: bool, f: impl FnOnce(&mut Self) -> T) -> T {
         let outer = std::mem::replace(&mut self.str_runs, on);
         let out = f(self);
@@ -1398,8 +1289,7 @@ impl Parser {
         out
     }
 
-    /// Operand of `<n>#…`: a table expression (`select …`, `` `tbl ``) or a noun
-    /// (`` name`col ``, `(expr)`, a bare name / list global).
+    /// The operand of `<n>#...`: a table expression or a noun.
     fn parse_take_operand(&mut self) -> Result<Expr, QplError> {
         if matches!(
             self.peek(),
@@ -1435,19 +1325,18 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, QplError> {
-        // `{[..] ..}` anywhere an expression is expected — a function literal,
-        // a first-class value like any other (see `Value::Closure`).
+        // a function literal
         if self.peek() == &TokenKind::LBrace {
             return self.parse_func_lit();
         }
-        // a run of ints juxtaposed with no operator is an int-vector literal
+        // juxtaposed ints: an int-vector literal
         if matches!(self.peek(), TokenKind::Int(_)) && matches!(self.peek2(), TokenKind::Int(_)) {
             return Ok(self.try_parse_int_run().unwrap());
         }
         match self.next() {
             TokenKind::Int(n) => Ok(Expr::Lit(Value::Int(n))),
             TokenKind::Float(n) => Ok(Expr::Lit(Value::Float(n))),
-            // a run of juxtaposed strings is a string-vector literal: `"a" "b"`
+            // juxtaposed strings: a string-vector literal
             TokenKind::Str(s) if self.str_runs && matches!(self.peek(), TokenKind::Str(_)) => {
                 let mut v = vec![s];
                 while let TokenKind::Str(next) = self.peek() {
@@ -1463,11 +1352,9 @@ impl Parser {
             TokenKind::Symbol(s) => Ok(Expr::Sym(s)),
             TokenKind::Temporal(v) => Ok(Expr::Lit(v)),
             TokenKind::Name(n) if n == "i" => Ok(Expr::IColRef),
-            // `enlist <value>` — the one-element list of an atom. A literal
-            // folds here; anything else is applied at run time (`ops::native_enlist`).
+            // `enlist <value>`: a literal folds now, anything else at run time
             TokenKind::Name(n) if n == "enlist" => Ok(enlist(self.parse_value()?)),
-            // in expression position `distinct` is the column verb (alias of
-            // `n_unique`); in table position `parse_table_expr` claims it first
+            // in an expression `distinct` is the column verb (`n_unique`)
             TokenKind::Distinct => Ok(Expr::ColRef("distinct".into())),
             TokenKind::Name(n) if n == "noop" => Ok(Expr::Noop),
             TokenKind::Name(n) if n == "while" && self.peek() == &TokenKind::LBracket => {
@@ -1476,13 +1363,10 @@ impl Parser {
             TokenKind::Name(n) if n == "while" => {
                 Err(QplError::Parse("'while' is a reserved word".into()))
             }
-            // Every other bare name — including `.qpl.dt`/`.qpl.tm`/`.qpl.ts`/`.qpl.dlta`
-            // and any other namespaced name — is an ordinary variable/table/function
-            // reference, resolved by lookup (see `Vm::lookup`, the niladic-call path).
+            // any other name (including namespaced ones) is resolved by lookup
             TokenKind::Name(n) => Ok(Expr::ColRef(n)),
             TokenKind::Op(op) if op == "?" => self.parse_case(),
-            // leading `-`: a negative literal (`-45.3`) or unary negation of the
-            // next primary, lowered to `0 - x` so it composes like any `-`
+            // leading `-`: a negative literal, or `0 - x`
             TokenKind::Op(op) if op == "-" => {
                 let rhs = self.parse_primary()?;
                 Ok(negate(rhs))
@@ -1501,9 +1385,8 @@ impl Parser {
     }
 }
 
-/// `<left> <op> <right>`. `?` (roll: `3?6`, `2?10 20 30`) isn't a scalar
-/// operator, so it lowers to `Call { func: "?", args: [right, left] }` —
-/// value context only, compiled directly (`compiler::compile_value_expr`) like `til`.
+/// `<left> <op> <right>`. `?` (roll) isn't a scalar operator, so it becomes
+/// `Call { func: "?", args: [right, left] }` (value context only).
 fn binop(left: Expr, op: String, right: Expr) -> Expr {
     if op == "?" {
         return Expr::Call {
@@ -1518,9 +1401,8 @@ fn binop(left: Expr, op: String, right: Expr) -> Expr {
     }
 }
 
-/// `enlist <operand>`: a literal atom folds to the one-element vector
-/// straight away (so it works anywhere a literal does, e.g. in a `where`);
-/// anything else defers to run time as `Call { func: "enlist", .. }`.
+/// `enlist <operand>`: a literal atom folds to a one-element vector (so it
+/// works anywhere a literal does); anything else is a call at run time.
 fn enlist(operand: Expr) -> Expr {
     let folded = match &operand {
         Expr::Lit(v) => v.enlist(),
@@ -1536,14 +1418,12 @@ fn enlist(operand: Expr) -> Expr {
     }
 }
 
-/// Applies a leading unary minus: folds a numeric literal in place, otherwise
-/// lowers to `0 - expr` so it reuses the existing subtraction path everywhere
-/// (scalar fold, column expr, filter).
+/// Unary minus: fold a numeric literal, otherwise `0 - expr`.
 fn negate(e: Expr) -> Expr {
     let flip = |v: Value| match v {
         Value::Int(n) => Some(Value::Int(-n)),
         Value::Float(f) => Some(Value::Float(-f)),
-        // temporal literals negate their integer offset (kdb treats them as ints)
+        // temporal literals negate their integer offset
         Value::Date(n) => Some(Value::Date(-n)),
         Value::Month(n) => Some(Value::Month(-n)),
         Value::Minute(n) => Some(Value::Minute(-n)),
@@ -1563,8 +1443,7 @@ fn negate(e: Expr) -> Expr {
     }
 }
 
-/// A table expression that, used in a value context, is a *column expression*:
-/// a single-column `select` with no `by` (it materialises to a list, not a table).
+/// A single-column `select` without `by`, which becomes a list in value context.
 fn is_column_expr(te: &TableExpr) -> bool {
     matches!(te, TableExpr::Select(sel)
         if sel.cols.len() == 1 && sel.by.is_none() && !sel.update && !sel.delete)
@@ -1581,10 +1460,8 @@ pub fn parse(tokens: Vec<Token>) -> Result<Stmt, QplError> {
     Ok(stmt)
 }
 
-/// Parse one or more juxtaposed expressions (space-separated), consuming every
-/// token. Used by the `log` stdout-write, which evaluates each as a scalar
-/// and concatenates the rendered values. Top-level juxtaposition separates
-/// items rather than forming a call — see [`Parser::parse_expr_no_call`].
+/// Parse space-separated expressions, consuming every token (the `log`
+/// argument list). Juxtaposition separates items rather than calling.
 pub fn parse_expr_seq(tokens: Vec<Token>) -> Result<Vec<Expr>, QplError> {
     let mut parser = Parser {
         tokens,
@@ -1598,19 +1475,11 @@ pub fn parse_expr_seq(tokens: Vec<Token>) -> Result<Vec<Expr>, QplError> {
     Ok(exprs)
 }
 
-/// Fold the physical lines of a script into logical statements.
-/// [`parse_program`] is the sole caller for script-shaped input; the REPL calls
-/// this indirectly through `parse_program` for one submitted line.
-///
-/// A statement starts at a line with no leading indentation. Any following
-/// line indented by a tab or four (or more) spaces is a continuation of that
-/// same statement; the run of lines is joined with `\n` (which the lexer
-/// treats as whitespace, and which correctly terminates any inline `/`
-/// comment). A blank or non-indented line ends the current statement. Blank
-/// lines and lines whose first non-space character is `/` are dropped unless
-/// they are continuations.
-///
-/// Returns `(zero-based line index where the statement began, statement text)`.
+/// Fold a script's physical lines into logical statements. A statement starts
+/// at an unindented line; following lines indented by a tab or 4+ spaces
+/// continue it (joined with `\n`, which also ends any inline `/` comment).
+/// Blank lines and comment-only lines are dropped unless they're
+/// continuations. Returns `(0-based start line, text)` pairs.
 pub fn logical_statements(src: &str) -> Vec<(u32, String)> {
     let mut out: Vec<(u32, String)> = Vec::new();
     let mut buf: Vec<&str> = Vec::new();
@@ -1638,22 +1507,11 @@ pub fn logical_statements(src: &str) -> Vec<(u32, String)> {
     out
 }
 
-/// Inside a `{[..] ..}` function body, let each line stand for one statement —
-/// same rule `logical_statements` already applies at the top level, just
-/// shifted one indent level in: a line indented no deeper than the body's own
-/// first line starts a new statement (an implicit `;` is inserted before it);
-/// a line indented *more* than that continues the statement above, exactly
-/// like a top-level continuation line does. An explicit `;` for several
-/// statements on one physical line still works (and combining it with this —
-/// an already-`;`-terminated line followed by a new baseline-indent line —
-/// just yields a harmless doubled `;`, which the parser tolerates). Blank and
-/// comment-only lines pass through without affecting the baseline; the line
-/// that closes the body (`}` as its first non-space character, at any indent)
-/// is never treated as a new statement.
-///
-/// A no-op whenever `src` has no multi-line `{..}` to fold (single-line
-/// definitions, or text with no `{` at all), so every other statement shape
-/// is completely unaffected.
+/// Inside a multi-line `{[..] ..}` body, a line at the body's baseline indent
+/// starts a new statement (an implicit `;`) and a deeper line continues the
+/// one above. Explicit `;`s still work (a doubled `;` is harmless). Blank and
+/// comment lines don't set the baseline, and a line starting with `}` never
+/// starts a statement. No-op without a multi-line `{..}`.
 pub fn normalize_function_body_newlines(src: &str) -> String {
     if !src.contains('\n') || !src.contains('{') {
         return src.to_string();
@@ -1672,8 +1530,7 @@ pub fn normalize_function_body_newlines(src: &str) -> String {
             }
         }
         if depth_at_start <= 0 {
-            // not yet inside a function body (the opening line itself, or
-            // anything before/after the whole `{..}` statement)
+            // outside any function body
             out_lines.push(line.to_string());
             continue;
         }
@@ -1695,10 +1552,8 @@ pub fn normalize_function_body_newlines(src: &str) -> String {
     out_lines.join("\n")
 }
 
-/// `\i`'s path argument is a quoted string (`\i "lib/utils.qpl"`), unlike
-/// `\l`'s bare one — the namespace derives from it, so writing it as a string
-/// keeps that visually distinct from an ordinary namespaced identifier
-/// appearing right after `\i` on the same line.
+/// `\i`'s path is a quoted string (`\i "lib/utils.qpl"`), which keeps it
+/// visually distinct from the namespaced names derived from it.
 fn parse_quoted_path(rest: &str) -> Result<String, QplError> {
     match tokenise(rest)?.as_slice() {
         [
@@ -1713,8 +1568,7 @@ fn parse_quoted_path(rest: &str) -> Result<String, QplError> {
     }
 }
 
-/// Recognise the stdout write: `log <expr>` (and bare `log`, which prints a
-/// blank line). Returns the argument text to evaluate as a scalar.
+/// `log <expr>` (or bare `log`): returns the argument text.
 fn log_target(line: &str) -> Option<&str> {
     if line == "log" {
         return Some("");
@@ -1725,9 +1579,8 @@ fn log_target(line: &str) -> Option<&str> {
     None
 }
 
-/// Recognise the `.qpl.cfg` config function: `.qpl.cfg key=value key=value ...`.
-/// Returns the argument text (possibly empty, for a bare `.qpl.cfg` which just
-/// prints the current settings). Not a config line → `None`.
+/// `.qpl.cfg key=value ...`: returns the argument text (empty for a bare
+/// `.qpl.cfg`), or `None`.
 fn cfg_directive(line: &str) -> Option<&str> {
     let rest = line.trim().strip_prefix(".qpl.cfg")?;
     match rest.chars().next() {
@@ -1737,10 +1590,8 @@ fn cfg_directive(line: &str) -> Option<&str> {
     }
 }
 
-/// Parse one already-normalized top-level statement's source text into a
-/// [`Stmt`], recognising the string-level forms (`\`-system commands,
-/// `.qpl.cfg`, bareword `log`) that never reach the token stream, before
-/// falling back to the ordinary token-based grammar.
+/// Parse one top-level statement, recognising the text-level forms (`\`
+/// commands, `.qpl.cfg`, bareword `log`) before the token grammar.
 fn parse_top_level_stmt(src: &str) -> Result<Stmt, QplError> {
     if let Some(inner) = src.strip_prefix("\\d").map(str::trim) {
         return Ok(Stmt::System {
@@ -1766,6 +1617,12 @@ fn parse_top_level_stmt(src: &str) -> Result<Stmt, QplError> {
             arg: path.to_string(),
         });
     }
+    if let Some(rest) = src.strip_prefix("\\port").map(str::trim) {
+        return Ok(Stmt::System {
+            cmd: 'p',
+            arg: rest.to_string(),
+        });
+    }
     if let Some(args) = cfg_directive(src) {
         return Ok(Stmt::Cfg(args.to_string()));
     }
@@ -1775,15 +1632,9 @@ fn parse_top_level_stmt(src: &str) -> Result<Stmt, QplError> {
     parse(tokenise(src)?)
 }
 
-/// Parse a whole script (or one submitted REPL line) into its logical
-/// top-level statements, each paired with its 0-based source line. This is the parser's whole-program entry point:
-/// `compiler::compile_program` consumes its output and never sees raw
-/// source text — every `\`-command / `.qpl.cfg` / bareword-`log` recognition
-/// happens here.
-/// A parse error anywhere aborts the whole parse (and carries a `path:line:`
-/// prefix, exactly like a runtime error at that line — see
-/// `compiler::wrap_line_error`), which is why a parse error anywhere in
-/// a script aborts before any statement runs.
+/// Parse a script (or one REPL submission) into top-level statements with
+/// their 0-based lines. Any parse error aborts the whole parse, with a
+/// `path:line:` prefix, so nothing runs.
 pub fn parse_program(src: &str, path: &str) -> Result<Vec<(u32, Stmt)>, QplError> {
     let mut out = Vec::new();
     for (lineno, raw) in logical_statements(src) {
@@ -1795,17 +1646,15 @@ pub fn parse_program(src: &str, path: &str) -> Result<Vec<(u32, Stmt)>, QplError
     Ok(out)
 }
 
-/// The token(s) just before a `$` in a cast expression, already parsed into
-/// `left`, decide the cast target: `f64$x` → `Prim("f64")`, `` `$x `` → `Sym`.
-/// `u8!`$x` and `name::`$x` are handled in `parse_expr` before this is reached.
+/// The cast target from what precedes `$`: `f64$x` → `Prim("f64")`,
+/// `` `$x `` → `Sym`. (`u8!`$x`/`name::`$x` are handled earlier.)
 fn cast_target(left: &Expr) -> Result<CastTarget, QplError> {
     match left {
         Expr::ColRef(name) => Ok(CastTarget::Prim(name.clone())),
-        // bare backtick before `$` — `` `$expr `` casts to a symbol / categorical
         Expr::Sym(s) if s.is_empty() => Ok(CastTarget::Sym),
-        // `` `date$x `` / `` `int$d `` — a named type before `` `$ ``
+        // `` `date$x `` / `` `int$d ``
         Expr::Sym(s) => Ok(CastTarget::Prim(s.clone())),
-        // `"p"$"…"` — a kdb single-char type code (or full name) before `$`
+        // `"p"$"..."`: a kdb type code (or full name)
         Expr::Lit(Value::Str(s)) => temporal_type_from_code(s)
             .map(|t| CastTarget::Prim(t.into()))
             .ok_or_else(|| QplError::Parse(format!("unknown cast type code {s:?}"))),
@@ -1815,8 +1664,7 @@ fn cast_target(left: &Expr) -> Result<CastTarget, QplError> {
     }
 }
 
-/// kdb single-char temporal type codes (and their full names) accepted as a
-/// cast target, e.g. `"p"$"2024.03.15D…"`.
+/// kdb temporal type codes (and full names) accepted as cast targets.
 fn temporal_type_from_code(s: &str) -> Option<&'static str> {
     Some(match s {
         "d" | "date" => "date",
@@ -1866,12 +1714,8 @@ fn table_ref(name: String) -> TableExpr {
     TableExpr::Source(TableSource::InMem(name))
 }
 
-/// Reconstructs source text from a token slice — the inverse of the lexer,
-/// used by `dispatch` to ship the rest of a statement to another process as
-/// plain text (see `Expr::Dispatch`). The lexer is whitespace-insensitive
-/// around punctuation, so joining every rendered token with a single space is
-/// always safe: the result doesn't have to be byte-identical to what the user
-/// typed, only re-tokenise/re-parse to the same AST.
+/// Rebuild source text from tokens, for `dispatch` to send. Tokens are joined
+/// with single spaces; the result only has to re-parse to the same AST.
 fn render_tokens(tokens: &[Token]) -> String {
     let mut parts = Vec::with_capacity(tokens.len());
     for t in tokens {
@@ -2082,9 +1926,8 @@ mod tests {
 
     #[test]
     fn expr_seq_bracket_call_still_applies_without_parens() {
-        // `f[a;b]`/`f[a]` is a noun-level postfix (unlike bareword `f a`
-        // juxtaposition, which `parse_expr_no_call` deliberately treats as two
-        // separate items) — so it applies even inside a `log` arg list.
+        // `f[a;b]` is a noun-level postfix, so it applies inside a `log` list
+        // (bareword `f a` doesn't)
         let got = seq("add[2;3]");
         assert_eq!(
             got,
@@ -2097,12 +1940,7 @@ mod tests {
 
     #[test]
     fn bracket_call_arg_may_be_a_table_expression() {
-        // regression: `f[lazy load out]` failed with "Unexpected token in
-        // primary: Lazy" — a bracket-call argument only ever tried an
-        // ordinary `parse_expr()`, which has no `parse_primary` case for
-        // `select`/`lazy`/`collect`/etc. `compiler::compile_value_expr` already hands
-        // a frame to a called function's parameter fine (it's the same path
-        // `` f[trades] `` uses) — this only needed a parser change.
+        // a table expression is a valid bracket-call argument
         match p("f[lazy load out]") {
             Stmt::SingleVar(Expr::Index { idx, .. }) => {
                 assert!(matches!(*idx, Expr::Table(_)), "{idx:?}");
@@ -2120,9 +1958,7 @@ mod tests {
 
     #[test]
     fn log_bracket_call_parses_juxtaposed_items_like_a_bareword_log() {
-        // no separator needed — same "space-separated items" grammar as the
-        // bareword `log a b c` form, just delimited by `[..]` instead of
-        // running to the end of the line.
+        // no separator needed, like bareword `log a b c`
         assert_eq!(
             p(r#"log["a" "b"]"#),
             Stmt::SingleVar(Expr::Call {
@@ -2391,8 +2227,7 @@ mod tests {
 
     #[test]
     fn dispatch_command_round_trips_through_render_tokens() {
-        // the rendered text isn't necessarily byte-identical to the input, but
-        // it must re-tokenise/re-parse to the same AST the original would have.
+        // the rendered text must re-parse to the same AST
         let src = r#"select sym, px: price from trades where sym like "AA*""#;
         let original = sel(src);
         match p(&format!("conn dispatch {src}")) {
@@ -2528,8 +2363,7 @@ mod tests {
 
     #[test]
     fn hash_take_count_need_not_be_a_literal() {
-        // regression: only a literal (or negative-literal) int was accepted
-        // before `#`; a bound global fell through to a parse error.
+        // the count before `#` can be any expression, not just a literal
         for source in ["k#trades", "-k#trades", "(k+1)#trades"] {
             assert!(
                 matches!(p(source), Stmt::SingleVar(Expr::Take { .. })),
@@ -2540,9 +2374,7 @@ mod tests {
 
     #[test]
     fn collect_and_lazy_accept_a_variable_hash_count() {
-        // regression: `collect k#t` / `collect (k#t)` errored ("expected
-        // Eof/RParen, got Hash") because `parse_lazy_operand` and
-        // `parse_table_expr` only recognised a *literal* int before `#`.
+        // likewise after `collect`/`lazy`
         for source in ["collect k#t", "collect (k#t)", "lazy k#t"] {
             let stmt = p(source);
             let te = match &stmt {
@@ -2813,8 +2645,7 @@ mod tests {
 
     #[test]
     fn load_accepts_a_variable_path() {
-        // regression: `load out` (a bound scalar global) failed to parse —
-        // `load` only ever accepted a literal string token.
+        // `load` takes a bound scalar global as well as a literal
         match p("load p") {
             Stmt::RetTable(TableExpr::Source(TableSource::Load(path))) => {
                 assert_eq!(*path, Expr::ColRef("p".into()));
@@ -2939,9 +2770,8 @@ mod tests {
 
     #[test]
     fn qpl_now_function_parses_as_an_ordinary_variable_reference() {
-        // `.qpl.ts` is a builtin (see `Vm::builtins`), but the parser doesn't
-        // know that — it's a bare `ColRef` like any other name, resolved (and
-        // auto-invoked, being niladic) by lookup at run time.
+        // `.qpl.ts` is a plain `ColRef` to the parser, resolved (and called,
+        // being niladic) at run time
         match p("l: .qpl.ts") {
             Stmt::ScalarAssign { expr, .. } => assert_eq!(expr, Expr::ColRef(".qpl.ts".into())),
             other => panic!("expected scalar assign, got {other:?}"),
@@ -2950,8 +2780,7 @@ mod tests {
 
     #[test]
     fn namespaced_identifier_parses_as_an_ordinary_variable_reference() {
-        // a general `.ns.name` is just a `ColRef` — resolved by name lookup
-        // like any other identifier, not a zero-arg call.
+        // `.ns.name` is a plain `ColRef`
         match p("l: .utils.helper") {
             Stmt::ScalarAssign { expr, .. } => {
                 assert_eq!(expr, Expr::ColRef(".utils.helper".into()))
@@ -3030,10 +2859,7 @@ mod tests {
 
     #[test]
     fn cast_of_a_select_statement_parses() {
-        // regression: `` `date$select ts from t `` failed with "Unexpected
-        // token in primary: Select" — a cast's RHS didn't know how to start a
-        // table expression, even though `compiler::compile_value_expr`'s `Expr::Cast`
-        // arm already handles a frame/materialised-list operand fine.
+        // a cast's operand can be a table expression
         match p("d: `date$select ts from t where high = 20") {
             Stmt::ScalarAssign {
                 expr:
@@ -3235,7 +3061,6 @@ mod tests {
 
     #[test]
     fn full_query() {
-        // select dbl: c3*2 by c1 from t where c2>15
         let s = sel("select dbl: c3*2 by c1 from t where c2>15");
         assert_eq!(
             s.cols,

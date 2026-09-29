@@ -1,21 +1,14 @@
-//! Built-in (native) functions — resolved through [`crate::vm::Vm::builtins`]
-//! exactly like a user function value (`Lookup::Builtin` alongside a `Value::Closure`
-//! in [`crate::vm::Lookup`]), the one difference being that a name in this map
-//! can never be bound over (see the `bind_*` guards in `vm.rs`).
+//! Built-in (native) functions. All natives share the [`NativeFn`] signature;
+//! where one is registered decides whether it can be shadowed:
 //!
-//! To add a builtin: register the name in [`builtins`] with a `NativeFn` that
-//! implements it — no parser/lexer/compiler changes needed, since a builtin's
-//! name is lexed and parsed as a plain identifier like any other.
+//! - this table (`.qpl.dt` etc.): looked up by name before any user binding,
+//!   and can't be rebound;
+//! - [`NativeId`] (`enlist`, roll, `\` commands): pushed by id by the
+//!   compiler, so no name lookup happens;
+//! - `ops::call_by_name` (`til`, `log`, `hopen`, ...): only reached when no
+//!   user function or table entry matches, so a user function wins.
 //!
-//! One call signature, `NativeFn`, is shared by every native in the
-//! interpreter: this table's `.qpl.dt/tm/ts/dlta`
-//! (name-keyed, unshadowable — checked by [`crate::vm::Vm::lookup`] ahead of
-//! any user binding), [`NativeId`]'s `enlist`/`?` roll (id-keyed, unshadowable
-//! — the compiler pushes the id directly, so no name lookup ever happens), and
-//! `ops::call_by_name`'s `til`/`log`/`hopen`/`whopen`/`await` (name-matched,
-//! shadowable — only reached once [`crate::vm::Vm::lookup`] has already found
-//! neither a user closure nor an entry in this table). Which table a native
-//! lives in is what decides its shadowability, not the signature.
+//! Adding an entry to [`builtins`] needs no lexer/parser/compiler change.
 
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
@@ -24,49 +17,32 @@ use crate::errors::QplError;
 use crate::temporal::{self, TemporalNowFuncType};
 use crate::vm::{Slot, Vm};
 
-/// A value-context primitive referenced by id, not by name: `enlist` and
-/// `?` (roll) are unconditional keywords (checked before a same-named user
-/// function could ever shadow them), so the compiler pushes one of these
-/// directly (`Operand::Native`) instead of the name, and `Op::Call` never has
-/// to look either up. Every *other* value-context primitive (`til`, `hopen`,
-/// `log`, …) is shadowable by a user function and so is resolved by name at
-/// run time — see `ops::call_by_name`.
+/// A primitive the compiler references by id (`Operand::Native`) rather than
+/// by name, so it can never be shadowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeId {
     Enlist,
     Roll,
-    /// `.qpl.cfg key=value ...`: compiled from
-    /// `ast::Stmt::Cfg`, never reachable as an identifier, so it's pushed by
-    /// id like `Enlist`/`Roll` rather than resolved by name.
+    /// `.qpl.cfg key=value ...`
     Cfg,
-    /// `\1 <path>` — point (or detach) the stdout log.
+    /// `\1 <path>`: point (or detach) the stdout log.
     StdoutLog,
-    /// `\d <stmt>` — print a pre-rendered disassembly listing (the listing
-    /// itself is computed at compile time; this just emits the text).
+    /// `\d <stmt>`: print a disassembly rendered at compile time.
     PrintText,
-    /// `\l <path>` — run an embedded [`crate::program::Operand::Program`]
-    /// flat, in the current session scope.
+    /// `\l <path>`: run an embedded `Operand::Program` in the current scope.
     LoadScript,
-    /// `\i "<path>"` — run an embedded `Operand::Program` as a namespaced
-    /// import: snapshot/rollback semantics on failure.
+    /// `\i "<path>"`: run an embedded `Operand::Program` as a namespaced
+    /// import, rolling back on failure.
     ImportScript,
+    /// `\port [<n>]`: close any open listener, then open one on `n` if given.
+    /// Servicing requests is left to the run loop (`repl::start`).
+    Port,
 }
 
-/// The one call signature every native function in the interpreter shares:
-/// it takes the already-evaluated
-/// argument [`Slot`]s (so it can be reused unchanged whether the caller looked
-/// it up by name or by [`NativeId`]) and `&mut Vm` (for the handful — `log`,
-/// `hopen`, `await` — that need session state), and returns a [`Slot`] rather
-/// than a bare [`crate::ast::Value`] so a native could in principle build a
-/// `Frame` too, even though none of today's do.
+/// The signature every native shares: evaluated argument slots in, one slot out.
 pub(crate) type NativeFn = fn(&mut Vm, Vec<Slot>) -> Result<Slot, QplError>;
 
-/// One native function: its accepted arity range (checked by the caller, the
-/// same way a user function's `params.len()` is — but a range rather than a
-/// single `usize` so an eventual variadic native needs no shape change) and
-/// its implementation. `Clone`, not `Copy`: `RangeInclusive` isn't `Copy`
-/// (deliberately, upstream — a `Copy` range invites double-iteration bugs),
-/// even though the function pointer alone would be.
+/// One native function: its accepted arity and implementation.
 #[derive(Clone)]
 pub(crate) struct Builtin {
     pub arity: RangeInclusive<usize>,
@@ -98,7 +74,7 @@ fn now_fn(typ: TemporalNowFuncType) -> NativeFn {
     }
 }
 
-/// The session-wide builtin table, populated once in [`Vm::new`](crate::vm::Vm::new).
+/// The builtin table, built once in [`Vm::new`](crate::vm::Vm::new).
 pub(crate) fn builtins() -> HashMap<String, Builtin> {
     let mut m = HashMap::new();
     m.insert(
@@ -132,9 +108,7 @@ pub(crate) fn builtins() -> HashMap<String, Builtin> {
     m
 }
 
-/// A human-readable rendering of an arity range for the "'{name}' takes …
-/// argument(s)" error text: every builtin today has a fixed (single-value)
-/// arity, which renders as a plain number.
+/// An arity range as text for "takes N argument(s)" errors.
 pub(crate) fn arity_desc(arity: &RangeInclusive<usize>) -> String {
     if arity.start() == arity.end() {
         arity.start().to_string()

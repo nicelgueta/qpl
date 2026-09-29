@@ -1,8 +1,8 @@
 # qpl — Quick Polars Language
 
-qpl is a language with two rather different parents. The syntax comes
-from kdb+/q, so it's terse to the point of looking cryptic until it suddenly
-doesn't. The engine underneath is [Polars](https://pola.rs), so the queries
+qpl is a language with two rather different influences. The syntax is
+inspired by kdb+/q, so it's terse to the point of looking cryptic until it
+suddenly doesn't. The engine underneath is [Polars](https://pola.rs), so the queries
 run at a speed competitive with DuckDB. Nothing else is involved: qpl is a
 single static binary, with no Python, no Polars install, and no runtime to
 set up.
@@ -10,6 +10,12 @@ set up.
 The result is a language you can type a real query into faster than you could
 describe that query to someone else, and which will then chew through a
 parquet file considerably larger than the machine's memory.
+
+qpl borrows a handful of ideas from q (terse right-to-left expressions,
+`select … by … from` queries, dotted temporal literals) but it isn't q, a q
+dialect, or an attempt at compatibility with kdb+. It's its own language, and
+in most respects a very different one: a different type system, a different
+execution model built around lazy Polars plans, and missing plenty of syntax and fea. Don't expect q code to run unchanged.
 
 📖 **[Read the book][book]** for the full guided tour. This README is the
 short version, and each section links to the chapter covering it properly.
@@ -126,8 +132,8 @@ be easy for an agent to drive and hard for one to do much damage with.
 Writing a DuckDB-grade engine solo isn't realistic, so Polars does that part.
 Its API is clean enough that the language is really a small VM translating
 syntax into Polars operations, which left me free to design the front end.
-That front end borrows from q, which I'd been lightly exposed to at work and
-wanted an excuse to learn properly. [More on the reasoning][why].
+That front end takes some inspiration from q, which I'd been lightly exposed
+to at work, but it goes its own way wherever that suited qpl better. [More on the reasoning][why].
 
 ## Working incrementally
 
@@ -257,7 +263,7 @@ select p95: 0.95 quantile price by sym from trades
 ```
 
 `%` is always true division, even for two ints (`10 % 4` is `2.5`, not `2`) —
-q convention, unlike `+`/`-`/`*` which stay integer when both sides are.
+as in q, unlike `+`/`-`/`*` which stay integer when both sides are.
 Evaluation is right to left, so parenthesise when an operator doesn't
 commute: `(int$"42") - 1`.
 
@@ -321,7 +327,7 @@ select s: f64$size, y: str$sym from trades   / name them: unaliased casts both w
 
 ### Temporal types · [chapter][temporal]
 
-kdb-style literals, each an integer offset underneath. Adding an integer
+Dotted literals (a notation borrowed from kdb+/q), each an integer offset underneath. Adding an integer
 shifts by one unit of that type's own resolution.
 
 | type | literal | counts |
@@ -349,8 +355,8 @@ A raw integer crossing the `int`/`long` ↔ `timestamp` boundary (`` `timestamp$
 to build one, `` `long$ts `` to unwrap one) is read and written as **ns since
 the Unix epoch (`1970.01.01`)** by default — the same convention a whole-column
 `` `timestamp$col `` cast already uses under Polars, and the one most people
-reach for outside kdb. Set `.qpl.cfg useqepoch=true` to switch that boundary
-back to kdb's native ns-since-`2000.01.01`, matching the type's internal
+reach for. Set `.qpl.cfg useqepoch=true` to switch that boundary to
+ns-since-`2000.01.01` (kdb's convention), matching the type's internal
 representation exactly (only the raw-integer casts move; date literals,
 arithmetic, and display are unaffected either way):
 
@@ -551,9 +557,13 @@ session and let short-lived clients query it, to let non-qpl callers fetch
 real tables over plain TCP, to fan out across several servers concurrently,
 or to reshape a running session without restarting it.
 
-`\port <n>` opens a listener and a bare `\port` closes it, in the interactive
-REPL only. Each request is evaluated exactly like a typed line, except for
-the `\`-prefixed system commands.
+`\port <n>` opens a listener and a bare `\port` closes it — in a script exactly
+like the REPL (`qpl script.qpl` keeps serving after the script's last statement
+if it left a port open, just as `-i` drops into the REPL). `<n>` is an ordinary
+expression, not just a literal — `\port ?[env like "prod"; 5001; 5002]` picks
+the port at runtime from a variable, a condition, whatever — see
+[`examples/ipc_server.qpl`](examples/ipc_server.qpl). Each request is
+evaluated exactly like a typed line, except for the `\`-prefixed system commands.
 
 ```q
 conn: hopen 5001                       / or hopen "db.internal:5001"

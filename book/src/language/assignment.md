@@ -72,6 +72,7 @@ anywhere else.
 
 ```qpl
 qpl) row_cap: 1e6
+qpl) row_cap
 ```
 
 ```

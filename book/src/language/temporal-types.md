@@ -1,8 +1,8 @@
 # Temporal types
 
-Dates and times in qpl follow kdb+/q, which means they are written as
-literals directly in the language rather than parsed from strings. If you've
-used q this will be entirely familiar. If you haven't, the notation to get
+Dates and times in qpl borrow their notation from kdb+/q: they are written
+as literals directly in the language rather than parsed from strings. If you've
+used q the notation will look familiar. If you haven't, the notation to get
 used to is that dates use dots rather than dashes, and a `D` separates the
 date part of a timestamp from the time part.
 
@@ -28,8 +28,8 @@ There are seven temporal types, differing in what they measure and how finely:
 | timespan | `0D12:30:00.000000000` | nanoseconds of duration |
 
 The right-hand column isn't trivia. Each of these really is an integer
-underneath, counting from the epoch shown, and you can see that number with a
-cast:
+underneath, counting in the unit shown, and for most of them you can see that
+number with a cast:
 
 ```qpl
 qpl) int$2024.03.15
@@ -38,6 +38,13 @@ qpl) int$2024.03.15
 ```
 i64: 8840
 ```
+
+Two don't quite line up with the table. A `time` steps in milliseconds when
+you do arithmetic on it, but it's stored to the nanosecond, so
+`int$12:30:00.000` gives `45000000000000` rather than `45000000`. And a
+timestamp cast to an integer counts from the Unix epoch by default, not from
+`2000.01.01`. [Raw integers and the epoch](#raw-integers-and-the-epoch), at
+the end of this chapter, explains why and how to change it.
 
 The last two rows deserve a distinction: a **timestamp** is a point in time,
 whereas a **timespan** is a length of time. They look similar because both
@@ -122,9 +129,11 @@ qpl) `timestamp$2024.03.15              / midnight on that date
 timestamp: 2024.03.15D00:00:00.000000000
 ```
 
-For parsing text, q's single-character type codes also work, applied to a
+For parsing text, single-character type codes (borrowed from q) also work, applied to a
 string: `"p"` for timestamp, `"d"` date, `"t"` time, `"m"` month, `"u"`
-minute, `"v"` second, `"n"` timespan.
+minute, `"v"` second, `"n"` timespan. The string is read as the literal it
+spells, so a month needs its trailing `m`: `"m"$"2024.03m"` works, while
+`"m"$"2024.03"` is an error.
 
 ```qpl
 qpl) "p"$"2024.03.15D12:30:00"
@@ -157,7 +166,7 @@ having to say which you have:
 
 | Cast | Produces |
 |---|---|
-| `` `date$s `` / `` `month$s `` | a `Date` column |
+| `` `date$s `` / `` `month$s `` | a `Date` column (`` `month$ `` doesn't truncate to the first of the month) |
 | `` `timestamp$s `` or `"p"$s` | a `Datetime` column, keeping the time |
 | `` `time$s `` or `"t"$s` | a `Time` column |
 
@@ -225,7 +234,7 @@ qpl) `timestamp$1700000000000000000
 timestamp: 2023.11.14D22:13:20.000000000
 ```
 
-If you're coming from kdb and want that boundary to use the type's own
+If you want that boundary to use the type's own
 internal epoch (`2000.01.01`) instead, set the
 [config](config.md) knob `useqepoch`:
 
@@ -239,7 +248,7 @@ and display are unaffected either way.
 
 ## Not there yet
 
-A few things q users reach for by reflex aren't implemented. Rather than let
+A few temporal operations aren't implemented yet. Rather than let
 you find out by trial and error: `xbar` bucketing, the `within` operator,
 the `.minute` and `.date` unit accessors, and arithmetic between a temporal
 **column** and an integer. That last one is the only real limitation in

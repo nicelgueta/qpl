@@ -1,20 +1,11 @@
-//! `DataFrame` <-> Arrow IPC *stream* bytes.
+//! `DataFrame` <-> Arrow IPC stream bytes: how the browser build (which has
+//! no filesystem) passes tables in and out. `wasm` feature only, but tests run
+//! on the host (`cargo test --no-default-features --features wasm`).
 //!
-//! This is the data boundary for the browser build: a host that has no
-//! filesystem (`load` is unavailable on wasm) hands tables in as Arrow IPC and
-//! gets query results back the same way, instead of scraping the pretty-printed
-//! text the REPL would show. Compiled only with the `wasm` feature, but it has no
-//! browser dependency, so its tests run on the host
-//! (`cargo test --no-default-features --features wasm`).
-//!
-//! It goes through `polars-arrow`'s `io_ipc` directly rather than polars'
-//! `ipc` / `ipc_streaming` features: the former forces `streaming` (and with it
-//! the cloud stack) and the latter enables IPC compression, which pulls in the
-//! C `lz4-sys` / `zstd-sys` builds. Neither builds for wasm. So:
-//!
-//! * **writing** never compresses, and
-//! * **reading** rejects compressed bodies (a JS `apache-arrow` writer doesn't
-//!   compress by default, so this is not something a caller hits by accident).
+//! Uses `polars-arrow`'s `io_ipc` directly, because polars' `ipc` features
+//! pull in C compression libraries that don't build for wasm. So writing never
+//! compresses and reading rejects compressed bodies (JS `apache-arrow` doesn't
+//! compress by default).
 
 use polars::prelude::*;
 use polars_arrow::array::new_empty_array;
@@ -30,15 +21,13 @@ fn rt(e: impl std::fmt::Display) -> QplError {
     QplError::Runtime(e.to_string())
 }
 
-/// Serialise `df` as an Arrow IPC stream.
-///
-/// Uses `CompatLevel::oldest()`, so text columns go out as `LargeUtf8` rather
-/// than the newer `Utf8View`, which most Arrow implementations (including
-/// `apache-arrow` for JS) can't read yet. Categoricals go out dictionary-encoded.
+/// Serialise `df` as an Arrow IPC stream. `CompatLevel::oldest()` sends text
+/// as `LargeUtf8`, since most readers (including JS `apache-arrow`) can't read
+/// `Utf8View`. Categoricals are dictionary-encoded.
 pub fn df_to_ipc(df: &DataFrame) -> Result<Vec<u8>, QplError> {
     let compat = CompatLevel::oldest();
-    // `iter_chunks` requires equal chunk layout across columns.
-    // TODO: see if we really need to clone here - could be v expensive for large df
+    // `iter_chunks` needs equal chunk layout across columns.
+    // TODO: avoid the clone; expensive for large frames
     let mut df = df.clone();
     df.rechunk_mut();
 
@@ -52,9 +41,8 @@ pub fn df_to_ipc(df: &DataFrame) -> Result<Vec<u8>, QplError> {
     Ok(writer.into_inner())
 }
 
-/// Parse an Arrow IPC stream into a `DataFrame`. All record batches are
-/// concatenated; a stream with a schema but no batches gives an empty frame
-/// with the right columns.
+/// Parse an Arrow IPC stream, concatenating all batches. A schema with no
+/// batches gives an empty frame with the right columns.
 pub fn ipc_to_df(bytes: &[u8]) -> Result<DataFrame, QplError> {
     let mut cursor = Cursor::new(bytes);
     let meta = read_stream_metadata(&mut cursor).map_err(rt)?;
@@ -85,16 +73,15 @@ pub fn ipc_to_df(bytes: &[u8]) -> Result<DataFrame, QplError> {
     DataFrame::new(height, cols).map_err(rt)
 }
 
-/// A table name a host may bind: a plain identifier. Anything with a dot would
-/// land in (or collide with) a namespace, and the rest can't be typed in a query.
+/// Whether a host may bind `name`: a plain identifier (dots would land in a
+/// namespace).
 pub fn is_valid_table_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Bind the table encoded in `ipc` as `name`, replacing any table, lazy frame
-/// or scalar already bound to it.
+/// Bind the table in `ipc` as `name`, replacing any existing binding.
 pub fn register_table(vm: &mut Vm, name: &str, ipc: &[u8]) -> Result<(), QplError> {
     if !is_valid_table_name(name) {
         return Err(QplError::Runtime(format!(
@@ -105,9 +92,8 @@ pub fn register_table(vm: &mut Vm, name: &str, ipc: &[u8]) -> Result<(), QplErro
     vm.bind(name.to_string(), ast::Value::Table(df))
 }
 
-/// Number of rows in the table (or lazy frame) bound to `name`, the way a host
-/// UI needs it for paging. Not the language's `count`, which counts the non-null
-/// values of a table's first column.
+/// Row count of the table or lazy frame bound to `name`, for host paging.
+/// (Not the language's `count`, which counts a column's non-null values.)
 pub fn row_count(vm: &Vm, name: &str) -> Result<usize, QplError> {
     match vm.globals.get(name) {
         Some(ast::Value::Table(df)) => Ok(df.height()),

@@ -125,6 +125,10 @@ shape: (3, 2)
 Read it out loud and it's the statement: select the average price, by sym,
 from trades. The grouping key appears once, not twice as SQL requires.
 
+The groups come out in no guaranteed order, and running the same query twice
+can list them differently. When the order matters, say so with `order`
+(below).
+
 Aggregates combine with everything else, and naming the output is usually
 worth it:
 
@@ -344,9 +348,9 @@ shape: (8, 3)
 └──────┴───────┴──────┘
 ```
 
-One statement does one or the other, never both, since removing rows and
-removing columns are different enough operations that combining them would
-only be confusing.
+Give it both and it does both: `` delete `ts from trades where size < 100 ``
+drops the two small trades *and* the `ts` column. That's legal, but two
+statements usually say what you mean more clearly.
 
 ## Where this is heading
 

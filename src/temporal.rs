@@ -1,15 +1,12 @@
-//! kdb+/q-style temporal scalars: parsing literals, formatting them back, and
-//! the `.qpl.dt` / `.qpl.tm` / `.qpl.ts` / `.qpl.dlta` "now" functions.
+//! kdb+/q temporal scalars: parsing and formatting literals, and the
+//! `.qpl.dt`/`.qpl.tm`/`.qpl.ts`/`.qpl.dlta` now-functions. No `chrono`:
+//! dates are proleptic-Gregorian day counts (Hinnant's algorithms).
 //!
-//! Everything calendar-related lives here so the lexer / vm / repl diffs stay
-//! small. No `chrono` dependency — dates are proleptic-Gregorian day counts
-//! computed with Howard Hinnant's `civil_from_days` / `days_from_civil`.
-//!
-//! Each [`ast::Value`] temporal variant carries the *kdb* integer offset:
-//! `Date` = days since 2000.01.01, `Timestamp` = ns since 2000.01.01,
-//! `Time` = ns since midnight, `Timespan` = ns, `Month` = months since 2000.01,
-//! `Minute` / `Second` = minutes / seconds since midnight. Conversion to the
-//! Polars epoch (1970) happens once, in `vm::ast_val_to_expr`.
+//! Each temporal [`ast::Value`] holds kdb's integer offset: `Date` = days and
+//! `Timestamp` = ns since 2000.01.01, `Month` = months since 2000.01, `Time` =
+//! ns since midnight, `Minute`/`Second` = minutes/seconds since midnight,
+//! `Timespan` = ns. Conversion to Polars' 1970 epoch happens in
+//! `vm::ast_val_to_expr`.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -61,9 +58,8 @@ pub fn civil_from_days(z: i32) -> (i32, u32, u32) {
 
 // ── parsing ───────────────────────────────────────────────────────────────
 
-/// Parse a temporal literal (`2024.03.15`, `12:30`, `0D12:30:00.5`, …) into the
-/// matching [`Value`]. Shared by the lexer and by `"<code>"$"…"` string casts.
-/// Returns `None` if `s` is not a recognised temporal shape.
+/// Parse a temporal literal (`2024.03.15`, `12:30`, `0D12:30:00.5`, ...), or
+/// `None`. Used by the lexer and by `"<code>"$"..."` casts.
 pub fn parse_temporal(s: &str) -> Option<Value> {
     let s = s.trim();
 
@@ -125,8 +121,7 @@ fn parse_ymd(s: &str) -> Option<i32> {
         return None;
     }
     let days = days_from_civil(y, m, d);
-    // reject impossible dates (`2024.02.30`) — `days_from_civil` would otherwise
-    // silently roll them into the next month
+    // reject impossible dates (`2024.02.30`) rather than rolling them over
     if civil_from_days(days) != (y, m, d) {
         return None;
     }
@@ -167,8 +162,8 @@ fn parse_tod_ns(s: &str) -> Option<i64> {
     Some(ns)
 }
 
-/// Split on the first uppercase `D` that is not the last char. Used to tell a
-/// `<date>D<tod>` / `<days>D<tod>` literal apart from a bare date.
+/// Split on the first uppercase `D` that isn't the last char, to tell
+/// `<date>D<tod>` / `<days>D<tod>` apart from a bare date.
 fn split_once_upper_d(s: &str) -> Option<(&str, &str)> {
     let idx = s.find('D')?;
     if idx + 1 == s.len() {
@@ -179,8 +174,7 @@ fn split_once_upper_d(s: &str) -> Option<(&str, &str)> {
 
 // ── formatting ────────────────────────────────────────────────────────────
 
-/// kdb-style rendering of a temporal scalar (`2024.03.15`,
-/// `2024.03.15D12:30:00.000000000`, …). `None` for a non-temporal value.
+/// kdb-style rendering of a temporal scalar; `None` for anything else.
 pub fn format_temporal(v: &Value) -> Option<String> {
     Some(match *v {
         Value::Date(d) => {
@@ -218,9 +212,8 @@ pub fn format_temporal(v: &Value) -> Option<String> {
     })
 }
 
-/// `HH:MM:SS.frac` for a nanosecond count, `frac_digits` wide. Handles a
-/// negative or past-24h `ns` (a `time` can leave `[0, 24h)` through arithmetic):
-/// the sign is hoisted out and the hour field is allowed to exceed `99`.
+/// `HH:MM:SS.frac` for a nanosecond count. Arithmetic can push a `time`
+/// outside `[0, 24h)`, so the sign is hoisted out and hours may exceed 99.
 fn fmt_tod(ns: i64, frac_digits: usize) -> String {
     let sign = if ns < 0 { "-" } else { "" };
     let ns = ns.unsigned_abs();
@@ -236,8 +229,7 @@ fn fmt_tod(ns: i64, frac_digits: usize) -> String {
 
 // ── `.qpl.*` now-functions ────────────────────────────────────────────────
 
-/// Evaluate `.qpl.dt` / `.qpl.tm` / `.qpl.ts` / `.qpl.dlta`. Times are **UTC** —
-/// there is no timezone database without an extra dependency.
+/// Evaluate a now-function, in UTC (there's no timezone database).
 pub fn now_value(func: TemporalNowFuncType) -> Result<Value, QplError> {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)

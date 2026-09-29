@@ -1,20 +1,10 @@
 //! Browser bindings (`wasm` feature).
 //!
-//! Two exports:
-//!
-//! * [`Repl`] — a long-lived [`Vm`] behind an `eval(line)` method. It is the
-//!   same statement pipeline the terminal REPL uses (`repl::eval_capture`
-//!   wraps the same `run_line` that `repl::start` calls), so every language
-//!   feature, `\` command and `.qpl.cfg` knob behaves identically; the only
-//!   difference is that output is returned as a string instead of printed.
-//!   Anything touching the filesystem (`load`, `sink`, `\l`, `\i`, `\1`) or a
-//!   socket (`ipc`, which is off in this build) fails as an ordinary qpl
-//!   runtime error rather than breaking the session.
-//!
-//! * [`qpl_lang_config`] — the editor configuration (Monarch tokenizer,
-//!   language configuration, completion items) built from the *same*
-//!   `tools/vscode/src/vocabulary.json` the VS Code extension reads, so a
-//!   browser editor and the extension cannot drift apart.
+//! * [`Repl`]: a long-lived [`Vm`] behind `eval(line)`, running the same
+//!   pipeline as the terminal REPL but returning output instead of printing
+//!   it. Filesystem and socket features fail as ordinary runtime errors.
+//! * [`qpl_lang_config`]: Monaco editor configuration built from the same
+//!   `tools/vscode/src/vocabulary.json` the VS Code extension reads.
 
 use crate::arrow_io;
 use crate::repl;
@@ -23,14 +13,11 @@ use js_sys::{Object, Reflect, Uint8Array};
 use serde_json::{Value as Json, json};
 use wasm_bindgen::prelude::*;
 
-/// `tools/vscode/src/vocabulary.json` — keyword/aggregate lists plus their
-/// hover-detail strings. Shared verbatim with the VS Code extension.
+/// Keyword/aggregate lists and hover text, shared with the VS Code extension.
 const VOCABULARY: &str = include_str!("../tools/vscode/src/vocabulary.json");
-/// `tools/vscode/language-configuration.json` — brackets, comments,
-/// auto-closing pairs, indentation rules.
+/// Brackets, comments, auto-closing pairs, indentation rules.
 const LANG_CONFIG: &str = include_str!("../tools/vscode/language-configuration.json");
-/// `tools/vscode/snippets/qpl.json` — VS Code snippet definitions, re-shaped
-/// into Monaco completion items below.
+/// VS Code snippets, reshaped into Monaco completion items.
 const SNIPPETS: &str = include_str!("../tools/vscode/snippets/qpl.json");
 
 #[wasm_bindgen]
@@ -39,9 +26,8 @@ extern "C" {
     fn console_error(msg: &str);
 }
 
-/// Runs once when the module is instantiated. The release profile is
-/// `panic = "abort"`, so a panic otherwise surfaces in JS as a bare
-/// `RuntimeError: unreachable` with no message; this logs the real one first.
+/// Runs on instantiation. With `panic = "abort"` a panic reaches JS as a bare
+/// `RuntimeError: unreachable`, so log the real message first.
 #[wasm_bindgen(start)]
 fn start() {
     std::panic::set_hook(Box::new(|info| {
@@ -68,10 +54,8 @@ impl Repl {
         Repl { vm: Vm::new() }
     }
 
-    /// Evaluate one submitted statement. Returns `{ output, error }`:
-    /// `output` is what the CLI would have printed to stdout (`""` for an
-    /// assignment), `error` is `null` unless the statement failed, in which
-    /// case it holds the message the CLI would have put on stderr.
+    /// Evaluate one statement. Returns `{ output, error }`: what the CLI would
+    /// print to stdout (`""` for an assignment), and the stderr message or `null`.
     pub fn eval(&mut self, line: &str) -> JsValue {
         let (output, error) = repl::eval_capture(line, &mut self.vm);
         let obj = Object::new();
@@ -83,19 +67,16 @@ impl Repl {
         obj.into()
     }
 
-    /// Bind `name` to the table in `ipc`, an Arrow IPC **stream** (what
-    /// `apache-arrow`'s `tableToIPC(t, 'stream')` writes; uncompressed). An
-    /// existing binding of that name is replaced. Throws on a bad name or
-    /// payload. This is how a browser host gets data in, since `load` needs a
-    /// filesystem.
+    /// Bind `name` to the table in `ipc`, an uncompressed Arrow IPC stream
+    /// (`tableToIPC(t, 'stream')`), replacing any existing binding. Throws on a
+    /// bad name or payload. This is how a host gets data in without `load`.
     #[wasm_bindgen(js_name = registerTable)]
     pub fn register_table(&mut self, name: &str, ipc: &[u8]) -> Result<(), JsError> {
         arrow_io::register_table(&mut self.vm, name, ipc).map_err(|e| JsError::new(&e.to_string()))
     }
 
-    /// Rows in the table bound to `name`, for paging. The language's `count`
-    /// counts non-null values in a table's first column, so it can't be used for
-    /// this. Throws if `name` isn't a table.
+    /// Rows in the table bound to `name`, for paging (the language's `count`
+    /// counts non-nulls in the first column). Throws if `name` isn't a table.
     #[wasm_bindgen(js_name = rowCount)]
     pub fn row_count(&self, name: &str) -> Result<f64, JsError> {
         arrow_io::row_count(&self.vm, name)
@@ -103,11 +84,9 @@ impl Repl {
             .map_err(|e| JsError::new(&e.to_string()))
     }
 
-    /// Like [`eval`](Self::eval), but a table result comes back as data.
-    /// Returns `{ output, error, ipc }`: `ipc` is a `Uint8Array` holding the
-    /// whole, untruncated result as an Arrow IPC stream when the statement
-    /// produced a table (and `output` is then empty), else `null` — a scalar or
-    /// list still goes to `output` as text, an assignment to neither.
+    /// Like [`eval`](Self::eval), plus `ipc`: the whole untruncated table as an
+    /// Arrow IPC stream when the statement produced one (`output` is then
+    /// empty), else `null`.
     #[wasm_bindgen(js_name = evalArrow)]
     pub fn eval_arrow(&mut self, line: &str) -> JsValue {
         let r = repl::eval_capture_table(line, &mut self.vm);
@@ -130,25 +109,23 @@ impl Repl {
         obj.into()
     }
 
-    /// Does `src` look like an unfinished statement the editor should keep
-    /// reading (unbalanced brackets, trailing comma, parse cut off at EOF)?
-    /// Exactly what the terminal REPL uses to decide between `qpl) ` and
-    /// `  ...  `.
+    /// Whether `src` is an unfinished statement (unbalanced brackets, trailing
+    /// comma, cut off mid-parse), as the terminal REPL decides it.
     #[wasm_bindgen(js_name = wantsMore)]
     pub fn wants_more(&self, src: &str) -> bool {
         repl::wants_more(src)
     }
 
-    /// What the session has bound right now, for editor completion:
-    /// `{ tables: [{ name, columns, rows? }], variables: [name], functions: [name] }`.
-    /// Lazy plans count as tables (no `columns`/`rows`: resolving a plan's
-    /// schema can be expensive). Sorted by name.
+    /// Current bindings for completion:
+    /// `{ tables: [{ name, columns, rows? }], variables: [name], functions: [name] }`,
+    /// sorted by name. Lazy plans are listed as tables without `columns`/`rows`
+    /// (resolving a schema can be expensive).
     pub fn symbols(&self) -> JsValue {
         js_sys::JSON::parse(&symbols_json(&self.vm).to_string())
             .expect("serde_json output is valid JSON")
     }
 
-    /// Bind the demo `trades` / `quotes` tables — the `--load-demo` flag.
+    /// Bind the demo `trades` / `quotes` tables (like `--load-demo`).
     #[wasm_bindgen(js_name = loadDemo)]
     pub fn load_demo(&mut self) {
         repl::load_demo_tables(&mut self.vm);
@@ -166,8 +143,7 @@ impl Default for Repl {
     }
 }
 
-/// Everything an online editor needs to give qpl the same treatment the VS
-/// Code extension does. Returns:
+/// Monaco configuration for qpl:
 ///
 /// ```js
 /// {
@@ -179,14 +155,10 @@ impl Default for Repl {
 /// }
 /// ```
 ///
-/// Wiring it up is three calls — `monaco.languages.register({ id, extensions,
-/// aliases })`, `setLanguageConfiguration(id, configuration)`,
-/// `setMonarchTokensProvider(id, monarch)` — plus a completion provider that
-/// maps each item's `kind` through `monaco.languages.CompletionItemKind` and
-/// its `insertTextRules` through `monaco.languages.CompletionItemInsertTextRule`
-/// (both are returned as names, not the numbers, which change between Monaco
-/// versions). `configuration`'s regex-valued fields are already real `RegExp`
-/// objects, so it can be handed over as-is.
+/// Register with `monaco.languages.register`, `setLanguageConfiguration` and
+/// `setMonarchTokensProvider`, plus a completion provider. `kind` and
+/// `insertTextRules` are names (map them through Monaco's enums, whose
+/// numbers vary by version); `configuration`'s regex fields are real `RegExp`s.
 #[wasm_bindgen(js_name = qplLangConfig)]
 pub fn qpl_lang_config() -> JsValue {
     let vocab: Json = serde_json::from_str(VOCABULARY).expect("vocabulary.json is valid JSON");
@@ -209,10 +181,8 @@ pub fn qpl_lang_config() -> JsValue {
     js
 }
 
-/// The Monarch language definition, mirroring `syntaxes/qpl.tmLanguage.json`
-/// rule for rule. The `@`-prefixed names in the `cases` block resolve against
-/// the sibling keyword arrays on this same object, which is why they're
-/// emitted here rather than left in `vocabulary`.
+/// The Monarch definition, mirroring `syntaxes/qpl.tmLanguage.json`. The
+/// `@`-names in `cases` resolve against sibling arrays on this object.
 fn monarch(vocab: &Json) -> Json {
     let cast_types = list(vocab, "castTypes").join("|");
     json!({
@@ -230,7 +200,7 @@ fn monarch(vocab: &Json) -> Json {
         ],
         "tokenizer": {
             "root": [
-                // `/` always starts a comment — qpl's division operator is `%`.
+                // `/` always starts a comment (division is `%`)
                 ["/.*$", "comment"],
                 // `\d` / `\1` / `\l` / `\i` / `\port` / `log`, statement-leading only
                 ["^\\s*(?:\\\\(?:[d1li]|port)|log)\\b", "keyword"],
@@ -265,9 +235,7 @@ fn monarch(vocab: &Json) -> Json {
     })
 }
 
-/// Completion items, in the same categories the VS Code provider offers:
-/// statement/builtin keywords, join and word operators, aggregates, cast
-/// types, then the snippets.
+/// Completion items, in the VS Code provider's categories.
 fn completions(vocab: &Json, snippets: &Json) -> Json {
     let mut items: Vec<Json> = Vec::new();
     let keyword_detail = &vocab["keywordDetail"];
@@ -331,10 +299,8 @@ fn list<'a>(vocab: &'a Json, key: &str) -> Vec<&'a str> {
         .unwrap_or_default()
 }
 
-/// Monaco wants real `RegExp` objects where `language-configuration.json`
-/// stores pattern strings, and there is no way to express one in JSON — so
-/// convert the four such fields in place, after the round-trip through
-/// `JSON.parse`.
+/// Convert `language-configuration.json`'s pattern strings to `RegExp`s,
+/// which JSON can't express.
 fn regexify_configuration(root: &JsValue) {
     let Ok(config) = Reflect::get(root, &"configuration".into()) else {
         return;
@@ -401,9 +367,7 @@ fn set(obj: &JsValue, key: &str, value: &JsValue) {
 mod tests {
     use super::*;
 
-    /// The three JSON files are embedded at compile time; a typo in any of
-    /// them (or a key renamed on the TypeScript side) has to fail here rather
-    /// than at `qplLangConfig()` call time in a browser.
+    /// The embedded JSON files must parse here, not fail later in a browser.
     #[test]
     fn embedded_vocabulary_has_every_list() {
         let vocab: Json = serde_json::from_str(VOCABULARY).unwrap();
@@ -424,8 +388,7 @@ mod tests {
         serde_json::from_str::<Json>(SNIPPETS).unwrap();
     }
 
-    /// Monarch resolves each `@name` in a `cases` block against a sibling
-    /// attribute of the language object, so every one of them must be emitted.
+    /// Every `@name` in a `cases` block must be emitted as a sibling attribute.
     #[test]
     fn monarch_cases_resolve_to_emitted_lists() {
         let vocab: Json = serde_json::from_str(VOCABULARY).unwrap();
@@ -445,10 +408,9 @@ mod tests {
         }
     }
 
-    /// Monarch takes the first matching entry of a `cases` block in key order,
-    /// and `@default` matches everything, so any entry after it is unreachable.
-    /// (Serialised with sorted keys it landed mid-block and no keyword highlighted.)
-    /// Checked on the string that actually crosses to JS, not just the in-memory value.
+    /// Monarch takes the first matching `cases` entry in key order and
+    /// `@default` matches everything, so it must come last. Checked on the
+    /// string that crosses to JS.
     #[test]
     fn default_is_the_last_case_so_keywords_are_reachable() {
         let vocab: Json = serde_json::from_str(VOCABULARY).unwrap();

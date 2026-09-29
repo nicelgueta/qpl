@@ -22,21 +22,17 @@ pub enum TokenKind {
     Lazy,
     Collect,
 
-    //literals
+    // literals
     Name(String),
     Int(i64),
-    // IntVec(Vec<i64>),
     Float(f64),
-    // FloatVec(Vec<f64>),
     Symbol(String),
     SymbolVec(Vec<String>),
     Bool(bool),
     BoolVec(Vec<bool>),
     Str(String),
-    /// a kdb temporal literal (`2024.03.15`, `12:30:00.000`, `0D12:30:00.0`, …),
-    /// already parsed to the matching `ast::Value` variant by the lexer.
+    /// A temporal literal (`2024.03.15`, `12:30:00.000`, ...), already parsed by the lexer.
     Temporal(crate::ast::Value),
-    // StrVec(Vec<String>),
 
     // punc
     Colon,

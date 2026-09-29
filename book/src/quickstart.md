@@ -98,8 +98,9 @@ shape: (3, 2)
 `by sym` groups, and `avg price` is what gets computed per group. Compare
 that to SQL, where you would name `sym` in the select list, then name it
 again in a `GROUP BY` clause at the bottom. Here you say it once. The groups
-come back in whatever order the grouping produced them, which is why MSFT
-leads; sorting is a separate thing you ask for when you want it.
+come back in no particular order, and it can change from one run to the
+next, so don't be surprised if yours aren't in the order shown here. Sorting
+is a separate thing you ask for when you want it.
 
 ## Keeping a result
 
@@ -174,11 +175,13 @@ qpl -i script.qpl   # run a script, then stay in the REPL with its state
 qpl -c '<command>'  # run one ad hoc command and exit, like `python -c`
 qpl -C script.qpl   # compile to script.qplc (add -o to redirect); doesn't run it
 qpl script.qplc     # run a compiled script — no lexing/parsing/compiling
+qpl -d script.qplc  # print a compiled (or source) script's bytecode; doesn't run it
 ```
 
-That last one is worth remembering. It's how you'd load your real tables from
+`-i` is the one worth remembering. It's how you'd load your real tables from
 a setup script and then explore interactively, rather than retyping the same
-`load` lines at the start of every session.
+`load` lines at the start of every session. The compiled forms are covered in
+[Compiled artifacts](architecture/compiled-artifacts.md).
 
 Longer worked examples live in
 [`examples/`](https://github.com/nicelgueta/qpl/tree/main/examples) in the

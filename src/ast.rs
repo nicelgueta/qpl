@@ -7,13 +7,11 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Str(String),
-    /// an interned symbol — `` `foo `` outside a table expression; names a
-    /// column, table or path. Distinct from `Str` even though it wraps a `String`.
+    /// An interned symbol (`` `foo ``): names a column, table or path.
     Sym(String),
     Bool(bool),
-    /// kdb+ temporal scalars. Each carries the integer offset kdb uses; the
-    /// conversion to the Polars (1970) epoch happens in `vm::ast_val_to_expr`.
-    /// See [`crate::temporal`].
+    /// kdb+ temporal scalars, each holding kdb's integer offset (see
+    /// [`crate::temporal`]); converted to Polars' 1970 epoch in `vm::ast_val_to_expr`.
     Date(i32), // days since 2000.01.01
     Month(i32),     // months since 2000.01
     Time(i64),      // ns since midnight
@@ -21,48 +19,25 @@ pub enum Value {
     Second(i32),    // seconds since midnight
     Timestamp(i64), // ns since 2000.01.01
     Timespan(i64),  // ns duration
-    /// `conn: hopen 5001` — an opaque handle to an open IPC connection. Only
-    /// meaningful as the left operand of `dispatch`/`async dispatch`. `ipc`
-    /// feature only; the variant itself always exists so non-`ipc` builds
-    /// don't need `#[cfg]` on every match over `Value`.
+    /// An open IPC connection (`hopen`). Exists in every build so matches over
+    /// `Value` need no `#[cfg]`; only the `ipc` feature produces one.
     Handle(i64),
-    /// `resp: conn async dispatch ...` — a pending response, resolved by
-    /// `await`. `ipc` feature only (see `Handle`).
+    /// A pending `async dispatch` response, resolved by `await` (see `Handle`).
     Future(i64),
-    /// `f: {[x] x+1}` / a bare `{[x] x+1}` in expression position — a
-    /// function as a first-class value: passable, returnable, storable. There
-    /// is no captured environment (see [`Function`]), so the `Arc` is shared
-    /// purely to keep cloning a binding cheap. Meaningless inside a query
-    /// expression — `vm::ast_val_to_expr` rejects it.
-    ///
-    /// This wraps
-    /// [`crate::program::Closure`] (params, its compiled entry point, and the
-    /// `Arc<Program>` it belongs to) rather than the raw AST `Function` — a
-    /// function literal compiles to bytecode once, at parse/compile time, and
-    /// is invoked via `CALL`/`RET`, not re-walked per call.
+    /// A function value (`{[x] x+1}`): params, compiled entry point and owning
+    /// `Program`. Nothing is captured; the `Arc` only makes cloning cheap.
+    /// Rejected inside a query expression.
     Closure(std::sync::Arc<crate::program::Closure>),
-    /// A materialised table binding — one of `Vm`'s single binding map's two
-    /// table-shaped kinds (see `Vm::globals` / `Vm::bind`). Meaningless inside
-    /// a query expression — `vm::ast_val_to_expr` rejects it, and a bare
-    /// lookup of one from `vm::Vm::lookup_global` returns `None` so it is
-    /// never substituted as a literal into a column expression.
+    /// An eager table binding. Never substituted into a column expression
+    /// (`lookup_global` skips it).
     Table(DataFrame),
-    /// A stored **lazy** query plan (`x: lazy select ...`) — the other
-    /// table-shaped binding kind. See `Table` above. Boxed: `LazyFrame` itself
-    /// is a large struct (its whole optimizer/plan state, not just a handle),
-    /// and inlining it here would balloon every `Value` — including the
-    /// common scalar cases — to its size, which is enough to blow the stack
-    /// on realistic function-call recursion (128 levels deep, each holding
-    /// several `Value`/`Slot`s on the stack).
+    /// A lazy query plan binding (`x: lazy select ...`). Boxed because an
+    /// inline `LazyFrame` would bloat every `Value` enough to overflow the
+    /// stack under deep recursion.
     Lazy(Box<LazyFrame>),
-    /// Vector variants are all backed by a Polars `Series` so that native
-    /// vectorised Polars operations (arithmetic, casts, gather/slice) apply
-    /// directly instead of hand-rolled Rust loops. Each carries the same raw
-    /// element representation as its scalar counterpart (e.g. `DateVec` holds
-    /// day offsets since 2000.01.01, matching `Date`) — conversion to/from a
-    /// native Polars dtype happens only in `vm::ast_val_to_expr` /
-    /// `ops::column_to_value`. See [`VecKind`] for generic dispatch over
-    /// these variants.
+    /// Vectors are backed by a `Series` so Polars ops apply directly. Elements
+    /// use the same raw representation as the scalar counterpart (e.g.
+    /// `DateVec` holds day offsets from 2000.01.01). See [`VecKind`].
     IntVec(Series),
     FloatVec(Series),
     SymVec(Series),
@@ -77,10 +52,7 @@ pub enum Value {
     TimespanVec(Series),
 }
 
-/// Manual only because `LazyFrame` has no `Debug` impl (a query plan isn't
-/// meaningfully printable without collecting it, which `{v:?}` must never do
-/// as a side effect); every other variant is formatted exactly as `derive`
-/// would.
+/// Manual because `LazyFrame` has no `Debug`; otherwise identical to `derive`.
 impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use Value::*;
@@ -118,13 +90,8 @@ impl std::fmt::Debug for Value {
     }
 }
 
-/// Manual because `DataFrame` has no total-order-free equality worth deriving
-/// (`equals_missing` treats nulls as equal to themselves, unlike Polars'
-/// regular `==`), `LazyFrame` has none at all (comparing plans isn't
-/// meaningful), and `Closure` compares by identity (`Arc::ptr_eq`) rather than
-/// structurally — a function is only ever "the same" as itself in a `qpl`
-/// program. Every other variant keeps the field-by-field equality `derive`
-/// would have produced.
+/// Manual because tables compare with nulls equal (`equals_missing`), lazy
+/// plans aren't comparable, and closures compare by identity.
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         use Value::*;
@@ -163,9 +130,7 @@ impl PartialEq for Value {
     }
 }
 
-/// Which element type a vector `Value` variant holds. Lets list-shaped
-/// operations (materialise / index / take / scalarise) be written once,
-/// generically, instead of once per vector variant.
+/// Element type of a vector `Value`, so list operations are written once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VecKind {
     Int,
@@ -217,8 +182,8 @@ impl Value {
         }
     }
 
-    /// The one-element vector of an atomic scalar (`enlist`); `None` for
-    /// anything that has no vector counterpart (a vector already, a handle, a closure).
+    /// The one-element vector of an atom (`enlist`); `None` if there's no
+    /// vector counterpart.
     pub fn enlist(&self) -> Option<Value> {
         use Value::*;
         Some(match self {
@@ -275,12 +240,8 @@ pub fn str_vec(v: Vec<String>) -> Value {
 pub fn date_vec(v: Vec<i32>) -> Value {
     Value::DateVec(Series::new("".into(), v))
 }
-// `month` / `minute` / `second` have no native Polars dtype (only `date` /
-// `time` / `datetime` / `duration` do), so — matching `CastTarget::Prim`,
-// which only ever resolves those three for a *scalar* cast — nothing
-// materialises a `MonthVec`/`MinuteVec`/`SecondVec` from a real column; only
-// `enlist` produces them. The type has full parity with every other atomic
-// scalar (see `VecKind`), ready for a real producer.
+// month/minute/second have no Polars dtype, so only `enlist` produces these
+// vectors.
 pub fn month_vec(v: Vec<i32>) -> Value {
     Value::MonthVec(Series::new("".into(), v))
 }
@@ -323,15 +284,11 @@ pub enum Expr {
     Lit(Value),
     Sym(String),
     ColRef(String),
-    /// `` `k1`k2!v1 v2 `` — a dict literal: an ordered list of (key, value-expr)
-    /// pairs (order matters — it becomes column order when fed to `zip`).
-    /// Each value is parsed as a single noun; a compound expression needs
-    /// parens. Value context only, and only meaningful as `zip`'s own
-    /// argument — `compiler::compile_value_expr`'s `zip` arm compiles it
-    /// directly to `CAST_LIST`/`ZIP`; a bare `Dict` anywhere else is a
-    /// compile-time error ("not supported in scalar context").
+    /// `` `k1`k2!v1 v2 ``: ordered (key, value) pairs, only valid as `zip`'s
+    /// argument. Each value is a single noun; compound values need parens.
+    /// TODO: support as a standalone object
     Dict(Vec<(String, Expr)>),
-    IColRef, // virtual i col (for indexing like: select i, col1, col2 from df)
+    IColRef, // virtual row-index column `i`
     BinOp {
         left: Box<Expr>,
         op: String,
@@ -349,95 +306,63 @@ pub enum Expr {
         branches: Vec<(Expr, Expr)>,
         default: Box<Expr>,
     },
-    /// `<func> over `p1`p2 [order `k1 asc `k2 desc]` — a window function.
-    /// `func` is either a column expression (`max salary`) applied per partition,
-    /// or the bare ranking verb `rn` / `rank` / `drank`. `order` is empty unless
-    /// an `order` sub-clause was given. `rolling` is `Some(n)` for the
-    /// `<agg> <col> <n>!rolling over ...` form (a fixed `n`-row rolling
-    /// aggregate); `func` must then be a plain aggregate call.
+    /// `<func> over `p1`p2 [order `k asc ...] [rolling n]`. `func` is an
+    /// expression evaluated per partition, or a ranking verb (`rn`/`rank`/
+    /// `drank`). `rolling` requires a plain aggregate.
     Window {
         func: Box<Expr>,
         partition: Vec<String>,
         order: Vec<(String, bool)>, // (column, descending)
         rolling: Option<usize>,
     },
-    /// A table expression used in a scalar / value context: `` name`col ``,
-    /// `` name`c1`c2 ``, or a `select … from …` whose result feeds a reduction,
-    /// slice, index or assignment rather than being printed as a table. A
-    /// one-column `Select` is a *column expression* (materialises to a list
-    /// `Value`); anything else stays a frame. Compiled by
-    /// `compiler::compile_value_expr`'s `Table` arm: frame ops, plus
-    /// `COLUMN` when it's a one-column select.
+    /// A table expression in value context (`` t`col ``, or a select feeding
+    /// a reduction/slice/index/assignment). A one-column select becomes a
+    /// list; anything else stays a frame.
     Table(Box<TableExpr>),
-    /// `<n>#<expr>` — take the first `n` rows (`n >= 0`) or the last `-n`
-    /// (`n < 0`) of a frame or list. `n` is any scalar-valued expression
-    /// (a literal, a bound global, …), evaluated at run time.
+    /// `<n>#<expr>`: first `n` rows/elements, or last `-n` if negative.
     Take {
         n: Box<Expr>,
         expr: Box<Expr>,
     },
-    /// `(<expr>) <i>` / `(<expr>) <i j k>` — positional index into a list with a
-    /// single int or an int run.
+    /// `(<expr>) <i>` / `(<expr>) <i j k>`: positional index into a list.
     Index {
         expr: Box<Expr>,
         idx: Box<Expr>,
     },
-    /// `f[a;b]` / `f[]` — apply a function to a semicolon-separated argument
-    /// list. `f[x]` with a single argument and no `;` parses as `Index` instead
-    /// and is resolved to an application at run time when `f` names a function.
-    /// Value context only. `func` is usually an `Expr::ColRef`, but any
-    /// expression evaluating to a `Value::Closure` applies.
+    /// `f[a;b]` / `f[]`. A single-argument `f[x]` parses as `Index` and becomes
+    /// a call at run time if `f` is a function.
     Apply {
         func: Box<Expr>,
         args: Vec<Expr>,
     },
-    /// `{[p1,p2] stmt; ...; last-expr}` — a function literal. Compiled
-    /// to `PUSH Func(proto)`, with the body
-    /// appended as bytecode after the enclosing program's main code — see
-    /// `compiler::compile_value_expr`'s `Lambda` arm. Value context only.
+    /// `{[p1,p2] ...}`: a function literal. Its body is compiled after the
+    /// enclosing program's main code.
     Lambda(Function),
-    /// `<conn> dispatch <rest of statement>` / `<conn> async dispatch <rest>` —
-    /// ship `command` (the exact remaining source, reconstructed from tokens
-    /// at parse time) to the connection named by `conn` and evaluate it there
-    /// as if typed at that server's REPL. `is_async`: `dispatch` blocks for the
-    /// reply; `async dispatch` returns a `Value::Future` immediately, resolved
-    /// later by `await`. `ipc` feature only (see `Value::Handle`). Value
-    /// context only; compiled directly to `Op::Dispatch`
-    /// (`compiler::compile_value_expr`'s `Dispatch` arm).
+    /// `<conn> [async] dispatch <rest>`: send `command` (the rest of the
+    /// statement's source) to the server. Sync waits for the reply; async
+    /// returns a `Value::Future` for `await`.
     Dispatch {
         conn: Box<Expr>,
         command: String,
         is_async: bool,
     },
-    /// `while[test; s1; ...; sn]` — while `test` (a boolean atom) is true, run
-    /// the statements in order in the *current* scope (so assignments bind
-    /// whatever scope the loop sits in: globals at the top level, locals inside
-    /// a function). Yields noop. Value context only; compiled by
-    /// `compiler::compile_while` to a backward `JUMP`/`JUMP_IF_FALSE` pair —
-    /// nothing is interpreted from the AST.
+    /// `while[test; s1; ...]`: runs the statements in the current scope while
+    /// `test` (a boolean atom) holds. Yields noop.
     While {
         cond: Box<Expr>,
         body: Vec<Stmt>,
     },
-    /// `noop` — evaluates to nothing: prints nothing, and can be neither
-    /// assigned nor used as an operand (`Slot::Noop`). Value
-    /// context only.
+    /// `noop`: evaluates to nothing; can't be assigned or used as an operand.
     Noop,
-    /// `<expr> where <predicate>[, <predicate>...]` where `<expr>` is a *list*
-    /// value (not a table-column expression, which has its own `where` sugar
-    /// via `TableExpr::Select`'s `where_`) — filters the list elementwise.
-    /// Each predicate is written against `x`, a plain column reference that
-    /// resolves against the list's own (single, `x`-named) materialisation —
-    /// see `compiler::compile_value_expr`'s `ListWhere` arm:
-    /// `LIST_WHERE_FRAME`, the predicates in query context, `FILTER`, `COLUMN`.
-    /// Value context only.
+    /// `<list> where <pred>, ...`: filters a list elementwise, with `x` bound
+    /// to each element. (Table columns use `Select`'s `where_` instead.)
     ListWhere {
         list: Box<Expr>,
         where_: Vec<Expr>,
     },
 }
 
-/// used for aliasing columns in select statements
+/// A column alias in a select projection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Alias {
     pub name: Option<String>, // might not always have an alias, e.g. select col1 from df
@@ -447,10 +372,7 @@ pub struct Alias {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableSource {
     InMem(String),
-    /// `load "path.parquet"` / `load path` — a string literal or a bound
-    /// scalar global; the path expression compiles to bytecode
-    /// (`compiler::compile_source`) and is resolved by `Op::LoadFile` at run
-    /// time.
+    /// `load "path"` / `load name`, resolved by `Op::LoadFile` at run time.
     Load(Box<Expr>),
 }
 
@@ -470,8 +392,7 @@ pub struct SelectStmt {
 pub enum TableExpr {
     Select(SelectStmt),
     BuiltIn(BuiltIn),
-    /// a bare table name or a `load "path"` — the base case a `from` clause
-    /// eventually bottoms out at once any nested table expressions are peeled away.
+    /// A bare table name or `load "path"`.
     Source(TableSource),
 }
 
@@ -486,47 +407,41 @@ pub enum Stmt {
         name: String,
         expr: Expr,
     },
-    // single var on its own - this just evals and prints in repl
+    // a bare expression: evaluated and printed
     SingleVar(Expr),
-    /// The stdout write, in its bareword spelling: `log a b c` (each `Expr` is
-    /// rendered and concatenated) or bare `log` (prints a blank line, `args`
-    /// empty). The bracketed spelling `log[..]` parses as an ordinary
-    /// `SingleVar(Expr::Call{func: "log", ..})` instead — see
-    /// `compiler::compile_program`'s handling of a top-level `log[..]` call,
-    /// which suppresses printing the same way this variant's compiled form
-    /// does.
+    /// Bareword `log a b c` (args rendered and concatenated) or bare `log`
+    /// (blank line). `log[..]` parses as an ordinary call instead.
     Log(Vec<Expr>),
-    /// `.qpl.cfg key=value key=value ...` (or a bare `.qpl.cfg`, `args`
-    /// empty, which prints the current configuration).
+    /// `.qpl.cfg key=value ...`, or bare `.qpl.cfg` to print the settings.
     Cfg(String),
-    /// A `\`-prefixed system command: `\d <stmt>` (disassemble), `\l <path>`
-    /// (load a script flat), `\i "<path>"` (load a script as a namespaced
-    /// import — `arg` is already the unquoted path), `\1 <path>` (mirror
-    /// stdout to `<path>`; bare `\1` with an empty `arg` detaches it).
+    /// A `\` command: `\d <stmt>`, `\l <path>`, `\i "<path>"` (`arg` is
+    /// unquoted), `\1 <path>`, `\port <n>`. An empty `arg` turns `\1`/`\port` off.
     System {
         cmd: char,
         arg: String,
     },
 }
 
-/// A function literal: `{[p1,p2] stmt; stmt; last-expr}`. Wrapped in a
-/// [`Value::Closure`] the moment it is parsed, so `name: {[..] ..}` is just an
-/// ordinary scalar assignment and a function is an ordinary value. The final
-/// statement in `body` must be an expression (its value is the return); earlier
-/// statements run for their (locally scoped) side effects. Nothing is captured
-/// — a call sees its own params plus the session globals, exactly as a named
-/// function always has (see `Vm::lookup`). The body is kept as AST and
-/// recompiled per call (qpl recompiles every line anyway).
+/// A system command's full name for error messages (`'p'` is `\port`).
+pub fn system_cmd_name(cmd: char) -> String {
+    if cmd == 'p' {
+        "port".to_string()
+    } else {
+        cmd.to_string()
+    }
+}
+
+/// A function literal: `{[p1,p2] stmt; stmt; last-expr}`. The last statement
+/// must be an expression (the return value). Nothing is captured: a call sees
+/// its own params plus globals.
 #[derive(Clone, PartialEq)]
 pub struct Function {
     pub params: Vec<String>,
     pub body: Vec<Stmt>,
 }
 
-/// Prints as the source shape (`{[x,y] ..}`) rather than the whole body AST.
-/// `{v:?}` on a `Value` is user-facing — it's what runtime errors
-/// interpolate — and a dumped body drowns
-/// both.
+/// Prints as `{[x,y] ..}` rather than the body AST, since runtime errors
+/// interpolate `{v:?}`.
 impl std::fmt::Debug for Function {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{{[{}] ..}}", self.params.join(","))

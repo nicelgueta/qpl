@@ -7,8 +7,7 @@ fn to_snake_case(s: &str) -> String {
     for c in s.chars() {
         if c.is_alphanumeric() {
             if c.is_uppercase() {
-                // Insert underscore before an uppercase letter that follows
-                // a lowercase letter or digit (handles camelCase -> camel_case)
+                // camelCase -> camel_case
                 if prev_is_lower_or_digit {
                     result.push('_');
                 }
@@ -19,7 +18,7 @@ fn to_snake_case(s: &str) -> String {
                 prev_is_lower_or_digit = true;
             }
         } else {
-            // Any non-alphanumeric char (space, -, ., /, etc.) becomes an underscore
+            // any other non-alphanumeric char becomes `_`
             if !result.ends_with('_') && !result.is_empty() {
                 result.push('_');
             }
@@ -27,7 +26,7 @@ fn to_snake_case(s: &str) -> String {
         }
     }
 
-    // Trim leading/trailing underscores and collapse doubles
+    // trim leading/trailing underscores and collapse repeats
     let trimmed = result.trim_matches('_');
     let mut cleaned = String::with_capacity(trimmed.len());
     let mut last_was_underscore = false;
@@ -53,9 +52,8 @@ pub fn rename_columns_snake_case(lf: LazyFrame) -> PolarsResult<LazyFrame> {
     Ok(lf.rename(&old_names, &new_names, true))
 }
 
-/// Next value of a thread-local splitmix64 stream, seeded once per thread from
-/// OS randomness (the browser's `Math.random` on wasm, where std has none).
-/// Not cryptographic — it backs the `?` roll operator only.
+/// Next value of a thread-local splitmix64 stream, seeded from OS randomness
+/// (`Math.random` on wasm). Not cryptographic; backs the `?` roll only.
 pub fn rand_u64() -> u64 {
     use std::cell::Cell;
     thread_local!(static STATE: Cell<u64> = Cell::new(seed()));

@@ -84,5 +84,5 @@ it obvious which clause was parsed differently from how you read it. The
 right-to-left evaluation described in [Casts](language/casts.md) is a common
 culprit, and `\d` is the fastest way to confirm it.
 
-[Architecture](architecture.md) says a little more about where those
+[Architecture](architecture/index.md) says a little more about where those
 instructions come from and what runs them.

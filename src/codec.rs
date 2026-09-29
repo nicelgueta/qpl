@@ -1,22 +1,11 @@
-//! Lossless binary codec for [`crate::ast::Value`], shared by the `ipc`
-//! feature's wire format and by [`crate::program::Program`]'s `.qplc`
-//! serialisation. Ungated (unlike `ipc.rs`)
-//! since a `.qplc` file has nothing to do with sockets.
+//! Lossless binary codec for [`crate::ast::Value`], shared by the IPC wire
+//! format and `.qplc` serialisation (so not `ipc`-gated).
 //!
-//! [`encode_value`]/[`decode_value`] round-trip every scalar and vector
-//! `Value` variant exactly, including nulls inside a vector (a validity flag
-//! precedes each element). `Table`, `Lazy`, `Closure`,
-//! `Handle` and `Future` still have no encoding here — [`encode_value`]
-//! returns `Err` for them; `program.rs`'s operand encoder propagates that
-//! error (none of those ever legitimately reaches an `Operand::Value`), while
-//! `ipc.rs` catches it and falls back to encoding the same
-//! `"<unrepresentable>"` string it always has, preserving its existing wire
-//! behaviour for connection/future handles and closures.
+//! Every scalar and vector variant round-trips exactly, nulls included (each
+//! vector element is preceded by a validity flag). `Table`, `Lazy`,
+//! `Closure`, `Handle` and `Future` have no encoding: [`encode_value`] errors.
 //!
-//! The one-byte [`ValueTag`] prefixing every encoded value is part of both
-//! the IPC wire format and the on-disk `.qplc` format — the tag values below
-//! must stay stable, and adding a `Value` variant means adding a tag here
-//! (an exhaustive match keeps the compiler honest about it).
+//! [`ValueTag`] bytes are part of both formats and must stay stable.
 
 use crate::ast::{self, Value};
 use crate::errors::QplError;
@@ -27,7 +16,7 @@ pub(crate) fn rt<E: std::fmt::Display>(e: E) -> QplError {
 }
 
 // ---------------------------------------------------------------------------
-// low-level primitives shared by every tagged encoding in this module
+// low-level primitives
 // ---------------------------------------------------------------------------
 
 pub(crate) fn push_u8(out: &mut Vec<u8>, v: u8) {
@@ -53,11 +42,8 @@ pub(crate) fn push_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
-/// A cursor over an in-memory byte buffer — every `.qplc` field and every
-/// IPC scalar payload is read through this. Every accessor rejects a
-/// truncated read with a plain [`QplError::Runtime`] rather than panicking,
-/// which is what lets `Program::from_bytes` turn a corrupted/truncated file
-/// into a clean error instead of a crash.
+/// A cursor over a byte buffer. Truncated reads return an error rather than
+/// panicking, so a corrupt `.qplc` fails cleanly.
 pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -72,11 +58,9 @@ impl<'a> Reader<'a> {
         self.pos >= self.buf.len()
     }
 
-    /// Bytes left unread. Used to cap a `Vec::with_capacity` sized from an
-    /// untrusted length prefix — every element takes at least one byte, so a
-    /// capacity request larger than this can only come from a corrupted or
-    /// truncated file, and pre-allocating it verbatim risks an OOM abort
-    /// before the length even gets a chance to fail a real read.
+    /// Bytes left unread. Caps `Vec::with_capacity` from an untrusted length
+    /// prefix (each element is at least one byte), so a corrupt length can't
+    /// trigger a huge allocation.
     pub fn remaining(&self) -> usize {
         self.buf.len().saturating_sub(self.pos)
     }
@@ -122,12 +106,8 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// The one-byte tag identifying which [`Value`] variant follows. Explicit
-/// discriminants so the encoding is stable across builds; kept as an enum
-/// (rather than loose `u8` constants) so adding a `Value` variant forces a
-/// decision here too — [`encode_value`]'s match is exhaustive over `Value`,
-/// so the compiler catches a forgotten codec update the moment a new
-/// scalar/vector variant is added.
+/// The one-byte tag for which [`Value`] variant follows. Discriminants are
+/// part of the on-disk and wire formats.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum ValueTag {
@@ -193,11 +173,8 @@ impl TryFrom<u8> for ValueTag {
     }
 }
 
-/// Encode one `Option<i64>`/`Option<i32>`/... element of a vector: a 1-byte
-/// validity flag, followed by the value's raw bytes iff it's `Some`. Used for
-/// every fixed-width vector kind (`Int`/`Date`/`Month`/`Time`/`Minute`/
-/// `Second`/`Timestamp`/`Timespan`); `Str`/`Sym`/`Bool` have their own
-/// analogous inline handling below since their payloads aren't all the same width.
+/// Encode one nullable fixed-width vector element: a validity byte, then the
+/// value's bytes if present.
 macro_rules! encode_nullable_vec {
     ($out:expr, $chunked:expr, $push:expr) => {{
         let ca = $chunked;
@@ -226,11 +203,8 @@ macro_rules! decode_nullable_vec {
     }};
 }
 
-/// Encode `v`, tagged with its [`ValueTag`] — see [`decode_value`]. Returns
-/// `Err` for `Table`/`Lazy`/`Closure`/`Handle`/`Future`, none of which has an
-/// on-disk or wire encoding (see the module doc); callers that can tolerate a
-/// lossy placeholder (the IPC scalar wire path) catch this and substitute one
-/// themselves rather than this function ever writing one silently.
+/// Encode `v` with its [`ValueTag`]. Errors for `Table`/`Lazy`/`Closure`/
+/// `Handle`/`Future`; callers that want a placeholder substitute their own.
 pub fn encode_value(v: &Value, out: &mut Vec<u8>) -> Result<(), QplError> {
     use Value::*;
     match v {
@@ -530,8 +504,7 @@ mod tests {
         assert_eq!(roundtrip(ast::int_vec(vec![])), ast::int_vec(vec![]));
     }
 
-    /// Nulls inside every vector kind
-    /// survive a round trip.
+    /// Nulls inside every vector kind survive a round trip.
     #[test]
     fn nulls_in_every_vector_kind_round_trip() {
         macro_rules! check {

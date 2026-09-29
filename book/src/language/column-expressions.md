@@ -151,7 +151,7 @@ sub: trades`price[2 3]       / rows 2 and 3 of the price column
 one: (trades`sym)[0]         / a single value: str "AAPL"
 ```
 
-Following q, a parenthesised expression can also be indexed by just putting
+A parenthesised expression can also be indexed by just putting
 the indices after it: `` (trades`price) 2 3 `` means the same as
 `` (trades`price)[2 3] ``.
 

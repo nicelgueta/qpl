@@ -16,101 +16,69 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct Vm {
-    /// The single session-level binding map: scalars, vectors, closures, and
-    /// table-shaped values too:
-    /// `Value::Table` for an eager binding, `Value::Lazy` for `lazy select ...`.
+    /// Every session binding: scalars, vectors, closures, `Table` (eager) and
+    /// `Lazy` (plan) values.
     pub globals: HashMap<String, ast::Value>,
-    /// Native functions (`.qpl.dt`, ...), populated once in [`Vm::new`] and
-    /// never mutated afterwards — resolved by [`Vm::lookup`] like any other
-    /// name but never reassignable or shadowable (see the `bind_*` guards
-    /// below). A *user* function isn't a binding kind at all: it's a
-    /// `Value::Closure` living in `globals` like any other value. See
-    /// [`crate::native`].
+    /// Reserved natives (`.qpl.dt`, ...), built in [`Vm::new`]. Looked up like
+    /// any name but can't be rebound. See [`crate::native`].
     pub(crate) builtins: HashMap<String, Builtin>,
-    /// The VM's operand stack — the only
-    /// execution state that survives across nested/re-entrant runs (see
-    /// [`Vm::run_compiled`]). Holds ordinary computation values *and*
-    /// [`Slot::Call`] activation records, interleaved with whatever a call was
-    /// in the middle of computing when it made a nested call.
+    /// The value stack. Holds computation values and [`Slot::Call`] frames,
+    /// interleaved.
     pub(crate) stack: Vec<Slot>,
-    /// The `Program` currently executing. Switched by `CALL`/`RET` (to the
-    /// callee's own program and back) and saved/restored around a re-entrant
-    /// [`Vm::run_compiled`].
+    /// The executing `Program`. Switched by `CALL`/`RET`, saved and restored
+    /// around a nested [`Vm::run_compiled`].
     pub(crate) prog: Arc<Program>,
     /// Instruction pointer into `prog.code`.
     pub(crate) ip: usize,
     /// Operand-stream cursor into `prog.operands`, consumed only by `PUSH`.
     pub(crate) cp: usize,
-    /// Index into `stack` of the innermost [`Slot::Call`] frame, or `None` at
-    /// the top level. Only this frame's `locals` are ever searched (see
-    /// [`Vm::lookup`]) — a call sees its own params/locals and the session
-    /// globals, never an enclosing caller's frame, so this is lexical (not
-    /// dynamic) scoping despite being implemented as a stack of frames.
+    /// Index of the innermost [`Slot::Call`] in `stack`, or `None` at top level.
+    /// Only this frame's locals are searched (lexical scoping).
     pub(crate) fp: Option<usize>,
-    /// Count of [`Slot::Call`] frames currently on `stack` — an O(1) stand-in
-    /// for scanning the stack, checked against [`MAX_CALL_DEPTH`] by
-    /// [`Vm::begin_closure_call`].
+    /// Number of [`Slot::Call`] frames on `stack`, checked against
+    /// [`MAX_CALL_DEPTH`].
     pub(crate) call_depth: usize,
-    /// The site of the first error to escape a top-level [`Vm::run_compiled`]
-    /// call: the `Arc<Program>` that was
-    /// executing and the `ip` of the opcode that failed, captured by
-    /// [`Vm::run_loop`] before any register is restored. Whichever `Program`
-    /// was live at the moment of failure carries the right `path`/`lines` for
-    /// the error — the main script, or (if the failure happened while running
-    /// an embedded `\l`/`\i` target, or inside a namespaced import's own
-    /// function) that target's own compiled `Program`. Consumed once by
-    /// [`Vm::take_error_site`] and translated to a `path:line:` prefix by
-    /// `repl::run_script`.
+    /// Where the first error escaping a top-level [`Vm::run_compiled`] happened:
+    /// the executing `Program` (main script or an embedded `\l`/`\i` target)
+    /// and the failing `ip`. Taken by [`Vm::take_error_site`] for the
+    /// `path:line:` prefix.
     pub(crate) error_site: Option<(Arc<Program>, usize)>,
-    /// When set (via the `\1 <path>` command), every line printed through
-    /// [`Vm::emit`] is also appended here — kdb-style stdout redirection.
+    /// Set by `\1 <path>`: [`Vm::emit`] also appends here.
     pub stdout_log: Option<std::fs::File>,
-    /// When set, [`Vm::emit`] appends to this buffer instead of writing to
-    /// stdout — how a non-terminal front-end (the wasm REPL) collects a
-    /// statement's output. See [`crate::repl::eval_capture`].
+    /// When set, [`Vm::emit`] appends here instead of printing (the wasm REPL).
     pub capture: Option<String>,
-    /// When set, a statement that yields a table stores it in [`Vm::last_table`]
-    /// instead of pretty-printing it — how the wasm front-end gets a result as
-    /// data rather than as (truncated) text. See [`crate::repl::eval_capture_table`].
-    /// `wasm` feature only.
+    /// When set, a table result goes to [`Vm::last_table`] instead of being
+    /// printed, so the wasm front-end gets data rather than text.
     #[cfg(feature = "wasm")]
     pub capture_table: bool,
-    /// The table produced by the last statement run under [`Vm::capture_table`].
-    /// `wasm` feature only.
+    /// The table from the last statement run under [`Vm::capture_table`].
     #[cfg(feature = "wasm")]
     pub last_table: Option<DataFrame>,
     /// Session-wide knobs set from `.qpl.cfg key=value ...`.
     pub config: VmConfig,
-    /// Ctrl-C flag, set by the `cli` signal handler and polled at check points
-    /// (see [`crate::interrupt`]).
+    /// Ctrl-C flag (see [`crate::interrupt`]).
     pub interrupt: crate::interrupt::Interrupt,
-    /// Open `hopen` connections, keyed by the `Value::Handle` id returned to
-    /// the caller. `ipc` feature only.
+    /// Open `hopen` connections, keyed by `Value::Handle` id.
     #[cfg(feature = "ipc")]
     pub connections: HashMap<i64, crate::ipc::ClientConn>,
-    /// Outstanding `async dispatch` replies, keyed by the `Value::Future` id;
-    /// removed and resolved by `await`. `ipc` feature only.
+    /// Pending `async dispatch` replies, keyed by `Value::Future` id.
     #[cfg(feature = "ipc")]
     pub pending: HashMap<i64, crate::ipc::ReplyRx>,
-    /// Next id handed out by `hopen`/`async dispatch` — one counter shared by
-    /// both, so a `Value::Handle` and a `Value::Future` are never confusable.
-    /// `ipc` feature only.
+    /// Next handle/future id (one counter, so the two never collide).
     #[cfg(feature = "ipc")]
     pub next_handle: i64,
-    /// Transient permission for the one dispatched request currently being
-    /// evaluated, if any — `Some(Read)`/`Some(Write)` only for the duration
-    /// of `Vm::with_request_permission`'s closure, `None` otherwise. Never
-    /// set for local REPL/script input, regardless of whether a port is
-    /// open, so a read handle can only ever restrict a *remote* caller.
-    /// `ipc` feature only.
+    /// The permission of the dispatched request being evaluated, set only
+    /// inside `with_request_permission`. Never set for local input.
     #[cfg(feature = "ipc")]
     pub request_mode: Option<crate::ipc::HandleMode>,
+    /// The open `\port` listener, set by `native_port`. The run loop checks it
+    /// to decide whether to serve; dropping it stops the listener thread.
+    #[cfg(feature = "ipc")]
+    pub port: Option<crate::ipc::PortState>,
 }
 
-/// One user-function call activation, pushed onto [`Vm::stack`] as
-/// [`Slot::Call`] by [`Vm::begin_closure_call`]. `locals` isolates a call's
-/// params/assignments from every other frame, and `ret_*` are the caller's
-/// registers, restored by `Op::Ret`.
+/// A user-function activation, pushed as [`Slot::Call`]. `locals` holds its
+/// params and assignments; `ret_*` are the caller's registers for `Op::Ret`.
 pub(crate) struct CallFrame {
     pub ret_prog: Arc<Program>,
     pub ret_ip: usize,
@@ -125,63 +93,35 @@ pub(crate) enum Lookup<'a> {
     Builtin(&'a Builtin),
 }
 
-/// Hard cap on user-function call nesting (a clearer error than a stack
-/// overflow); checked against `Vm::call_depth`. A call (`CALL`/`RET`) never recurses
-/// through the native Rust call stack — it only pushes a `Slot::Call`
-/// onto `Vm::stack` and jumps — so this cap is purely a language-level
-/// guard against runaway recursion, not a Rust-stack-overflow avoidance
-/// measure.
+/// Max user-function call nesting. Calls don't recurse in Rust (they push a
+/// `Slot::Call` and jump), so this only guards against runaway recursion.
 pub(crate) const MAX_CALL_DEPTH: usize = 128;
 
-/// The VM's operand stack slot. Everything
-/// `run_compiled` needs while executing a statement lives here — there is no
-/// longer a separate `frame` / `keys` / `proj` / `lazy_mode` local: a table
-/// being built is `Frame`, a `by`/projection list under construction is
-/// `List`, and `Noop` is an explicit "nothing" result (`noop` / `while` /
-/// a niladic call that returns nothing) rather than "nothing was pushed".
-///
-/// `LazyFrame` is boxed inside `Frame` for the same reason `ast::Value::Lazy`
-/// boxes it: unboxed it's a large struct (its whole optimizer/plan state),
-/// and every `Slot` variant sits inline in `Vm::stack`, so leaving it
-/// unboxed would balloon every entry on that stack to its size — enough to
-/// risk the same stack overflow `ast::Value::Lazy` was boxed to avoid,
-/// especially wherever a `Vm::run_compiled` sub-program still nests through
-/// the native Rust call stack (`\l`/`\i`'s embedded `Operand::Program`,
-/// `native_load_script`/`native_import_script`).
+/// A stack slot. All of a statement's working state lives in these: a table
+/// being built is `Frame`, a key/projection list is `List`, and `Noop` is an
+/// explicit "nothing" result. `LazyFrame` is boxed to keep slots small.
 pub(crate) enum Slot {
     Expr(Expr),
-    /// A table being built. Laziness travels with the frame itself — reading
-    /// a `Value::Lazy` binding, or `Op::Lazy`, sets `lazy: true`; `Op::Collect`
-    /// (and `cols`) sets it back to `false`.
+    /// A table being built. `lazy` is set by reading a `Value::Lazy` or
+    /// `Op::Lazy`, and cleared by `Op::Collect` (and `cols`).
     Frame {
         lf: Box<LazyFrame>,
         lazy: bool,
     },
     Scalar(ast::Value),
-    /// A projection / key / predicate list under construction (`Op::List`),
-    /// popped whole by `Select` / `SelectBy` / `Join` / `Update`.
+    /// A projection/key/predicate list under construction (`Op::List`).
     List(Vec<Expr>),
-    /// A payload just pushed by `Op::Push` for the very next opcode to
-    /// interpret (a name, count, spec, ...) — everything an `Operand` carries
-    /// except `Operand::Value`, which becomes `Slot::Scalar` directly (see
-    /// `Vm::run_compiled`'s `Op::Push` arm).
+    /// A value `Op::Push` placed for the next opcode (any `Operand` except
+    /// `Value`, which becomes `Scalar`).
     Operand(Operand),
-    /// A raw, already-typed Polars column produced by `Op::CastList` (a `zip`
-    /// column whose value carried a top-level cast) — kept as a `Column`
-    /// rather than round-tripped through `ast::Value` so a narrow width
-    /// (`i8`, categorical, …) survives into the assembled table. Transient:
-    /// only `Op::Zip` ever pops one.
+    /// A typed Polars column from `Op::CastList`, kept as-is so a narrow dtype
+    /// survives into `Op::Zip`, its only consumer.
     Column(polars::prelude::Column),
-    /// The result of `noop`, a `while` statement, or any value-context
-    /// construct that yields nothing. `Store` of a `Noop` is the existing
-    /// "cannot assign a no-op expression." error; at the top level `Vm::eval`
-    /// reports it as `EvalResult::Stored`, same as an empty stack today.
+    /// The result of `noop`, `while`, or anything else that yields nothing.
+    /// Can't be stored; at top level it evaluates to `EvalResult::Stored`.
     Noop,
-    /// A user-function call activation —
-    /// see [`CallFrame`]. Pushed by `Vm::begin_closure_call`, popped by
-    /// `Op::Ret`. Never appears as an opcode's *input*; it's addressed
-    /// directly by index (`Vm::fp`), not popped through the usual stack
-    /// helpers.
+    /// A call activation ([`CallFrame`]). Addressed by index (`Vm::fp`), never
+    /// an opcode input.
     Call(CallFrame),
 }
 
@@ -237,18 +177,13 @@ impl Slot {
     }
 }
 
-/// Pop the top of the stack as a column expression: an `Expr` slot as-is, or
-/// a `Scalar` lifted with [`ast_val_to_expr`] (a literal `Op::Push`ed by
-/// `Operand::Value` — `PUSH` pushes it as a plain scalar since it doesn't
-/// know the context it will be used in; whichever opcode expects a column
-/// expression is responsible for lifting it). Anything else is a runtime
-/// error.
+/// Pop a column expression: an `Expr` as-is, or a `Scalar` lifted with
+/// [`ast_val_to_expr`] (`PUSH` doesn't know the context, so the consumer lifts).
 fn pop_expr(stack: &mut Vec<Slot>) -> Result<Expr, QplError> {
     slot_to_expr(pop1(stack)?)
 }
 
-/// The owned-`Slot` half of [`pop_expr`], for callers that already popped a
-/// batch of slots (e.g. `Op::Verb`'s `popn`) and need to convert each one.
+/// [`pop_expr`] for an already-popped slot.
 fn slot_to_expr(slot: Slot) -> Result<Expr, QplError> {
     match slot {
         Slot::Expr(e) => Ok(e),
@@ -260,10 +195,7 @@ fn slot_to_expr(slot: Slot) -> Result<Expr, QplError> {
     }
 }
 
-/// `BINOP`'s "not both `Scalar`" path: an `Expr` slot as-is, a `Scalar` lifted
-/// with [`ast_val_to_expr`] — same as [`slot_to_expr`], except a `Frame` /
-/// `Noop` operand gets the dedicated error
-/// text for a table / no-op used as a binop operand in value context.
+/// Like [`slot_to_expr`], with specific errors for a table or `Noop` operand.
 fn expr_for_binop(slot: Slot) -> Result<Expr, QplError> {
     match slot {
         Slot::Expr(e) => Ok(e),
@@ -311,10 +243,8 @@ fn pop_target(stack: &mut Vec<Slot>) -> Result<(u32, u32), QplError> {
     }
 }
 
-/// Pop the single expected `Str` argument of a statement-native (`.qpl.cfg`,
-/// `\1`, `\d`) — these are always compiled with exactly one `Operand::Value`
-/// argument, so this is an internal-consistency check (a "corrupt bytecode"
-/// message), not a user-facing arity error.
+/// The single `Str` argument of a statement native (`.qpl.cfg`, `\1`, `\d`).
+/// A mismatch means corrupt bytecode, not a user error.
 fn expect_one_str(args: &mut Vec<Slot>, what: &str) -> Result<String, QplError> {
     if args.len() != 1 {
         return Err(QplError::Runtime(format!(
@@ -330,9 +260,7 @@ fn expect_one_str(args: &mut Vec<Slot>, what: &str) -> Result<String, QplError> 
     }
 }
 
-/// Pop the single expected embedded-program argument of `\l`/`\i` —
-/// `Operand::Program`, pushed by `compiler::compile_system` and never
-/// resolved by name, so a mismatch here is also a "corrupt bytecode" error.
+/// The single embedded-program argument of `\l`/`\i` (corrupt bytecode if not).
 fn expect_one_program(args: &mut Vec<Slot>, what: &str) -> Result<Arc<Program>, QplError> {
     if args.is_empty() {
         return Err(QplError::Runtime(format!(
@@ -348,12 +276,8 @@ fn expect_one_program(args: &mut Vec<Slot>, what: &str) -> Result<Arc<Program>, 
     }
 }
 
-/// The nearest `Frame` at or below the top of the stack — the dtype probe for
-/// a column-context cast (`` type$expr ``): while a select's projection is
-/// mid-construction, the frame it will run against sits somewhere below the
-/// expression currently on top, not necessarily immediately below it (e.g.
-/// while a `by` key list or an earlier projected column is also on the
-/// stack). Doesn't pop — the frame stays right where later frame ops expect it.
+/// The nearest `Frame` on the stack, without popping: the dtype probe for a
+/// column-context cast (other lists may sit above it mid-select).
 fn nearest_frame(stack: &[Slot]) -> Option<&LazyFrame> {
     stack.iter().rev().find_map(|s| match s {
         Slot::Frame { lf, .. } => Some(lf.as_ref()),
@@ -395,13 +319,13 @@ impl Vm {
             next_handle: 0,
             #[cfg(feature = "ipc")]
             request_mode: None,
+            #[cfg(feature = "ipc")]
+            port: None,
         }
     }
 
-    /// Run `f` with the transient per-request permission set to `mode` for
-    /// its duration, then cleared — so it can never leak into subsequent
-    /// local input. Used by the `\port` server loop, wrapped around the
-    /// evaluation of exactly one dispatched command.
+    /// Run `f` with the request permission set to `mode`, then clear it. Wraps
+    /// each dispatched command.
     #[cfg(feature = "ipc")]
     pub fn with_request_permission<T>(
         &mut self,
@@ -414,10 +338,8 @@ impl Vm {
         result
     }
 
-    /// Errors out `what` when the request currently being evaluated (if any)
-    /// arrived over a read-only `hopen` connection. A no-op for local
-    /// input — `request_mode` is only ever set for the duration of one
-    /// dispatched command (see `with_request_permission`).
+    /// Error if the current dispatched request came over a read-only handle.
+    /// A no-op for local input.
     #[cfg_attr(not(feature = "ipc"), allow(unused_variables))]
     pub(crate) fn check_write_allowed(&self, what: &str) -> Result<(), QplError> {
         #[cfg(feature = "ipc")]
@@ -451,22 +373,11 @@ impl Vm {
         }
     }
 
-    /// Resolve `name`: the active call frame (if any) first, then the session
-    /// globals. Deliberately **not** a walk of the whole call stack — a
-    /// function call only ever sees its own frame and the globals, never an
-    /// enclosing caller's frame, which is what makes this lexical scoping
-    /// rather than "whatever the dynamic call chain happens to have bound".
-    ///
-    /// Namespace qualification
-    /// (`\i "lib.qpl"`) is resolved entirely at **compile time**
-    /// (`compiler::qualify_program`):
-    /// every bare reference to a name the imported file itself binds at its
-    /// top level is already rewritten to `.lib.name` in the compiled
-    /// bytecode, so there is no namespace-aware fallback here — a
-    /// bare `LOAD`/`LOAD_COL`/`CALL` target is looked up exactly as written.
+    /// Resolve `name`: reserved builtins, then the innermost call frame's
+    /// locals, then globals. Never an enclosing caller's frame. Namespaces are
+    /// resolved at compile time, so names are looked up exactly as written.
     pub(crate) fn lookup(&self, name: &str) -> Option<Lookup<'_>> {
-        // checked first and unscoped: a builtin can never be shadowed (see
-        // the `bind_*` guards below), so there's no ambiguity to resolve.
+        // builtins can't be rebound, so checking them first is unambiguous
         if let Some(b) = self.builtins.get(name) {
             return Some(Lookup::Builtin(b));
         }
@@ -476,11 +387,8 @@ impl Vm {
         self.globals.get(name).map(Lookup::Value)
     }
 
-    /// `lookup`, narrowed to a value that is meaningful as a scalar/literal —
-    /// i.e. not a table-shaped binding (`Value::Table`/`Value::Lazy`), which
-    /// must never be substituted as a literal into a column expression (a
-    /// table name there should instead be treated as an ordinary column
-    /// reference).
+    /// `lookup` excluding table values, which must never become literals in a
+    /// column expression.
     pub(crate) fn lookup_global(&self, name: &str) -> Option<&ast::Value> {
         match self.lookup(name) {
             Some(Lookup::Value(v)) if !matches!(v, ast::Value::Table(_) | ast::Value::Lazy(_)) => {
@@ -490,8 +398,7 @@ impl Vm {
         }
     }
 
-    /// Whether `name` can be called (with `[..]` and/or, if niladic, bare) —
-    /// a bound function value or a builtin.
+    /// Whether `name` is a function value or builtin.
     pub(crate) fn is_callable(&self, name: &str) -> bool {
         matches!(
             self.lookup(name),
@@ -499,8 +406,7 @@ impl Vm {
         )
     }
 
-    /// Every bind goes through this first: a builtin's name is reserved and
-    /// can never be reassigned or shadowed.
+    /// Reject binding a builtin's name.
     fn check_not_builtin(&self, name: &str) -> Result<(), QplError> {
         if self.builtins.contains_key(name) {
             return Err(QplError::Runtime(format!(
@@ -510,10 +416,8 @@ impl Vm {
         Ok(())
     }
 
-    /// Bind `val` (scalar, table, lazy plan, closure — any [`ast::Value`]) to
-    /// `name` in the active call frame, or the session globals when there is
-    /// none. There is one binding map per frame now, so this simply
-    /// overwrites whatever `name` previously held there, of any kind.
+    /// Bind `val` to `name` in the active call frame, or globals at top level,
+    /// replacing whatever was there.
     pub(crate) fn bind(&mut self, name: String, val: ast::Value) -> Result<(), QplError> {
         self.check_not_builtin(&name)?;
         match self.current_frame_mut() {
@@ -527,8 +431,7 @@ impl Vm {
         Ok(())
     }
 
-    /// Point stdout logging at `path` (created / appended). Passing an empty
-    /// path detaches any current log.
+    /// Point the stdout log at `path` (appending), or detach it with `""`.
     pub fn set_stdout_log(&mut self, path: &str) -> Result<(), QplError> {
         self.check_write_allowed("\\1 (stdout log)")?;
         if path.is_empty() {
@@ -544,8 +447,7 @@ impl Vm {
         Ok(())
     }
 
-    /// Print `text` to stdout (or to the capture buffer, when one is active),
-    /// mirroring it to the stdout log if one is set.
+    /// Print `text` (or capture it), mirroring it to the stdout log if set.
     pub fn emit(&mut self, text: &str) {
         match self.capture.as_mut() {
             Some(buf) => {
@@ -561,7 +463,7 @@ impl Vm {
         }
     }
 
-    /// Returns a two-column table: `column` (name) and `dtype` for every field in `table_name`.
+    /// A `column`/`dtype` table describing `lf`'s schema.
     pub fn schema(&self, mut lf: LazyFrame) -> Result<DataFrame, QplError> {
         let schema = lf
             .collect_schema()
@@ -574,19 +476,11 @@ impl Vm {
         df!["column" => names, "dtype" => types].map_err(|e| QplError::Runtime(e.to_string()))
     }
 
-    /// Build the Polars expr for a column-context cast (`` type$expr ``) applied
-    /// to `expr`. `frame` (the active frame, when there is one) is consulted to
-    /// tell a string source column apart from an already-typed one, since the
-    /// target alone doesn't say what `expr` is.
-    ///
-    /// String → temporal casts route through Polars' string datetime/time
-    /// parser: `expr.cast(Date/Datetime/Time)` on a String is deprecated (gone
-    /// in Polars 2.0). `to_datetime` infers the format per value (ISO *and*
-    /// kdb's dotted `2024.03.15`), so `` `date$ `` / `` `month$ `` parse there
-    /// and then truncate to a real `Date`; `` `timestamp$ `` keeps the time
-    /// part; `` `time$ `` uses the time parser. Every *other* source dtype — a
-    /// column already `Date` / `Datetime` / `Time`, or a raw integer offset
-    /// (kdb `` `date$8000 ``-style) — takes a plain `.cast()`.
+    /// The Polars expr for a column-context cast. `frame` tells a string source
+    /// from a typed one. Strings go through Polars' string parsers, which infer
+    /// the format per value (ISO or kdb dotted): `` `date$ ``/`` `month$ `` yield
+    /// a `Date`, `` `timestamp$ `` keeps the time, `` `time$ `` parses a time.
+    /// Other sources (temporal columns, raw integer offsets) use `.cast()`.
     pub(crate) fn build_cast_expr(
         &self,
         target: &ast::CastTarget,
@@ -614,14 +508,14 @@ impl Vm {
         })
     }
 
-    /// Resolves a column-context cast target to a concrete Polars `DataType`.
+    /// A column-context cast target as a Polars `DataType`.
     fn resolve_cast_target(&self, target: &ast::CastTarget) -> Result<DataType, QplError> {
         match target {
             ast::CastTarget::Prim(name) => polars_dtype(name),
-            // `` `$col `` — a Polars Categorical (interned string pool), default u32 physical
+            // `` `$col ``: Categorical, u32 codes
             ast::CastTarget::Sym => Ok(DataType::from_categories(Categories::global())),
-            // `` u8!`$col `` — Categorical with an explicit physical width; one
-            // process-global pool per width, keyed by (name, namespace, physical)
+            // `` u8!`$col ``: Categorical with an explicit width (one global
+            // pool per width)
             ast::CastTarget::SymPhysical(width) => {
                 let phys = match width.as_str() {
                     "u8" => CategoricalPhysical::U8,
@@ -639,8 +533,7 @@ impl Vm {
                     phys,
                 )))
             }
-            // `` name::`$col `` — a Polars Enum whose categories come, in order,
-            // from the global symbol vector `name`
+            // `` name::`$col ``: an Enum with categories from symbol vector `name`
             ast::CastTarget::Enum(name) => {
                 let cats = match self.lookup_global(name) {
                     Some(v @ Value::SymVec(_)) => v.vec_strings().map_err(QplError::Runtime)?,
@@ -658,9 +551,7 @@ impl Vm {
         }
     }
 
-    /// Executes a compiled program and reduces its result to an
-    /// [`EvalResult`]. The instruction loop itself lives in [`Vm::run_compiled`],
-    /// which also backs `\l`/`\i`'s nested sub-program runs.
+    /// Run a program and reduce its result to an [`EvalResult`].
     pub fn eval(&mut self, program: Program) -> Result<EvalResult, QplError> {
         self.interrupt.check()?;
         let result = self.run_compiled(Arc::new(program))?;
@@ -683,20 +574,10 @@ impl Vm {
         }
     }
 
-    /// Runs `program` to completion on the VM's shared `stack`/registers,
-    /// above whatever's already there:
-    /// `prog`/`ip`/`cp` are saved and restored around the run, so this nests
-    /// freely — a query-context helper compiling and running a small
-    /// sub-program while a user-function call is already active (e.g.
-    /// `Vm::eval_value_expr`, or a niladic call from `LOAD_COL`) sees its own
-    /// program's code without disturbing the enclosing call's
-    /// registers. `fp` is deliberately left untouched across a *successful*
-    /// run — lookups inside the sub-program must still see the enclosing
-    /// call's locals — but is rolled back (along with the stack, to its
-    /// height before this call) on error, so a caught/retried error can never
-    /// leave a half-finished call frame or leftover values behind. (E.g.
-    /// `native_load_script`/`native_import_script` calling back into this
-    /// while a user function is already active.)
+    /// Run `program` on the shared stack above whatever is there, saving and
+    /// restoring `prog`/`ip`/`cp` so it nests inside an active call. `fp` is
+    /// kept on success (so the sub-program sees the caller's locals); on error
+    /// the stack and `fp` roll back so no half-finished frame is left.
     pub(crate) fn run_compiled(&mut self, program: Arc<Program>) -> Result<Slot, QplError> {
         let saved_prog = self.prog.clone();
         let saved_ip = self.ip;
@@ -762,21 +643,15 @@ impl Vm {
         Ok(())
     }
 
-    /// Takes and clears the error site recorded by [`Vm::run_loop`], if any —
-    /// called exactly once per top-level program run (successful or not) so
-    /// a stale site from an earlier statement can never leak into a later
-    /// one's error message.
+    /// Take and clear the recorded error site. Called once per top-level run so
+    /// a stale site never reaches a later error.
     pub(crate) fn take_error_site(&mut self) -> Option<(Arc<Program>, usize)> {
         self.error_site.take()
     }
 
-    /// Executes exactly one opcode at `self.prog.code[self.ip]`: decodes it via [`Op::try_from`], consuming the
-    /// operand stream in lockstep only for [`Op::Push`] — every other opcode
-    /// takes all of its inputs from `self.stack`. Calling this directly (in a
-    /// small loop, rather than via [`Vm::run_loop`]) is how a single opcode
-    /// handler can synchronously wait out a nested `CALL` it just issued
-    /// without any native Rust recursion — see the `Op::LoadCol` arm's
-    /// niladic-function-call path.
+    /// Execute the opcode at `ip`. Only `Push` reads the operand stream. An
+    /// opcode handler can call this in a small loop to wait out a nested `CALL`
+    /// without Rust recursion (see `Op::LoadCol`).
     fn step(&mut self) -> Result<(), QplError> {
         let byte = self.prog.code[self.ip];
         self.ip += 1;
@@ -789,10 +664,7 @@ impl Vm {
                 self.cp += 1;
                 match operand {
                     Operand::Value(v) => self.stack.push(Slot::Scalar(v)),
-                    // attach the currently-running program so the closure
-                    // stays callable after this program is dropped (a
-                    // function defined on one REPL line, invoked on a
-                    // later one).
+                    // attach the running program so the closure outlives it
                     Operand::Func(proto) => {
                         let closure = Closure {
                             params: proto.params.clone(),
@@ -810,8 +682,7 @@ impl Vm {
             Op::Source => {
                 let name = pop_name(&mut self.stack)?;
                 let (lf, lazy) = match self.lookup(&name) {
-                    // reading from a lazy binding is contagious: the
-                    // result stays lazy unless explicitly collected.
+                    // reading a lazy binding keeps the result lazy
                     Some(Lookup::Value(Value::Lazy(lf))) => ((**lf).clone(), true),
                     Some(Lookup::Value(Value::Table(df))) => (df.clone().lazy(), false),
                     _ => {
@@ -854,18 +725,11 @@ impl Vm {
                 });
             }
 
-            // a niladic function/builtin (e.g. `.qpl.dt`) reduces to the
-            // literal it returns — resolved like any other bare name, not
-            // specially recognised here. Checked ahead of the global
-            // shortcut below because a niladic *user* function is itself a
-            // global (a `Value::Closure`), and the point is to call it. A
-            // closure call is run to completion right here (still via
-            // `CALL`/`RET`, no Rust
-            // recursion — just a nested `step()` loop bounded by this
-            // specific call's own frame, since `LOAD_COL` needs the
-            // result's *type* immediately to give its own error text)
-            // rather than jumping and letting the surrounding `step()`
-            // loop carry on, unlike `Op::Load`/`Op::Call`.
+            // A niladic function (e.g. `.qpl.dt`) is called and its result
+            // used as a literal; checked before globals because a user
+            // function is itself a global. Unlike `Load`/`Call`, the call runs
+            // to completion here (a nested `step()` loop, not Rust recursion),
+            // since `LOAD_COL` needs the result's type for its error text.
             Op::LoadCol => {
                 let name = pop_name(&mut self.stack)?;
                 match self.niladic_closure_or_builtin(&name) {
@@ -907,8 +771,7 @@ impl Vm {
                             }
                         }
                     }
-                    // globals shadow column names, substituting a literal
-                    // into the lazy plan.
+                    // a global shadows a column name, substituting a literal
                     Niladic::None => {
                         if let Some(val) = self.lookup_global(&name) {
                             self.stack.push(Slot::Expr(ast_val_to_expr(val.clone())?));
@@ -923,12 +786,9 @@ impl Vm {
                 self.stack.push(Slot::Expr(col("i")));
             }
 
-            // Value context: resolves a
-            // bare name — a niladic user function/builtin is called (via
-            // the same `CALL`/`RET` mechanism as an explicit `f[..]`, no
-            // Rust recursion), a `Table`/`Lazy` global becomes a `Frame`,
-            // everything else a `Scalar`; a non-niladic builtin or an
-            // undefined name is today's exact error text.
+            // Value context: resolve a bare name. A niladic function is called
+            // (via `CALL`/`RET`), a table global becomes a `Frame`, anything
+            // else a `Scalar`.
             Op::Load => {
                 let name = pop_name(&mut self.stack)?;
                 match self.niladic_closure_or_builtin(&name) {
@@ -960,12 +820,8 @@ impl Vm {
                 }
             }
 
-            // Value context: like
-            // `Load`, but never auto-calls a niladic closure/builtin — the
-            // call-target position (`f[x]`, `x[i]`). A callable name is
-            // deferred (pushed back as the raw `Operand::Name`) for
-            // `Op::Index`/`Op::Call` to resolve; anything else resolves
-            // exactly like `Load`'s non-niladic-call path.
+            // Value context: like `Load`, but a callable name isn't called; it's
+            // pushed back as a name for `Index`/`Call` to resolve.
             Op::LoadFn => {
                 let name = pop_name(&mut self.stack)?;
                 if self.is_callable(&name) {
@@ -992,15 +848,9 @@ impl Vm {
                 }
             }
 
-            // Value context: `enlist` /
-            // `?` roll (`Operand::Native`, unconditional keywords) or a
-            // name (resolved at run time: a bound closure/builtin wins,
-            // else a shadowable keyword, else a generic column verb — see
-            // `ops::call_by_name`) or a closure literal already on the
-            // stack (an anonymous function applied in place). A closure
-            // call doesn't push a result here — see `Vm::call_value` —
-            // it jumps into the callee's own bytecode; `Op::Ret` pushes
-            // the result once the callee returns.
+            // Value context: a native by id, a name (see `ops::call_by_name`), or
+            // a closure on the stack. A closure call jumps into the callee;
+            // `Op::Ret` pushes the result.
             Op::Call => {
                 let callee = pop1(&mut self.stack)?;
                 let n = pop_count(&mut self.stack)?;
@@ -1008,8 +858,7 @@ impl Vm {
                 self.call_value(callee, args)?;
             }
 
-            // Value context: `` n#expr ``
-            // head/tail slicing.
+            // Value context: `n#expr`
             Op::Take => {
                 let target = pop1(&mut self.stack)?;
                 let n = match pop1(&mut self.stack)?.unwrap_scalar()? {
@@ -1038,10 +887,8 @@ impl Vm {
                 self.stack.push(result);
             }
 
-            // Value context: a callable
-            // target (from `LoadFn`, or a closure literal) calls;
-            // otherwise positional list indexing (an atom index picks an
-            // element, an int-vector index picks a sub-list).
+            // Value context: call a callable target, otherwise index a list
+            // (an atom picks an element, an int vector a sub-list).
             Op::Index => {
                 let n = pop_count(&mut self.stack)?;
                 let idx_args = popn(&mut self.stack, n)?;
@@ -1084,9 +931,7 @@ impl Vm {
                 }
             }
 
-            // Value context: a one-column
-            // `select`'s materialisation to a list (`compile_value_expr`'s
-            // `Expr::Table` arm — `is_column_select`).
+            // Value context: a one-column select as a list
             Op::Column => {
                 let (lf, _lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
                 let df = lf.collect().map_err(|e| QplError::Runtime(e.to_string()))?;
@@ -1097,16 +942,10 @@ impl Vm {
                 self.stack.push(Slot::Scalar(ops::column_to_value(col)?));
             }
 
-            // `` zip `k1`k2!v1 v2 ``: each
-            // column is already a `Column` (from `Op::CastList`) or a
-            // list `Value`/`Frame` (a plain, non-cast dict value).
-            //
-            // `compile_value_expr` commits to this dict lowering at
-            // compile time (a dict literal argument has no other
-            // representation to compile to), so a user function named
-            // `zip` can only be checked for here, at run time: a bound
-            // closure/builtin named `zip` errors instead of silently
-            // falling through to the built-in constructor.
+            // `` zip `k1`k2!v1 v2 ``: each column is a `Column` (from `CastList`)
+            // or a list value. The compiler always lowers a dict argument this
+            // way, so a user function named `zip` is caught here at run time
+            // and reported as an error.
             Op::Zip if self.is_callable("zip") => {
                 return Err(QplError::Runtime(
                         "'zip' is shadowed by a user-defined function here — it cannot be called with a dict literal (a dict has no plain-value form to pass); call it as 'zip[<value>]' instead".into(),
@@ -1169,10 +1008,8 @@ impl Vm {
                 });
             }
 
-            // `zip`'s internal cast-column lowering only: applies a top-level cast to a list
-            // value, keeping the exact resulting Series (not round-tripped
-            // through `ast::Value`, which would lose a narrow width or a
-            // categorical) — see `ops::zip_value_to_series`.
+            // cast a `zip` column's list, keeping the exact Series (dtype and
+            // width) rather than going through `ast::Value`
             Op::CastList => {
                 let name = pop_name(&mut self.stack)?;
                 let target = match pop1(&mut self.stack)?.unwrap_operand()? {
@@ -1202,10 +1039,8 @@ impl Vm {
                 self.stack.push(Slot::Column(column));
             }
 
-            // `<list-expr> where <predicate>...`: the list half — checks `list` is
-            // list-shaped and aliases it to a one-column `x` frame for the
-            // query-context predicates the compiler emits right after
-            // this opcode.
+            // the list half of `<list> where <pred>`: check it's a list and
+            // expose it as a one-column `x` frame for the predicates that follow
             Op::ListWhereFrame => {
                 let list_val = ops::slot_to_scalar_value(pop1(&mut self.stack)?)?;
                 if !ops::is_list_value(&list_val) {
@@ -1220,7 +1055,7 @@ impl Vm {
                 });
             }
 
-            // `<conn> dispatch <cmd>` / `<conn> async dispatch <cmd>`
+            // `<conn> [async] dispatch <cmd>`
             Op::Dispatch => {
                 let is_async = match pop1(&mut self.stack)?.unwrap_scalar()? {
                     Value::Bool(b) => b,
@@ -1253,13 +1088,8 @@ impl Vm {
                 }
             }
 
-            // Type-dispatched: both
-            // operands `Scalar` evaluate eagerly in Rust
-            // (`ops::value_binop`); otherwise the (possibly-lifted) operands
-            // build a Polars expression, A `Frame` operand
-            // (a bare table name used as a value) is the same
-            // "expected a scalar here, got a table" error; a `Noop` operand likewise keeps its
-            // "cannot use a no-op expression as a value" text.
+            // two scalars evaluate eagerly (`ops::value_binop`); otherwise build
+            // a Polars expression. A table or `Noop` operand is an error.
             Op::BinOp => {
                 let kind = match pop1(&mut self.stack)?.unwrap_operand()? {
                     Operand::BinOp(k) => k,
@@ -1488,7 +1318,7 @@ impl Vm {
             Op::Cols => {
                 let (lf, _lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
                 let df = self.schema(lf)?;
-                // `cols` fully resolves the schema; always show it as a table.
+                // `cols` resolves the schema, so show it as a table
                 self.stack.push(Slot::Frame {
                     lf: Box::new(df.lazy()),
                     lazy: false,
@@ -1602,10 +1432,8 @@ impl Vm {
                     .collect::<Result<Vec<_>, _>>()?;
                 let (mut lf, lazy) = pop1(&mut self.stack)?.unwrap_frame()?;
                 let predicate = preds.into_iter().reduce(|left, right| left.and(right));
-                // `update col: … where p` keeps the old value where `p` is
-                // false — but a brand-new column has no old value, so it
-                // gets null there instead of `col(name)` (which would fail
-                // to resolve).
+                // `update col: … where p` keeps the old value where `p` is false;
+                // a new column has no old value, so it gets null
                 let schema = match &predicate {
                     Some(_) => Some(
                         lf.collect_schema()
@@ -1747,18 +1575,14 @@ impl Vm {
                 }
             }
 
-            // `(x → )` — discard a function body's non-final expression
-            // statement's value.
+            // `(x → )`
             Op::Pop => {
                 pop1(&mut self.stack)?;
             }
 
-            // `(x → )` — print a top-level expression statement's result,
-            // a lazy `Frame` prints its
-            // (optimised) plan; an eager `Frame` collects and prints the
-            // table, or — under `Vm::capture_table` (`wasm` feature) — is
-            // stashed in `Vm::last_table` instead of rendered; a `Scalar`
-            // prints via `fmt_val`; `Noop` prints nothing.
+            // `(x → )`: print a top-level result. A lazy frame prints its plan,
+            // an eager one its table (or goes to `last_table` under
+            // `capture_table`), a scalar via `fmt_val`, `Noop` nothing.
             Op::Emit => match pop1(&mut self.stack)? {
                 Slot::Frame { lf, lazy } => {
                     if lazy {
@@ -1789,9 +1613,8 @@ impl Vm {
                 }
             },
 
-            // `(result → result)` — return from the innermost `CALL`
-            // unwind to `fp`, restore the
-            // caller's registers, leave `result` on top for the caller.
+            // `(result → result)`: unwind to `fp`, restore the caller's
+            // registers, leave `result` on top
             Op::Ret => {
                 let result = pop1(&mut self.stack)?;
                 let fp = self.fp.expect("RET executed outside an active call frame");
@@ -1813,14 +1636,12 @@ impl Vm {
                 self.stack.push(result);
             }
 
-            // See the doc comment on `Op::Halt` in `program.rs`.
             Op::Halt => {
                 self.ip = self.prog.code.len();
             }
 
-            // `(target → )` — unconditional jump: a `while` looping back to its top. `self.ip` has already
-            // advanced past this opcode's own byte, so comparing it to the
-            // popped target tells backward from forward.
+            // `(target → )`. `ip` is already past this byte, so comparing it
+            // with the target tells a backward jump (a loop) from a forward one.
             Op::Jump => {
                 let (ip, cp) = pop_target(&mut self.stack)?;
                 if (ip as usize) < self.ip {
@@ -1830,9 +1651,7 @@ impl Vm {
                 self.cp = cp as usize;
             }
 
-            // `(cond target msg → )`: `while`'s and `?[..]`'s atom
-            // paths. Any `cond` other than a `Bool` atom is the caller's own
-            // error text, carried in `msg`.
+            // `(cond target msg → )`: a non-`Bool` cond errors with `msg`
             Op::JumpIfFalse => {
                 let msg = match pop1(&mut self.stack)?.unwrap_operand()? {
                     Operand::Text(t) => t,
@@ -1853,9 +1672,7 @@ impl Vm {
                 }
             }
 
-            // `(cond target → cond)`: peeks `cond` (never pops),
-            // jumps iff it's a `BoolVec` — value-context `?[..]`'s divert to
-            // the elementwise `CASE_VEC` tail.
+            // `(cond target → cond)`: jump if `cond` is a `BoolVec` (peeked)
             Op::JumpIfVec => {
                 let (ip, cp) = pop_target(&mut self.stack)?;
                 if matches!(self.stack.last(), Some(Slot::Scalar(Value::BoolVec(_)))) {
@@ -1864,7 +1681,7 @@ impl Vm {
                 }
             }
 
-            // `(mask v1 c2 v2 … d n → Val)` — see `ops::case_vec`.
+            // `(mask v1 c2 v2 … d n → Val)`: see `ops::case_vec`
             Op::CaseVec => {
                 let n = pop_count(&mut self.stack)?;
                 let rest = popn(&mut self.stack, n)?;
@@ -1872,8 +1689,7 @@ impl Vm {
                 self.stack.push(Slot::Scalar(ops::case_vec(mask, rest)?));
             }
 
-            // `( → Noop)`: `noop`, and a `while` statement's own
-            // value once its loop exits.
+            // `( → Noop)`
             Op::Noop => {
                 self.stack.push(Slot::Noop);
             }
@@ -1881,13 +1697,8 @@ impl Vm {
         Ok(())
     }
 
-    /// Whether `name` currently resolves to a *niladic* (zero-parameter)
-    /// closure or builtin — the shared precondition for `LOAD`'s and
-    /// `LOAD_COL`'s "a bare name that names a niladic function calls it"
-    /// behaviour. Returns owned data (a
-    /// cloned `Builtin`, a cloned `Arc<Closure>`) rather than a `Lookup<'_>`
-    /// so the caller is free to mutate `self` (push a call frame, run the
-    /// builtin) immediately afterwards.
+    /// Whether `name` is a niladic closure or builtin, which `LOAD`/`LOAD_COL`
+    /// call when named bare. Returns owned data so the caller can mutate `self`.
     fn niladic_closure_or_builtin(&self, name: &str) -> Niladic {
         match self.lookup(name) {
             Some(Lookup::Builtin(b)) if b.arity == (0..=0) => Niladic::Builtin(b.clone()),
@@ -1898,9 +1709,7 @@ impl Vm {
         }
     }
 
-    /// A bare name resolved as an ordinary (non-call) value — `LOAD`'s and
-    /// `LOAD_FN`'s shared tail once a niladic call has already been ruled
-    /// out.
+    /// A bare name as an ordinary value, once a niladic call is ruled out.
     fn resolve_plain(&self, name: &str) -> Resolved {
         match self.lookup(name) {
             Some(Lookup::Value(Value::Lazy(lf))) => Resolved::Lazy(lf.clone()),
@@ -1911,12 +1720,9 @@ impl Vm {
         }
     }
 
-    /// `Op::Call`'s full runtime dispatch (also used by `Op::Index` and by
-    /// `Op::Load`/`Op::LoadCol`'s niladic-call path): a native keyword calls
-    /// directly; a bound closure name or an anonymous closure value begins a
-    /// `CALL`; a name that's
-    /// neither a closure nor a builtin falls to [`ops::call_by_name`] (a
-    /// handful of shadowable keywords, else a generic column verb).
+    /// `Op::Call`'s dispatch (also used by `Index` and niladic loads): a native
+    /// by id runs directly, a closure begins a `CALL`, and any other name goes
+    /// to [`ops::call_by_name`].
     fn call_value(&mut self, callee: Slot, args: Vec<Slot>) -> Result<(), QplError> {
         match callee {
             Slot::Operand(Operand::Native(id)) => {
@@ -1928,6 +1734,7 @@ impl Vm {
                     crate::native::NativeId::PrintText => self.native_print_text(args)?,
                     crate::native::NativeId::LoadScript => self.native_load_script(args)?,
                     crate::native::NativeId::ImportScript => self.native_import_script(args)?,
+                    crate::native::NativeId::Port => self.native_port(args)?,
                 };
                 self.stack.push(result);
             }
@@ -1981,11 +1788,7 @@ impl Vm {
         (b.call)(self, args)
     }
 
-    /// `.qpl.cfg key=value ...`: compiled from
-    /// `ast::Stmt::Cfg` into `PUSH Native(Cfg); PUSH Value(Str(args)); PUSH
-    /// Count(1); CALL`. A bare `.qpl.cfg` (`args` empty) prints the current
-    /// configuration; otherwise every whitespace-separated `key=value` pair is
-    /// applied.
+    /// `.qpl.cfg key=value ...`; bare, print the settings.
     fn native_cfg(&mut self, mut args: Vec<Slot>) -> Result<Slot, QplError> {
         let args = expect_one_str(&mut args, ".qpl.cfg")?;
         if args.is_empty() {
@@ -2003,38 +1806,30 @@ impl Vm {
         Ok(Slot::Noop)
     }
 
-    /// `\1 <path>`: point (or, for an empty
-    /// path, detach) the stdout log — see [`Vm::set_stdout_log`].
+    /// `\1 <path>`: set (or with `""`, detach) the stdout log.
     fn native_stdout_log(&mut self, mut args: Vec<Slot>) -> Result<Slot, QplError> {
         let path = expect_one_str(&mut args, "\\1")?;
         self.set_stdout_log(&path)?;
         Ok(Slot::Noop)
     }
 
-    /// `\d <stmt>`: the disassembly listing is
-    /// already rendered at compile time (`compiler::compile_system`) and
-    /// carried as a plain `Str` operand — this just prints it.
+    /// `\d <stmt>`: print the disassembly rendered at compile time.
     fn native_print_text(&mut self, mut args: Vec<Slot>) -> Result<Slot, QplError> {
         let text = expect_one_str(&mut args, "\\d")?;
         self.emit(&text);
         Ok(Slot::Noop)
     }
 
-    /// `\l <path>`: run the embedded target
-    /// program flat, in the current session scope — no source, lexing or
-    /// parsing left to do at run time (see `Operand::Program`).
+    /// `\l <path>`: run the embedded program in the current scope.
     fn native_load_script(&mut self, mut args: Vec<Slot>) -> Result<Slot, QplError> {
         let program = expect_one_program(&mut args, "\\l")?;
         self.run_compiled(program)?;
         Ok(Slot::Noop)
     }
 
-    /// `\i "<path>"`: run the embedded target
-    /// program as a namespaced import — a snapshot/rollback transaction against a
-    /// pre-compiled `Operand::Program`.
-    /// Namespace *qualification* itself already happened at compile time
-    /// (`compiler::qualify_program`) when the target was compiled, so this is
-    /// purely a runtime bookkeeping transaction, not a rename.
+    /// `\i "<path>"`: run the embedded program as an import. Names were
+    /// already qualified at compile time; this snapshots `globals`, clears the
+    /// namespace, and restores the snapshot on failure.
     fn native_import_script(&mut self, mut args: Vec<Slot>) -> Result<Slot, QplError> {
         if args.len() != 2 {
             return Err(QplError::Runtime(format!(
@@ -2062,19 +1857,51 @@ impl Vm {
         Ok(Slot::Noop)
     }
 
-    /// Begins a user-function call: the
-    /// arity/depth/interrupt checks, then instead of recursing through the
-    /// native Rust call stack this pushes one [`Slot::Call`] activation record onto
-    /// `self.stack` and switches `self.prog`/`self.ip`/`self.cp` to the
-    /// closure's own entry point — the surrounding `step()` loop then simply
-    /// keeps going, now executing the callee's bytecode, until `Op::Ret`
-    /// switches the registers back. No Rust stack frame is added per call.
-    ///
-    /// `args` are already evaluated (in the *caller's* frame, before this
-    /// runs — the caller compiled/evaluated them ahead of `CALL`/`INDEX`).
-    /// `name` is `Some` only for a bare-name call target — what the arity
-    /// error and namespace resolution key off; an anonymous target
-    /// (`{[x] ..}[5]`, a parameter holding a function) has neither.
+    /// `\port [<expr>]`: close any open listener, then bind one on the port
+    /// given as an `Int` or digit `Str` (an empty string, from bare `\port`,
+    /// just closes). Never blocks; the run loop does the serving.
+    #[cfg(feature = "ipc")]
+    fn native_port(&mut self, mut args: Vec<Slot>) -> Result<Slot, QplError> {
+        if args.len() != 1 {
+            return Err(QplError::Runtime(format!(
+                "corrupt bytecode: '\\port' expects exactly 1 argument, got {}",
+                args.len()
+            )));
+        }
+        let val = args.remove(0).unwrap_scalar()?;
+        if let Some(state) = self.port.take() {
+            state.handle.close();
+        }
+        let port: u16 = match val {
+            Value::Str(s) if s.trim().is_empty() => return Ok(Slot::Noop),
+            Value::Str(s) => s.trim().parse().map_err(|_| {
+                QplError::Runtime(format!("\\port: expected a port number, got '{s}'"))
+            })?,
+            Value::Int(n) => u16::try_from(n)
+                .map_err(|_| QplError::Runtime(format!("\\port: port number out of range: {n}")))?,
+            other => {
+                return Err(QplError::Runtime(format!(
+                    "\\port: expected a port number, got {other:?}"
+                )));
+            }
+        };
+        self.port = Some(crate::ipc::PortState::open(port)?);
+        Ok(Slot::Noop)
+    }
+
+    #[cfg(not(feature = "ipc"))]
+    fn native_port(&mut self, _args: Vec<Slot>) -> Result<Slot, QplError> {
+        Err(QplError::Runtime(
+            "\\port requires the `ipc` feature (on by default; this build used `--no-default-features`)"
+                .into(),
+        ))
+    }
+
+    /// Begin a user-function call: check arity, depth and interrupt, push a
+    /// [`Slot::Call`], and jump to the closure's entry point. The `step()` loop
+    /// carries on in the callee until `Op::Ret`; no Rust frame is added.
+    /// `args` were evaluated in the caller's frame. `name` is `Some` for a
+    /// bare-name call (for the arity error).
     pub(crate) fn begin_closure_call(
         &mut self,
         closure: Arc<Closure>,
@@ -2095,8 +1922,8 @@ impl Vm {
                 "function recursion too deep (limit {MAX_CALL_DEPTH})"
             )));
         }
-        // arguments bind into the callee's own frame a lazy frame arg stays a `Value::Lazy`, any other frame
-        // collects to a `Value::Table`.
+        // bind args as locals; a lazy frame stays `Lazy`, any other frame is
+        // collected to a `Table`
         let mut locals = HashMap::with_capacity(closure.params.len());
         for (p, slot) in closure.params.iter().zip(args) {
             let v = match slot {
@@ -2164,7 +1991,7 @@ pub enum EvalResult {
     Table(DataFrame),
     Stored,
     Scalar(ast::Value),
-    /// a bare lazy table expression: carries the (optimised) query plan text.
+    /// a lazy plan's (optimised) text
     Lazy(String),
 }
 
@@ -2183,13 +2010,8 @@ pub fn run_vm(source: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-/// Does `expr`, resolved against the active `frame`'s schema, have dtype
-/// `String`? Used to decide whether a `` `date$ `` / `` `timestamp$ `` /
-/// `` `time$ `` cast should parse a string or plain-`.cast()` an already
-/// temporal (or raw integer offset) source. `expr` is a moved-through
-/// `PushColRef`/`PushConst`/… expression, not necessarily a bare column, so
-/// this resolves it the same way Polars would: select it (schema-only, no
-/// data touched) off a clone of the current plan.
+/// Whether `expr` has dtype `String` against `frame`'s schema, to choose
+/// between parsing and `.cast()` for a temporal cast. Resolved schema-only.
 fn expr_dtype_is_string(frame: Option<&LazyFrame>, expr: &Expr) -> Result<bool, QplError> {
     let Some(lf) = frame else { return Ok(false) };
     let schema = lf
@@ -2231,8 +2053,7 @@ pub(crate) fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
         ast::Value::FloatVec(s) => s.lit(),
         ast::Value::BoolVec(s) => s.lit(),
         ast::Value::SymVec(s) | ast::Value::StrVec(s) => s.lit(),
-        // temporal scalars carry a kdb offset; re-base to the Polars 1970 epoch
-        // and give the literal its Polars dtype so it composes with columns.
+        // rebase kdb offsets to Polars' 1970 epoch, with the Polars dtype
         ast::Value::Date(d) => lit(d + temporal::DAYS_2000_TO_1970).cast(DataType::Date),
         ast::Value::Month(mo) => {
             let days = temporal::days_from_civil(
@@ -2259,17 +2080,13 @@ pub(crate) fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
                 "a function cannot be used in a query expression".into(),
             ));
         }
-        // a table/lazy-plan global is never substituted as a literal here in
-        // the first place (see `Vm::lookup_global`) — reaching this arm would
-        // mean a table-shaped value flowed into scalar/expression position
-        // some other way.
+        // unreachable in practice: `lookup_global` never substitutes a table
         v @ (ast::Value::Table(_) | ast::Value::Lazy(_)) => {
             return Err(QplError::Runtime(format!(
                 "{v:?} cannot be used in a query expression"
             )));
         }
-        // typed temporal vectors: same offset-rebasing as their scalar
-        // counterparts, applied elementwise via Series/Expr arithmetic.
+        // temporal vectors rebase like their scalars, elementwise
         ast::Value::DateVec(s) => (s.lit() + lit(temporal::DAYS_2000_TO_1970)).cast(DataType::Date),
         ast::Value::MonthVec(s) => {
             let days: Vec<i32> = s
@@ -2323,9 +2140,8 @@ fn polars_dtype(name: &str) -> Result<DataType, QplError> {
         "bool" => DataType::Boolean,
         "str" | "string" => DataType::String,
         "long" => DataType::Int64,
-        // temporal targets in column context. `month` has no Polars dtype so it
-        // maps to `Date`; `minute` / `second` map to `Time` (truncation to the
-        // unit is not implemented).
+        // column-context temporal targets: `month` maps to `Date`, and
+        // `minute`/`second` to `Time` (not truncated to the unit)
         "date" => DataType::Date,
         "month" => DataType::Date,
         "time" | "minute" | "second" => DataType::Time,
@@ -2335,11 +2151,8 @@ fn polars_dtype(name: &str) -> Result<DataType, QplError> {
     })
 }
 
-/// `load <path>`. Unavailable on wasm: a browser has no filesystem, and the
-/// Polars features that provide the readers (`parquet`/`csv`) can't be built
-/// for that target at all — see the `[target...dependencies.polars]` blocks in
-/// `Cargo.toml`. It stays a runtime error rather than a missing builtin so the
-/// grammar, the compiler and every error message are identical everywhere.
+/// `load <path>`. Unavailable on wasm (no filesystem, and the readers don't
+/// build there); a runtime error so grammar and messages stay identical.
 #[cfg(target_family = "wasm")]
 fn load_file(path: &str) -> Result<LazyFrame, QplError> {
     Err(QplError::Runtime(format!(
@@ -2413,11 +2226,9 @@ fn sink_file(lf: LazyFrame, path: &str) -> Result<(), QplError> {
     Ok(())
 }
 
-/// Apply `.over(partition)` to `e`, honouring an optional window `order`
-/// sub-clause. With no `order` this is a plain partition broadcast; with one it
-/// sorts each partition by the order keys first (a single direction is applied
-/// to every key — mixed asc/desc is only supported by the ranking verbs). The
-/// result is mapped back onto the original row positions.
+/// `.over(partition)`, sorting each partition by the `order` keys first if
+/// given (one direction for all keys; mixed directions are ranking-only).
+/// Results map back to the original rows.
 fn apply_over(e: Expr, part: &[Expr], order: &[(String, bool)]) -> Result<Expr, QplError> {
     if order.is_empty() {
         return e
@@ -2434,9 +2245,8 @@ fn apply_over(e: Expr, part: &[Expr], order: &[(String, bool)]) -> Result<Expr, 
     .map_err(|err| QplError::Runtime(err.to_string()))
 }
 
-/// Build a fixed-size rolling-window aggregate (`<agg> <col> <n>!rolling over
-/// `key [order `k asc]`). Unlike the plain window path the aggregate is *not*
-/// pre-applied: `col` is the raw column and `agg` names the rolling reduction.
+/// A rolling-window aggregate (`... over `k order `t asc rolling n`). `col` is
+/// the raw column; `agg` names the rolling reduction.
 fn build_rolling_window(
     agg: &str,
     window: usize,
@@ -2469,16 +2279,12 @@ fn build_rolling_window(
     apply_over(rolled, &part, order)
 }
 
-/// Build a window expression. `WindowFn::Over` broadcasts `target` (an aggregate
-/// or column expression) across each partition.
-///
-/// The ranking verbs need a single per-partition ordering key. For one `order`
-/// column that key is the column itself. For several — with independent asc/desc
-/// directions — each column is replaced by its dense per-partition rank (which
-/// preserves order and value-equality) and the ranks are packed positionally
-/// into one number, so ascending order matches the requested lexicographic
-/// order and equal keys stay equal. That composite is then ranked with the
-/// method for the verb (`Ordinal` = `rn`, `Min` = `rank`, `Dense` = `drank`).
+/// A window expression. `WindowFn::Over` broadcasts `target` over each
+/// partition. Ranking verbs need one ordering key: a single `order` column is
+/// used directly; several (each with its own direction) are replaced by dense
+/// per-partition ranks packed into one number that sorts lexicographically.
+/// That key is ranked with `Ordinal` (`rn`), `Min` (`rank`) or `Dense`
+/// (`drank`).
 fn build_window(
     func: WindowFn,
     target: Option<Expr>,
@@ -2495,12 +2301,10 @@ fn build_window(
         return apply_over(target.expect("Over target"), &part, order);
     }
 
-    // (rank_key, descending) — the single key the final rank is computed over.
     let (rank_key, descending) = if let [(name, desc)] = order {
         (col(name.as_str()), *desc)
     } else {
-        // pack per-column dense ranks: composite = ((r1)*B2 + r2)*B3 + r3 ...
-        // where Bi = (max r_i in partition) + 1 keeps digits from colliding.
+        // composite = ((r1)*B2 + r2)*B3 + r3 ..., where Bi = max(r_i) + 1
         let mut composite: Option<Expr> = None;
         for (name, desc) in order {
             let ri = over(
@@ -2543,8 +2347,7 @@ pub(crate) fn apply_call(func: &str, mut args: Vec<Expr>) -> Result<Expr, QplErr
     if args.is_empty() {
         return Err(QplError::Runtime(format!("'{func}' called with no args")));
     }
-    // dyadic verbs (`<param> verb <col>`): the parser hands us `[value, param]`,
-    // mirroring `round`. They never reach here with any other arity.
+    // dyadic verbs (`<param> verb <col>`): args are `[value, param]`
     if args.len() == 2 {
         let param = args.pop().unwrap();
         let value = args.pop().unwrap();
@@ -2588,7 +2391,7 @@ pub(crate) fn apply_call(func: &str, mut args: Vec<Expr>) -> Result<Expr, QplErr
     })
 }
 
-/// Dyadic column verbs, parsed q-style as `<param> verb <col>` (like `round`).
+/// Dyadic column verbs, `<param> verb <col>` (like `round`).
 pub(crate) fn apply_dyadic(func: &str, value: Expr, param: Expr) -> Result<Expr, QplError> {
     Ok(match func {
         "quantile" | "pctl" => value.quantile(param, QuantileMethod::Linear),
@@ -2777,8 +2580,7 @@ mod tests {
     #[test]
     #[cfg(not(target_family = "wasm"))]
     fn load_accepts_a_bound_variable_path() {
-        // regression: `load` only ever accepted a literal string token, so
-        // `p: "x.csv"; load p` (or `f[lazy load p]`) failed to parse.
+        // `load` takes a variable path
         let path = std::env::temp_dir().join("qpl_vm_test_load_variable_path.csv");
         let path_str = path.to_str().unwrap();
 
@@ -2795,9 +2597,7 @@ mod tests {
     #[test]
     #[cfg(not(target_family = "wasm"))]
     fn function_call_accepts_a_lazy_load_bracket_argument() {
-        // regression: `analysis[lazy load p]` failed to *parse* at all
-        // ("Unexpected token in primary: Lazy") — a bracket-call argument
-        // didn't know how to start a table expression.
+        // a lazy load as a bracket-call argument
         let path = std::env::temp_dir().join("qpl_vm_test_lazy_load_bracket_arg.csv");
         let path_str = path.to_str().unwrap();
         run_instructions(make_vm(), &format!("t sink \"{path_str}\""));
@@ -2881,8 +2681,7 @@ mod tests {
 
         #[test]
         fn read_handle_does_not_reject_a_plain_select() {
-            // only assignment / sink / stdout-log are gated — an ordinary query
-            // (no write) must still work over a read handle.
+            // only writes are gated; a query works over a read handle
             let mut vm = make_vm();
             vm.with_request_permission(HandleMode::Read, |vm| run_vm("select from t", vm))
                 .expect("a read-only select must succeed");
@@ -2890,10 +2689,8 @@ mod tests {
 
         #[test]
         fn local_input_is_never_restricted_regardless_of_request_mode() {
-            // `request_mode` only exists for the duration of a dispatched
-            // request; local calls (nothing wraps them in
-            // `with_request_permission`) always see `None` and are unaffected,
-            // even on a server that also happens to have read handles connected.
+            // local calls aren't wrapped in `with_request_permission`, so they
+            // always see `None`
             let mut vm = make_vm();
             assert_eq!(vm.request_mode, None);
             run_vm("x: 1", &mut vm).expect("local assignment always allowed");
@@ -2961,7 +2758,7 @@ mod tests {
 
     #[test]
     fn eval_scalar_cast_end_to_end() {
-        // the `l: int$45.3` case from the docs: a cast folds during scalar eval
+        // `l: int$45.3` folds during scalar eval
         let mut vm = make_vm();
         run_vm("l: int$45.3", &mut vm).unwrap();
         assert_eq!(vm.globals.get("l"), Some(&ast::Value::Int(45)));
@@ -3089,9 +2886,8 @@ mod tests {
     #[test]
     fn timestamp_int_boundary_defaults_to_unix_epoch() {
         use ast::Value::*;
-        // a raw long is read/written as ns since 1970.01.01 by default, not
-        // kdb's 2000.01.01 — matches what a whole-column `` `timestamp$ ``
-        // cast already does under Polars
+        // a raw long is ns since 1970.01.01 by default, matching Polars' column
+        // cast
         let mut vm = make_vm();
         run_vm("l: `timestamp$1000000000", &mut vm).unwrap();
         assert_eq!(
@@ -3101,7 +2897,7 @@ mod tests {
         run_vm("l: `long$2000.01.01D00:00:00.0", &mut vm).unwrap();
         assert_eq!(vm.globals.get("l"), Some(&Int(temporal::NS_2000_TO_1970)));
 
-        // `useqepoch=true` restores the legacy kdb-offset boundary
+        // `useqepoch=true` uses kdb's 2000.01.01 boundary
         vm.config.useqepoch = true;
         run_vm("l: `timestamp$1000000000", &mut vm).unwrap();
         assert_eq!(vm.globals.get("l"), Some(&Timestamp(1_000_000_000)));
@@ -3130,11 +2926,9 @@ mod tests {
 
     #[test]
     fn string_temporal_casts_use_the_dedicated_parsers() {
-        // String → temporal casts route through Polars' string parsers, not a
-        // deprecated `expr.cast(<temporal>)`. `` `date$ `` / `` `month$ `` yield
-        // a real `Date`; `` `timestamp$ `` a `Datetime` that keeps the time
-        // part; `` `time$ `` a `Time`. `to_datetime`'s inference handles both
-        // ISO and kdb's dotted `2024.03.15`, so nothing comes back null.
+        // string → temporal casts go through Polars' string parsers: `date$`/
+        // `month$` give `Date`, `timestamp$` keeps the time, `time$` gives
+        // `Time`. ISO and kdb dotted formats both parse.
         let mut vm = make_vm();
         let src = df![
             "ds"  => ["2024.03.15", "2024-06-01", "2024-01-02"],
@@ -3167,8 +2961,7 @@ mod tests {
 
     #[test]
     fn string_date_cast_rejects_an_unparseable_value() {
-        // strict by default: a value the inferred format cannot read aborts the
-        // query rather than silently nulling.
+        // strict: an unparseable value aborts the query rather than nulling
         let mut vm = make_vm();
         let src = df!["ds" => ["2024-03-15", "not a date", "2024-01-02"]].unwrap();
         vm.globals.insert("d".into(), Value::Table(src));
@@ -3185,9 +2978,7 @@ mod tests {
 
     #[test]
     fn temporal_casts_on_an_already_temporal_column_use_a_plain_cast() {
-        // a column that's already `Date`/`Datetime`/`Time` (not `String`) must
-        // NOT go through the string parser — it should plain-`.cast()`, same as
-        // any other non-string source.
+        // an already-temporal column uses `.cast()`, not the string parser
         let mut vm = make_vm();
         let src = df!["ts" => ["2024-03-15T09:30:00", "2024-06-01T16:00:00"]]
             .unwrap()
@@ -3230,8 +3021,7 @@ mod tests {
 
     #[test]
     fn load_of_a_bare_table_name_gives_a_frame() {
-        // `u: t` is a `ScalarAssign` (value context): `t` bare resolves
-        // through `LOAD` to a `Frame` (not an "undefined variable" error).
+        // `u: t` resolves `t` through `LOAD` to a `Frame`
         let mut vm = make_vm();
         run_vm("u: t", &mut vm).expect("t resolves to a frame, not a scalar error");
         assert!(matches!(vm.globals.get("u"), Some(ast::Value::Table(_))));
@@ -3270,9 +3060,7 @@ mod tests {
 
     #[test]
     fn binop_mixed_fallback_still_computes_the_right_answer() {
-        // `n * fac[n-1]`-shaped expression: the multiplication compiles
-        // directly (BINOP), the call operand compiles separately — and the two
-        // compose to the right value.
+        // the BINOP and the call operand compose to the right value
         let mut vm = Vm::new();
         run_vm("fac: {[n] ?[n<=1; 1; n * fac[n-1]]}", &mut vm).expect("define fac");
         match run_vm("fac[5]", &mut vm).expect("call fac") {
@@ -3401,11 +3189,7 @@ mod tests {
 
     #[test]
     fn cast_of_a_select_statement_end_to_end() {
-        // regression: `` `date$select ts from t `` (also `` `date$collect
-        // select … ``) failed to *parse* at all ("Unexpected token in
-        // primary: Select"/"Collect"). This checks the cast actually
-        // executes once parsed, applying to the frame the same way
-        // `` f64$trades`price `` already did.
+        // a cast applies to a select's frame
         match run_instructions(make_vm(), "int$select c3 from t where c2 > 15") {
             EvalResult::Scalar(ast::Value::IntVec(s)) => {
                 let got: Vec<i64> = s.i64().unwrap().into_no_null_iter().collect();
@@ -3754,8 +3538,7 @@ mod tests {
 
     #[test]
     fn op_div() {
-        // q uses % for division — always float, even for two ints (10%4 is
-        // 2.5, not 2), unlike +/-/* which stay integer for two ints.
+        // `%` is always float division
         let df = run(make_vm(), "select h: c2%2 from t");
         assert_eq!(f64s(&df, "h"), vec![5.0, 10.0, 15.0, 7.5]);
     }
@@ -3947,15 +3730,12 @@ mod tests {
 
     #[test]
     fn by_key_reprojected_by_name_does_not_duplicate_the_column() {
-        // regression: `group_by(keys).agg(proj)` already carries the key
-        // column through, so also projecting it by name used to hand Polars
-        // two columns called "c1" and panic.
+        // projecting a `by` key by name mustn't duplicate the column
         let df = sorted(
             run(make_vm(), "select c1, c2, r: 1 diff c2 by c1 from t"),
             "c1",
         );
-        // one row per group; "c1" appears exactly once in the schema (not
-        // duplicated by both the group key and the projection)
+        // one row per group; "c1" appears once in the schema
         assert_eq!(strs(&df, "c1"), vec!["a", "b", "c"]);
         assert_eq!(
             df.get_column_names()
@@ -4365,9 +4145,8 @@ mod tests {
 
     #[test]
     fn enlist_cannot_be_shadowed_by_a_same_named_function() {
-        // `enlist`/`?` (roll) are `Operand::Native` — pushed by id, never
-        // looked up by name — so a same-named user function has no effect on
-        // them (unlike `til`/`sum`/... above, which resolve by name).
+        // `enlist`/`?` are called by id, so a same-named user function has no
+        // effect (unlike `til`/`sum`)
         let mut vm = Vm::new();
         run_vm("enlist: {[x] 999}", &mut vm).unwrap();
         assert_eq!(scalar(&mut vm, "enlist 5"), ast::int_vec(vec![5]));
@@ -4375,8 +4154,7 @@ mod tests {
 
     #[test]
     fn log_compiles_at_every_arity_in_bracket_form() {
-        // All arities take the same `Op::Call`
-        // path (`compiler::compile_value_expr`'s dedicated `log` arm).
+        // every arity takes the same `Op::Call` path
         let mut vm = Vm::new();
         assert_eq!(scalar(&mut vm, "log[]"), Value::Str("".into()));
         assert_eq!(scalar(&mut vm, r#"log["a"]"#), Value::Str("a".into()));
@@ -4388,9 +4166,8 @@ mod tests {
 
     #[test]
     fn a_user_function_named_log_wins_over_the_native() {
-        // `log` is a shadowable native, resolved by name in `Op::Call`'s
-        // runtime dispatch (`ops::call_by_name`) exactly like `til`/`sum` —
-        // a bound closure of the same name is tried first, at every arity.
+        // `log` resolves by name, so a user closure of that name wins at every
+        // arity
         let mut vm = Vm::new();
         run_vm("log: {[x] 999}", &mut vm).unwrap();
         assert_eq!(scalar(&mut vm, r#"log["hi"]"#), Value::Int(999));
@@ -4398,9 +4175,8 @@ mod tests {
 
     #[test]
     fn dot_qpl_dt_cannot_be_reassigned() {
-        // `.qpl.dt`/`tm`/`ts`/`dlta` are name-keyed but unshadowable (unlike
-        // `log`/`til`/...): `Vm::lookup` finds them ahead of any user
-        // binding, and `check_not_builtin` rejects an assignment outright.
+        // `.qpl.*` builtins are found before user bindings, and assigning to
+        // one is rejected
         let mut vm = Vm::new();
         let err = run_vm(".qpl.dt: 5", &mut vm).unwrap_err().to_string();
         assert!(
@@ -4409,15 +4185,13 @@ mod tests {
         );
     }
 }
-// These assert value-context *behaviour* (bare names, calls, casts, `zip`,
-// `where`, closures, `while`/`?[..]`, interrupts, ...) as compiled to
-// bytecode and run by this module's `Vm`/`run_vm`.
+// Value-context behaviour (bare names, calls, casts, `zip`, `where`,
+// closures, `while`/`?[..]`, interrupts, ...).
 #[cfg(test)]
 mod value_context_tests {
     use super::*;
 
-    /// Test-only helper: the eager table bound to `name` (panics if it isn't
-    /// one) — table-shaped bindings live in `vm.globals`, not a separate map.
+    /// The eager table bound to `name` (panics otherwise).
     fn table<'a>(vm: &'a Vm, name: &str) -> &'a DataFrame {
         match vm.globals.get(name) {
             Some(Value::Table(df)) => df,
@@ -4700,11 +4474,7 @@ mod value_context_tests {
 
     #[test]
     fn function_body_tolerates_a_stray_extra_semicolon() {
-        // regression: a doubled `;;` between statements (an easy typo, e.g.
-        // from a trailing `;` left behind after reordering lines) failed with
-        // "Unexpected token in primary: Semicolon" — the parser tried to read
-        // a whole statement starting at the second `;` instead of treating it
-        // as an empty no-op statement.
+        // a doubled `;;` between statements is an empty statement
         let mut vm = make_vm();
         run_vm("sq: {[x] tmp: x*x;; tmp}", &mut vm).unwrap();
         assert_eq!(scalar(&mut vm, "sq[9]"), Value::Int(81));
@@ -4712,10 +4482,8 @@ mod value_context_tests {
 
     #[test]
     fn a_callee_cannot_see_its_caller_s_locals() {
-        // lexical, not dynamic, scoping: `callee` has no param/local named `a`,
-        // so it must resolve `a` against the true global (99), never against
-        // `caller`'s own `a` param — even though `caller` is still on the call
-        // stack when `callee` runs.
+        // lexical scoping: `callee` resolves `a` to the global (99), not
+        // `caller`'s param, although `caller` is still on the stack
         let mut vm = make_vm();
         vm.globals.insert("a".into(), Value::Int(99));
         run_vm("callee: {[] a}", &mut vm).unwrap();
@@ -4732,13 +4500,8 @@ mod value_context_tests {
 
     #[test]
     fn recursion_to_depth_127_succeeds_128_is_the_cap() {
-        // `CALL`/`RET` don't recurse through the native Rust call stack
-        // (they push a `Slot::Call` and jump), and neither does value-context
-        // `?[..]` (`JUMP_IF_VEC`/`JUMP_IF_FALSE`/`CASE_VEC`) — so this runs on the *default* stack, not a
-        // custom-sized thread: 128 total activations (`n` from 127 down to 0)
-        // succeed, a 129th (`count[128]`) doesn't, and the cap is purely the
-        // language-level `MAX_CALL_DEPTH` guard, not a proxy for a Rust stack
-        // overflow.
+        // calls and `?[..]` don't recurse in Rust, so this runs on the default
+        // stack: 128 activations succeed and the 129th hits `MAX_CALL_DEPTH`
         let mut vm = make_vm();
         run_vm("count: {[n] ?[n=0;0;1+count[n-1]]}", &mut vm).unwrap();
         assert_eq!(scalar(&mut vm, "count[127]"), Value::Int(127));
@@ -4755,12 +4518,8 @@ mod value_context_tests {
 
     #[test]
     fn a_while_loop_of_100k_iterations_does_not_grow_the_rust_or_vm_stack() {
-        // `while`'s backward `JUMP` re-tests
-        // the loop condition and re-runs the body without ever growing
-        // `Vm::stack` (no `Slot::Call` is pushed — the body runs in the
-        // current scope) or the native Rust call stack (no recursion at all,
-        // just `ip`/`cp` reset by `Op::Jump`) — run on the default stack,
-        // with no custom thread, to demonstrate it.
+        // a `while` loop grows neither `Vm::stack` nor the Rust stack (default
+        // stack, no custom thread)
         let mut vm = make_vm();
         run_stored(&mut vm, "n: 0");
         let base_depth = vm.stack.len();
@@ -4775,8 +4534,7 @@ mod value_context_tests {
 
     #[test]
     fn a_nested_lambda_can_be_called_from_inside_its_defining_body() {
-        // not just returned (see `a_function_can_be_returned_stored_and_rebound`
-        // below) — invoked in place, right where it's defined.
+        // a lambda invoked where it's defined
         let mut vm = make_vm();
         run_vm("f: {[x] g: {[y] y*2}; g[x] + 1}", &mut vm).unwrap();
         assert_eq!(scalar(&mut vm, "f[10]"), Value::Int(21));
@@ -4784,10 +4542,8 @@ mod value_context_tests {
 
     #[test]
     fn a_niladic_function_is_usable_inside_a_select_column() {
-        // `LOAD_COL`'s niladic-call path:
-        // runs the call to completion via a nested `step()` loop (no Rust
-        // recursion) and requires the result to be a scalar, lifting it into
-        // the column expression with `lit(..)`.
+        // `LOAD_COL` calls a niladic function to completion and lifts its
+        // scalar result into the column expression
         let mut vm = make_vm();
         run_vm("five: {[] 5}", &mut vm).unwrap();
         match run_vm("select c2, plus5: c2 + five from t", &mut vm).expect("run") {
@@ -4803,8 +4559,7 @@ mod value_context_tests {
             }
             other => panic!("expected a table, got {}", kind(&other)),
         }
-        // a function that returns a table is rejected with a clear error,
-        // not a generic stack-shape one.
+        // a function returning a table gets a clear error
         run_vm("q: {[] select from t}", &mut vm).unwrap();
         let err = run_vm("select a: q from t", &mut vm)
             .unwrap_err()
@@ -4817,10 +4572,8 @@ mod value_context_tests {
 
     #[test]
     fn a_user_defined_zip_wins_over_the_builtin_dict_constructor() {
-        // `compile_value_expr` commits to the dict-literal lowering at
-        // compile time (no VM access there to check `is_callable`), so
-        // `Op::Zip` checks for a user `zip` at run time. Calling a *non*-dict
-        // argument (`zip[5]`) goes through the ordinary call path.
+        // a dict-literal `zip` checks for a user `zip` at run time; a non-dict
+        // argument (`zip[5]`) takes the ordinary call path
         let mut vm = make_vm();
         run_vm("zip: {[x] x+1}", &mut vm).unwrap();
         assert_eq!(scalar(&mut vm, "zip[5]"), Value::Int(6));
@@ -4858,11 +4611,7 @@ mod value_context_tests {
 
     #[test]
     fn unbounded_recursion_hits_the_depth_cap_and_unwinds_cleanly() {
-        // `apply_function` recurses through the native Rust call stack (compile
-        // + eval + eval_value per level), so MAX_CALL_DEPTH levels need more
-        // headroom than the default *test-thread* stack (smaller than the main
-        // thread the REPL actually runs on) reliably provides — run this one on
-        // an explicitly-sized thread rather than weakening the real guard.
+        // run on an explicitly sized thread for headroom at MAX_CALL_DEPTH
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
@@ -4870,9 +4619,7 @@ mod value_context_tests {
                 run_vm("loop: {[n] loop[n+1]}", &mut vm).unwrap();
                 let err = run_vm("loop[0]", &mut vm);
                 assert!(err.is_err());
-                // every pushed call frame was popped again on the way back out
-                // through the error, even though none of those calls returned
-                // normally
+                // every call frame was popped on the way out through the error
                 assert!(vm.fp.is_none());
             })
             .unwrap()
@@ -4899,7 +4646,7 @@ mod value_context_tests {
         run_vm("apply: {[f,x] f[x]}", &mut vm).unwrap();
         // an anonymous literal ...
         assert_eq!(scalar(&mut vm, "apply[{[y] y*2}; 5]"), Value::Int(10));
-        // ... and a bound name, which now resolves through `globals` like any value
+        // ... and a bound name
         run_vm("double: {[y] y*2}", &mut vm).unwrap();
         assert_eq!(scalar(&mut vm, "apply[double; 21]"), Value::Int(42));
         // the parameter is callable more than once, and nests
@@ -4928,8 +4675,7 @@ mod value_context_tests {
 
     #[test]
     fn a_function_body_sees_no_caller_locals_even_when_passed_in() {
-        // the non-capturing invariant: `f`'s body resolves `n` against the
-        // session globals, never against `outer`'s frame.
+        // no capture: `f` resolves `n` against globals, not `outer`'s frame
         let mut vm = make_vm();
         run_vm("outer: {[n] apply[{[y] y+n}; 1]}", &mut vm).unwrap();
         run_vm("apply: {[f,x] f[x]}", &mut vm).unwrap();
@@ -5019,13 +4765,9 @@ mod value_context_tests {
         );
     }
 
-    // `` t`c2 where <pred> `` is already claimed by the *existing* column-expr
-    // `where` sugar (a table row-filter by a real column, compiled through
-    // `finish_table_ref` before list-where's own postfix check ever runs) —
-    // list-where only kicks in on an operand that sugar didn't already
-    // consume. Chaining onto its *result* works once parenthesised, since
-    // the parenthesised expression is then a plain noun for list-where to
-    // attach to.
+    // `` t`c2 where <pred> `` is the table row-filter form, so list-where only
+    // applies to an operand it didn't consume; parenthesising the result
+    // makes it a plain noun for list-where.
     #[test]
     fn list_where_chains_onto_a_parenthesised_column_expression_result() {
         assert_eq!(
@@ -5059,12 +4801,8 @@ mod value_context_tests {
 
     #[test]
     fn reducer_ignores_nulls_in_the_source_column() {
-        // regression: `max t`col` used to force an eager materialise of the
-        // raw source column before applying the reducer, which rejected any
-        // column containing nulls outright ("cannot be materialised into a
-        // list") even though the reducer itself (like plain Polars) would
-        // just skip them. Pushing the reduction into the lazy plan directly
-        // means only the *result* is checked for nulls now.
+        // a reducer over `` t`col `` runs inside the lazy plan, so nulls in the
+        // column are skipped rather than rejected
         let mut vm = make_vm();
         let df = df!["n" => [Some(10i64), None, Some(30)]].unwrap();
         vm.globals.insert("nt".into(), Value::Table(df));
@@ -5078,9 +4816,7 @@ mod value_context_tests {
 
     #[test]
     fn cast_then_reduce_a_column_expression() {
-        // regression: `max f64$t`c2` used to error ("not supported in scalar
-        // context") because a cast on a column expression fell into the plain
-        // scalar folder, which can't resolve a table/column expr underneath it.
+        // a cast on a column expression works under a reducer
         assert_eq!(scalar(&mut make_vm(), "max f64$t`c2"), Value::Float(30.0));
         assert_eq!(scalar(&mut make_vm(), "avg f64$t`c2"), Value::Float(18.75));
     }
@@ -5104,9 +4840,7 @@ mod value_context_tests {
 
     #[test]
     fn take_count_can_be_a_bound_global() {
-        // regression: `k#…` only ever accepted a literal int for `k`; a
-        // variable count fell through to a parse error ("expected Eof/RParen,
-        // got Hash") because the take-count was baked in at parse time.
+        // a variable take count
         let mut vm = make_vm();
         run_vm("k: 2", &mut vm).expect("run");
         assert_eq!(scalar(&mut vm, "k#t`c2"), ast::int_vec(vec![10, 20]));

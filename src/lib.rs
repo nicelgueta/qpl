@@ -1,8 +1,6 @@
-//! The qpl interpreter as a library: `tokenise -> parse -> compile -> run_vm`,
-//! plus the [`repl`] driver that feeds it one line at a time.
-//!
-//! The `qpl` binary (`main.rs`, `cli` feature) and the browser bindings
-//! (`wasm.rs`, `wasm` feature) are both thin front-ends over this.
+//! The qpl interpreter as a library. The `qpl` binary (`main.rs`, `cli`
+//! feature) and the browser bindings (`wasm.rs`, `wasm` feature) are thin
+//! front-ends over it.
 
 #[cfg(feature = "wasm")]
 pub mod arrow_io;

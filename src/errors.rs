@@ -8,8 +8,7 @@ pub enum QplError {
     Parse(String),
     Compile(String),
     Runtime(String),
-    /// Ctrl-C stopped the running statement. Its own variant (not a `Runtime`
-    /// string) so the script runner / REPL can tell it apart.
+    /// Ctrl-C stopped the running statement.
     Interrupted,
 }
 

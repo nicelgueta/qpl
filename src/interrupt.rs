@@ -1,16 +1,13 @@
 //! Cooperative Ctrl-C: a flag the signal handler sets and the interpreter polls.
 //!
-//! While `rustyline` is reading a line the terminal is in raw mode, so Ctrl-C
-//! never becomes a signal there. While a statement *runs* it does, and (with no
-//! handler) it kills the whole process. `main.rs` installs a handler that calls
-//! [`Interrupt::on_ctrl_c`]; the interpreter calls [`Interrupt::check`] at the
-//! points listed in `CONTROL_FLOW_PLAN.md` (each `while` iteration, function
-//! entry, statement entry, either side of a Polars `collect`, IPC waits), which
-//! turns a requested interrupt into [`QplError::Interrupted`].
+//! While rustyline reads a line the terminal is in raw mode, so Ctrl-C isn't a
+//! signal there. While a statement runs it is: `main.rs`'s handler calls
+//! [`Interrupt::on_ctrl_c`], and the interpreter calls [`Interrupt::check`] at
+//! safe points (loop back-edges, calls, around Polars `collect`s, IPC waits),
+//! which turns the request into [`QplError::Interrupted`].
 //!
-//! The flag lives on each `Vm` rather than in a global `static`, so parallel
-//! tests can't interrupt each other. It is a pair of atomics behind an `Arc`
-//! — the only state `Vm` shares with another thread, and never a lock.
+//! The flag lives on each `Vm` (not a `static`) so parallel tests can't
+//! interrupt each other.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,10 +46,9 @@ impl Interrupt {
         }
     }
 
-    /// Mark the start of one top-level statement. Entering the outermost
-    /// statement clears any stale request, and so does leaving it; a nested one
-    /// (`\l` running a script from a statement) just restores the previous
-    /// `running` on drop.
+    /// Mark the start of a top-level statement. The outermost guard clears any
+    /// stale request on entry and exit; a nested one (`\l` inside a statement)
+    /// restores the previous `running` on drop.
     pub fn statement(&self) -> StatementGuard {
         let prev = self.0.running.swap(true, Ordering::Relaxed);
         if !prev {

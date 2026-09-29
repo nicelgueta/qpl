@@ -45,9 +45,11 @@ possible:
 select sym, gap: (max price over `sym) - price from trades
 ```
 
-The parentheses there are load-bearing. `over` binds more tightly than `-`,
-so without them the expression would be read as partitioning by
-`` (`sym) - price ``, which is nonsense.
+The parentheses are there for the reader rather than the parser. Leave them
+out and qpl still reads `` max price over `sym - price `` the same way, but
+with right-to-left evaluation in the back of your mind it's easy to misread
+it as partitioning by `` `sym - price ``. The brackets make the grouping
+impossible to mistake.
 
 ## Ordering within a partition
 
@@ -184,7 +186,7 @@ Rolling works with `sum`, `avg`, `min`, `max`, `std`, `var` and `median`.
 ## The row number column
 
 One last piece fits naturally here. `i` is a virtual column holding the row
-index, available in any query without existing in the table. Following q, it
+index, available in any query without existing in the table. As in q, it
 comes out named `x`:
 
 ```qpl
