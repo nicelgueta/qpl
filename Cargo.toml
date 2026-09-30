@@ -3,7 +3,7 @@ members = ["qpl-macros"]
 
 [package]
 name = "qpl"
-version = "0.1.34"
+version = "0.1.35"
 edition = "2024"
 
 # The interpreter lives in a library so it can be driven by something other than
