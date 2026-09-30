@@ -47,6 +47,18 @@ impl Parser {
             &TokenKind::Eof
         }
     }
+    fn peek4(&self) -> &TokenKind {
+        if self.i + 3 < self.tokens.len() {
+            &self.tokens[self.i + 3].kind
+        } else {
+            &TokenKind::Eof
+        }
+    }
+    /// Is `distinct`'s operand unambiguously a table (same tokens `#` treats
+    /// as a table)? A bare name is a value, resolved at run time.
+    fn distinct_has_table_operand(&self) -> bool {
+        is_unambiguous_table_operand(self.peek2())
+    }
     /// Is the next thing `` `w!hopen ``? Distinguishes it from the `` `c!01b t ``
     /// sort and `` `a`b!... `` forms, which also start `Symbol` `Bang`.
     fn is_whopen_modifier(&self) -> bool {
@@ -95,10 +107,14 @@ impl Parser {
             // query keywords give a table statement (or a column expression
             // from `parse_body`); anything else is a scalar expression
             match self.peek() {
+                // `distinct <x>` is a table op only when `x` is unambiguous;
+                // a bare name or list is a value
+                TokenKind::Distinct if self.distinct_has_table_operand() => {
+                    self.assign_from_body(name)
+                }
                 TokenKind::Select
                 | TokenKind::Update
                 | TokenKind::Delete
-                | TokenKind::Distinct
                 | TokenKind::Cols
                 | TokenKind::Load
                 | TokenKind::Lazy
@@ -114,20 +130,28 @@ impl Parser {
                 {
                     self.assign_from_body(name)
                 }
-                // `n limit <table-expr>` is a table op; `n#...` is a value take
-                TokenKind::Int(_) if self.peek2() == &TokenKind::Limit => {
+                // `n limit <table-expr>` is a table op, unless the operand is
+                // obviously a list, e.g. `n limit 1 2 3` — then it's a value take
+                TokenKind::Int(_)
+                    if self.peek2() == &TokenKind::Limit
+                        && !is_list_literal_start(self.peek3()) =>
+                {
                     self.assign_from_body(name)
                 }
                 // `-n limit <table-expr>`
                 TokenKind::Op(op)
                     if op == "-"
                         && matches!(self.peek2(), TokenKind::Int(_))
-                        && self.peek3() == &TokenKind::Limit =>
+                        && self.peek3() == &TokenKind::Limit
+                        && !is_list_literal_start(self.peek4()) =>
                 {
                     self.assign_from_body(name)
                 }
                 // `<name> limit <table-expr>`
-                TokenKind::Name(_) if self.peek2() == &TokenKind::Limit => {
+                TokenKind::Name(_)
+                    if self.peek2() == &TokenKind::Limit
+                        && !is_list_literal_start(self.peek3()) =>
+                {
                     self.assign_from_body(name)
                 }
                 _ => {
@@ -225,16 +249,22 @@ impl Parser {
             })));
         }
 
-        // a leading `Int` starts a table statement only for `n limit ...`
+        // a leading `Int` starts a table statement only for `n limit <table>`;
+        // `n limit <list>` is a value take
         let leading_int = matches!(self.peek(), TokenKind::Int(_));
-        let int_table = leading_int && self.peek2() == &TokenKind::Limit;
+        let int_table = leading_int
+            && self.peek2() == &TokenKind::Limit
+            && !is_list_literal_start(self.peek3());
         // `-n limit <table-expr>`
         let leading_neg_int = matches!(self.peek(), TokenKind::Op(op) if op == "-")
             && matches!(self.peek2(), TokenKind::Int(_));
-        let neg_int_table = leading_neg_int && self.peek3() == &TokenKind::Limit;
+        let neg_int_table = leading_neg_int
+            && self.peek3() == &TokenKind::Limit
+            && !is_list_literal_start(self.peek4());
         // `<name> limit <table-expr>`
-        let name_table_limit =
-            matches!(self.peek(), TokenKind::Name(_)) && self.peek2() == &TokenKind::Limit;
+        let name_table_limit = matches!(self.peek(), TokenKind::Name(_))
+            && self.peek2() == &TokenKind::Limit
+            && !is_list_literal_start(self.peek3());
         // `` `c!01b t `` / `` `a`b drop t ``: a table op keyed off a symbol
         let sym_table_op = !self.is_whopen_modifier()
             && matches!(self.peek(), TokenKind::Symbol(_) | TokenKind::SymbolVec(_))
@@ -242,7 +272,11 @@ impl Parser {
                 self.peek2(),
                 TokenKind::Bang | TokenKind::Drop | TokenKind::DropNull
             ) || matches!(self.peek2(), TokenKind::Name(n) if n == "_"));
-        if (is_table_expr_start(self.peek()) && !leading_int)
+        // `distinct <x>` is a table op only when `x` is itself unambiguous
+        let distinct_table =
+            matches!(self.peek(), TokenKind::Distinct) && self.distinct_has_table_operand();
+        let distinct_ambiguous = matches!(self.peek(), TokenKind::Distinct) && !distinct_table;
+        if ((is_table_expr_start(self.peek()) && !leading_int) && !distinct_ambiguous)
             || int_table
             || neg_int_table
             || name_table_limit
@@ -1036,9 +1070,14 @@ impl Parser {
     /// A primary plus the tightest-binding postfixes: `` name`col `` /
     /// `` name`c1`c2 `` references and positional indexing (`(expr) 2 3`).
     fn parse_noun(&mut self) -> Result<Expr, QplError> {
-        // `<n>#<operand>`, caught before the int is read as a literal
+        // `<n>#<operand>` / `<n> limit <operand>`, caught before the int is
+        // read as a literal
         if let Some(take) = self.try_parse_take()? {
             return Ok(take);
+        }
+        // `<n> drop <operand>` / `<n> _ <operand>`
+        if let Some(drop) = self.try_parse_drop()? {
+            return Ok(drop);
         }
         let mut e = self.parse_primary()?;
         // after a closing paren, `(x) 2 3` indexes even if `x` is a bare name
@@ -1228,8 +1267,9 @@ impl Parser {
         ))))
     }
 
-    /// `<count>#<operand>`, or `None`. `<count>` is any primary expression,
-    /// parsed speculatively and backtracked if no `#` follows.
+    /// `<count>#<operand>` / `<count> limit <operand>`, or `None`. `<count>`
+    /// is any primary expression, parsed speculatively and backtracked if
+    /// neither follows.
     fn try_parse_take(&mut self) -> Result<Option<Expr>, QplError> {
         let checkpoint = self.i;
         let n = match self.parse_primary() {
@@ -1239,14 +1279,39 @@ impl Parser {
                 return Ok(None);
             }
         };
-        if self.peek() != &TokenKind::Hash {
+        if !matches!(self.peek(), TokenKind::Hash | TokenKind::Limit) {
             self.i = checkpoint;
             return Ok(None);
         }
-        self.next(); // `#`
+        self.next(); // `#` / `limit`
         Ok(Some(Expr::Take {
             n: Box::new(n),
             expr: Box::new(self.parse_take_operand()?),
+        }))
+    }
+
+    /// `<count> drop <operand>` / `<count> _ <operand>`: the value-context
+    /// complement of take. No table meaning — a table's `drop` is always
+    /// keyed by symbol (`` `col drop t ``), never a count.
+    fn try_parse_drop(&mut self) -> Result<Option<Expr>, QplError> {
+        let checkpoint = self.i;
+        let n = match self.parse_primary() {
+            Ok(n) => n,
+            Err(_) => {
+                self.i = checkpoint;
+                return Ok(None);
+            }
+        };
+        if !matches!(self.peek(), TokenKind::Drop)
+            && !matches!(self.peek(), TokenKind::Name(nm) if nm == "_")
+        {
+            self.i = checkpoint;
+            return Ok(None);
+        }
+        self.next(); // `drop` / `_`
+        Ok(Some(Expr::Call {
+            func: "drop".into(),
+            args: vec![self.parse_take_operand()?, n],
         }))
     }
 
@@ -1255,6 +1320,9 @@ impl Parser {
     /// (`` `date$select ts from t ``) and bracket-call arguments
     /// (`f[lazy load "x.csv"]`). `None` otherwise.
     fn try_parse_table_operand(&mut self) -> Result<Option<Expr>, QplError> {
+        if matches!(self.peek(), TokenKind::Distinct) && !self.distinct_has_table_operand() {
+            return Ok(None);
+        }
         if matches!(
             self.peek(),
             TokenKind::Select
@@ -1291,6 +1359,9 @@ impl Parser {
 
     /// The operand of `<n>#...`: a table expression or a noun.
     fn parse_take_operand(&mut self) -> Result<Expr, QplError> {
+        if matches!(self.peek(), TokenKind::Distinct) && !self.distinct_has_table_operand() {
+            return self.parse_noun();
+        }
         if matches!(
             self.peek(),
             TokenKind::Select
@@ -1356,6 +1427,12 @@ impl Parser {
             TokenKind::Name(n) if n == "enlist" => Ok(enlist(self.parse_value()?)),
             // in an expression `distinct` is the column verb (`n_unique`)
             TokenKind::Distinct => Ok(Expr::ColRef("distinct".into())),
+            // `asc`/`desc`/`dropnull`/`where` on a value, built by the same
+            // `ColRef` + noun-follows rule as `distinct`/`sum`/`avg`
+            TokenKind::Asc => Ok(Expr::ColRef("asc".into())),
+            TokenKind::Desc => Ok(Expr::ColRef("desc".into())),
+            TokenKind::DropNull => Ok(Expr::ColRef("dropnull".into())),
+            TokenKind::Where => Ok(Expr::ColRef("where".into())),
             TokenKind::Name(n) if n == "noop" => Ok(Expr::Noop),
             TokenKind::Name(n) if n == "while" && self.peek() == &TokenKind::LBracket => {
                 self.parse_while()
@@ -1691,6 +1768,37 @@ fn is_noun_start(token: &TokenKind) -> bool {
             | TokenKind::BoolVec(_)
             | TokenKind::Temporal(_)
             | TokenKind::LParen
+    )
+}
+
+/// A literal that can't possibly be a table name — `<n> limit <x>` stays a
+/// table op for a bare name, and only becomes a value take when `x` is
+/// obviously a list literal.
+fn is_list_literal_start(token: &TokenKind) -> bool {
+    matches!(
+        token,
+        TokenKind::Int(_)
+            | TokenKind::Float(_)
+            | TokenKind::Bool(_)
+            | TokenKind::BoolVec(_)
+            | TokenKind::Str(_)
+            | TokenKind::Temporal(_)
+    )
+}
+
+/// A `select`-shaped source, or a symbol sort/drop/drop-null key — decides
+/// table vs. list for `distinct`, the same way `#` already decides for `x`.
+fn is_unambiguous_table_operand(token: &TokenKind) -> bool {
+    matches!(
+        token,
+        TokenKind::Select
+            | TokenKind::Update
+            | TokenKind::Delete
+            | TokenKind::Distinct
+            | TokenKind::Cols
+            | TokenKind::Load
+            | TokenKind::Symbol(_)
+            | TokenKind::SymbolVec(_)
     )
 }
 
@@ -2387,6 +2495,102 @@ mod tests {
                     TableExpr::BuiltIn(BuiltIn::Collect(_)) | TableExpr::BuiltIn(BuiltIn::Lazy(_))
                 ),
                 "'{source}' -> {te:?}"
+            );
+        }
+    }
+
+    // keywords on plain values
+
+    #[test]
+    fn asc_desc_prefix_on_a_value() {
+        for (source, name) in [("asc 3 1 2", "asc"), ("desc 3 1 2", "desc")] {
+            assert!(
+                matches!(p(source), Stmt::SingleVar(Expr::Call { func, .. }) if func == name),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_on_a_list_is_a_value_call() {
+        for source in ["distinct 1 1 2", "distinct xs"] {
+            assert!(
+                matches!(p(source), Stmt::SingleVar(Expr::Call { func, .. }) if func == "distinct"),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_table_forms_still_parse_as_before() {
+        for source in ["distinct select from trades", "distinct `sym drop trades"] {
+            assert!(
+                matches!(
+                    p(source),
+                    Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Distinct(_)))
+                ),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn limit_on_a_list_is_a_take() {
+        for source in ["2 limit 1 2 3", "n limit 1 2 3"] {
+            assert!(
+                matches!(p(source), Stmt::SingleVar(Expr::Take { .. })),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_and_underscore_on_a_list() {
+        for source in ["2 drop 1 2 3", "2 _ 1 2 3"] {
+            assert!(
+                matches!(p(source), Stmt::SingleVar(Expr::Call { func, .. }) if func == "drop"),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_keyed_table_drop_is_unchanged() {
+        for source in ["`sym drop trades", "`sym _ trades"] {
+            assert!(
+                matches!(
+                    p(source),
+                    Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::Drop(_, _)))
+                ),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn dropnull_and_where_prefix_on_a_value() {
+        for (source, name) in [("dropnull xs", "dropnull"), ("where 101b", "where")] {
+            assert!(
+                matches!(p(source), Stmt::SingleVar(Expr::Call { func, .. }) if func == name),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_keyed_table_dropnull_is_unchanged() {
+        assert!(matches!(
+            p("`sym dropnull trades"),
+            Stmt::RetTable(TableExpr::BuiltIn(BuiltIn::DropNull(_, _)))
+        ));
+    }
+
+    #[test]
+    fn take_on_a_string_still_uses_take() {
+        for source in [r#"3#"hello""#, r#"3 limit "hello""#] {
+            assert!(
+                matches!(p(source), Stmt::SingleVar(Expr::Take { .. })),
+                "{source}"
             );
         }
     }

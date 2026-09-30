@@ -17,3 +17,24 @@ enlist `sym
 3?1.0                     / 3 floats in [0, 1)
 picks: 4 ? trades`price   / from a table column
 picks
+
+/ keywords that work in a query also work on a plain list (same spelling,
+/ same argument order)
+asc 3 1 4 1 5              / sorted ascending
+desc 3 1 4 1 5              / sorted descending
+distinct 1 1 2 2 3 1        / unique elements, first-seen order
+2 limit 1 2 3 4 5           / same as 2#1 2 3 4 5
+-2 limit 1 2 3 4 5          / last 2, same as -2#...
+3 drop 1 2 3 4 5            / drops the first 3
+-3 drop 1 2 3 4 5           / drops the last 3
+3 _ 1 2 3 4 5               / same as `drop`
+where 10110b                 / indices of the true values
+
+/ take on a single string: characters, not elements (a string list still
+/ takes elements)
+3#"hello"
+-3#"hello"
+2#("abc" "de" "f")
+
+/ quantile collapses to a scalar on a list, same as in a query
+0.5 quantile 3 1 4 1 5

@@ -5066,6 +5066,135 @@ mod value_context_tests {
         ));
     }
 
+    // keywords on plain values
+
+    #[test]
+    fn asc_sorts_a_list_ascending() {
+        assert_eq!(
+            scalar(&mut make_vm(), "asc 3 1 2"),
+            ast::int_vec(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn desc_sorts_a_list_descending() {
+        assert_eq!(
+            scalar(&mut make_vm(), "desc 3 1 2"),
+            ast::int_vec(vec![3, 2, 1])
+        );
+    }
+
+    #[test]
+    fn distinct_on_a_list_is_unique_elements_first_seen_order() {
+        assert_eq!(
+            scalar(&mut make_vm(), "distinct 1 1 2 2 3 1"),
+            ast::int_vec(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn distinct_on_a_bare_table_keeps_every_column() {
+        let mut vm = make_vm();
+        let df = match run_vm("distinct t", &mut vm).expect("run") {
+            EvalResult::Table(df) => df,
+            other => panic!("expected a table, got {}", kind(&other)),
+        };
+        assert_eq!(df.width(), table(&vm, "t").width());
+        assert_eq!(df.height(), table(&vm, "t").height());
+    }
+
+    #[test]
+    fn limit_on_a_list_matches_hash_take() {
+        assert_eq!(
+            scalar(&mut make_vm(), "2 limit 1 2 3 4 5"),
+            ast::int_vec(vec![1, 2])
+        );
+        assert_eq!(
+            scalar(&mut make_vm(), "-2 limit 1 2 3 4 5"),
+            ast::int_vec(vec![4, 5])
+        );
+    }
+
+    #[test]
+    fn limit_on_a_bare_table_name_still_behaves_as_before() {
+        assert!(matches!(
+            run_vm("3 limit t", &mut make_vm()),
+            Ok(EvalResult::Table(_))
+        ));
+    }
+
+    #[test]
+    fn drop_and_underscore_drop_the_first_n() {
+        assert_eq!(
+            scalar(&mut make_vm(), "2 drop 1 2 3 4 5"),
+            ast::int_vec(vec![3, 4, 5])
+        );
+        assert_eq!(
+            scalar(&mut make_vm(), "2 _ 1 2 3 4 5"),
+            ast::int_vec(vec![3, 4, 5])
+        );
+    }
+
+    #[test]
+    fn drop_and_underscore_negative_count_drops_the_last_n() {
+        assert_eq!(
+            scalar(&mut make_vm(), "-2 drop 1 2 3 4 5"),
+            ast::int_vec(vec![1, 2, 3])
+        );
+        assert_eq!(
+            scalar(&mut make_vm(), "-2 _ 1 2 3 4 5"),
+            ast::int_vec(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn dropnull_removes_nulls_from_a_list() {
+        let mut vm = make_vm();
+        vm.globals.insert(
+            "xs".into(),
+            Value::IntVec(Series::new("".into(), &[Some(1i64), None, Some(3), None])),
+        );
+        assert_eq!(scalar(&mut vm, "dropnull xs"), ast::int_vec(vec![1, 3]));
+    }
+
+    #[test]
+    fn where_gives_indices_of_true_values() {
+        assert_eq!(
+            scalar(&mut make_vm(), "where 101b"),
+            ast::int_vec(vec![0, 2])
+        );
+    }
+
+    #[test]
+    fn take_on_a_single_string_is_character_take() {
+        assert_eq!(
+            scalar(&mut make_vm(), r#"3#"hello""#),
+            Value::Str("hel".into())
+        );
+        assert_eq!(
+            scalar(&mut make_vm(), r#"-3#"hello""#),
+            Value::Str("llo".into())
+        );
+        // clamped when n exceeds the string's length
+        assert_eq!(
+            scalar(&mut make_vm(), r#"10#"hi""#),
+            Value::Str("hi".into())
+        );
+        // a string *list* still takes elements
+        assert_eq!(
+            scalar(&mut make_vm(), r#"2#("abc" "de" "f")"#),
+            ast::str_vec(vec!["abc".into(), "de".into()])
+        );
+    }
+
+    #[test]
+    fn quantile_on_a_list_is_a_scalar() {
+        assert_eq!(
+            scalar(&mut make_vm(), "0.5 quantile 3 1 2"),
+            Value::Float(2.0)
+        );
+    }
+
     #[test]
     fn out_of_range_index_errors() {
         assert!(run_vm("(t`c2) 9", &mut make_vm()).is_err());

@@ -544,6 +544,8 @@ pub(crate) fn is_reducer(f: &str) -> bool {
             | "null_count"
             | "distinct"
             | "n_unique"
+            | "quantile"
+            | "pctl"
     )
 }
 
@@ -693,7 +695,20 @@ fn any_value_to_scalar(kind: ast::VecKind, av: AnyValue) -> Result<Value, QplErr
     })
 }
 
+/// `n#xs` / `n limit xs`: a string atom takes characters, clamped; a string
+/// list still takes elements.
 pub(crate) fn take_list(v: Value, n: i64) -> Result<Value, QplError> {
+    if let Value::Str(s) = &v {
+        let chars: Vec<char> = s.chars().collect();
+        let len = chars.len() as i64;
+        let k = n.unsigned_abs().min(len as u64) as usize;
+        let out: String = if n >= 0 {
+            chars[..k].iter().collect()
+        } else {
+            chars[chars.len() - k..].iter().collect()
+        };
+        return Ok(Value::Str(out));
+    }
     let (kind, s) = v
         .as_vec()
         .ok_or_else(|| QplError::Runtime(format!("cannot slice {v:?} — not a list")))?;
@@ -702,6 +717,21 @@ pub(crate) fn take_list(v: Value, n: i64) -> Result<Value, QplError> {
         s.head(Some(n.clamp(0, len) as usize))
     } else {
         s.tail(Some((-n).clamp(0, len) as usize))
+    };
+    Ok(Value::from_vec(kind, out))
+}
+
+/// `n drop xs` / `n _ xs`: drops the first `n` elements, or the last `|n|`
+/// when `n` is negative.
+pub(crate) fn drop_list(v: Value, n: i64) -> Result<Value, QplError> {
+    let (kind, s) = v
+        .as_vec()
+        .ok_or_else(|| QplError::Runtime(format!("cannot slice {v:?} — not a list")))?;
+    let len = s.len() as i64;
+    let out = if n >= 0 {
+        s.tail(Some((len - n.clamp(0, len)) as usize))
+    } else {
+        s.head(Some((len - (-n).clamp(0, len)) as usize))
     };
     Ok(Value::from_vec(kind, out))
 }
@@ -891,7 +921,6 @@ pub(crate) fn value_verb(vm: &mut Vm, name: &str, args: Vec<Slot>) -> Result<Slo
         .next()
         .ok_or_else(|| QplError::Runtime(format!("'{name}' needs at least one argument")))?;
     let param = args.next();
-    let is_monadic = param.is_none();
     let lf = slot_to_source_lf(source)?;
     let col_name = first_col_name(&lf)?;
     let base = col(col_name.as_str());
@@ -917,7 +946,9 @@ pub(crate) fn value_verb(vm: &mut Vm, name: &str, args: Vec<Slot>) -> Result<Slo
 
     let df = lf.select([applied.alias("r")]).collect().map_err(rt)?;
     let materialised = column_to_value(df.column("r").map_err(rt)?)?;
-    if is_monadic && is_reducer(name) {
+    // a reducer always collapses to a scalar, even called dyadically
+    // (`0.5 quantile xs` — the parameter is the quantile, not a second column)
+    if is_reducer(name) {
         Ok(Slot::Scalar(scalarise(materialised)?))
     } else {
         Ok(Slot::Scalar(materialised))
@@ -1060,11 +1091,77 @@ pub(crate) fn call_by_name(vm: &mut Vm, name: &str, args: Vec<Slot>) -> Result<S
         ))),
         "log" => native_log(vm, args),
         "til" => native_til(args),
+        // `distinct xs`: the unique elements in first-seen order
+        "distinct" if args.len() == 1 => distinct_verb(args.into_iter().next().unwrap()),
+        // list-shaping keywords that aren't reducers
+        "asc" | "desc" | "dropnull" | "where" if args.len() == 1 => {
+            list_shape_verb(name, args.into_iter().next().unwrap())
+        }
+        // `n drop xs` / `n _ xs`; args are `[value, param]`, like the other
+        // dyadic verbs
+        "drop" if args.len() == 2 => {
+            let mut it = args.into_iter();
+            let value = slot_to_scalar_value(it.next().expect("arity checked above"))?;
+            let n = match slot_to_scalar_value(it.next().expect("arity checked above"))? {
+                Value::Int(n) => n,
+                other => {
+                    return Err(QplError::Runtime(format!(
+                        "'drop' count must be an int, got {other:?}"
+                    )));
+                }
+            };
+            Ok(Slot::Scalar(drop_list(value, n)?))
+        }
         _ if (1..=2).contains(&args.len()) => value_verb(vm, name, args),
         _ => Err(QplError::Runtime(format!(
             "not supported in scalar context: Call {{ func: {name:?}, args: .. }}"
         ))),
     }
+}
+
+/// `distinct xs`. A `Frame` keeps its table shape and every column, same as
+/// the table `distinct` builtin; a list collapses to its unique elements.
+fn distinct_verb(source: Slot) -> Result<Slot, QplError> {
+    match source {
+        Slot::Frame { lf, lazy } => Ok(Slot::Frame {
+            lf: Box::new(lf.unique_stable(None, UniqueKeepStrategy::First)),
+            lazy,
+        }),
+        other => {
+            let lf = list_to_lazy(slot_to_scalar_value(other)?)?;
+            let df = lf
+                .unique_stable(None, UniqueKeepStrategy::First)
+                .collect()
+                .map_err(rt)?;
+            Ok(Slot::Scalar(column_to_value(df.column("x").map_err(rt)?)?))
+        }
+    }
+}
+
+/// `asc`/`desc`/`dropnull`/`where` on a list (or a single-column frame).
+fn list_shape_verb(name: &str, source: Slot) -> Result<Slot, QplError> {
+    let lf = list_to_lazy(slot_to_list_value(source)?)?;
+    if name == "where" {
+        let df = lf
+            .select([arg_where(col("x")).alias("r")])
+            .collect()
+            .map_err(rt)?;
+        return Ok(Slot::Scalar(column_to_value(df.column("r").map_err(rt)?)?));
+    }
+    let shaped = match name {
+        "asc" => lf.sort_by_exprs(
+            [col("x")],
+            SortMultipleOptions::new().with_order_descending_multi(vec![false]),
+        ),
+        "desc" => lf.sort_by_exprs(
+            [col("x")],
+            SortMultipleOptions::new().with_order_descending_multi(vec![true]),
+        ),
+        "dropnull" => lf.drop_nulls(Some(cols(vec!["x".to_string()]))),
+        _ => unreachable!("guarded by call_by_name's match"),
+    };
+    let df = shaped.collect().map_err(rt)?;
+    Ok(Slot::Scalar(column_to_value(df.column("x").map_err(rt)?)?))
 }
 
 #[cfg(feature = "ipc")]

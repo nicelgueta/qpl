@@ -371,6 +371,7 @@ l[1 3 4]                        / i64[3]: 20 40 50 — index, or gather
 3#trades`price                  / first 3 (-3# for the last 3)
 l + 2                           / elementwise; scalars broadcast
 nums where x > 25               / filter a list by its own values, `x` is the element
+asc 3 1 2                       / i64[3]: 1 2 3 — a keyword that works in a query also works on a list: asc/desc/distinct/limit/drop/_/dropnull/where
 til 5                           / i64[5]: 0 1 2 3 4
 ("ab" "cd" "ef")                / str[3] — space-separated strings; parens keep it apart from other values
 enlist 23                       / i64[1]: 23 — one-element list of any atom (`enlist "a"` is a str[1])

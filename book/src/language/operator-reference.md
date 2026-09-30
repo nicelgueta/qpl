@@ -19,11 +19,12 @@ explains it.
 | `noop` | nothing: prints nothing, can't be assigned or used as a value | [Control flow](control-flow.md) |
 | `like` | glob pattern match | [Expressions](expressions.md) |
 | `round` | `<n> round <col>`, mode from `.qpl.cfg round_type` | [Expressions](expressions.md) |
-| `quantile` `shift` `lag` `lead` `diff` `pctchange` | parameter-on-the-left verbs | [Expressions](expressions.md) |
+| `quantile` `shift` `lag` `lead` `diff` `pctchange` | parameter-on-the-left verbs; `quantile`/`pctl` collapse to a scalar on a list, like any reducer | [Expressions](expressions.md), [Column expressions](column-expressions.md#keywords-on-lists) |
 | `fill` | `<v> fill <col>` replaces nulls with `v` | [Expressions](expressions.md#nulls) |
 | `isnull` `notnull` | boolean per row: is / isn't null | [Expressions](expressions.md#nulls) |
-| `dropnull` | `` `a`b dropnull <table> `` drops rows with a null in those columns | [Table operators](table-operators.md#dropping-rows-with-nulls) |
-| `distinct` | table: unique rows; column: count of distinct values (`n_unique`) | [Table operators](table-operators.md), [Expressions](expressions.md) |
+| `dropnull` | `` `a`b dropnull <table> `` drops rows with a null in those columns; `dropnull xs` drops the nulls from a list | [Table operators](table-operators.md#dropping-rows-with-nulls), [Column expressions](column-expressions.md#keywords-on-lists) |
+| `distinct` | table: unique rows; column: count of distinct values (`n_unique`); list: the unique elements, first-seen order | [Table operators](table-operators.md), [Expressions](expressions.md), [Column expressions](column-expressions.md#keywords-on-lists) |
+| `asc` `desc` | sort: `` `col!01b `` table sort direction, window `order`; on a list, sorts it | [Table operators](table-operators.md#sorting), [Column expressions](column-expressions.md#keywords-on-lists) |
 | `over` | window: `` <expr> over `p [order `k asc] [rolling n] `` | [Window functions](window-functions.md) |
 | `rn` `rank` `drank` | ranking verbs, require `order` | [Window functions](window-functions.md) |
 | `i` | virtual row-index column, printed as `x` | [Window functions](window-functions.md) |
@@ -31,10 +32,10 @@ explains it.
 | `` `$x `` | intern a string as a symbol; in a query, cast to categorical | [Symbols](symbols.md), [Categoricals & enums](categoricals-enums.md) |
 | `::` | enum cast, `` lvl::`$x `` | [Categoricals & enums](categoricals-enums.md) |
 | `!` | dict literal; sort map `` `col!01b ``; `` u8!`$x `` code width | [Column expressions](column-expressions.md), [Table operators](table-operators.md) |
-| `#` | first n rows of a table; take from a list (`3#l`, `-3#l`) | [Table operators](table-operators.md), [Column expressions](column-expressions.md) |
+| `#` `limit` | first n rows of a table (`limit` reads as prose); take from a list (`3#l`, `-3#l`, `3 limit l`); on a single string, characters, not elements | [Table operators](table-operators.md), [Column expressions](column-expressions.md#keywords-on-lists) |
 | `[...]` | index into a list (`l[0]`, `l[1 2 3]`); call a function | [Column expressions](column-expressions.md), [Functions](functions.md) |
-| `_` | drop columns, `` `a`b _ t `` | [Table operators](table-operators.md) |
-| `where` | filter rows in a query; filter a list elementwise, where `x` is the element | [select](select-update-delete.md), [Column expressions](column-expressions.md) |
+| `_` `drop` | drop columns, `` `a`b _ t ``; on a list, drop the first/last `n` elements (`3 drop l`, `3 _ l`) | [Table operators](table-operators.md), [Column expressions](column-expressions.md#keywords-on-lists) |
+| `where` | filter rows in a query; filter a list elementwise, where `x` is the element; prefix `where bs` gives the indices of the true values | [select](select-update-delete.md), [Column expressions](column-expressions.md#keywords-on-lists) |
 | `til` | `til n` gives `0..n-1`; `lo til hi` gives `lo..hi-1` | [Column expressions](column-expressions.md) |
 | `enlist` | `enlist x` gives the one-element list of the atom `x` (a string is one atom) | [Column expressions](column-expressions.md) |
 | `?` (infix) | roll: `n?6` gives `n` random ints below 6, `n?2.5` uniform floats, `n?list` random elements; with replacement | [Column expressions](column-expressions.md) |

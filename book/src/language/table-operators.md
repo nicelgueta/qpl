@@ -32,6 +32,9 @@ it does depends on which columns you selected first.
 Inside a select list, `distinct` is something else: the column verb that counts
 distinct values, an alias for `n_unique`. See [Expressions](expressions.md).
 
+`distinct` on a plain list gives its unique elements instead of a count — see
+[Keywords on lists](column-expressions.md#keywords-on-lists).
+
 ## Limiting
 
 Taking the first few rows has two spellings that do the same thing. `limit`
@@ -70,6 +73,9 @@ on a list:
 qpl) -3 limit trades      / identical to -3#trades
 ```
 
+`limit`/`#` on a plain list take the first (or, negative, last) `n`
+elements — see [Keywords on lists](column-expressions.md#keywords-on-lists).
+
 ## Dropping columns
 
 Also two spellings, `drop` and `_`, taking a list of column names as symbols:
@@ -83,6 +89,10 @@ This overlaps with `delete `price`size from trades` from the
 [select chapter](select-update-delete.md). Use whichever reads better in
 context; `_` is handy mid-pipeline, `delete` when the statement is already a
 query.
+
+An int on the left instead of a symbol list means something else again:
+`3 drop xs`/`3 _ xs` drops the first 3 *elements* of a list — see
+[Keywords on lists](column-expressions.md#keywords-on-lists).
 
 ## Dropping rows with nulls
 
@@ -98,6 +108,9 @@ clean: `price dropnull trades
 
 Nulls in columns you didn't name are ignored. To keep rows and replace the
 nulls instead, use [`fill`](expressions.md#nulls).
+
+`dropnull xs` (no symbol, one list) drops the nulls from the list itself —
+see [Keywords on lists](column-expressions.md#keywords-on-lists).
 
 ## Sorting
 

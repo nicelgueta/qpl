@@ -227,6 +227,73 @@ which:
 Read that as: take the prices of trades bigger than 100 shares, then keep
 only those above 400.
 
+## Keywords on lists
+
+A keyword that works in a query also works on a plain list, with the same
+spelling and argument order:
+
+```qpl
+qpl) asc 3 1 4 1 5
+qpl) desc 3 1 4 1 5
+qpl) distinct 1 1 2 2 3 1
+```
+
+```
+i64[5]: 1 1 3 4 5
+i64[5]: 5 4 3 1 1
+i64[3]: 1 2 3
+```
+
+`asc`/`desc` sort the list; `distinct` keeps the unique elements in
+first-seen order (unlike the query verb `distinct col`, which counts distinct
+values — `n_unique` is the count of a list).
+
+`limit`/`#`, `drop`/`_` and `dropnull` mirror their table forms:
+
+```qpl
+2 limit 1 2 3 4 5                / i64[2]: 1 2, same as 2#1 2 3 4 5
+-2 limit 1 2 3 4 5                / i64[2]: 4 5, from the end
+3 drop 1 2 3 4 5                  / i64[2]: 4 5, drops the first 3
+-3 drop 1 2 3 4 5                  / i64[2]: 1 2, drops the last 3
+3 _ 1 2 3 4 5                     / same as `drop`
+```
+
+A single string is an atom, so `#`/`limit` take characters instead of
+elements, clamped when the count exceeds the string's length:
+
+```qpl
+qpl) 3#"hello"
+qpl) -3#"hello"
+```
+
+```
+str: "hel"
+str: "llo"
+```
+
+A string *list* still takes elements: `2#("abc" "de" "f")` is `"abc" "de"`.
+
+`where` on its own (not the postfix form above) gives the indices of the true
+values, as an int list:
+
+```qpl
+qpl) where 10110b
+```
+
+```
+i64[3]: 0 2 3
+```
+
+`quantile`/`pctl` collapse to a scalar, the same as any other reducer:
+
+```qpl
+qpl) 0.5 quantile 3 1 4 1 5
+```
+
+```
+f64: 3
+```
+
 ## Building lists and tables from nothing
 
 A few constructors round the chapter off. `til` generates a range, either from
