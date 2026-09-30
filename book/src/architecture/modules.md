@@ -95,9 +95,10 @@ extensions gets the same front-end as `main.rs`; see
 [Rust extensions](../extensions.md).
 
 **`permission`** defines `Effect`, the class of change an action makes:
-`Read` (nothing), `Session` (the session's own bindings and settings) or
-`Write` (anything outside the session). `Vm::authorize` refuses an action
-whose effect the session or the current IPC request doesn't permit; see
+`Read` (session data only), `IRead` (reads outside the session, or changes
+the session's own bindings and settings) or `Write` (anything outside the
+session). `Vm::authorize` refuses an action whose effect the session or the
+current IPC request doesn't permit; see
 [Read-only sessions](../language/read-only.md).
 
 **`temporal`** handles everything calendar-related: parsing q-style date

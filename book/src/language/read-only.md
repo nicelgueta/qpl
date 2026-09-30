@@ -10,17 +10,24 @@ The guarantee is enforced by the language's own VM, not by a container or
 permissions layer around it. So it goes wherever qpl goes: a laptop, a CI
 job, or a server shared by a team of agents.
 
-## Read and write
+## Read, iread and write
 
-Everything in the language has a permission, and there are two of them:
+Everything in the language has a permission, and there are three of them:
 
 | Permission | Allows | Examples |
 |---|---|---|
-| **read** | everything except writing to disk or changing state outside the session | queries, `load`, assignment, functions, `log`, `.qpl.cfg`, `hopen`, `dispatch`, `await`, `\l`, `\i`, `\d`, `\port` |
+| **read** | reads session data only | queries, maths, functions, `log`, `.qpl.dt`, `hopen`, `dispatch`, `await` |
+| **iread** | reads outside the session, or changes the session | `load`, assignment, `.qpl.cfg` |
 | **write** | anything | `sink`, `\1 <path>` (the stdout log), `` `w!hopen `` (a write handle to another server) |
 
+Every session allows `read` and `iread`; only `write` needs `-w` (below).
+`iread` matters over IPC: a read-only connection refuses it as well as
+`write` — see [Read-only servers](#read-only-servers) and [IPC](ipc.md).
+The `\` commands (`\l`, `\i`, `\d`, `\port`, `\1`) are local only, and a
+server refuses them over any connection.
+
 Functions added by a [Rust extension](../extensions.md) declare one of the
-two as well, and are treated exactly like the built-in actions above.
+three as well, and are treated exactly like the built-in actions above.
 
 A session has a permission too. It's **read** unless qpl is started with
 `-w` (`--write`), in which case it's **write**:
@@ -37,10 +44,10 @@ That works the same way for every way of running qpl: the REPL, a script,
 session starts. No statement can change it, so whatever a read-only session
 is given to run, it stays read-only until it exits.
 
-Binding names, defining functions and changing settings are all read actions
-because they only change the session itself, and that state disappears when
-the session ends. A write action changes something that outlives the
-session.
+Binding names, defining functions and changing settings are all `iread`
+actions because they only change the session itself, and that state
+disappears when the session ends. A write action changes something that
+outlives the session.
 
 A write in a read-only session fails with a runtime error that names it:
 
@@ -113,15 +120,17 @@ matters, or use Claude Code's [sandbox](https://code.claude.com/docs/en/sandboxi
 
 A read-only session can still open a [`\port`](ipc.md). The session's
 permission applies to every request it serves, on top of the per-connection
-one. Over a read handle, clients can only query. Over a `` `w!hopen `` handle,
-they can also assign and change settings, but a `sink` is still refused. A
-server whose clients should be able to write has to be started with `-w`.
+one. Over a read handle, clients can only query — `load` is refused, so a
+remote client can't have the server read a file for it, only query tables
+that are already loaded. Over a `` `w!hopen `` handle, they can also `load`,
+assign and change settings, but a `sink` is still refused. A server whose
+clients should be able to write has to be started with `-w`.
 
 ## What it doesn't cover
 
-Read-only mode stops a session changing things. It doesn't limit what the
-session can *see*. `load` and `\l` can read any file the qpl process can,
-and `hopen` can connect to any server it can reach. It also doesn't cap how
-much CPU or memory a query uses. So run the process as a user that can only
-read the data the agent should see, and put the usual resource limits around
-it, just as you would for any other process.
+Read-only mode stops a local session changing things. It doesn't limit what
+the session itself can *see*: `load` and `\l` can read any file the qpl
+process can, and `hopen` can connect to any server it can reach. It also
+doesn't cap how much CPU or memory a query uses. So run the process as a
+user that can only read the data the agent should see, and put the usual
+resource limits around it, just as you would for any other process.

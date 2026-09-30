@@ -1,9 +1,13 @@
 //! Rust extensions: native functions written in Rust and called from qpl.
 //!
 //! An extension function is an ordinary Rust function marked with
-//! [`#[qpl::native(read)]`](crate::native) or `#[qpl::native(write)]`. The
-//! permission is required: the VM checks it before every call, so a read-only
-//! session refuses a `write` extension exactly as it refuses `sink`.
+//! [`#[qpl::native(read)]`](crate::native), `#[qpl::native(iread)]` or
+//! `#[qpl::native(write)]`. The permission is required: the VM checks it
+//! before every call, so a read-only session refuses a `write` extension
+//! exactly as it refuses `sink`, and a read-only IPC handle refuses `iread`
+//! and `write` extensions alike. Use `iread` for anything that reads outside
+//! the session (a file, an environment variable) — `read` is for session
+//! data only.
 //!
 //! ```ignore
 //! #[qpl::native(read)]
@@ -48,7 +52,10 @@ pub type ExtFn = fn(Vec<Value>) -> Result<Option<Value>, String>;
 pub trait Native {
     /// The name after the extension's namespace: `NAME` in `.<ns>.<NAME>`.
     const NAME: &'static str;
-    /// What the function may change; a read-only session refuses `Write`.
+    /// What the function may change: `Read` (session data only), `IRead`
+    /// (reads outside the session or changes it) or `Write`. A read-only
+    /// session refuses `Write`; a read-only IPC handle refuses `IRead` and
+    /// `Write`.
     const EFFECT: Effect;
     /// The exact number of arguments it takes.
     const ARITY: usize;
@@ -458,6 +465,11 @@ mod tests {
         std::fs::write(path, "")
     }
 
+    #[crate::native(iread)]
+    fn exists(path: String) -> bool {
+        std::path::Path::new(&path).exists()
+    }
+
     fn test_ext() -> Extension {
         Extension::new("t")
             .with::<add>()
@@ -467,6 +479,7 @@ mod tests {
             .with::<head2>()
             .with::<passthrough>()
             .with::<touch>()
+            .with::<exists>()
     }
 
     fn vm_with(mut vm: Vm) -> Vm {
@@ -592,6 +605,28 @@ mod tests {
             vm.with_request_permission(crate::ipc::HandleMode::Read, |vm| run_vm(&src, vm));
         assert!(matches!(result, Err(QplError::Runtime(m)) if m.contains("read-only connection")));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_iread_function_is_allowed_locally_read_only_or_not() {
+        let src = r#".t.exists["/"]"#;
+        let mut vm = vm_with(Vm::new());
+        assert!(matches!(scalar(&mut vm, src), Value::Bool(true)));
+        let mut vm = vm_with(Vm::new_writable());
+        assert!(matches!(scalar(&mut vm, src), Value::Bool(true)));
+    }
+
+    #[cfg(feature = "ipc")]
+    #[test]
+    fn a_read_handle_refuses_an_iread_function() {
+        let mut vm = vm_with(Vm::new());
+        let src = r#".t.exists["/"]"#;
+        let result = vm.with_request_permission(crate::ipc::HandleMode::Read, |vm| run_vm(src, vm));
+        assert!(matches!(result, Err(QplError::Runtime(m)) if m.contains("read-only connection")));
+
+        let result =
+            vm.with_request_permission(crate::ipc::HandleMode::Write, |vm| run_vm(src, vm));
+        assert!(matches!(result, Ok(EvalResult::Scalar(Value::Bool(true)))));
     }
 
     #[test]

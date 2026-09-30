@@ -111,17 +111,19 @@ conn dispatch t: select from u
 
 ## Read and write handles
 
-A client that can run arbitrary statements on a server can also modify it, so
-qpl defaults to the cautious option. A bare `hopen` gives a **read-only**
-connection, and the server refuses anything that would write to its session:
-assignments, `sink`, and changing a [`.qpl.cfg`](config.md) setting. Queries
+A client that can run arbitrary statements on a server can also modify it, or
+read things the server can see that it shouldn't have to expose, so qpl
+defaults to the cautious option. A bare `hopen` gives a **read-only**
+connection, and the server refuses anything beyond a plain read: `load`,
+assignments, changing a [`.qpl.cfg`](config.md) setting, and `sink`. Queries
 of every kind still work. (A bare `.qpl.cfg` is allowed too, but it prints
 the settings on the *server's* console. The client just gets `true` back.)
 
 ```qpl
 ro: hopen 5001                          / read-only, the default
 ro dispatch t: select from trades       / rejected by the server
-ro dispatch select from trades          / fine, nothing is written
+ro dispatch select from load "f"        / rejected: load is refused too
+ro dispatch select from trades          / fine, nothing is read or written
 ```
 
 When you do want write access, ask for it explicitly at connection time:

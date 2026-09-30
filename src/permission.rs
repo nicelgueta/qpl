@@ -4,18 +4,23 @@
 //!
 //! - a read-only session (every session not started with `qpl -w`) refuses
 //!   [`Effect::Write`], from every source;
-//! - a request over a read-only IPC handle also refuses [`Effect::Session`].
+//! - a request over a read-only IPC handle also refuses [`Effect::IRead`]
+//!   and [`Effect::Write`].
 //!
-//! User-facing docs only talk about read and write: `Session` is a read as far
-//! as a session's own permission goes, and only matters for IPC handles.
+//! User-facing docs call the three levels `read`, `iread` and `write`.
 
 /// The most an action can change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
-    /// Changes nothing: queries, `load`, `hopen`, `log`.
+    /// Reads session data only: queries, maths, `.qpl.dt`. Allowed
+    /// everywhere, including over a read-only IPC handle.
     Read,
-    /// Changes the session only: assignment, `.qpl.cfg key=value`.
-    Session,
-    /// Changes state outside the session: `sink`, `\1 <path>`, a write handle.
+    /// Reads outside the session, or changes the session: `load`,
+    /// assignment, `.qpl.cfg key=value`, `\1`. Refused over a read-only IPC
+    /// handle, allowed everywhere else.
+    IRead,
+    /// Changes state outside the session: `sink`, `\1 <path>`, a write
+    /// handle. Refused in a read-only session and over a read-only IPC
+    /// handle.
     Write,
 }

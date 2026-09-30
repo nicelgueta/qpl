@@ -83,13 +83,16 @@ qpl puts the boundary inside the language:
   goes through qpl's own actions. There's no `exec`, no shell-out and no
   package import to step outside them, so in a read-only session the worst a
   confused agent can do is run a bad query.
-- **Everything has a permission.** Every action in the language is either a
-  **read** or a **write**. Read covers almost everything: querying, loading
-  files, binding names, defining functions, changing settings, logging,
-  connecting to other servers. Write is anything that writes to disk or
-  changes state outside the session: `sink`, `\1 <path>`, and a write handle
-  to another server. The VM checks the permission before the action runs,
-  every time.
+- **Everything has a permission.** Every action in the language is a
+  **read**, an **iread** or a **write**. Read covers querying, calling
+  functions, logging and connecting to other servers. Iread is anything that
+  reads outside the session or changes the session itself: loading a file,
+  assignment, changing settings. Write is anything that writes to disk or
+  changes state outside the session: `sink`, `\1 <path>` and a write handle
+  to another server. Every session allows read and iread, and only `-w`
+  allows write; iread matters over IPC, where a read-only connection
+  refuses it as well as write. The VM checks the permission before the
+  action runs, every time.
 - **Read-only by default.** A session only gets write permission when it's
   started with `-w` (`--write`). Without it, every write fails with
   `Cannot perform write action in read-only session: <action>`, and
@@ -99,8 +102,8 @@ qpl puts the boundary inside the language:
   permission. It holds through functions, `\l`-loaded scripts, compiled
   `.qplc` files and IPC requests alike.
 - **Extensions keep the guarantee.** A [Rust extension][extensions] function
-  has to declare `read` or `write`, and a read-only session refuses its
-  writes like any built-in's.
+  has to declare `read`, `iread` or `write`, and a read-only session refuses
+  its writes like any built-in's.
 
 In practice a qpl tool for an agent is a one-liner:
 
@@ -643,20 +646,21 @@ pending: conn async dispatch select avg price by sym from trades
 result: await pending
 ```
 
-A bare `hopen` is **read-only**, and the server rejects assignments, `sink`
-and changing `.qpl.cfg` settings from it. `` `w!hopen `` opens a write handle. The permission is
-chosen by the client, enforced per request, and never applies to the server
-operator's own input.
+A bare `hopen` is **read-only**, and the server rejects `load`, assignments,
+`sink` and changing `.qpl.cfg` settings from it. `` `w!hopen `` opens a write
+handle. The permission is chosen by the client, enforced per request, and
+never applies to the server operator's own input.
 
 ### Read-only sessions · [chapter][read-only]
 
 The safety guarantee that makes qpl fit for agents (see
-[Built for agents](#built-for-agents)). Every action is a read or a write,
-and a session is read-only unless it's started with `qpl -w`. In a
+[Built for agents](#built-for-agents)). Every action is a read, an iread or
+a write, and a session is read-only unless it's started with `qpl -w`. In a
 read-only session `sink`, `\1 <path>` and `` `w!hopen `` fail with
 `Cannot perform write action in read-only session: <action>`, while queries,
-assignments, functions, `log` and `.qpl.cfg` work as normal. No statement
-can change a session's permission.
+`load`, assignments, functions, `log` and `.qpl.cfg` work as normal. No
+statement can change a session's permission; a read-only IPC handle also
+refuses `load`, assignment and `.qpl.cfg`, on top of writes.
 
 ### Operator reference · [chapter][operators]
 

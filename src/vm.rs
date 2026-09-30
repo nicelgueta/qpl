@@ -490,7 +490,7 @@ impl Vm {
     /// Point the stdout log at `path` (appending), or detach it with `""`.
     pub fn set_stdout_log(&mut self, path: &str) -> Result<(), QplError> {
         if path.is_empty() {
-            self.authorize(Effect::Session, "\\1 (stdout log)")?;
+            self.authorize(Effect::IRead, "\\1 (stdout log)")?;
             self.stdout_log = None;
             return Ok(());
         }
@@ -767,6 +767,7 @@ impl Vm {
                         )));
                     }
                 };
+                self.authorize(Effect::IRead, "load")?;
                 let lf = rename_columns_snake_case(load_file(&path_str)?)?;
                 self.stack.push(Slot::Frame {
                     lf: Box::new(lf),
@@ -1598,7 +1599,7 @@ impl Vm {
             }
 
             Op::Store => {
-                self.authorize(Effect::Session, "assignment")?;
+                self.authorize(Effect::IRead, "assignment")?;
                 let name = pop_name(&mut self.stack)?;
                 let value = self
                     .stack
@@ -1867,7 +1868,7 @@ impl Vm {
             self.emit(&current);
             return Ok(Slot::Noop);
         }
-        self.authorize(Effect::Session, ".qpl.cfg")?;
+        self.authorize(Effect::IRead, ".qpl.cfg")?;
         for pair in args.split_whitespace() {
             let (key, value) = pair.split_once('=').ok_or_else(|| {
                 QplError::Runtime(format!("expected key=value in `.qpl.cfg`, got '{pair}'"))
@@ -2835,6 +2836,16 @@ mod tests {
         }
 
         #[test]
+        fn read_handle_rejects_load() {
+            assert_read_only_rejects(r#"select from load "examples/data/trades.parquet""#);
+        }
+
+        #[test]
+        fn write_handle_allows_load() {
+            assert_write_allows(r#"select from load "examples/data/trades.parquet""#);
+        }
+
+        #[test]
         fn write_handle_allows_assignment() {
             assert_write_allows("x: 1");
         }
@@ -2863,6 +2874,60 @@ mod tests {
             assert_eq!(vm.request_mode, None);
             run_vm("x: 1", &mut vm).expect("local assignment always allowed");
         }
+    }
+
+    #[test]
+    fn effect_matrix_across_session_and_request_mode() {
+        // (effect, local read-only, local -w, read-only IPC request, write IPC request)
+        let cases = [
+            (Effect::Read, true, true, true, true),
+            (Effect::IRead, true, true, false, true),
+            (Effect::Write, false, true, false, true),
+        ];
+        for (effect, ro_local, w_local, ro_request, w_request) in cases {
+            #[cfg(not(feature = "ipc"))]
+            let (_, _) = (ro_request, w_request);
+            let ro = Vm::new();
+            assert_eq!(
+                ro.authorize(effect, "x").is_ok(),
+                ro_local,
+                "{effect:?} local read-only session"
+            );
+            let w = Vm::new_writable();
+            assert_eq!(
+                w.authorize(effect, "x").is_ok(),
+                w_local,
+                "{effect:?} local -w session"
+            );
+
+            #[cfg(feature = "ipc")]
+            {
+                use crate::ipc::HandleMode;
+                // a write session's own permission never blocks a read; only
+                // the handle mode does, so a -w session isolates that check
+                let mut vm = Vm::new_writable();
+                let ok = vm.with_request_permission(HandleMode::Read, |vm| {
+                    vm.authorize(effect, "x").is_ok()
+                });
+                assert_eq!(ok, ro_request, "{effect:?} read-only IPC request");
+                let mut vm = Vm::new_writable();
+                let ok = vm.with_request_permission(HandleMode::Write, |vm| {
+                    vm.authorize(effect, "x").is_ok()
+                });
+                assert_eq!(ok, w_request, "{effect:?} write IPC request (server -w)");
+            }
+        }
+    }
+
+    #[cfg(feature = "ipc")]
+    #[test]
+    fn a_write_ipc_request_still_needs_a_writable_server_for_write() {
+        use crate::ipc::HandleMode;
+        let mut ro_server = Vm::new();
+        let ok = ro_server.with_request_permission(HandleMode::Write, |vm| {
+            vm.authorize(Effect::Write, "x").is_ok()
+        });
+        assert!(!ok, "a read-only server must still refuse a write");
     }
 
     #[test]

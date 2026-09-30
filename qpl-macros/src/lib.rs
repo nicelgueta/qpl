@@ -1,5 +1,6 @@
-//! `#[qpl::native(read|write)]`: expose a Rust function to qpl. Use it through
-//! the `qpl` crate (`qpl::native`), whose `ext` module documents the API.
+//! `#[qpl::native(read|iread|write)]`: expose a Rust function to qpl. Use it
+//! through the `qpl` crate (`qpl::native`), whose `ext` module documents the
+//! API.
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -8,8 +9,10 @@ use syn::spanned::Spanned;
 use syn::{Expr, FnArg, ItemFn, Lit, Meta, Token, Type, parse_macro_input};
 
 /// Mark a function as a qpl extension function and declare its permission:
-/// `read` (changes nothing outside the session) or `write` (anything else;
-/// refused in a read-only session). `name = "..."` renames it in qpl.
+/// `read` (reads session data only), `iread` (reads outside the session, or
+/// changes the session; refused over a read-only IPC handle), or `write`
+/// (changes state outside the session; refused in a read-only session).
+/// `name = "..."` renames it in qpl.
 ///
 /// Generates a type of the same name implementing `qpl::ext::Native`, which
 /// `Extension::with::<name>()` registers. The function itself is unchanged.
@@ -22,7 +25,7 @@ pub fn native(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into()
 }
 
-const USAGE: &str = "declare a permission: `#[qpl::native(read)]` or `#[qpl::native(write)]`";
+const USAGE: &str = "declare a permission: `#[qpl::native(read)]`, `#[qpl::native(iread)]` or `#[qpl::native(write)]`";
 
 fn expand(
     args: Punctuated<Meta, Token![,]>,
@@ -32,15 +35,17 @@ fn expand(
     let mut name = None;
     for meta in &args {
         match meta {
-            Meta::Path(p) if p.is_ident("read") || p.is_ident("write") => {
+            Meta::Path(p) if p.is_ident("read") || p.is_ident("iread") || p.is_ident("write") => {
                 if effect.is_some() {
                     return Err(syn::Error::new(
                         p.span(),
-                        "declare exactly one of `read` or `write`",
+                        "declare exactly one of `read`, `iread` or `write`",
                     ));
                 }
                 effect = Some(if p.is_ident("read") {
                     quote!(Read)
+                } else if p.is_ident("iread") {
+                    quote!(IRead)
                 } else {
                     quote!(Write)
                 });
@@ -181,6 +186,7 @@ mod tests {
     fn exactly_one_permission() {
         assert!(expand_err("read, write", "fn f() {}").contains("exactly one"));
         assert!(expand_err("read, read", "fn f() {}").contains("exactly one"));
+        assert!(expand_err("read, iread", "fn f() {}").contains("exactly one"));
     }
 
     #[test]
@@ -208,5 +214,8 @@ mod tests {
         let out = expands("read", "pub fn r#type() -> i64 { 1 }");
         assert!(out.contains("Effect :: Read"), "{out}");
         assert!(out.contains("\"type\""), "{out}");
+
+        let out = expands("iread", "fn f() {}");
+        assert!(out.contains("Effect :: IRead"), "{out}");
     }
 }

@@ -16,12 +16,15 @@ fn note(path: String, text: String) -> std::io::Result<()> {
 }
 ```
 
-The permission is the same one every built-in action has (see
-[Read-only sessions](language/read-only.md)). A `read` function can be called
-from any session. A `write` function is refused in a read-only session, just
-as `sink` is, with the same error. The VM checks it before every call, so an
-extension can't widen what an agent in a read-only session is able to do,
-however it's called. Leaving the permission out is a compile error.
+The permission is one of `read`, `iread` or `write` — the same three every
+built-in action has (see [Read-only sessions](language/read-only.md)). A
+`read` function can be called from any session, including over a read-only
+IPC handle. An `iread` function is refused over a read-only IPC handle, but
+allowed in any local session, read-only or not. A `write` function is
+refused in a read-only session, just as `sink` is, with the same error. The
+VM checks the permission before every call, so an extension can't widen what
+an agent in a read-only session is able to do, however it's called. Leaving
+the permission out is a compile error.
 
 ## A qpl binary with extensions
 
@@ -151,17 +154,26 @@ qpl) .geo.km["x";0;0;0]
 `name = "..."` in the attribute changes the name the function has in qpl,
 for when the Rust name doesn't suit: `#[qpl::native(read, name = "dist")]`.
 
-## Choosing read or write
+## Choosing read, iread or write
 
 Declare a function `write` if it changes anything that outlives the session:
 it writes a file, sends a message, changes a database, or makes a request
-that changes state somewhere else. Everything else is `read`.
+that changes state somewhere else.
+
+Declare it `iread` if it only reads, but reads something outside the
+session: a file's contents, an environment variable, a network request. A
+read-only IPC handle shouldn't be able to make the server read arbitrary
+files or secrets on its behalf, so `iread` keeps that reachable locally
+(and over a write handle) while a read-only connection can't trigger it.
+
+Everything else — a function that only looks at the arguments it's given —
+is `read`.
 
 The attribute is a declaration, and qpl can't check the function body
-against it. A function declared `read` that writes to disk anyway breaks the
-read-only guarantee for every session it's linked into. Extensions are
-trusted code, so review them the way you'd review anything else that goes
-into the binary you give an agent.
+against it. A function declared `read` that reads a file or writes to disk
+anyway breaks the guarantee for every session it's linked into. Extensions
+are trusted code, so review them the way you'd review anything else that
+goes into the binary you give an agent.
 
 ## Other hosts
 
