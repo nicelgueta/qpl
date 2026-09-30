@@ -817,6 +817,8 @@ wasm`. [The full story](tools/wasm/README.md).
 - A basic standard library of commonly needed functions, shipped with qpl.
 - Python extensions, with the same read/write permissions as
   [Rust extensions][extensions].
+- Extension functions inside queries, built on Polars' own framework for
+  vectorised Rust functions.
 - Decide whether to support null as a first-class value in the language.
 - Float list literals: `1.5 2.5` should be a list, as `1 2 3` is for ints.
 - More of the language. Gaps are noted in the [book][book] beside the feature

@@ -16,6 +16,12 @@ script or passed around as `\i` imports.
 write permission that every session enforces. Extending the same model to
 Python functions is an option for consideration further down the line.
 
+**Extension functions inside queries.** [Rust extensions](extensions.md)
+work on values, so they can't be called inside a `select` projection. Polars
+has its own framework for running Rust functions over whole columns; building
+on it would let an extension function take columns in a query and run as part
+of the lazy plan.
+
 **Deciding on nulls.** Whether null should be a first-class value in the
 language itself, with its own literal and semantics, is still an open design
 question.
