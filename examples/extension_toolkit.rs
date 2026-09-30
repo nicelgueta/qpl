@@ -10,9 +10,9 @@
 //! `.stats` is all reads. `.files` mixes a read (`exists`) with a write
 //! (`append`), which is refused unless the session was started with `-w`.
 
-use std::io::Write;
 use qpl::ext::Extension;
 use qpl::ext::polars::prelude::*;
+use std::io::Write;
 
 // ---- .stats: reads only ----
 
@@ -89,8 +89,6 @@ fn main() {
         .with::<top_n>()
         .with::<sample>()
         .with::<about>();
-    let files = Extension::new("files")
-        .with::<exists>()
-        .with::<append>();
+    let files = Extension::new("files").with::<exists>().with::<append>();
     qpl::cli::run(vec![stats, files]);
 }
