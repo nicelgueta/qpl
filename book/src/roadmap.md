@@ -12,21 +12,9 @@ builds for the target unaided.
 with qpl itself, so everyday helpers don't have to be rewritten in every
 script or passed around as `\i` imports.
 
-**A permissioned Rust extension framework.** qpl is meant to be safe to hand
-to an agent: it can run any qpl it likes, but it has no way out to arbitrary
-code the way a Python session does, and a
-[read-only session](language/read-only.md) can't write at all, so there's a
-hard limit on how much damage a confused agent can do. Extensions need to keep that property. The plan is to
-let you write native functions in Rust and expose them to qpl with a proc
-macro that declares each one as either a **read** or a **write** action, so
-that a read-only session refuses every write action at once, built-in or
-extension alike. Permissioning then lives in the language itself rather than
-in whatever sandbox happens to be wrapped around it: an agent given a
-read-only qpl session can call anything it likes and still can't change
-state.
-
-Extending the same model to Python functions is an option for consideration
-further down the line.
+**Python extensions.** [Rust extensions](extensions.md) declare a read or
+write permission that every session enforces. Extending the same model to
+Python functions is an option for consideration further down the line.
 
 **Deciding on nulls.** Whether null should be a first-class value in the
 language itself, with its own literal and semantics, is still an open design

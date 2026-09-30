@@ -8,6 +8,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - src/**
+      - qpl-macros/**
 
 jobs:
   create-tag:

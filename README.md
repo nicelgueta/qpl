@@ -98,6 +98,9 @@ qpl puts the boundary inside the language:
 - **Fixed for the life of the session.** No statement can grant write
   permission. It holds through functions, `\l`-loaded scripts, compiled
   `.qplc` files and IPC requests alike.
+- **Extensions keep the guarantee.** A [Rust extension][extensions] function
+  has to declare `read` or `write`, and a read-only session refuses its
+  writes like any built-in's.
 
 In practice a qpl tool for an agent is a one-liner:
 
@@ -688,6 +691,35 @@ can change a session's permission.
 | `.qpl.cfg` | session config |
 | `hopen` `` `w!hopen `` `dispatch` `async dispatch` `await` | IPC client |
 
+## Rust extensions · [chapter][extensions]
+
+Add your own native functions in Rust. Each one declares its permission, and
+the VM enforces it like any built-in, so a read-only session refuses a
+`write` extension exactly as it refuses `sink`. Extensions stay safe to hand
+to an agent.
+
+```rust
+#[qpl::native(read)]
+fn km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 { /* ... */ }
+
+#[qpl::native(write)]
+fn note(path: String, text: String) -> std::io::Result<()> { /* ... */ }
+
+fn main() {
+    let geo = qpl::ext::Extension::new("geo").with::<km>().with::<note>();
+    qpl::cli::run(vec![geo]);   // the full `qpl` CLI, plus `.geo.km` and `.geo.note`
+}
+```
+
+```bash
+cargo run --example extension -- -c '.geo.km[51.51;-0.13;40.71;-74.01]'
+cargo run --example extension_toolkit -- --load-demo -c '.stats.top[trades; `price; 3]'
+```
+
+[`examples/extension_toolkit.rs`](examples/extension_toolkit.rs) registers two
+extensions with several functions each, covering lists, tables, lazy plans and
+errors.
+
 ## REPL
 
 | Command | Action |
@@ -783,12 +815,8 @@ wasm`. [The full story](tools/wasm/README.md).
 - Drop the Polars patch from the WASM build, once upstream builds for
   `wasm32-unknown-unknown` unaided.
 - A basic standard library of commonly needed functions, shipped with qpl.
-- A permissioned Rust extension framework, so qpl stays safe to hand to an
-  agent as it grows. A proc macro exposes a Rust function to qpl and declares
-  it a **read** or **write** action, so a read-only session refuses every
-  write action, built-in or extension, and can't change state whatever it
-  calls. Permissioning is part of the language, not a sandbox
-  bolted on around it. Python extensions may be considered later.
+- Python extensions, with the same read/write permissions as
+  [Rust extensions][extensions].
 - Decide whether to support null as a first-class value in the language.
 - More of the language. Gaps are noted in the [book][book] beside the feature
   they belong to.
@@ -817,4 +845,5 @@ wasm`. [The full story](tools/wasm/README.md).
 [ipc]: https://nicelgueta.github.io/qpl/language/ipc.html
 [operators]: https://nicelgueta.github.io/qpl/language/operator-reference.html
 [read-only]: https://nicelgueta.github.io/qpl/language/read-only.html
+[extensions]: https://nicelgueta.github.io/qpl/extensions.html
 [architecture]: https://nicelgueta.github.io/qpl/architecture.html

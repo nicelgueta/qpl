@@ -19,6 +19,9 @@ Everything in the language has a permission, and there are two of them:
 | **read** | everything except writing to disk or changing state outside the session | queries, `load`, assignment, functions, `log`, `.qpl.cfg`, `hopen`, `dispatch`, `await`, `\l`, `\i`, `\d`, `\port` |
 | **write** | anything | `sink`, `\1 <path>` (the stdout log), `` `w!hopen `` (a write handle to another server) |
 
+Functions added by a [Rust extension](../extensions.md) declare one of the
+two as well, and are treated exactly like the built-in actions above.
+
 A session has a permission too. It's **read** unless qpl is started with
 `-w` (`--write`), in which case it's **write**:
 

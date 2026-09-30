@@ -50,7 +50,15 @@ pub(crate) type NativeFn = fn(&mut Vm, Vec<Slot>) -> Result<Slot, QplError>;
 pub(crate) struct Builtin {
     pub arity: RangeInclusive<usize>,
     pub effect: Effect,
-    pub call: NativeFn,
+    pub call: NativeCall,
+}
+
+/// A builtin's implementation: part of qpl itself, working on stack slots, or
+/// a Rust extension ([`crate::ext`]), working on values.
+#[derive(Clone, Copy)]
+pub(crate) enum NativeCall {
+    Internal(NativeFn),
+    Extension(crate::ext::ExtFn),
 }
 
 fn now_fn(typ: TemporalNowFuncType) -> NativeFn {
@@ -86,7 +94,7 @@ pub(crate) fn builtins() -> HashMap<String, Builtin> {
         Builtin {
             arity: 0..=0,
             effect: Effect::Read,
-            call: now_fn(TemporalNowFuncType::Date),
+            call: NativeCall::Internal(now_fn(TemporalNowFuncType::Date)),
         },
     );
     m.insert(
@@ -94,7 +102,7 @@ pub(crate) fn builtins() -> HashMap<String, Builtin> {
         Builtin {
             arity: 0..=0,
             effect: Effect::Read,
-            call: now_fn(TemporalNowFuncType::Time),
+            call: NativeCall::Internal(now_fn(TemporalNowFuncType::Time)),
         },
     );
     m.insert(
@@ -102,7 +110,7 @@ pub(crate) fn builtins() -> HashMap<String, Builtin> {
         Builtin {
             arity: 0..=0,
             effect: Effect::Read,
-            call: now_fn(TemporalNowFuncType::Timestamp),
+            call: NativeCall::Internal(now_fn(TemporalNowFuncType::Timestamp)),
         },
     );
     m.insert(
@@ -110,7 +118,7 @@ pub(crate) fn builtins() -> HashMap<String, Builtin> {
         Builtin {
             arity: 0..=0,
             effect: Effect::Read,
-            call: now_fn(TemporalNowFuncType::Timespan),
+            call: NativeCall::Internal(now_fn(TemporalNowFuncType::Timespan)),
         },
     );
     m
@@ -134,10 +142,10 @@ mod tests {
         let mut vm = Vm::new();
         for (name, b) in builtins() {
             assert_eq!(b.arity, 0..=0, "{name} is niladic");
-            assert!(
-                (b.call)(&mut vm, vec![]).is_ok(),
-                "{name} returned an error"
-            );
+            let NativeCall::Internal(call) = b.call else {
+                panic!("{name} is an extension");
+            };
+            assert!(call(&mut vm, vec![]).is_ok(), "{name} returned an error");
         }
     }
 }

@@ -85,6 +85,15 @@ compiler calls *by id* rather than by name, so no binding can ever get in
 their way. Every entry in the table carries the `Effect` it may have, which
 the VM checks before calling it.
 
+**`ext`** is the Rust extension API: the `Native` trait that
+`#[qpl::native]` (from the `qpl-macros` crate) implements, `Extension` and
+`Vm::register`, and the `FromValue`/`IntoValue` conversions. An extension
+function becomes an ordinary entry in the `native` table, so the VM calls and
+authorizes it exactly like a builtin. **`cli`** is the whole `qpl` command
+line as a library function, `cli::run(extensions)`, so a binary with
+extensions gets the same front-end as `main.rs`; see
+[Rust extensions](../extensions.md).
+
 **`permission`** defines `Effect`, the class of change an action makes:
 `Read` (nothing), `Session` (the session's own bindings and settings) or
 `Write` (anything outside the session). `Vm::authorize` refuses an action

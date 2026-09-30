@@ -30,6 +30,7 @@
   - [Read-only sessions](language/read-only.md)
   - [Operator reference](language/operator-reference.md)
 - [REPL](repl.md)
+- [Rust extensions](extensions.md)
 - [Architecture](architecture/index.md)
   - [The pipeline](architecture/pipeline.md)
   - [The modules](architecture/modules.md)

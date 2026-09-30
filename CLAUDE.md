@@ -19,6 +19,7 @@ cargo build --release       # release build (large: bundles all of Polars)
 cargo test                  # run all tests (unit tests live in #[cfg(test)] modules per source file)
 cargo test <name>           # run tests matching a substring, e.g. `cargo test lazy`
 cargo test --package qpl parser::   # run one module's tests
+cargo test --workspace      # also the `qpl-macros` crate's tests (`cargo test` alone skips them)
 cargo run                   # start the REPL
 cargo run -- --load-demo    # REPL preloaded with demo `trades` / `quotes` tables
 cargo run -- script.qpl     # execute a script (read-only: `sink`/`\1 <path>` refused)
@@ -30,6 +31,8 @@ cargo run -- -C script.qpl                      # compile to script.qplc (add -o
 cargo run -- script.qplc                        # run a compiled artifact — no lexing/parsing/compiling
 cargo build --no-default-features               # drop `ipc` (hopen/dispatch/await, \port — see Architecture)
 cargo test --no-default-features --features wasm   # browser bindings, host-side tests
+cargo run --example extension -- -c '.geo.km[51.51;-0.13;40.71;-74.01]'   # a qpl binary with a Rust extension
+cargo run --example extension_toolkit -- --load-demo -c '.stats.top[trades; `price; 3]'   # two extensions, every arg/result kind
 make wasm                   # browser bundle -> tools/wasm/pkg (patches polars first,
                             # see scripts/build-wasm.sh and tools/wasm/README.md)
 ```
@@ -38,7 +41,14 @@ make wasm                   # browser bundle -> tools/wasm/pkg (patches polars f
 already includes both; `--no-default-features` is only needed to build/test without
 them. `cli` gates the binary itself (`[[bin]] required-features`) along with
 clap/rustyline/mimalloc; the interpreter lives in `src/lib.rs` so that the binary
-and the `wasm` bindings are both thin front-ends over the same library.
+and the `wasm` bindings are both thin front-ends over the same library. The
+command line itself is `src/cli.rs` (`qpl::cli::run(extensions)`), so
+`main.rs` is three lines and a binary with Rust extensions (`examples/extension.rs`)
+gets the identical front-end.
+
+The repo is a Cargo workspace of two crates: `qpl` (the root package) and
+`qpl-macros/` (the `#[qpl::native]` proc macro, re-exported as `qpl::native`).
+Workspace-wide checks need `--workspace` (`cargo clippy --workspace --all-targets`).
 
 There is no separate lint step configured; use `cargo clippy --all-targets` and
 `cargo fmt` as normal. `cargo clippy --all-targets` is expected to be
@@ -84,8 +94,8 @@ by the `\l`/`\i` native (`\l`/`\i` targets are read, parsed and compiled
 *when the including script is compiled*, not at run time — see "Namespaces"
 below).
 
-Entry points: `main.rs` parses CLI args (clap) and constructs one long-lived
-`vm::Vm`, then calls into `repl.rs`. `repl::run_script` (a file) and
+Entry points: `cli::run` (called by `main.rs`) parses CLI args (clap), constructs one long-lived
+`vm::Vm` (read-only unless `-w`) and registers any Rust extensions, then calls into `repl.rs`. `repl::run_script` (a file) and
 `repl::start`'s REPL loop both funnel source through `parser::parse_program`
 → `compiler::compile_program` → `Vm::run_compiled`. `vm::run_vm(source, vm)`
 — the entry point most tests use — compiles a *single* statement
@@ -107,13 +117,15 @@ is reused.
 | `ops` | Type-dispatched semantics the opcode dispatch loop delegates to, so `vm.rs`'s `match` arms stay thin: scalar/vector/temporal binops and casts, verb application, `like`, natives that don't need a native-function slot to themselves (`til`, `enlist`, roll, `zip`, `log`, `hopen`/`whopen`/`await`, `dispatch` — `call_by_name` is the shadowable-by-name dispatch point) |
 | `vm` | `Vm` (the single evaluator), `Slot` (stack entries), `CallFrame`-equivalent (`Slot::Call`), the `Op` decode/dispatch loop (`Vm::run_compiled`) — each arm small, delegating to `ops.rs`. `run_vm` (single-statement helper) and `EvalResult` also live here |
 | `native` | Built-in (native) functions — a `name → Builtin` map built once in `Vm::new`, resolved through `Vm::lookup` exactly like a user function, except a builtin name can never be bound over. `NativeId` (`Enlist`/`Roll`/`Cfg`/…) is for the handful of primitives the compiler references *by id* instead of by name, so they can't be shadowed at all. Adding a name-resolved native needs no lexer/parser/compiler change |
+| `ext` | Rust extensions: `Native` (implemented by `#[qpl::native(read\|write)]` from `qpl-macros`, which generates a same-named braced struct in the type namespace so the function stays callable), `Extension` (`Extension::new(ns).with::<f>()`), `Vm::register` (namespaced `.<ns>.<name>` entries in the builtin table as `NativeCall::Extension`, atomic, `qpl` reserved), and the `FromValue`/`IntoValue`/`IntoReturn` conversions. `Vm::call_builtin` converts slots ↔ values at the boundary; an `Err` becomes `<name>: <msg>` |
+| `cli` | `cli` feature only. The whole command line (clap `Cli`, `-C`/`-d`/`-c`/`-w`, Ctrl-C handler) as `cli::run(extensions)`; also the CLI tests, which spawn `target/<profile>/qpl` |
 | `permission` | `Effect` (`Read`/`Session`/`Write`) — what an action may change. `Vm::authorize(effect, what)` is the single permission check: a read-only session (`Vm::new`/`Vm::default` — the default; `Vm::new_writable` for `qpl -w`; fixed at construction, never changed) refuses `Write`; a request over a read-only IPC handle refuses `Session` and `Write`. `Builtin` entries carry an `effect` that `Vm::call_builtin` checks before every call; `sink`, assignment, `.qpl.cfg`, `\1` and `whopen` call `authorize` inline |
 | `vm_config` | `VmConfig` — session knobs set by `.qpl.cfg key=value` (`maxcol`, `maxrow`, `tblwidth`, `strlen`, `round_type`, `useqepoch`); a new knob is a field + a `VmConfig::set` arm and nothing else |
 | `errors` | `QplError` (Lex/Parse/Compile/Runtime variants) — the single error type threaded everywhere |
-| `repl` | The REPL loop, `run_script` (parse_program → compile_program → run_compiled for a whole file, aborting before any statement runs on a parse/compile error anywhere in it — including inside a `\l`/`\i` target; also runs a `.qplc` file straight from bytes, sniffed by magic number), `compile_script` (source → `Program`, no run — `qpl -C`), `run_command` (`qpl -c`), demo tables, result formatting. `wants_more` (interactive-loop-only: brackets/trailing-comma/parse-cut-off) decides whether to keep reading a half-typed statement. All printing goes through `Vm::emit`, which mirrors to the stdout log. `\port` is an ordinary statement (`Vm::native_port` sets `Vm::port`); `start()` switches to polling stdin and the listener once a port is open, and `main.rs` enters it after a script that left one open |
+| `repl` | The REPL loop, `run_script` (parse_program → compile_program → run_compiled for a whole file, aborting before any statement runs on a parse/compile error anywhere in it — including inside a `\l`/`\i` target; also runs a `.qplc` file straight from bytes, sniffed by magic number), `compile_script` (source → `Program`, no run — `qpl -C`), `run_command` (`qpl -c`), demo tables, result formatting. `wants_more` (interactive-loop-only: brackets/trailing-comma/parse-cut-off) decides whether to keep reading a half-typed statement. All printing goes through `Vm::emit`, which mirrors to the stdout log. `\port` is an ordinary statement (`Vm::native_port` sets `Vm::port`); `start()` switches to polling stdin and the listener once a port is open, and `cli::run` enters it after a script that left one open |
 | `wasm` | `wasm` feature only (`#[cfg(feature = "wasm")] mod wasm;` in `lib.rs`). `Repl` (a `Vm` behind `eval(line)`, driven by `repl::eval_capture` — same path the terminal REPL uses, with output captured instead of printed) and `qplLangConfig()` (Monaco tokenizer/config/completions, built at compile time from `tools/vscode/`'s JSON). Builds only against a patched Polars (stock 0.55.2 doesn't compile for `wasm32-unknown-unknown`) — [`tools/wasm/README.md`](tools/wasm/README.md) has the build steps and the patch |
-| `interrupt` | Ctrl-C flag (`Interrupt`, an `Arc` of two atomics on `Vm`). The `cli` handler in `main.rs` sets it; the interpreter polls `vm.interrupt.check()` (each backward `JUMP`, `CALL`, around Polars `collect`s, IPC waits) and returns `QplError::Interrupted`. One `interrupt.statement()` guard covers a whole `run_source` call (a full script or one REPL line), however many statements it contains |
-| `ipc` | `ipc` feature only (`#[cfg(feature = "ipc")]`, `mod ipc;` in `main.rs` is itself gated). Client (`hopen`/`dispatch`/`async dispatch`/`await`) and server (`\port`) over a plain `zeromq` REQ/REP pair — see the IPC subsection below |
+| `interrupt` | Ctrl-C flag (`Interrupt`, an `Arc` of two atomics on `Vm`). The `cli` handler in `cli.rs` sets it; the interpreter polls `vm.interrupt.check()` (each backward `JUMP`, `CALL`, around Polars `collect`s, IPC waits) and returns `QplError::Interrupted`. One `interrupt.statement()` guard covers a whole `run_source` call (a full script or one REPL line), however many statements it contains |
+| `ipc` | `ipc` feature only (`#[cfg(feature = "ipc")]`, `pub mod ipc;` in `lib.rs` is itself gated). Client (`hopen`/`dispatch`/`async dispatch`/`await`) and server (`\port`) over a plain `zeromq` REQ/REP pair — see the IPC subsection below |
 
 ### VM state and evaluation model
 
@@ -214,6 +226,11 @@ existing opcode via a new `Operand` variant over adding a new opcode, and
 prefer expressing a new language feature in terms of existing opcodes over
 either. Opcode count is deliberately kept well under the 256 a single byte
 allows.
+
+**Adding a Rust extension function** (outside qpl itself): see `src/ext.rs`
+and `book/src/extensions.md`. Extensions reach the VM only through `Native`
+and `Vm::register`; don't give them `Slot`/`Vm` access, which would let one
+bypass `authorize`.
 
 **Adding a new native function**: add an entry to `native::builtins()` with
 the `Effect` it has — `Write` for anything that changes state outside the
@@ -318,7 +335,7 @@ running the source. `qpl -c '<command>'` runs a short ad hoc command and
 exits (`repl::run_command`, source text through the same
 parse→compile→run path as a script, reported unprefixed like `<main>` REPL
 input); `-C`, `-c`, `-d`, `-i`, and a `file` argument all conflict with each other
-in `main.rs`'s clap `Cli`.
+in `cli.rs`'s clap `Cli`.
 
 `Program::to_bytes`/`from_bytes` (`program.rs`) serialise `code`/`operands`/
 `lines` (recursing into an embedded `Operand::Program`), gated by a `u16

@@ -3,7 +3,7 @@ use crate::compiler::compile;
 use crate::errors::QplError;
 use crate::helpers::rename_columns_snake_case;
 use crate::lexer::tokenise;
-use crate::native::Builtin;
+use crate::native::{Builtin, NativeCall};
 use crate::ops;
 use crate::parser::parse;
 use crate::permission::Effect;
@@ -277,6 +277,39 @@ fn expect_one_program(args: &mut Vec<Slot>, what: &str) -> Result<Arc<Program>, 
             "corrupt bytecode: '{what}' expected an embedded program, got {}",
             other.type_name()
         ))),
+    }
+}
+
+/// A call argument as a value: a lazy frame stays `Lazy`, any other frame is
+/// collected to a `Table`.
+fn slot_into_value(slot: Slot) -> Result<Value, QplError> {
+    match slot {
+        Slot::Scalar(s) => Ok(s),
+        Slot::Frame { lf, lazy: true } => Ok(Value::Lazy(lf)),
+        Slot::Frame { lf, lazy: false } => Ok(Value::Table(
+            (*lf)
+                .collect()
+                .map_err(|e| QplError::Runtime(e.to_string()))?,
+        )),
+        Slot::Noop => Err(QplError::Runtime(
+            "cannot use a no-op expression as a value".into(),
+        )),
+        other => Err(QplError::Runtime(format!(
+            "Expected Expr on stack, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// A returned value as a slot: tables become frames, keeping laziness.
+fn value_into_slot(v: Value) -> Slot {
+    match v {
+        Value::Table(df) => Slot::Frame {
+            lf: Box::new(df.lazy()),
+            lazy: false,
+        },
+        Value::Lazy(lf) => Slot::Frame { lf, lazy: true },
+        other => Slot::Scalar(other),
     }
 }
 
@@ -1800,7 +1833,8 @@ impl Vm {
         Ok(())
     }
 
-    /// Authorizes, arity-checks and runs a builtin (`.qpl.dt`, ...).
+    /// Authorizes, arity-checks and runs a builtin (`.qpl.dt`, a Rust
+    /// extension, ...).
     fn call_builtin(&mut self, name: &str, b: Builtin, args: Vec<Slot>) -> Result<Slot, QplError> {
         self.authorize(b.effect, name)?;
         if !b.arity.contains(&args.len()) {
@@ -1810,7 +1844,19 @@ impl Vm {
                 args.len()
             )));
         }
-        (b.call)(self, args)
+        match b.call {
+            NativeCall::Internal(call) => call(self, args),
+            NativeCall::Extension(call) => {
+                let args = args
+                    .into_iter()
+                    .map(slot_into_value)
+                    .collect::<Result<Vec<_>, _>>()?;
+                match call(args).map_err(|e| QplError::Runtime(format!("{name}: {e}")))? {
+                    Some(v) => Ok(value_into_slot(v)),
+                    None => Ok(Slot::Noop),
+                }
+            }
+        }
     }
 
     /// `.qpl.cfg key=value ...`; bare, print the settings.
@@ -1947,36 +1993,9 @@ impl Vm {
                 "function recursion too deep (limit {MAX_CALL_DEPTH})"
             )));
         }
-        // bind args as locals; a lazy frame stays `Lazy`, any other frame is
-        // collected to a `Table`
         let mut locals = HashMap::with_capacity(closure.params.len());
         for (p, slot) in closure.params.iter().zip(args) {
-            let v = match slot {
-                Slot::Scalar(s) => s,
-                Slot::Frame { lf, lazy } => {
-                    if lazy {
-                        Value::Lazy(lf)
-                    } else {
-                        Value::Table(
-                            (*lf)
-                                .collect()
-                                .map_err(|e| QplError::Runtime(e.to_string()))?,
-                        )
-                    }
-                }
-                Slot::Noop => {
-                    return Err(QplError::Runtime(
-                        "cannot use a no-op expression as a value".into(),
-                    ));
-                }
-                other => {
-                    return Err(QplError::Runtime(format!(
-                        "Expected Expr on stack, got {}",
-                        other.type_name()
-                    )));
-                }
-            };
-            locals.insert(p.clone(), v);
+            locals.insert(p.clone(), slot_into_value(slot)?);
         }
         let frame = CallFrame {
             ret_prog: self.prog.clone(),
@@ -2737,7 +2756,7 @@ mod tests {
                     Builtin {
                         arity,
                         effect: Effect::Write,
-                        call: must_not_run,
+                        call: NativeCall::Internal(must_not_run),
                     },
                 );
             }
