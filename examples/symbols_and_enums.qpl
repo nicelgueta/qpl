@@ -9,7 +9,7 @@
 /                     vector `name` (order matters; unknown values -> null)
 /
 / Run from the repo root:
-/   cargo run -- examples/symbols_and_enums.qpl
+/   cargo run -- -w examples/symbols_and_enums.qpl
 / ─────────────────────────────────────────────────────────────────────────────
 
 trades: load "examples/data/trades.parquet"

@@ -135,3 +135,9 @@ The permission is chosen by the client when it connects and enforced by the
 server on every request over that connection. It applies only to statements
 arriving over a socket, never to what the person sitting at the server's own
 prompt types.
+
+A read handle also can't open a write handle to another server
+(`` ro dispatch `w!hopen 5002 `` is refused), so it can't use the server to
+reach one. The server's own session permission applies on top: unless it was
+started with `qpl -w`, it's [read-only](read-only.md) and refuses `sink` even
+over a write handle.

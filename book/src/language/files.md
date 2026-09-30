@@ -36,7 +36,9 @@ changes.
 
 ## sink
 
-`sink` goes the other way, streaming a table out to a file:
+`sink` goes the other way, streaming a table out to a file. It's a write
+action, so it needs a session started with `qpl -w`; see
+[Read-only sessions](read-only.md).
 
 ```qpl
 trades sink "summary.parquet"

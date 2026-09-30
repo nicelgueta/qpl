@@ -3,7 +3,7 @@
 / recreate them.
 /
 / Run from the repo root:
-/   cargo run -- --load-demo examples/setup_data.qpl
+/   cargo run -- -w --load-demo examples/setup_data.qpl
 
 trades sink "examples/data/trades.parquet"
 quotes sink "examples/data/quotes.parquet"

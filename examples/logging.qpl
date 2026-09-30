@@ -7,7 +7,7 @@
 /   \1                            detach the log
 /
 / Run from the repo root:
-/   cargo run -- examples/logging.qpl
+/   cargo run -- -w examples/logging.qpl
 / ─────────────────────────────────────────────────────────────────────────────
 
 trades: load "examples/data/trades.parquet"

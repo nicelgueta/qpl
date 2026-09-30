@@ -6,6 +6,7 @@ use crate::lexer::tokenise;
 use crate::native::Builtin;
 use crate::ops;
 use crate::parser::parse;
+use crate::permission::Effect;
 use crate::program::{Closure, Op, Operand, Program, WindowFn};
 use crate::temporal;
 use crate::vm_config::VmConfig;
@@ -43,6 +44,9 @@ pub struct Vm {
     /// and the failing `ip`. Taken by [`Vm::take_error_site`] for the
     /// `path:line:` prefix.
     pub(crate) error_site: Option<(Arc<Program>, usize)>,
+    /// Refuses every [`Effect::Write`] action unless built with
+    /// [`Vm::new_writable`]. Fixed when the `Vm` is built and never changed.
+    read_only: bool,
     /// Set by `\1 <path>`: [`Vm::emit`] also appends here.
     pub stdout_log: Option<std::fs::File>,
     /// When set, [`Vm::emit`] appends here instead of printing (the wasm REPL).
@@ -292,6 +296,7 @@ impl Default for Vm {
 }
 
 impl Vm {
+    /// A read-only session: it refuses every write action for its whole life.
     pub fn new() -> Self {
         Self {
             globals: HashMap::new(),
@@ -303,6 +308,7 @@ impl Vm {
             fp: None,
             call_depth: 0,
             error_site: None,
+            read_only: true,
             stdout_log: None,
             capture: None,
             #[cfg(feature = "wasm")]
@@ -338,12 +344,29 @@ impl Vm {
         result
     }
 
-    /// Error if the current dispatched request came over a read-only handle.
-    /// A no-op for local input.
-    #[cfg_attr(not(feature = "ipc"), allow(unused_variables))]
-    pub(crate) fn check_write_allowed(&self, what: &str) -> Result<(), QplError> {
+    /// A session that may also perform write actions (`qpl -w`).
+    pub fn new_writable() -> Self {
+        Self {
+            read_only: false,
+            ..Self::new()
+        }
+    }
+
+    /// Whether this session refuses write actions.
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Error if the session may not perform an action with `effect`: a write
+    /// in a read-only session, or any change over a read-only IPC handle.
+    pub(crate) fn authorize(&self, effect: Effect, what: &str) -> Result<(), QplError> {
+        if effect == Effect::Write && self.read_only {
+            return Err(QplError::Runtime(format!(
+                "Cannot perform write action in read-only session: {what} (start qpl with -w to allow writes)"
+            )));
+        }
         #[cfg(feature = "ipc")]
-        if self.request_mode == Some(crate::ipc::HandleMode::Read) {
+        if effect != Effect::Read && self.request_mode == Some(crate::ipc::HandleMode::Read) {
             return Err(QplError::Runtime(format!(
                 "{what} is not allowed over a read-only connection (open with `w!hopen` for a write handle)"
             )));
@@ -433,11 +456,12 @@ impl Vm {
 
     /// Point the stdout log at `path` (appending), or detach it with `""`.
     pub fn set_stdout_log(&mut self, path: &str) -> Result<(), QplError> {
-        self.check_write_allowed("\\1 (stdout log)")?;
         if path.is_empty() {
+            self.authorize(Effect::Session, "\\1 (stdout log)")?;
             self.stdout_log = None;
             return Ok(());
         }
+        self.authorize(Effect::Write, "\\1 (stdout log)")?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -734,7 +758,7 @@ impl Vm {
                 let name = pop_name(&mut self.stack)?;
                 match self.niladic_closure_or_builtin(&name) {
                     Niladic::Builtin(b) => {
-                        let v = match (b.call)(self, vec![])? {
+                        let v = match self.call_builtin(&name, b, vec![])? {
                             Slot::Scalar(v) => v,
                             other => {
                                 return Err(QplError::Runtime(format!(
@@ -793,7 +817,7 @@ impl Vm {
                 let name = pop_name(&mut self.stack)?;
                 match self.niladic_closure_or_builtin(&name) {
                     Niladic::Builtin(b) => {
-                        let slot = (b.call)(self, vec![])?;
+                        let slot = self.call_builtin(&name, b, vec![])?;
                         self.stack.push(slot);
                     }
                     Niladic::Closure(c) => {
@@ -1326,7 +1350,7 @@ impl Vm {
             }
 
             Op::Sink => {
-                self.check_write_allowed("sink")?;
+                self.authorize(Effect::Write, "sink")?;
                 let path = pop1(&mut self.stack)?.unwrap_scalar()?;
                 let path_str = match path {
                     Value::Str(s) => s,
@@ -1541,7 +1565,7 @@ impl Vm {
             }
 
             Op::Store => {
-                self.check_write_allowed("assignment")?;
+                self.authorize(Effect::Session, "assignment")?;
                 let name = pop_name(&mut self.stack)?;
                 let value = self
                     .stack
@@ -1776,8 +1800,9 @@ impl Vm {
         Ok(())
     }
 
-    /// Arity-checks and runs a builtin (`.qpl.dt`, ...).
+    /// Authorizes, arity-checks and runs a builtin (`.qpl.dt`, ...).
     fn call_builtin(&mut self, name: &str, b: Builtin, args: Vec<Slot>) -> Result<Slot, QplError> {
+        self.authorize(b.effect, name)?;
         if !b.arity.contains(&args.len()) {
             return Err(QplError::Runtime(format!(
                 "'{name}' takes {} argument(s), got {}",
@@ -1796,7 +1821,7 @@ impl Vm {
             self.emit(&current);
             return Ok(Slot::Noop);
         }
-        self.check_write_allowed(".qpl.cfg")?;
+        self.authorize(Effect::Session, ".qpl.cfg")?;
         for pair in args.split_whitespace() {
             let (key, value) = pair.split_once('=').ok_or_else(|| {
                 QplError::Runtime(format!("expected key=value in `.qpl.cfg`, got '{pair}'"))
@@ -2419,7 +2444,7 @@ mod tests {
             "c3" => [1.0f64, 2.0, 3.0, 4.0],
         ]
         .unwrap();
-        let mut vm = Vm::new();
+        let mut vm = Vm::new_writable();
         vm.globals.insert("t".into(), Value::Table(df));
         vm
     }
@@ -2624,6 +2649,125 @@ mod tests {
         }
     }
 
+    // --- read-only sessions (the default; `qpl -w` for writes) ---
+
+    mod read_only_session {
+        use super::*;
+
+        fn read_only_vm() -> Vm {
+            let mut vm = Vm::new();
+            vm.globals = make_vm().globals;
+            vm
+        }
+
+        fn assert_write_refused(vm: &mut Vm, src: &str, what: &str) {
+            match run_vm(src, vm) {
+                Err(QplError::Runtime(msg)) => assert_eq!(
+                    msg,
+                    format!(
+                        "Cannot perform write action in read-only session: {what} (start qpl with -w to allow writes)"
+                    )
+                ),
+                other => panic!("expected '{src}' to be refused, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_session_is_read_only_unless_built_writable() {
+            assert!(Vm::new().read_only());
+            assert!(Vm::default().read_only());
+            assert!(!Vm::new_writable().read_only());
+        }
+
+        #[test]
+        fn sink_is_refused_and_writes_nothing() {
+            let path = "qpl_vm_test_read_only_session_sink.parquet";
+            let mut vm = read_only_vm();
+            assert_write_refused(&mut vm, &format!(r#"t sink "{path}""#), "sink");
+            assert!(!std::path::Path::new(path).exists());
+        }
+
+        #[test]
+        fn sink_inside_a_function_is_refused_when_reached() {
+            let path = "qpl_vm_test_read_only_session_fn_sink.parquet";
+            let mut vm = read_only_vm();
+            run_vm(&format!(r#"save: {{[x] x sink "{path}"}}"#), &mut vm)
+                .expect("defining the function writes nothing");
+            assert_write_refused(&mut vm, "save[t]", "sink");
+            assert!(!std::path::Path::new(path).exists());
+        }
+
+        #[test]
+        fn queries_bindings_cfg_and_log_are_allowed() {
+            let mut vm = read_only_vm();
+            run_vm("u: select from t where c2 > 10", &mut vm).expect("assignment");
+            run_vm("x: 1 + 2", &mut vm).expect("scalar assignment");
+            run_vm("select from u", &mut vm).expect("query");
+            vm.capture = Some(String::new());
+            run_vm(r#"log["x is "; x]"#, &mut vm).expect("log");
+            assert_eq!(vm.capture.as_deref(), Some("x is 3\n"));
+            vm.native_cfg(vec![Slot::Scalar(Value::Str("round_type=HALF_UP".into()))])
+                .expect(".qpl.cfg");
+        }
+
+        #[test]
+        fn stdout_log_to_a_file_is_refused_but_detaching_is_allowed() {
+            let path = "qpl_vm_test_read_only_session_stdout.log";
+            let mut vm = read_only_vm();
+            match vm.set_stdout_log(path) {
+                Err(QplError::Runtime(msg)) => assert_eq!(
+                    msg,
+                    "Cannot perform write action in read-only session: \\1 (stdout log) (start qpl with -w to allow writes)"
+                ),
+                other => panic!("expected \\1 to be refused, got {other:?}"),
+            }
+            assert!(!std::path::Path::new(path).exists());
+            vm.set_stdout_log("").expect("detaching writes nothing");
+        }
+
+        #[test]
+        fn a_write_builtin_is_refused_before_it_runs() {
+            fn must_not_run(_: &mut Vm, _: Vec<Slot>) -> Result<Slot, QplError> {
+                panic!("a write builtin ran in a read-only session")
+            }
+            let mut vm = read_only_vm();
+            for (name, arity) in [(".test.write", 1..=1), (".test.write0", 0..=0)] {
+                vm.builtins.insert(
+                    name.into(),
+                    Builtin {
+                        arity,
+                        effect: Effect::Write,
+                        call: must_not_run,
+                    },
+                );
+            }
+            assert_write_refused(&mut vm, ".test.write[1]", ".test.write");
+            // a niladic builtin is called by naming it bare
+            assert_write_refused(&mut vm, "x: .test.write0", ".test.write0");
+        }
+
+        #[cfg(feature = "ipc")]
+        #[test]
+        fn a_write_handle_is_refused_before_connecting() {
+            let mut vm = read_only_vm();
+            assert_write_refused(&mut vm, "`w!hopen 1", "whopen");
+            assert!(vm.connections.is_empty());
+        }
+
+        #[cfg(feature = "ipc")]
+        #[test]
+        fn a_write_handle_request_still_cannot_write() {
+            use crate::ipc::HandleMode;
+            let path = "qpl_vm_test_read_only_session_ipc_sink.parquet";
+            let mut vm = read_only_vm();
+            vm.with_request_permission(HandleMode::Write, |vm| {
+                run_vm("x: 1", vm).expect("assignment over a write handle");
+                assert_write_refused(vm, &format!(r#"t sink "{path}""#), "sink");
+            });
+            assert!(!std::path::Path::new(path).exists());
+        }
+    }
+
     // --- per-connection read/write permission (`ipc` feature) ---
 
     #[cfg(feature = "ipc")]
@@ -2664,6 +2808,11 @@ mod tests {
         fn read_handle_rejects_sink() {
             assert_read_only_rejects(r#"t sink "qpl_vm_test_read_only_sink.parquet""#);
             assert!(!std::path::Path::new("qpl_vm_test_read_only_sink.parquet").exists());
+        }
+
+        #[test]
+        fn read_handle_rejects_opening_a_write_handle() {
+            assert_read_only_rejects("`w!hopen 1");
         }
 
         #[test]

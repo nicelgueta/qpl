@@ -100,7 +100,9 @@ body can't rely on "the rest of the line" the way a REPL line can.
 ## Teeing output to a file
 
 `\1 <path>` mirrors everything printed — log lines and query results alike —
-into a file as well as the terminal. A bare `\1` stops it. This works in
+into a file as well as the terminal. A bare `\1` stops it. Writing the file
+is a write action, so it needs a session started with `qpl -w`; see
+[Read-only sessions](read-only.md). This works in
 scripts and in the REPL:
 
 ```qpl

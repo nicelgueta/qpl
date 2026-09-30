@@ -82,7 +82,14 @@ table can't be taken at all.
 when a `Vm` starts. It also defines `NativeId`, the short list of
 primitives (`\l`, `\i`, `\port`, `.qpl.cfg` and a few others) that the
 compiler calls *by id* rather than by name, so no binding can ever get in
-their way.
+their way. Every entry in the table carries the `Effect` it may have, which
+the VM checks before calling it.
+
+**`permission`** defines `Effect`, the class of change an action makes:
+`Read` (nothing), `Session` (the session's own bindings and settings) or
+`Write` (anything outside the session). `Vm::authorize` refuses an action
+whose effect the session or the current IPC request doesn't permit; see
+[Read-only sessions](../language/read-only.md).
 
 **`temporal`** handles everything calendar-related: parsing q-style date
 and time literals, formatting them back, the `.qpl.dt`/`.qpl.tm`-style "now"

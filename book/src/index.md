@@ -12,6 +12,14 @@ The result is a language you can type a real query into faster than you could
 describe that query to somebody else, and which will then chew through a
 parquet file considerably larger than the memory on the machine.
 
+It's also a language you can safely hand to an AI agent, and that is a design
+goal, not a side effect. Everything in the language has a permission, read or
+write, and every session is read-only unless it's started with `-w`. A
+read-only session can run any qpl it's given, but it can't write to disk or
+change anything outside itself, and nothing it runs can change that. The safety guarantee lives in the language rather than in
+a sandbox wrapped around it. [Read-only sessions](language/read-only.md)
+covers it in full.
+
 It's worth being clear up front about what "inspired by" means. qpl borrows
 a handful of ideas from q: terse right-to-left expressions, `select … by …
 from` queries, dotted date and time literals. It is not q, not a q dialect,

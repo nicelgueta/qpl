@@ -26,7 +26,7 @@ tables that ship with the REPL (`qpl --load-demo`). They're not committed so the
 scripts run out of the box. To recreate them:
 
 ```bash
-cargo run -- --load-demo examples/setup_data.qpl
+cargo run -- -w --load-demo examples/setup_data.qpl
 ```
 
 
@@ -35,17 +35,19 @@ cargo run -- --load-demo examples/setup_data.qpl
 ```bash
 cargo run -- examples/basics.qpl
 cargo run -- examples/lazy_and_collect.qpl
-cargo run -- examples/lazy_join_pipeline.qpl
+cargo run -- -w examples/lazy_join_pipeline.qpl
 ```
 
 Or, with an installed binary:
 
 ```bash
-qpl examples/lazy_join_pipeline.qpl
+qpl -w examples/lazy_join_pipeline.qpl
 ```
 
 
-`lazy_join_pipeline.qpl` writes `data/market_summary.parquet` when it runs.
+`lazy_join_pipeline.qpl` writes `data/market_summary.parquet` when it runs,
+which is why it needs `-w`: without it a session is read-only and `sink` is
+refused.
 
 
 ## Namespaces & imports

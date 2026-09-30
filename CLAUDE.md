@@ -21,7 +21,8 @@ cargo test <name>           # run tests matching a substring, e.g. `cargo test l
 cargo test --package qpl parser::   # run one module's tests
 cargo run                   # start the REPL
 cargo run -- --load-demo    # REPL preloaded with demo `trades` / `quotes` tables
-cargo run -- script.qpl     # execute a script
+cargo run -- script.qpl     # execute a script (read-only: `sink`/`\1 <path>` refused)
+cargo run -- -w script.qpl  # execute a script with write permission
 cargo run -- -i script.qpl  # execute a script, then drop into the REPL
 cargo run -- examples/lazy_join_pipeline.qpl   # run an example
 cargo run -- -c 'select avg price by sym from trades' --load-demo   # run an ad hoc command and exit
@@ -106,6 +107,7 @@ is reused.
 | `ops` | Type-dispatched semantics the opcode dispatch loop delegates to, so `vm.rs`'s `match` arms stay thin: scalar/vector/temporal binops and casts, verb application, `like`, natives that don't need a native-function slot to themselves (`til`, `enlist`, roll, `zip`, `log`, `hopen`/`whopen`/`await`, `dispatch` — `call_by_name` is the shadowable-by-name dispatch point) |
 | `vm` | `Vm` (the single evaluator), `Slot` (stack entries), `CallFrame`-equivalent (`Slot::Call`), the `Op` decode/dispatch loop (`Vm::run_compiled`) — each arm small, delegating to `ops.rs`. `run_vm` (single-statement helper) and `EvalResult` also live here |
 | `native` | Built-in (native) functions — a `name → Builtin` map built once in `Vm::new`, resolved through `Vm::lookup` exactly like a user function, except a builtin name can never be bound over. `NativeId` (`Enlist`/`Roll`/`Cfg`/…) is for the handful of primitives the compiler references *by id* instead of by name, so they can't be shadowed at all. Adding a name-resolved native needs no lexer/parser/compiler change |
+| `permission` | `Effect` (`Read`/`Session`/`Write`) — what an action may change. `Vm::authorize(effect, what)` is the single permission check: a read-only session (`Vm::new`/`Vm::default` — the default; `Vm::new_writable` for `qpl -w`; fixed at construction, never changed) refuses `Write`; a request over a read-only IPC handle refuses `Session` and `Write`. `Builtin` entries carry an `effect` that `Vm::call_builtin` checks before every call; `sink`, assignment, `.qpl.cfg`, `\1` and `whopen` call `authorize` inline |
 | `vm_config` | `VmConfig` — session knobs set by `.qpl.cfg key=value` (`maxcol`, `maxrow`, `tblwidth`, `strlen`, `round_type`, `useqepoch`); a new knob is a field + a `VmConfig::set` arm and nothing else |
 | `errors` | `QplError` (Lex/Parse/Compile/Runtime variants) — the single error type threaded everywhere |
 | `repl` | The REPL loop, `run_script` (parse_program → compile_program → run_compiled for a whole file, aborting before any statement runs on a parse/compile error anywhere in it — including inside a `\l`/`\i` target; also runs a `.qplc` file straight from bytes, sniffed by magic number), `compile_script` (source → `Program`, no run — `qpl -C`), `run_command` (`qpl -c`), demo tables, result formatting. `wants_more` (interactive-loop-only: brackets/trailing-comma/parse-cut-off) decides whether to keep reading a half-typed statement. All printing goes through `Vm::emit`, which mirrors to the stdout log. `\port` is an ordinary statement (`Vm::native_port` sets `Vm::port`); `start()` switches to polling stdin and the listener once a port is open, and `main.rs` enters it after a script that left one open |
@@ -213,7 +215,9 @@ prefer expressing a new language feature in terms of existing opcodes over
 either. Opcode count is deliberately kept well under the 256 a single byte
 allows.
 
-**Adding a new native function**: add an entry to `native::builtins()` (or,
+**Adding a new native function**: add an entry to `native::builtins()` with
+the `Effect` it has — `Write` for anything that changes state outside the
+session, so a read-only session refuses it (or,
 if it must never be shadowable and the compiler can reference it directly
 without a name lookup, a `NativeId` variant) — no lexer/parser/compiler
 change needed for a name-resolved native.

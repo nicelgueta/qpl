@@ -17,6 +17,7 @@ pub mod lexer;
 pub mod native;
 pub mod ops;
 pub mod parser;
+pub mod permission;
 pub mod program;
 pub mod repl;
 pub mod temporal;

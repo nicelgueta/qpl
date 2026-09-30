@@ -27,6 +27,7 @@
   - [Logging](language/logging.md)
   - [Config](language/config.md)
   - [IPC](language/ipc.md)
+  - [Read-only sessions](language/read-only.md)
   - [Operator reference](language/operator-reference.md)
 - [REPL](repl.md)
 - [Architecture](architecture/index.md)

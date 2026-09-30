@@ -19,6 +19,11 @@ struct Cli {
     #[arg(long = "load-demo", action = SetTrue)]
     load_demo: bool,
 
+    /// Allow write actions (`sink`, `\1 <path>`, `w!hopen`) — without it the
+    /// session is read-only
+    #[arg(short = 'w', long = "write", action = SetTrue, conflicts_with_all = ["compile", "disassemble"])]
+    write: bool,
+
     /// Compile a script to bytecode and exit (writes <script-stem>.qplc next
     /// to it, or -o's path) — doesn't run it
     #[arg(short = 'C', long = "compile", value_name = "SCRIPT", conflicts_with_all = ["file", "interactive", "command", "disassemble"])]
@@ -70,7 +75,11 @@ fn main() {
         return;
     }
 
-    let mut vm = vm::Vm::new();
+    let mut vm = if cli.write {
+        vm::Vm::new_writable()
+    } else {
+        vm::Vm::new()
+    };
     install_ctrl_c(&vm);
 
     if cli.load_demo {
@@ -429,6 +438,53 @@ mod tests {
             err(&["qpl", "-C", "a.qpl", "-i"]),
             "-C conflicts with -i (which also needs a file)"
         );
+
+        assert!(ok(&["qpl", "-w"]));
+        assert!(ok(&["qpl", "--write", "script.qpl"]));
+        assert!(ok(&["qpl", "-w", "-c", "1+1"]));
+        assert!(ok(&["qpl", "-wi", "script.qpl"]));
+        assert!(
+            err(&["qpl", "-w", "-C", "a.qpl"]),
+            "-w conflicts with -C (nothing runs)"
+        );
+        assert!(
+            err(&["qpl", "-w", "-d", "a.qplc"]),
+            "-w conflicts with -d (nothing runs)"
+        );
+    }
+
+    #[test]
+    fn sessions_are_read_only_unless_started_with_write() {
+        let path = scratch_path("read_only_cli.parquet");
+        let _ = std::fs::remove_file(&path);
+        let sink = format!(
+            "a: 1 2\nt: zip `a!a\nlog \"rows \" a\nt sink \"{}\"",
+            path.display()
+        );
+
+        let out = qpl().args(["-c", &sink]).output().expect("run qpl -c");
+        assert!(!out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "rows 1 2");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(
+                "Cannot perform write action in read-only session: sink (start qpl with -w"
+            ),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!path.exists());
+
+        let out = qpl()
+            .args(["-w", "-c", &sink])
+            .output()
+            .expect("run qpl -w -c");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(path.exists());
+        let _ = std::fs::remove_file(&path);
     }
 
     // the temp-file-then-rename write path, in-process

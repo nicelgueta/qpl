@@ -656,7 +656,8 @@ mod golden {
         name: &str,
         run: impl FnOnce(&str, &mut Vm) -> Result<(), QplError>,
     ) -> (String, Option<String>) {
-        let mut vm = Vm::new();
+        // examples demonstrate writes, and are run with `qpl -w`
+        let mut vm = Vm::new_writable();
         load_demo_tables(&mut vm);
         vm.capture = Some(String::new());
 

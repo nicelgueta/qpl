@@ -8,13 +8,14 @@
 //! - `ops::call_by_name` (`til`, `log`, `hopen`, ...): only reached when no
 //!   user function or table entry matches, so a user function wins.
 //!
-//! 
+//!
 //! Adding an entry to [`builtins`] needs no lexer/parser/compiler change.
 
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 
 use crate::errors::QplError;
+use crate::permission::Effect;
 use crate::temporal::{self, TemporalNowFuncType};
 use crate::vm::{Slot, Vm};
 
@@ -43,10 +44,12 @@ pub enum NativeId {
 /// The signature every native shares: evaluated argument slots in, one slot out.
 pub(crate) type NativeFn = fn(&mut Vm, Vec<Slot>) -> Result<Slot, QplError>;
 
-/// One native function: its accepted arity and implementation.
+/// One native function: its accepted arity, what it may change (checked by
+/// the VM before every call), and implementation.
 #[derive(Clone)]
 pub(crate) struct Builtin {
     pub arity: RangeInclusive<usize>,
+    pub effect: Effect,
     pub call: NativeFn,
 }
 
@@ -82,6 +85,7 @@ pub(crate) fn builtins() -> HashMap<String, Builtin> {
         ".qpl.dt".to_string(),
         Builtin {
             arity: 0..=0,
+            effect: Effect::Read,
             call: now_fn(TemporalNowFuncType::Date),
         },
     );
@@ -89,6 +93,7 @@ pub(crate) fn builtins() -> HashMap<String, Builtin> {
         ".qpl.tm".to_string(),
         Builtin {
             arity: 0..=0,
+            effect: Effect::Read,
             call: now_fn(TemporalNowFuncType::Time),
         },
     );
@@ -96,6 +101,7 @@ pub(crate) fn builtins() -> HashMap<String, Builtin> {
         ".qpl.ts".to_string(),
         Builtin {
             arity: 0..=0,
+            effect: Effect::Read,
             call: now_fn(TemporalNowFuncType::Timestamp),
         },
     );
@@ -103,6 +109,7 @@ pub(crate) fn builtins() -> HashMap<String, Builtin> {
         ".qpl.dlta".to_string(),
         Builtin {
             arity: 0..=0,
+            effect: Effect::Read,
             call: now_fn(TemporalNowFuncType::Timespan),
         },
     );

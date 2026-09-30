@@ -1073,6 +1073,10 @@ pub(crate) fn native_hopen(
     args: Vec<Slot>,
     mode: crate::ipc::HandleMode,
 ) -> Result<Slot, QplError> {
+    // a write handle can change the remote session
+    if mode == crate::ipc::HandleMode::Write {
+        vm.authorize(crate::permission::Effect::Write, "whopen")?;
+    }
     let addr_val = slot_to_scalar_value(
         args.into_iter()
             .next()

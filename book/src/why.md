@@ -20,11 +20,41 @@ than just writing the query, assuming the language lets me write it quickly.
 That "assuming" is the whole project. I wanted something concise enough to
 type without really thinking about it, which behaves like a scripting
 language when I need it to, treats queries as first-class syntax rather than
-strings, and still runs at a speed in the same league as DuckDB. A pleasant
-side effect is that a language like that is also easy for an LLM agent to
-drive, and difficult for one to do much damage with, sandboxed or not.
+strings, and still runs at a speed in the same league as DuckDB.
 
 Ambitious? Well. Quite.
+
+## Safe to hand to an agent
+
+A language like that turns out to suit LLM agents as much as people. It's
+terse, so queries cost few tokens. It gives an error straight away rather
+than a wrong answer later. And it runs fast enough that an agent can explore
+a dataset one small query at a time, the same way a person at the REPL
+would.
+
+What matters more is what an agent *can't* do with it. Handing an agent
+Python or a shell to work with data also hands it the ability to delete
+files, overwrite the data it was meant to be reading, or install whatever it
+likes. So the safety has to come from a container or permissions layer
+wrapped around the interpreter, which the language itself knows nothing
+about and which has to be set up again for every deployment.
+
+qpl draws that line inside the language. An agent can run any qpl it likes,
+but there's no `exec`, no shell-out and no package import, so everything it
+does goes through qpl's own actions, and every one of those has a permission:
+read or write. A session is read-only unless it's started with `-w`, and a
+read-only session refuses every write for the life of the process: no
+`sink`, no log file, no write handle to another server. Nothing the agent
+types, loads or dispatches can change that. The agent still gets the whole
+language to reason with (bindings, functions, loops, lazy plans), and only
+loses the ability to leave a mark on anything outside the session. Because
+writing takes an explicit flag, an agent harness can forbid it with a single
+rule.
+
+That makes the permissions part of the language rather than something
+bolted on around it, and it's the property that everything qpl adds later
+has to preserve. [Read-only sessions](language/read-only.md) has the
+details.
 
 ## Standing on Polars
 

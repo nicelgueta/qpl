@@ -16,7 +16,7 @@ reimplementation: `Repl.eval` calls `repl::eval_capture`, which wraps the same
 
 | Export | Notes |
 |--------|-------|
-| `new Repl()` | one long-lived `Vm`; state carries across `eval` calls exactly as it does across REPL lines |
+| `new Repl()` | one long-lived, read-only `Vm` (there's no filesystem to write to); state carries across `eval` calls exactly as it does across REPL lines |
 | `repl.eval(line)` | `{ output, error }` — `output` is what the CLI would print to stdout, `error` is `null` or the message it would print to stderr |
 | `repl.registerTable(name, ipc)` | bind `name` to the table in `ipc`, an uncompressed Arrow IPC **stream**; replaces an existing binding. Throws on a bad name (plain identifiers only) or payload. This is how a host gets data in, since `load` needs a filesystem |
 | `repl.rowCount(name)` | rows in the table bound to `name`, for paging. The language's `count` counts non-null values in a table's first column, so it can't be used for this |

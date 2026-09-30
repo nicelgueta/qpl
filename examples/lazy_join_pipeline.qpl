@@ -7,7 +7,7 @@
 / only execution happens when `sink` writes the final plan to disk.
 /
 / Run from the repo root:
-/   cargo run -- examples/lazy_join_pipeline.qpl
+/   cargo run -- -w examples/lazy_join_pipeline.qpl
 / ─────────────────────────────────────────────────────────────────────────────
 
 / 1. scan both inputs as lazy plans (no IO yet)

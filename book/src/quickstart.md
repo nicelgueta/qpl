@@ -143,10 +143,20 @@ Finally, write it somewhere:
 
 ```qpl
 qpl) t sink "big.parquet"          / write it out
+'Cannot perform write action in read-only session: sink (start qpl with -w to allow writes)
 ```
 
-`sink` streams a table to a file, choosing the format from the extension.
-There's no separate "materialise, then save" step to perform.
+That's deliberate. Every qpl session is read-only unless you ask otherwise,
+so nothing you (or an agent) run in it can write to disk by accident; see
+[Read-only sessions](language/read-only.md). Start qpl with `-w` to allow
+writes:
+
+```bash
+qpl -w --load-demo
+```
+
+and the same `sink` streams the table to a file, choosing the format from the
+extension. There's no separate "materialise, then save" step to perform.
 
 That trailing `/ write it out` is a comment. `/` comments out everything to
 the end of the line, and it's used throughout this book to annotate examples.
@@ -176,6 +186,7 @@ qpl -c '<command>'  # run one ad hoc command and exit, like `python -c`
 qpl -C script.qpl   # compile to script.qplc (add -o to redirect); doesn't run it
 qpl script.qplc     # run a compiled script — no lexing/parsing/compiling
 qpl -d script.qplc  # print a compiled (or source) script's bytecode; doesn't run it
+qpl -w ...          # any of the running forms, with write permission (`sink`, `\1 <path>`)
 ```
 
 `-i` is the one worth remembering. It's how you'd load your real tables from

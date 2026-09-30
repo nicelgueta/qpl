@@ -65,10 +65,12 @@ Every connection carries a permission, chosen by the client when it opens
 the handle. Plain `hopen` gives a read-only handle, and `` `w!hopen `` (which
 comes out of the parser as `whopen`) asks for a write handle. The mode rides
 along as a single tag byte in front of each request. While the server
-evaluates that request it holds the mode on the `Vm`, and anything that
-would change the session (an assignment, `sink`, `.qpl.cfg`, `\1`) checks
-it and refuses on a read-only handle. Input typed at the server's own
-prompt is never restricted.
+evaluates that request it holds the mode on the `Vm`. `Vm::authorize`
+refuses anything whose `permission::Effect` isn't `Read` (an assignment,
+`sink`, `.qpl.cfg`, `\1`, `whopen`) on a read-only handle. The same check
+enforces a read-only session (any session not started with `qpl -w`),
+which refuses `Effect::Write` from every source. Input typed at the server's own prompt is only subject to the
+session's restriction.
 
 ## The client side
 

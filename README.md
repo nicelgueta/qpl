@@ -11,6 +11,12 @@ The result is a language you can type a real query into faster than you could
 describe that query to someone else, and which will then chew through a
 parquet file considerably larger than the machine's memory.
 
+It's also a language you can safely hand to an AI agent. Every qpl session is
+read-only unless it's started with `-w`, and a read-only session can't write
+to disk or change anything outside itself, whatever it's asked to run. That
+guarantee comes from the language itself, not from a sandbox around it.
+[More below](#built-for-agents).
+
 qpl borrows a handful of ideas from q (terse right-to-left expressions,
 `select … by … from` queries, dotted temporal literals) but it isn't q, a q
 dialect, or an attempt at compatibility with kdb+. It's its own language, and
@@ -61,6 +67,62 @@ select tot: sum price * size, avg_spread: avg ask - bid, n: count price
 No `CREATE TYPE` preamble, no `COPY (...) TO` wrapper to get the output onto
 disk, and the grouping keys named once rather than repeated in a `GROUP BY`.
 
+## Built for agents
+
+Giving an agent Python or a shell to explore data means giving it everything
+else too: it can delete files, overwrite the data it was meant to read, or
+install packages. The usual answer is a container or a permissions layer
+wrapped around the interpreter. That works, but the safety then lives in
+infrastructure the agent's language knows nothing about, and it has to be
+rebuilt for every deployment.
+
+qpl puts the boundary inside the language:
+
+- **Any qpl, limited reach.** An agent can write and run any qpl it likes:
+  queries, bindings, functions, loops, lazy plans. But everything it does
+  goes through qpl's own actions. There's no `exec`, no shell-out and no
+  package import to step outside them, so in a read-only session the worst a
+  confused agent can do is run a bad query.
+- **Everything has a permission.** Every action in the language is either a
+  **read** or a **write**. Read covers almost everything: querying, loading
+  files, binding names, defining functions, changing settings, logging,
+  connecting to other servers. Write is anything that writes to disk or
+  changes state outside the session: `sink`, `\1 <path>`, and a write handle
+  to another server. The VM checks the permission before the action runs,
+  every time.
+- **Read-only by default.** A session only gets write permission when it's
+  started with `-w` (`--write`). Without it, every write fails with
+  `Cannot perform write action in read-only session: <action>`, and
+  everything else works as normal, so the agent still gets a full language
+  to think in.
+- **Fixed for the life of the session.** No statement can grant write
+  permission. It holds through functions, `\l`-loaded scripts, compiled
+  `.qplc` files and IPC requests alike.
+
+In practice a qpl tool for an agent is a one-liner:
+
+```bash
+qpl -c "$QUERY"            # one query per tool call
+qpl -i setup.qpl           # or a long-lived session: load the data once,
+                           # open a \port, and let agents query it over IPC
+```
+
+Because writing needs an explicit flag, it's also easy to forbid. In
+[Claude Code](https://code.claude.com/docs/en/permissions), for example, a
+project's `.claude/settings.json` can let the agent run qpl freely while
+denying it write permission:
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(qpl *)"],
+    "deny": ["Bash(qpl *-w*)", "Bash(qpl *-iw*)", "Bash(qpl *--write*)"]
+  }
+}
+```
+
+[The chapter][read-only] explains how that works and where its limits are.
+
 ## Install
 
 ```bash
@@ -99,6 +161,7 @@ qpl script.qpl      # run a script
 qpl -i script.qpl   # run a script, then stay in the REPL with its state
 qpl -c 'select avg price by sym from trades' --load-demo   # run one command and exit
 qpl -C script.qpl   # compile to script.qplc; `qpl script.qplc` then runs it with no parsing
+qpl -w script.qpl   # allow writes (`sink`, `\1 <path>`): sessions are read-only by default
 ```
 
 ```q
@@ -106,7 +169,7 @@ qpl) trades                                     / a bare table name prints it
 qpl) select sym, price from trades where price > 200
 qpl) select avg price by sym from trades        / group-by, key named once
 qpl) t: select from trades where size > 100     / bind a table
-qpl) t sink "big.parquet"                       / stream it to a file
+qpl) t sink "big.parquet"                       / stream it to a file (needs qpl -w)
 ```
 
 Runnable scripts are in [`examples/`](examples/).
@@ -128,7 +191,8 @@ write it quickly.
 So: something concise enough to type without thinking, that behaves like a
 scripting language, treats queries as first-class syntax rather than strings,
 and runs in the same league as DuckDB. A language like that also turns out to
-be easy for an agent to drive and hard for one to do much damage with.
+be easy for an agent to drive and hard for one to do much damage with, and
+read-only sessions turn "hard" into "can't" (see [Built for agents](#built-for-agents)).
 
 Writing a DuckDB-grade engine solo isn't realistic, so Polars does that part.
 Its API is clean enough that the language is really a small VM translating
@@ -235,7 +299,8 @@ select price, bid from trades `sym lj (select sym, bid from quotes where bid > 0
 ### Reading & writing files · [chapter][files]
 
 `load` reads parquet or CSV and is eager on its own; `sink` streams a table
-expression out to a file; `cols` shows a schema without reading data.
+expression out to a file (in a session started with `-w`); `cols` shows a
+schema without reading data.
 
 ```q
 t: load "data/trades.parquet"
@@ -579,6 +644,16 @@ and changing `.qpl.cfg` settings from it. `` `w!hopen `` opens a write handle. T
 chosen by the client, enforced per request, and never applies to the server
 operator's own input.
 
+### Read-only sessions · [chapter][read-only]
+
+The safety guarantee that makes qpl fit for agents (see
+[Built for agents](#built-for-agents)). Every action is a read or a write,
+and a session is read-only unless it's started with `qpl -w`. In a
+read-only session `sink`, `\1 <path>` and `` `w!hopen `` fail with
+`Cannot perform write action in read-only session: <action>`, while queries,
+assignments, functions, `log` and `.qpl.cfg` work as normal. No statement
+can change a session's permission.
+
 ### Operator reference · [chapter][operators]
 
 | Operator | Meaning |
@@ -708,14 +783,11 @@ wasm`. [The full story](tools/wasm/README.md).
 - Drop the Polars patch from the WASM build, once upstream builds for
   `wasm32-unknown-unknown` unaided.
 - A basic standard library of commonly needed functions, shipped with qpl.
-- A `--read-only` CLI flag. `sink` and logging become write actions, which
-  fail with `Cannot perform write action in read-only session` when the flag
-  is set.
 - A permissioned Rust extension framework, so qpl stays safe to hand to an
   agent as it grows. A proc macro exposes a Rust function to qpl and declares
-  it a **read** or **write** action, and `--read-only` switches off every
-  write action, built-in or extension, so a read-only session can't change state
-  whatever it calls. Permissioning is part of the language, not a sandbox
+  it a **read** or **write** action, so a read-only session refuses every
+  write action, built-in or extension, and can't change state whatever it
+  calls. Permissioning is part of the language, not a sandbox
   bolted on around it. Python extensions may be considered later.
 - Decide whether to support null as a first-class value in the language.
 - More of the language. Gaps are noted in the [book][book] beside the feature
@@ -744,4 +816,5 @@ wasm`. [The full story](tools/wasm/README.md).
 [imports]: https://nicelgueta.github.io/qpl/language/imports.html
 [ipc]: https://nicelgueta.github.io/qpl/language/ipc.html
 [operators]: https://nicelgueta.github.io/qpl/language/operator-reference.html
+[read-only]: https://nicelgueta.github.io/qpl/language/read-only.html
 [architecture]: https://nicelgueta.github.io/qpl/architecture.html
