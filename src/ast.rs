@@ -1,4 +1,4 @@
-use polars::prelude::{DataFrame, JoinType, LazyFrame, NamedFrom, Series};
+use polars::prelude::{DataFrame, JoinType, LazyFrame, NamedFrom, PolarsResult, Series};
 
 use crate::builtins::BuiltIn;
 
@@ -201,6 +201,21 @@ impl Value {
             Timespan(t) => timespan_vec(vec![*t]),
             _ => return None,
         })
+    }
+
+    /// Apply `f` to a vector's backing `Series`, rewrapping the result in the
+    /// same vector variant (a `DateVec` stays a `DateVec`). An error if
+    /// `self` isn't a list.
+    pub fn map_vec(
+        &self,
+        f: impl FnOnce(&Series) -> PolarsResult<Series>,
+    ) -> Result<Value, String> {
+        match self.as_vec() {
+            Some((kind, s)) => f(s)
+                .map(|s| Value::from_vec(kind, s))
+                .map_err(|e| e.to_string()),
+            None => Err(format!("expected a list, got {self:?}")),
+        }
     }
 
     /// Build a vector `Value` of the given kind from a backing `Series`.

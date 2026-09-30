@@ -67,16 +67,32 @@ pub trait Native {
 /// [`Vm::register`] (or passed to [`crate::cli::run`]).
 pub struct Extension {
     namespace: String,
+    owner: String,
     functions: Vec<(&'static str, Effect, usize, ExtFn)>,
 }
 
 impl Extension {
     /// An empty extension whose functions are called as `.<namespace>.<name>`.
+    /// `namespace` may be dotted (`"std.fs"`) to nest under a shared root.
+    /// Its owner defaults to the namespace itself; set [`Extension::owner`]
+    /// explicitly when several `Extension`s share a root.
     pub fn new(namespace: impl Into<String>) -> Self {
+        let namespace = namespace.into();
         Self {
-            namespace: namespace.into(),
+            owner: namespace.clone(),
+            namespace,
             functions: Vec::new(),
         }
+    }
+
+    /// Identify the crate or package registering this extension, so other
+    /// `Extension`s with the same owner can share its namespace root (e.g.
+    /// `Extension::new("std.fs").owner("qpl-std")` and
+    /// `Extension::new("std.env").owner("qpl-std")` both claim `std`).
+    /// Extensions with different owners are refused the same root.
+    pub fn owner(mut self, owner: impl Into<String>) -> Self {
+        self.owner = owner.into();
+        self
     }
 
     /// Add the function marked `#[qpl::native]` as `N`.
@@ -88,18 +104,30 @@ impl Extension {
 
 impl Vm {
     /// Add `ext`'s functions to this session's builtins. Fails, adding
-    /// nothing, on a bad or reserved namespace or a name already taken.
+    /// nothing, on a bad or reserved namespace, a root already owned by a
+    /// different extension, or a name already taken.
     pub fn register(&mut self, ext: Extension) -> Result<(), QplError> {
         let ns = &ext.namespace;
-        if !is_ident(ns) {
+        if !is_namespace(ns) {
             return Err(QplError::Runtime(format!(
-                "extension namespace '{ns}' must be a plain identifier (letters, digits, '_')"
+                "extension namespace '{ns}' must be dot-separated identifiers (letters, digits, '_')"
             )));
         }
-        if ns == "qpl" {
+        let root = ns
+            .split('.')
+            .next()
+            .expect("a valid namespace has a first segment");
+        if root == "qpl" {
             return Err(QplError::Runtime(
                 "extension namespace 'qpl' is reserved for qpl's own builtins".into(),
             ));
+        }
+        if let Some(owner) = self.extension_owners.get(root)
+            && owner != &ext.owner
+        {
+            return Err(QplError::Runtime(format!(
+                "extension namespace root '{root}' is already owned by '{owner}'"
+            )));
         }
         let mut entries = Vec::with_capacity(ext.functions.len());
         for &(name, effect, arity, call) in &ext.functions {
@@ -122,6 +150,8 @@ impl Vm {
             entries.push((full, builtin));
         }
         self.builtins.extend(entries);
+        self.extension_owners
+            .insert(root.to_string(), ext.owner.clone());
         Ok(())
     }
 }
@@ -130,6 +160,11 @@ fn is_ident(s: &str) -> bool {
     let mut chars = s.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A dot-separated namespace: every segment a plain identifier, none empty.
+fn is_namespace(ns: &str) -> bool {
+    ns.split('.').all(is_ident)
 }
 
 /// A qpl value's type, for conversion errors.
@@ -315,6 +350,39 @@ impl FromValue for Vec<String> {
             DataType::String,
             |s| Ok(s.str()?.iter().map(|o| o.map(str::to_owned)).collect()),
         )
+    }
+}
+
+/// A string or symbol argument that also accepts a list of either, so one
+/// function handles both forms.
+pub enum StrArg {
+    One(String),
+    /// A `String`-dtype `Series` backing a `StrVec`/`SymVec` argument.
+    Many(Series),
+}
+
+impl FromValue for StrArg {
+    fn from_value(v: Value) -> Result<Self, String> {
+        match v {
+            Value::Str(s) | Value::Sym(s) => Ok(StrArg::One(s)),
+            Value::StrVec(s) | Value::SymVec(s) => Ok(StrArg::Many(s)),
+            other => Err(expected("a string, a symbol, or a list of either", &other)),
+        }
+    }
+}
+
+impl StrArg {
+    /// Apply an elementwise string transform: a scalar `Value::Str` for
+    /// `One`, a `Value::StrVec` for `Many`. Nulls in `Many` pass through
+    /// unchanged.
+    pub fn map(&self, f: impl Fn(&str) -> String + Copy) -> Value {
+        match self {
+            StrArg::One(s) => Value::Str(f(s)),
+            StrArg::Many(s) => {
+                let ca = s.str().expect("StrArg::Many backs a String series");
+                Value::StrVec(ca.apply_values(|v| f(v).into()).into_series())
+            }
+        }
     }
 }
 
@@ -639,7 +707,17 @@ mod tests {
     #[test]
     fn register_rejects_bad_namespaces_and_duplicates_atomically() {
         let mut vm = Vm::new();
-        for ns in ["qpl", "", "a.b", "1x", "has space"] {
+        for ns in [
+            "qpl",
+            "qpl.sub",
+            "",
+            "a..b",
+            ".a",
+            "a.",
+            "1x",
+            "a.1x",
+            "has space",
+        ] {
             assert!(
                 vm.register(Extension::new(ns).with::<add>()).is_err(),
                 "namespace '{ns}' should be rejected"
@@ -663,6 +741,125 @@ mod tests {
         assert!(
             !vm.builtins.contains_key(".t.answer"),
             "a failed register adds nothing"
+        );
+    }
+
+    #[test]
+    fn a_dotted_namespace_is_callable_in_every_call_form() {
+        let mut vm = Vm::new();
+        vm.register(
+            Extension::new("a.b")
+                .with::<add>()
+                .with::<shout>()
+                .with::<answer>(),
+        )
+        .expect("dotted namespace registers");
+        assert!(matches!(scalar(&mut vm, ".a.b.add[2;3]"), Value::Int(5)));
+        assert!(matches!(
+            scalar(&mut vm, r#".a.b.shout "hi""#),
+            Value::Str(s) if s == "HI"
+        ));
+        assert!(matches!(scalar(&mut vm, ".a.b.answer"), Value::Int(42)));
+    }
+
+    #[test]
+    fn a_namespace_root_is_owned_by_its_first_registrant() {
+        let mut vm = Vm::new();
+        vm.register(Extension::new("std.str").owner("qpl-std").with::<shout>())
+            .expect("first sub-namespace");
+        vm.register(Extension::new("std.arr").owner("qpl-std").with::<answer>())
+            .expect("same owner, different sub-namespace");
+        assert!(vm.builtins.contains_key(".std.str.shout"));
+        assert!(vm.builtins.contains_key(".std.arr.answer"));
+
+        let err = vm
+            .register(
+                Extension::new("std.env")
+                    .owner("someone-else")
+                    .with::<add>(),
+            )
+            .expect_err("a different owner is refused the root");
+        assert!(
+            matches!(&err, QplError::Runtime(m) if m.contains("std") && m.contains("qpl-std")),
+            "{err:?}"
+        );
+        assert!(!vm.builtins.contains_key(".std.env.add"));
+
+        // same owner, no explicit `.owner()` call: each extension defaults to
+        // owning its own full namespace, so it's refused too.
+        let err = vm
+            .register(Extension::new("std.env").with::<add>())
+            .expect_err("default owner differs from 'qpl-std'");
+        assert!(matches!(err, QplError::Runtime(_)));
+    }
+
+    #[crate::native(read)]
+    fn upper(s: StrArg) -> Value {
+        s.map(str::to_uppercase)
+    }
+
+    #[test]
+    fn str_arg_maps_a_scalar_or_a_list() {
+        let mut vm = Vm::new();
+        vm.register(Extension::new("s").with::<upper>())
+            .expect("register");
+        assert!(matches!(
+            scalar(&mut vm, r#".s.upper["hi"]"#),
+            Value::Str(s) if s == "HI"
+        ));
+        assert!(matches!(
+            scalar(&mut vm, ".s.upper[`hi]"),
+            Value::Str(s) if s == "HI"
+        ));
+        match run_vm(r#".s.upper["a" "b"]"#, &mut vm) {
+            Ok(EvalResult::Scalar(Value::StrVec(s))) => {
+                assert_eq!(
+                    s.str().unwrap().iter().collect::<Vec<_>>(),
+                    vec![Some("A"), Some("B")]
+                );
+            }
+            other => panic!("expected a StrVec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn str_arg_rejects_other_kinds() {
+        let mut vm = Vm::new();
+        vm.register(Extension::new("s").with::<upper>())
+            .expect("register");
+        assert_eq!(
+            runtime_err(&mut vm, ".s.upper[1]"),
+            ".s.upper: argument 1: expected a string, a symbol, or a list of either, got an int"
+        );
+    }
+
+    #[crate::native(read)]
+    fn reversed(xs: Value) -> Result<Value, String> {
+        xs.map_vec(|s| Ok(s.reverse()))
+    }
+
+    #[test]
+    fn map_vec_rewraps_the_same_vector_kind() {
+        let mut vm = Vm::new();
+        vm.register(Extension::new("v").with::<reversed>())
+            .expect("register");
+        run_vm("xs: 1 2 3", &mut vm).expect("assign");
+        match run_vm(".v.reversed[xs]", &mut vm) {
+            Ok(EvalResult::Scalar(Value::IntVec(s))) => {
+                assert_eq!(
+                    s.i64().unwrap().iter().collect::<Vec<_>>(),
+                    vec![Some(3), Some(2), Some(1)]
+                );
+            }
+            other => panic!("expected an IntVec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_vec_rejects_a_non_list() {
+        assert_eq!(
+            Value::Int(1).map_vec(|s| Ok(s.clone())).unwrap_err(),
+            "expected a list, got Int(1)"
         );
     }
 }

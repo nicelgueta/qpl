@@ -23,6 +23,10 @@ pub struct Vm {
     /// Reserved natives (`.qpl.dt`, ...), built in [`Vm::new`]. Looked up like
     /// any name but can't be rebound. See [`crate::native`].
     pub(crate) builtins: HashMap<String, Builtin>,
+    /// Extension namespace roots already registered, mapped to the owner
+    /// that claimed them (see [`crate::ext::Extension::owner`]). A later
+    /// [`Vm::register`] under the same root must give the same owner.
+    pub(crate) extension_owners: HashMap<String, String>,
     /// The value stack. Holds computation values and [`Slot::Call`] frames,
     /// interleaved.
     pub(crate) stack: Vec<Slot>,
@@ -334,6 +338,7 @@ impl Vm {
         Self {
             globals: HashMap::new(),
             builtins: crate::native::builtins(),
+            extension_owners: HashMap::new(),
             stack: Vec::new(),
             prog: Arc::new(Program::default()),
             ip: 0,

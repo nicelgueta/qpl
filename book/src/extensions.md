@@ -111,6 +111,60 @@ Extension functions work on values: scalars, lists and whole tables. Like
 user-defined functions, they can't be called inside a `select` projection. To
 work on a column, take a list or a table.
 
+## Dotted namespaces and ownership
+
+`Extension::new` accepts a dotted namespace (`"std.fs"`), so a crate can
+group several extensions under a shared root: `.std.fs.exists`,
+`.std.env.r`, and so on. Each dot-separated segment is validated like any
+other identifier; an empty segment is rejected.
+
+The first extension registered under a root (`std`, here) owns it. A second
+extension registering under the same root is refused unless it declares the
+same owner with `Extension::owner`, which defaults to the extension's own
+namespace:
+
+```rust
+let str_ext = Extension::new("std.str").owner("qpl-std").with::<upper>();
+let arr_ext = Extension::new("std.arr").owner("qpl-std").with::<rv>();
+vm.register(str_ext)?;
+vm.register(arr_ext)?; // same owner, same root: allowed
+```
+
+Without an explicit owner, two unrelated extensions can't collide on a root
+by accident — each is refused the other's namespace unless they opt in by
+naming the same owner.
+
+## String arguments
+
+`ext::StrArg` accepts either a string/symbol scalar or a string/symbol list,
+so one function handles both:
+
+```rust
+#[qpl::native(read)]
+fn shout(s: StrArg) -> Value {
+    s.map(str::to_uppercase)
+}
+```
+
+`StrArg::map` applies an elementwise transform and returns the matching
+shape: a scalar for a scalar argument, a string list for a list argument
+(nulls pass through unchanged).
+
+## Preserving a list's kind
+
+A function that transforms a whole list without changing its element type
+uses `Value::map_vec`, which rewraps the result in the same vector variant:
+a `DateVec` argument comes back as a `DateVec`, not a plain list:
+
+```rust
+#[qpl::native(read)]
+fn rv(xs: Value) -> Result<Value, String> {
+    xs.map_vec(|s| Ok(s.reverse()))
+}
+```
+
+`map_vec` errors if the argument isn't a list.
+
 ## Arguments and results
 
 Parameters and return values convert to and from qpl values by type:
@@ -123,6 +177,7 @@ Parameters and return values convert to and from qpl values by type:
 | `String` | string, or a symbol as an argument |
 | `Vec<i64>`, `Vec<f64>`, `Vec<bool>`, `Vec<String>` | a list of that type |
 | `Series` | any list, as an argument |
+| `qpl::ext::StrArg` | a string/symbol or a list of either, as an argument |
 | `DataFrame` | a table (a lazy argument is collected first) |
 | `LazyFrame` | a table, kept lazy |
 | `qpl::ast::Value` | any value, unconverted |
