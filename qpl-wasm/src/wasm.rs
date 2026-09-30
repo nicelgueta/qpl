@@ -7,18 +7,18 @@
 //!   `tools/vscode/src/vocabulary.json` the VS Code extension reads.
 
 use crate::arrow_io;
-use crate::repl;
-use crate::vm::Vm;
 use js_sys::{Object, Reflect, Uint8Array};
+use qpl::repl;
+use qpl::vm::Vm;
 use serde_json::{Value as Json, json};
 use wasm_bindgen::prelude::*;
 
 /// Keyword/aggregate lists and hover text, shared with the VS Code extension.
-const VOCABULARY: &str = include_str!("../tools/vscode/src/vocabulary.json");
+const VOCABULARY: &str = include_str!("../../tools/vscode/src/vocabulary.json");
 /// Brackets, comments, auto-closing pairs, indentation rules.
-const LANG_CONFIG: &str = include_str!("../tools/vscode/language-configuration.json");
+const LANG_CONFIG: &str = include_str!("../../tools/vscode/language-configuration.json");
 /// VS Code snippets, reshaped into Monaco completion items.
-const SNIPPETS: &str = include_str!("../tools/vscode/snippets/qpl.json");
+const SNIPPETS: &str = include_str!("../../tools/vscode/snippets/qpl.json");
 
 #[wasm_bindgen]
 extern "C" {
@@ -334,7 +334,7 @@ fn to_regex(obj: &JsValue, key: &str) {
 
 /// The session's top-level bindings as JSON (see [`Repl::symbols`]).
 fn symbols_json(vm: &Vm) -> Json {
-    use crate::ast::Value;
+    use qpl::ast::Value;
     let mut tables: Vec<Json> = Vec::new();
     let mut variables = Vec::new();
     let mut functions = Vec::new();

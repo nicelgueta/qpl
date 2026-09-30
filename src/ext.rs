@@ -10,7 +10,7 @@
 //! fn haversine(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 { ... }
 //!
 //! fn main() {
-//!     qpl::cli::run(vec![qpl::ext::Extension::new("geo").with::<haversine>()]);
+//!     qpl_cli::run(vec![qpl::ext::Extension::new("geo").with::<haversine>()]);
 //! }
 //! ```
 //!

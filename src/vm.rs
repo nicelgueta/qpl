@@ -474,7 +474,7 @@ impl Vm {
 
     /// Bind `val` to `name` in the active call frame, or globals at top level,
     /// replacing whatever was there.
-    pub(crate) fn bind(&mut self, name: String, val: ast::Value) -> Result<(), QplError> {
+    pub fn bind(&mut self, name: String, val: ast::Value) -> Result<(), QplError> {
         self.check_not_builtin(&name)?;
         match self.current_frame_mut() {
             Some(frame) => {

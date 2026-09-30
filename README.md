@@ -129,7 +129,7 @@ denying it write permission:
 ## Install
 
 ```bash
-cargo install --path .
+cargo install --path qpl-cli
 ```
 
 Polars is a large crate, so a cold build takes a few minutes. Prebuilt
@@ -708,18 +708,18 @@ fn note(path: String, text: String) -> std::io::Result<()> { /* ... */ }
 
 fn main() {
     let geo = qpl::ext::Extension::new("geo").with::<km>().with::<note>();
-    qpl::cli::run(vec![geo]);   // the full `qpl` CLI, plus `.geo.km` and `.geo.note`
+    qpl_cli::run(vec![geo]);   // the full `qpl` CLI, plus `.geo.km` and `.geo.note`
 }
 ```
 
 ```bash
-cargo run --example extension -- -c '.geo.km[51.51;-0.13;40.71;-74.01]'
-cargo run --example extension_toolkit -- --load-demo -c '.stats.top[trades; `price; 3]'
+cargo run -p qpl-cli --example extension -- -c '.geo.km[51.51;-0.13;40.71;-74.01]'
+cargo run -p qpl-cli --example extension_toolkit -- --load-demo -c '.stats.top[trades; `price; 3]'
 ```
 
-[`examples/extension_toolkit.rs`](examples/extension_toolkit.rs) registers two
-extensions with several functions each, covering lists, tables, lazy plans and
-errors.
+[`qpl-cli/examples/extension_toolkit.rs`](qpl-cli/examples/extension_toolkit.rs)
+registers two extensions with several functions each, covering lists, tables,
+lazy plans and errors.
 
 ## REPL
 

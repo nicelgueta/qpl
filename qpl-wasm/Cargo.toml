@@ -1,0 +1,49 @@
+[package]
+name = "qpl-wasm"
+version.workspace = true
+edition.workspace = true
+
+# `wasm-pack` links `cdylib`; `rlib` is what the host-side tests (`cargo test
+# -p qpl-wasm`, run on the native target — see `tools/wasm/README.md`) link
+# against.
+[lib]
+name = "qpl_wasm"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+qpl = { path = "..", default-features = false, features = ["wasm"] }
+# `df <-> Arrow IPC` (see `arrow_io.rs`) goes through polars-arrow's `io_ipc`
+# directly, NOT polars' `ipc`/`ipc_streaming` features, which force
+# `streaming` / enable the C lz4+zstd builds and so don't compile for wasm.
+polars-arrow = { version = "0.55.2", default-features = false, features = ["io_ipc"] }
+wasm-bindgen = "0.2"
+# builds the `qplLangConfig()` object (and the `{output, error}` eval result)
+# without pulling in serde.
+js-sys = "0.3"
+# assembles `qplLangConfig()` from the JSON the VS Code extension also reads
+# as its vocabulary (see `wasm.rs`). `preserve_order`: Monarch takes the first
+# matching entry of a `cases` block *in key order*, and `@default` must come
+# last. serde_json's default map sorts keys, which put it in the middle and
+# made every keyword after it (`select`, `from`, `like`, ...) unreachable.
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# `arrow_io.rs`/`wasm.rs` use `polars::prelude::*` directly (DataFrame,
+# Series, ...), so this crate needs its own `polars` dependency too, not just
+# the one `qpl` pulls in transitively. `fmt` pulls `comfy-table/tty` ->
+# `crossterm`, which has no wasm backend; `parquet`/`csv` force polars'
+# `streaming` feature, which drags in cloud/object_store/hyper/reqwest/ring,
+# none of which build for wasm. A browser has no filesystem to `load`/`sink`
+# against anyway.
+[target.'cfg(not(target_family = "wasm"))'.dependencies.polars]
+version = "0.55.2"
+default-features = false
+features = ["fmt", "parquet", "csv"]
+
+[target.'cfg(target_family = "wasm")'.dependencies.polars]
+version = "0.55.2"
+default-features = false
+features = ["fmt_no_tty"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+# wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]

@@ -1,0 +1,4 @@
+[alias]
+# `cargo qpl -c '1+1'` -> the `qpl` binary (`qpl-cli` package), without
+# having to remember `-p qpl-cli --`.
+qpl = "run -p qpl-cli --"

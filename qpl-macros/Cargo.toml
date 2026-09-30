@@ -1,7 +1,7 @@
 [package]
 name = "qpl-macros"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "The `#[qpl::native]` attribute for qpl's Rust extensions"
 
 [lib]

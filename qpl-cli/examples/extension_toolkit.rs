@@ -1,11 +1,11 @@
 //! A `qpl` binary with two Rust extensions and several functions each,
 //! covering every kind of argument and result. Run from the repo root:
 //!
-//!   cargo run --example extension_toolkit -- -c '.stats.mean[1 2 3 4]'
-//!   cargo run --example extension_toolkit -- --load-demo -c '.stats.zscore[trades`price]'
-//!   cargo run --example extension_toolkit -- --load-demo -c '.stats.top[trades; `price; 3]'
-//!   cargo run --example extension_toolkit -- -c '.stats.about'
-//!   cargo run --example extension_toolkit -- -w -c '.files.append["notes.txt"; ("one" "two")]'
+//!   cargo run -p qpl-cli --example extension_toolkit -- -c '.stats.mean[1 2 3 4]'
+//!   cargo run -p qpl-cli --example extension_toolkit -- --load-demo -c '.stats.zscore[trades`price]'
+//!   cargo run -p qpl-cli --example extension_toolkit -- --load-demo -c '.stats.top[trades; `price; 3]'
+//!   cargo run -p qpl-cli --example extension_toolkit -- -c '.stats.about'
+//!   cargo run -p qpl-cli --example extension_toolkit -- -w -c '.files.append["notes.txt"; ("one" "two")]'
 //!
 //! `.stats` is all reads. `.files` mixes a read (`exists`) with a write
 //! (`append`), which is refused unless the session was started with `-w`.
@@ -90,5 +90,5 @@ fn main() {
         .with::<sample>()
         .with::<about>();
     let files = Extension::new("files").with::<exists>().with::<append>();
-    qpl::cli::run(vec![stats, files]);
+    qpl_cli::run(vec![stats, files]);
 }

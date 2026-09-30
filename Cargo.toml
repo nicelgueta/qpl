@@ -1,41 +1,30 @@
 [workspace]
-members = ["qpl-macros"]
+members = ["qpl-macros", "qpl-cli", "qpl-wasm"]
+# `qpl-macros` is skipped by a plain `cargo test`/`cargo build` (needs
+# `--workspace`); `qpl-wasm` needs the patched-Polars wasm32 toolchain (see
+# `scripts/build-wasm.sh`) to build for real, so it's opted in with `-p`.
+default-members = [".", "qpl-cli"]
 
-[package]
-name = "qpl"
+[workspace.package]
 version = "0.1.35"
 edition = "2024"
 
-# The interpreter lives in a library so it can be driven by something other than
-# the terminal REPL — `cdylib` is what `wasm-pack` links for the `wasm` feature,
-# `rlib` is what the `qpl` binary (and the tests) link against.
+[package]
+name = "qpl"
+version.workspace = true
+edition.workspace = true
+
+# The pure interpreter: lexer, parser, compiler, VM. No front-end of its own
+# — `qpl-cli` (the `qpl` binary) and `qpl-wasm` (browser bindings) are thin
+# front-ends over it, each in its own crate so neither pulls the other's
+# dependencies in.
 [lib]
 name = "qpl"
 path = "src/lib.rs"
-crate-type = ["cdylib", "rlib"]
-
-# `cli` is a default feature, so a plain `cargo build` still produces the binary;
-# the wasm build (`--no-default-features --features wasm`) drops it, along with
-# the terminal-only deps (clap/rustyline/mimalloc) that don't exist in a browser.
-[[bin]]
-name = "qpl"
-path = "src/main.rs"
-required-features = ["cli"]
-
-# `examples/extension.rs`: a `qpl` binary with a Rust extension (see `src/ext.rs`)
-[[example]]
-name = "extension"
-required-features = ["cli"]
-
-# `examples/extension_toolkit.rs`: two extensions, one of each kind of function
-[[example]]
-name = "extension_toolkit"
-required-features = ["cli"]
 
 [dependencies]
 # `#[qpl::native(read|write)]` for Rust extensions (see `src/ext.rs`)
-qpl-macros = { path = "qpl-macros", version = "0.1.0" }
-clap = { version = "4.6.6", features = ["derive"], optional = true }
+qpl-macros = { path = "qpl-macros" }
 # `default-features = false` drops polars' `docs` / `zip_with` / `dtype-slim` defaults.
 # `temporal` is NOT a qpl language
 # feature but cannot be dropped -- polars-expr's `strings` dispatch does
@@ -51,12 +40,6 @@ polars = { version = "0.55.2", default-features = false, features = ["temporal",
 # pulled in only to name `RoundMode` (the `polars` facade re-exports it crate-privately);
 # already compiled as a transitive dep, same version.
 polars-ops = { version = "0.55.2", features = ["round_series"] }
-# `wasm` feature only — `df <-> Arrow IPC` (see `arrow_io.rs`) goes through polars-arrow's
-# `io_ipc` directly, NOT polars' `ipc`/`ipc_streaming` features, which force `streaming` /
-# enable the C lz4+zstd builds and so don't compile for wasm. Already compiled as a
-# transitive dep.
-polars-arrow = { version = "0.55.2", default-features = false, features = ["io_ipc"], optional = true }
-rustyline = { version = "18.0.1", optional = true }
 # `like`'s q-glob pattern is translated to an anchored regex, then matched with
 # this directly for scalars; polars' own (already-linked, transitive) regex
 # engine handles the column-expression case via `.str().contains(...)`.
@@ -67,33 +50,15 @@ regex = "1"
 # connection / one thread for the listener; the rest of the VM stays sync.
 tokio = { version = "1", features = ["rt", "time"], optional = true }
 zeromq = { version = "0.5", optional = true }
-# global allocator (see `main.rs`) — Polars' own official builds do the same;
-# the default system allocator is measurably slower for its allocation-heavy
-# workloads (CSV parsing, hash tables for group-by, ...). Cut a real script's
-# wall time by ~25% in testing, on top of `opt-level = 3` below.
-mimalloc = { version = "0.1.52", optional = true }
-# `wasm` feature only — the browser bindings in `src/wasm.rs`. `js-sys` is what
-# builds the `qplLangConfig()` object (and the `{output, error}` eval result)
-# without pulling in serde.
-wasm-bindgen = { version = "0.2", optional = true }
-js-sys = { version = "0.3", optional = true }
-# `wasm` feature only — assembles `qplLangConfig()` from the JSON that the
-# VS Code extension already uses as its vocabulary (see `src/wasm.rs`).
-# `preserve_order`: Monarch takes the first matching entry of a `cases` block *in key order*,
-# and `@default` must come last. serde_json's default map sorts keys, which put it in the
-# middle and made every keyword after it (`select`, `from`, `like`, ...) unreachable.
-serde_json = { version = "1", optional = true, features = ["preserve_order"] }
-# `cli` only — turns Ctrl-C during a running statement into a cooperative
-# interrupt (see `interrupt.rs` / `main.rs`) instead of killing the session.
-ctrlc = { version = "3.5.2", optional = true }
 
 [features]
-default = ["cli", "ipc"]
-cli = ["dep:clap", "dep:rustyline", "dep:mimalloc", "dep:ctrlc"]
+default = ["ipc"]
 ipc = ["dep:tokio", "dep:zeromq"]
-# Browser target: `wasm-pack build --target web --no-default-features --features wasm`.
-# Mutually exclusive with `ipc` (no sockets) and `cli` (no terminal).
-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde_json", "dep:polars-arrow"]
+# Plumbing a non-terminal front-end needs from `Vm` (captured table results,
+# see `vm::Vm::capture_table`) instead of printed text — no dependencies of
+# its own; `qpl-wasm` enables it. Mutually exclusive with `ipc` in practice
+# (no sockets in a browser), though nothing here enforces that.
+wasm = []
 
 # `fmt` pulls `comfy-table/tty` -> `crossterm`, which has no wasm backend; polars'
 # own `make check-wasm` excludes it for exactly this reason. `fmt_no_tty` is the
@@ -113,15 +78,6 @@ features = ["fmt", "parquet", "csv"]
 version = "0.55.2"
 default-features = false
 features = ["fmt_no_tty"]
-
-# Off by default for two reasons: wasm-pack's bundled `wasm-opt` predates
-# bulk-memory being on by default and rejects the `memory.copy` rustc emits
-# (hence the explicit feature flags), and `-O` over a Polars-sized module takes
-# far longer than the compile itself. Swap `false` for the flag list below when
-# you actually want the size win.
-[package.metadata.wasm-pack.profile.release]
-wasm-opt = false
-# wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
 
 [profile.release]
 opt-level = 3

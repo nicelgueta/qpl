@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Bumps the [package].version in Cargo.toml (semver major/minor/patch) and
-# refreshes Cargo.lock to match. Invoked via `make bump <major|minor|patch>`.
+# Bumps [workspace.package].version in Cargo.toml (semver major/minor/patch,
+# shared by every crate via `version.workspace = true`) and refreshes
+# Cargo.lock to match. Invoked via `make bump <major|minor|patch>`.
 set -euo pipefail
 
 level="${1:-}"
@@ -11,7 +12,7 @@ fi
 
 cd "$(dirname "$0")/.."
 
-current=$(awk -F ' = ' '$1 ~ /^version/ { gsub(/["]/, "", $2); print $2; exit }' Cargo.toml)
+current=$(awk -F ' = ' '/^\[workspace\.package\]/{f=1} f && $1=="version"{gsub(/["]/, "", $2); print $2; exit}' Cargo.toml)
 IFS='.' read -r raw_major raw_minor raw_patch <<<"$current"
 
 # A segment may carry a trailing pre-release marker (a/b), e.g. "0.1a.0" or

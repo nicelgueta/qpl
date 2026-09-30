@@ -5,12 +5,10 @@ use crate::lexer::tokenise;
 use crate::parser::{normalize_function_body_newlines, parse, parse_program};
 use crate::temporal;
 use crate::tokens::TokenKind;
-#[cfg(all(feature = "ipc", feature = "cli"))]
+#[cfg(feature = "ipc")]
 use crate::vm::EvalResult;
 use crate::vm::Vm;
 use polars::prelude::*;
-#[cfg(feature = "cli")]
-use rustyline::{DefaultEditor, error::ReadlineError};
 use std::sync::Arc;
 
 /// Run a script, printing results. The whole file (and any `\l`/`\i` target)
@@ -156,109 +154,6 @@ pub fn wants_more(src: &str) -> bool {
     }
 }
 
-#[cfg(feature = "cli")]
-pub fn start(vm: &mut Vm) {
-    let mut rl = DefaultEditor::new().expect("failed to create line editor");
-
-    println!(
-        "qpl v{} (Quick Polars Language) REPL - \\d disassemble, \\l <path> run a script, \\i \"<path>\" import as a namespace, \\1 <path> log stdout, \\port <n> open a listener",
-        env!("CARGO_PKG_VERSION")
-    );
-
-    let mut buf: Vec<String> = Vec::new();
-    // a script run with `-i` (or that left a port open) may have opened a
-    // port already
-    #[cfg(feature = "ipc")]
-    let mut port_session: Option<PortSession> = if vm.port.is_some() {
-        Some(PortSession::new())
-    } else {
-        None
-    };
-
-    loop {
-        // While a port is open, poll stdin and the listener instead of a
-        // blocking `readline()`, so requests interleave with typed input. This
-        // gives up rustyline's line editing for the rest of the session: stdin
-        // can't be handed back once another thread reads it.
-        #[cfg(feature = "ipc")]
-        if let Some(session) = port_session.as_mut() {
-            // no `readline()` here, so print the prompt by hand, once per
-            // read cycle
-            if session.needs_prompt {
-                print_port_prompt(vm);
-                session.needs_prompt = false;
-            }
-            match session.poll(vm) {
-                PortEvent::Line(line) => {
-                    process_submitted(&line, vm);
-                    session.needs_prompt = true;
-                }
-                PortEvent::Request(mode, command, reply_tx) => {
-                    let _running = vm.interrupt.statement();
-                    let result =
-                        vm.with_request_permission(mode, |vm| eval_for_dispatch(&command, vm));
-                    let _ = reply_tx.send(crate::ipc::encode_result(&result));
-                    session.needs_prompt = true;
-                }
-                PortEvent::StdinClosed => break,
-            }
-            continue;
-        }
-
-        let prompt = if buf.is_empty() { "qpl) " } else { "  ...  " };
-        match rl.readline(prompt) {
-            Ok(line) => {
-                let blank = line.trim().is_empty();
-                if buf.is_empty() {
-                    if blank || line.trim_start().starts_with('/') {
-                        continue;
-                    }
-                    buf.push(line);
-                } else if !blank {
-                    buf.push(line);
-                }
-                // a blank line with a partial statement force-submits
-                let src = buf.join("\n");
-                if !blank && wants_more(&src) {
-                    continue;
-                }
-                buf.clear();
-                let src = src.trim().to_string();
-                if src.is_empty() {
-                    continue;
-                }
-                let _ = rl.add_history_entry(&src);
-                process_submitted(&src, vm);
-                // switch to polling if that statement opened a port
-                #[cfg(feature = "ipc")]
-                if vm.port.is_some() && port_session.is_none() {
-                    port_session = Some(PortSession::new());
-                }
-            }
-            Err(ReadlineError::Interrupted) => {
-                // abandon a partial statement, or exit at an empty prompt
-                if buf.is_empty() {
-                    break;
-                }
-                buf.clear();
-            }
-            Err(ReadlineError::Eof) => break,
-            Err(e) => {
-                eprintln!("readline error: {e}");
-                break;
-            }
-        }
-    }
-}
-
-/// Run one submitted REPL line, printing any error.
-#[cfg(feature = "cli")]
-fn process_submitted(src: &str, vm: &mut Vm) {
-    if let Err(e) = run_line(src, vm, "<main>", 0) {
-        eprintln!("{}", fmt_repl_error(&e));
-    }
-}
-
 /// Run one line with output captured instead of printed (the wasm REPL).
 /// Returns `(output, error)`: what the CLI would print to stdout (including
 /// anything before a failure) and to stderr.
@@ -304,9 +199,11 @@ pub fn eval_capture_table(src: &str, vm: &mut Vm) -> TableEval {
 
 /// Evaluate a command received over `\port` like a REPL line, in `Result`
 /// mode so its value comes back as an [`EvalResult`]. `\` commands are
-/// rejected: they're local session administration.
-#[cfg(all(feature = "ipc", feature = "cli"))]
-fn eval_for_dispatch(line: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
+/// rejected: they're local session administration. The serving loop that
+/// drives `Vm::port`'s request channel is a front-end concern (the terminal
+/// REPL's polling loop).
+#[cfg(feature = "ipc")]
+pub fn eval_for_dispatch(line: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
     let stmts = parse_program(line, "<main>")?;
     if let Some((_, ast::Stmt::System { cmd, .. })) = stmts
         .iter()
@@ -320,81 +217,6 @@ fn eval_for_dispatch(line: &str, vm: &mut Vm) -> Result<EvalResult, QplError> {
     let ctx = CompileCtx::result("<main>");
     let program = crate::compiler::compile_program(stmts, ctx)?;
     vm.eval(program)
-}
-
-/// Run-loop state while serving: the stdin-reader thread (spawned the first
-/// time a port opens) and whether a prompt is owed. The listener itself lives
-/// on `Vm::port`.
-#[cfg(all(feature = "ipc", feature = "cli"))]
-struct PortSession {
-    stdin_rx: std::sync::mpsc::Receiver<String>,
-    needs_prompt: bool,
-}
-
-#[cfg(all(feature = "ipc", feature = "cli"))]
-enum PortEvent {
-    Line(String),
-    Request(
-        crate::ipc::HandleMode,
-        String,
-        std::sync::mpsc::Sender<Vec<u8>>,
-    ),
-    StdinClosed,
-}
-
-#[cfg(all(feature = "ipc", feature = "cli"))]
-impl PortSession {
-    fn new() -> Self {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            use std::io::BufRead;
-            for line in std::io::stdin().lock().lines() {
-                match line {
-                    Ok(l) => {
-                        if tx.send(l).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        Self {
-            stdin_rx: rx,
-            needs_prompt: true,
-        }
-    }
-
-    /// Wait for a stdin line or a request. `vm.port` is re-read each time since
-    /// `\port` can close or reopen it at any point.
-    fn poll(&mut self, vm: &mut Vm) -> PortEvent {
-        loop {
-            match self.stdin_rx.try_recv() {
-                Ok(line) => return PortEvent::Line(line),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return PortEvent::StdinClosed,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-            if let Some(state) = &vm.port
-                && let Ok((mode, command, reply_tx)) = state.rx.try_recv()
-            {
-                return PortEvent::Request(mode, command, reply_tx);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(15));
-        }
-    }
-}
-
-/// The polling loop's prompt: `qpl [127.0.0.1:<port>]) ` while a port is open,
-/// `qpl) ` after it closes (polling continues either way). Flushed by hand
-/// since no line editor draws it.
-#[cfg(all(feature = "ipc", feature = "cli"))]
-fn print_port_prompt(vm: &Vm) {
-    use std::io::Write;
-    match &vm.port {
-        Some(state) => print!("qpl [127.0.0.1:{}] ) ", state.port),
-        None => print!("qpl) "),
-    }
-    let _ = std::io::stdout().flush();
 }
 
 /// A kdb timestamp literal as ns since the Unix epoch, for the demo `ts` column.
@@ -601,7 +423,8 @@ pub(crate) fn fmt_val(v: &ast::Value) -> String {
     }
 }
 
-fn fmt_repl_error(error: &QplError) -> String {
+/// Render a runtime error the way the terminal REPL prints it (`'<message>`).
+pub fn fmt_repl_error(error: &QplError) -> String {
     match error {
         QplError::Lex(message)
         | QplError::Parse(message)
@@ -1126,7 +949,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(all(feature = "ipc", feature = "cli"))]
+    #[cfg(feature = "ipc")]
     #[test]
     fn dispatch_supports_qpl_cfg() {
         let mut vm = Vm::new();
@@ -1136,7 +959,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "ipc", feature = "cli"))]
+    #[cfg(feature = "ipc")]
     #[test]
     fn dispatch_rejects_system_commands() {
         let mut vm = Vm::new();
@@ -1465,7 +1288,7 @@ mod tests {
         assert!(vm.port.is_some());
 
         // prove it listens on the chosen port by servicing one real request,
-        // as `repl::start`'s polling loop would
+        // as the terminal REPL's polling loop would
         let state = vm.port.as_ref().unwrap();
         let client = std::thread::spawn(|| {
             let conn = crate::ipc::hopen("51574", crate::ipc::HandleMode::Read).expect("hopen");

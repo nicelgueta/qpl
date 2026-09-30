@@ -1,17 +1,19 @@
-//! The `qpl` command line (`cli` feature). A library module rather than
-//! `main.rs` so that a binary built with Rust extensions (see [`crate::ext`])
-//! gets exactly the same front-end:
+//! The `qpl` command line. A library crate rather than a plain `main.rs` so
+//! that a binary built with Rust extensions (see [`qpl::ext`]) gets exactly
+//! the same front-end:
 //!
 //! ```ignore
 //! fn main() {
-//!     qpl::cli::run(vec![qpl::ext::Extension::new("geo").with::<haversine>()]);
+//!     qpl_cli::run(vec![qpl::ext::Extension::new("geo").with::<haversine>()]);
 //! }
 //! ```
 
+mod interactive;
+
 use clap::{ArgAction::SetTrue, Parser};
 
-use crate::ext::Extension;
-use crate::{repl, vm};
+use qpl::ext::Extension;
+use qpl::{repl, vm};
 
 /// The allocator the `qpl` binary uses (see `mimalloc` in Cargo.toml); an
 /// extension binary can install it with `#[global_allocator]` too.
@@ -112,18 +114,18 @@ pub fn run(extensions: Vec<Extension>) {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 eprintln!("{e}");
-                let interrupted = matches!(e, crate::errors::QplError::Interrupted);
+                let interrupted = matches!(e, qpl::errors::QplError::Interrupted);
                 std::process::exit(if interrupted { 130 } else { 1 });
             }
         }
     }
 
     match cli.file {
-        None => repl::start(&mut vm),
+        None => interactive::start(&mut vm),
         Some(ref path) => {
             if let Err(e) = repl::run_script(path, &mut vm) {
                 eprintln!("{e}");
-                let interrupted = matches!(e, crate::errors::QplError::Interrupted);
+                let interrupted = matches!(e, qpl::errors::QplError::Interrupted);
                 // `-i`, or a script that left a `\port` open, carries on
                 // into the REPL/serve loop even after an error
                 if !(cli.interactive || repl::port_open(&vm)) {
@@ -132,7 +134,7 @@ pub fn run(extensions: Vec<Extension>) {
             }
             // a script that opened `\port` keeps serving, like `-i`
             if cli.interactive || repl::port_open(&vm) {
-                repl::start(&mut vm);
+                interactive::start(&mut vm);
             }
         }
     }
@@ -171,8 +173,8 @@ fn compile_to_qplc(script: &str, output: Option<&str>) -> Result<(), String> {
 fn install_ctrl_c(vm: &vm::Vm) {
     let interrupt = vm.interrupt.clone();
     let _ = ctrlc::set_handler(move || match interrupt.on_ctrl_c() {
-        crate::interrupt::CtrlC::Exit => std::process::exit(130),
-        crate::interrupt::CtrlC::Interrupting => {
+        qpl::interrupt::CtrlC::Exit => std::process::exit(130),
+        qpl::interrupt::CtrlC::Interrupting => {
             eprintln!("^C interrupting... (Ctrl-C again to force quit)");
         }
     });

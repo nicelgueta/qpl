@@ -12,10 +12,11 @@ test:
 run:
 	cargo run
 
-# Build the browser bundle into tools/wasm/pkg. Prepares a patched Polars
-# checkout first (stock Polars doesn't compile for wasm32-unknown-unknown --
-# see tools/wasm/README.md) and points cargo at it for the duration of the
-# build. Slow on a cold cache: the whole Polars tree, for a new target.
+# Build the browser bundle (qpl-wasm) into tools/wasm/pkg. Prepares a patched
+# Polars checkout first (stock Polars doesn't compile for
+# wasm32-unknown-unknown -- see tools/wasm/README.md) and points cargo at it
+# for the duration of the build. Slow on a cold cache: the whole Polars tree,
+# for a new target.
 wasm:
 	@./scripts/build-wasm.sh
 

@@ -101,11 +101,11 @@ trap restore EXIT INT TERM
 
 # --- 5. build ----------------------------------------------------------------
 # `getrandom_backend` is required on this target — polars' own `make -C crates
-# check-wasm` sets the same flag.
+# check-wasm` sets the same flag. `--out-dir` is relative to the crate path
+# (qpl-wasm), not the repo root.
 echo "==> wasm-pack build (this is slow: the whole polars tree, for a new target)"
 RUSTFLAGS='--cfg getrandom_backend="wasm_js"' \
-	wasm-pack build --target web --out-dir tools/wasm/pkg \
-	--no-default-features --features wasm ${WASM_PACK_ARGS:-}
+	wasm-pack build qpl-wasm --target web --out-dir ../tools/wasm/pkg ${WASM_PACK_ARGS:-}
 
 echo
 echo "==> done: tools/wasm/pkg"

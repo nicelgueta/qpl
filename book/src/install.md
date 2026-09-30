@@ -3,7 +3,7 @@
 If you already have a Rust toolchain, building from source is one command:
 
 ```bash
-cargo install --path .
+cargo install --path qpl-cli
 ```
 
 Be warned that Polars is a large crate and a cold build takes a few minutes.
@@ -25,7 +25,7 @@ tables held in another running one. That's built in by default. If you don't
 want the two extra dependencies it pulls in (`tokio`, `zeromq`), drop it:
 
 ```bash
-cargo install --path . --no-default-features
+cargo install --path qpl-cli --no-default-features
 ```
 
 Nothing about that is a dead end, since you can rebuild with the feature

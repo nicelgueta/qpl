@@ -25,7 +25,7 @@ jobs:
         id: "pkg-version"
         shell: "bash"
         run: |
-          echo PKG_VERSION=$(awk -F ' = ' '$1 ~ /version/ { gsub(/["]/, "", $2); printf("%s",$2); exit }' Cargo.toml) >> $GITHUB_OUTPUT
+          echo PKG_VERSION=$(awk -F ' = ' '/^\[workspace\.package\]/{f=1} f && $1=="version"{gsub(/["]/, "", $2); printf("%s",$2); exit}' Cargo.toml) >> $GITHUB_OUTPUT
 
   create-release:
     name: "Create release"
@@ -73,6 +73,7 @@ jobs:
         uses: "taiki-e/upload-rust-binary-action@v1"
         with:
           bin: "qpl"
+          manifest_path: "qpl-cli/Cargo.toml"
           target: ${{ matrix.target }}
           archive: $bin-${{ matrix.target }}
           features: "ipc"

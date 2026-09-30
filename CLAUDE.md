@@ -14,50 +14,60 @@ internal architecture.
 ## Commands
 
 ```bash
-cargo build                 # debug build
+cargo build                 # debug build -> target/debug/qpl (qpl-cli's binary)
 cargo build --release       # release build (large: bundles all of Polars)
 cargo test                  # run all tests (unit tests live in #[cfg(test)] modules per source file)
 cargo test <name>           # run tests matching a substring, e.g. `cargo test lazy`
 cargo test --package qpl parser::   # run one module's tests
-cargo test --workspace      # also the `qpl-macros` crate's tests (`cargo test` alone skips them)
+cargo test --workspace      # also `qpl-macros` and `qpl-wasm` (`cargo test` alone skips them)
 cargo run                   # start the REPL
-cargo run -- --load-demo    # REPL preloaded with demo `trades` / `quotes` tables
-cargo run -- script.qpl     # execute a script (read-only: `sink`/`\1 <path>` refused)
-cargo run -- -w script.qpl  # execute a script with write permission
-cargo run -- -i script.qpl  # execute a script, then drop into the REPL
-cargo run -- examples/lazy_join_pipeline.qpl   # run an example
-cargo run -- -c 'select avg price by sym from trades' --load-demo   # run an ad hoc command and exit
-cargo run -- -C script.qpl                      # compile to script.qplc (add -o to redirect)
-cargo run -- script.qplc                        # run a compiled artifact — no lexing/parsing/compiling
-cargo build --no-default-features               # drop `ipc` (hopen/dispatch/await, \port — see Architecture)
-cargo test --no-default-features --features wasm   # browser bindings, host-side tests
-cargo run --example extension -- -c '.geo.km[51.51;-0.13;40.71;-74.01]'   # a qpl binary with a Rust extension
-cargo run --example extension_toolkit -- --load-demo -c '.stats.top[trades; `price; 3]'   # two extensions, every arg/result kind
+cargo qpl --load-demo    # REPL preloaded with demo `trades` / `quotes` tables (`cargo qpl` is a `cargo run -p qpl-cli --` alias, see .cargo/config.toml)
+cargo qpl script.qpl     # execute a script (read-only: `sink`/`\1 <path>` refused)
+cargo qpl -w script.qpl  # execute a script with write permission
+cargo qpl -i script.qpl  # execute a script, then drop into the REPL
+cargo qpl examples/lazy_join_pipeline.qpl   # run an example
+cargo qpl -c 'select avg price by sym from trades' --load-demo   # run an ad hoc command and exit
+cargo qpl -C script.qpl                      # compile to script.qplc (add -o to redirect)
+cargo qpl script.qplc                        # run a compiled artifact — no lexing/parsing/compiling
+cargo build -p qpl --no-default-features        # the library alone, drop `ipc` (hopen/dispatch/await, \port — see Architecture)
+cargo test -p qpl-wasm                          # browser bindings, host-side tests
+cargo run -p qpl-cli --example extension -- -c '.geo.km[51.51;-0.13;40.71;-74.01]'   # a qpl binary with a Rust extension
+cargo run -p qpl-cli --example extension_toolkit -- --load-demo -c '.stats.top[trades; `price; 3]'   # two extensions, every arg/result kind
 make wasm                   # browser bundle -> tools/wasm/pkg (patches polars first,
                             # see scripts/build-wasm.sh and tools/wasm/README.md)
 ```
 
-`cli` and `ipc` are default features, so a plain `cargo build`/`cargo test`/`cargo run`
-already includes both; `--no-default-features` is only needed to build/test without
-them. `cli` gates the binary itself (`[[bin]] required-features`) along with
-clap/rustyline/mimalloc; the interpreter lives in `src/lib.rs` so that the binary
-and the `wasm` bindings are both thin front-ends over the same library. The
-command line itself is `src/cli.rs` (`qpl::cli::run(extensions)`), so
-`main.rs` is three lines and a binary with Rust extensions (`examples/extension.rs`)
-gets the identical front-end.
+`ipc` is a default feature of the `qpl` library, so a plain `cargo build`/`cargo
+test`/`cargo run` already includes it; `-p qpl --no-default-features` is only
+needed to build/test without it. The library (`qpl`, this crate's root) has no
+front-end of its own and no terminal/browser dependencies — `qpl-cli` (the
+`qpl` binary: clap/rustyline/mimalloc/ctrlc) and `qpl-wasm` (browser bindings:
+wasm-bindgen/js-sys/serde_json) are thin front-ends over it in their own
+crates, so neither pulls the other's dependencies in and neither needs to be
+a dependency of the library itself. A binary with Rust extensions
+(`qpl-cli/examples/extension.rs`) gets the identical front-end by depending on
+`qpl-cli` and calling `qpl_cli::run(extensions)`.
 
-The repo is a Cargo workspace of two crates: `qpl` (the root package) and
-`qpl-macros/` (the `#[qpl::native]` proc macro, re-exported as `qpl::native`).
-Workspace-wide checks need `--workspace` (`cargo clippy --workspace --all-targets`).
+The repo is a Cargo workspace of four crates: `qpl` (the root package, the
+pure interpreter library), `qpl-macros/` (the `#[qpl::native]` proc macro,
+re-exported as `qpl::native`), `qpl-cli/` (the `qpl` binary) and `qpl-wasm/`
+(browser bindings). `[workspace.package].version` is the one version number,
+shared by every crate via `version.workspace = true`. Plain `cargo
+build`/`test`/`run` at the root operate on `qpl` and `qpl-cli` (`[workspace]
+default-members` in the root `Cargo.toml`) — the obvious "build/test/run the
+interpreter and its CLI" default; `qpl-macros` and `qpl-wasm` need an explicit
+`-p` or `--workspace`. `cargo qpl` is a `.cargo/config.toml` alias for `cargo
+run -p qpl-cli --`. Workspace-wide checks need `--workspace` (`cargo clippy
+--workspace --all-targets`).
 
 There is no separate lint step configured; use `cargo clippy --all-targets` and
-`cargo fmt` as normal. `cargo clippy --all-targets` is expected to be
-**warning-free** for the default feature set, `--no-default-features`, and
-`--no-default-features --features wasm` — check all three before calling a
-change done.
+`cargo fmt` as normal. `cargo clippy --workspace --all-targets` is expected to
+be **warning-free**, as is `cargo clippy -p qpl --all-targets` for
+`--no-default-features` and `--no-default-features --features wasm` — check
+all three before calling a change done.
 
 Tests are colocated with the code they cover (`#[cfg(test)] mod tests` at the
-bottom of each `src/*.rs`). There is no `tests/` directory. `vm.rs`,
+bottom of each source file). There is no `tests/` directory. `vm.rs`,
 `parser.rs`, `compiler.rs`, and `lexer.rs` carry the bulk of them. `repl.rs`
 also has a `golden` test module that runs every `examples/*.qpl` and diffs
 its captured output against `examples/golden/<name>.out`
@@ -66,14 +76,15 @@ deliberate, reviewed output change, never to make a red test green).
 
 ## Release process
 
-Releases are fully automated by GitHub Actions and driven by the version in
-`Cargo.toml`. On a push to `main` that touches `Cargo.toml`, `Cargo.lock`, or
-`src/**`, [`.github/workflows/tag.yml`](.github/workflows/tag.yml) reads
-`package.version` and pushes a `v<version>` tag. That tag triggers
+Releases are fully automated by GitHub Actions and driven by the workspace
+version in `Cargo.toml`. On a push to `main` that touches `Cargo.toml`,
+`Cargo.lock`, `src/**`, `qpl-macros/**`, `qpl-cli/**` or `qpl-wasm/**`,
+[`.github/workflows/tag.yml`](.github/workflows/tag.yml) reads
+`workspace.package.version` and pushes a `v<version>` tag. That tag triggers
 [`release.yml`](.github/workflows/release.yml), which creates the GitHub release
-and cross-compiles binaries for Linux (gnu/musl), Linux ARM64, and macOS
-(x86/ARM). **To cut a release, bump `version` in `Cargo.toml` and merge to main** —
-nothing else.
+and cross-compiles the `qpl-cli` package's `qpl` binary for Linux (gnu/musl),
+Linux ARM64, and macOS (x86/ARM). **To cut a release, bump `version` in
+`[workspace.package]` and merge to main** — nothing else.
 
 ## Architecture
 
@@ -94,16 +105,27 @@ by the `\l`/`\i` native (`\l`/`\i` targets are read, parsed and compiled
 *when the including script is compiled*, not at run time — see "Namespaces"
 below).
 
-Entry points: `cli::run` (called by `main.rs`) parses CLI args (clap), constructs one long-lived
-`vm::Vm` (read-only unless `-w`) and registers any Rust extensions, then calls into `repl.rs`. `repl::run_script` (a file) and
-`repl::start`'s REPL loop both funnel source through `parser::parse_program`
-→ `compiler::compile_program` → `Vm::run_compiled`. `vm::run_vm(source, vm)`
-— the entry point most tests use — compiles a *single* statement
-(`parser::parse` + `compiler::compile`) in `Result` mode and reduces it to an `EvalResult` via `Vm::eval`. State
+Entry points: `qpl_cli::run` (called by `qpl-cli/src/main.rs`) parses CLI args
+(clap), constructs one long-lived `vm::Vm` (read-only unless `-w`) and
+registers any Rust extensions, then calls into `qpl::repl`. `repl::run_script`
+(a file) and `qpl-cli`'s interactive REPL loop both funnel source through
+`parser::parse_program` → `compiler::compile_program` → `Vm::run_compiled`.
+`vm::run_vm(source, vm)` — the entry point most tests use — compiles a
+*single* statement (`parser::parse` + `compiler::compile`) in `Result` mode
+and reduces it to an `EvalResult` via `Vm::eval`. State
 carries across runs because the same `Vm` (its `globals` map and registers)
 is reused.
 
 ### Key modules
+
+Every module below lives in the `qpl` library (`src/`) unless said otherwise.
+`qpl-cli/src/` holds the command line (`lib.rs`, `main.rs`, `interactive.rs`
+— the terminal REPL loop) and `qpl-wasm/src/` the browser bindings
+(`wasm.rs`, `arrow_io.rs`). The library's own `wasm` feature enables nothing
+but `vm::Vm`'s `capture_table`/`last_table` fields — the plumbing a
+non-terminal front-end needs to get a `DataFrame` back instead of printed
+text — and has no dependencies of its own; `qpl-wasm` enables it on its `qpl`
+dependency.
 
 | Module | Role |
 |--------|------|
@@ -118,13 +140,11 @@ is reused.
 | `vm` | `Vm` (the single evaluator), `Slot` (stack entries), `CallFrame`-equivalent (`Slot::Call`), the `Op` decode/dispatch loop (`Vm::run_compiled`) — each arm small, delegating to `ops.rs`. `run_vm` (single-statement helper) and `EvalResult` also live here |
 | `native` | Built-in (native) functions — a `name → Builtin` map built once in `Vm::new`, resolved through `Vm::lookup` exactly like a user function, except a builtin name can never be bound over. `NativeId` (`Enlist`/`Roll`/`Cfg`/…) is for the handful of primitives the compiler references *by id* instead of by name, so they can't be shadowed at all. Adding a name-resolved native needs no lexer/parser/compiler change |
 | `ext` | Rust extensions: `Native` (implemented by `#[qpl::native(read\|write)]` from `qpl-macros`, which generates a same-named braced struct in the type namespace so the function stays callable), `Extension` (`Extension::new(ns).with::<f>()`), `Vm::register` (namespaced `.<ns>.<name>` entries in the builtin table as `NativeCall::Extension`, atomic, `qpl` reserved), and the `FromValue`/`IntoValue`/`IntoReturn` conversions. `Vm::call_builtin` converts slots ↔ values at the boundary; an `Err` becomes `<name>: <msg>` |
-| `cli` | `cli` feature only. The whole command line (clap `Cli`, `-C`/`-d`/`-c`/`-w`, Ctrl-C handler) as `cli::run(extensions)`; also the CLI tests, which spawn `target/<profile>/qpl` |
 | `permission` | `Effect` (`Read`/`Session`/`Write`) — what an action may change. `Vm::authorize(effect, what)` is the single permission check: a read-only session (`Vm::new`/`Vm::default` — the default; `Vm::new_writable` for `qpl -w`; fixed at construction, never changed) refuses `Write`; a request over a read-only IPC handle refuses `Session` and `Write`. `Builtin` entries carry an `effect` that `Vm::call_builtin` checks before every call; `sink`, assignment, `.qpl.cfg`, `\1` and `whopen` call `authorize` inline |
 | `vm_config` | `VmConfig` — session knobs set by `.qpl.cfg key=value` (`maxcol`, `maxrow`, `tblwidth`, `strlen`, `round_type`, `useqepoch`); a new knob is a field + a `VmConfig::set` arm and nothing else |
 | `errors` | `QplError` (Lex/Parse/Compile/Runtime variants) — the single error type threaded everywhere |
-| `repl` | The REPL loop, `run_script` (parse_program → compile_program → run_compiled for a whole file, aborting before any statement runs on a parse/compile error anywhere in it — including inside a `\l`/`\i` target; also runs a `.qplc` file straight from bytes, sniffed by magic number), `compile_script` (source → `Program`, no run — `qpl -C`), `run_command` (`qpl -c`), demo tables, result formatting. `wants_more` (interactive-loop-only: brackets/trailing-comma/parse-cut-off) decides whether to keep reading a half-typed statement. All printing goes through `Vm::emit`, which mirrors to the stdout log. `\port` is an ordinary statement (`Vm::native_port` sets `Vm::port`); `start()` switches to polling stdin and the listener once a port is open, and `cli::run` enters it after a script that left one open |
-| `wasm` | `wasm` feature only (`#[cfg(feature = "wasm")] mod wasm;` in `lib.rs`). `Repl` (a `Vm` behind `eval(line)`, driven by `repl::eval_capture` — same path the terminal REPL uses, with output captured instead of printed) and `qplLangConfig()` (Monaco tokenizer/config/completions, built at compile time from `tools/vscode/`'s JSON). Builds only against a patched Polars (stock 0.55.2 doesn't compile for `wasm32-unknown-unknown`) — [`tools/wasm/README.md`](tools/wasm/README.md) has the build steps and the patch |
-| `interrupt` | Ctrl-C flag (`Interrupt`, an `Arc` of two atomics on `Vm`). The `cli` handler in `cli.rs` sets it; the interpreter polls `vm.interrupt.check()` (each backward `JUMP`, `CALL`, around Polars `collect`s, IPC waits) and returns `QplError::Interrupted`. One `interrupt.statement()` guard covers a whole `run_source` call (a full script or one REPL line), however many statements it contains |
+| `repl` | Source-running plumbing shared by every front-end: `run_script` (parse_program → compile_program → run_compiled for a whole file, aborting before any statement runs on a parse/compile error anywhere in it — including inside a `\l`/`\i` target; also runs a `.qplc` file straight from bytes, sniffed by magic number), `compile_script` (source → `Program`, no run — `qpl -C`), `run_command` (`qpl -c`), `eval_capture`/`eval_capture_table` (output captured instead of printed — the wasm REPL), `eval_for_dispatch` (`ipc` feature: evaluate one `\port`-dispatched command), demo tables, result formatting. `wants_more` (interactive-loop-only: brackets/trailing-comma/parse-cut-off) decides whether to keep reading a half-typed statement. All printing goes through `Vm::emit`, which mirrors to the stdout log. `\port` is an ordinary statement (`Vm::native_port` sets `Vm::port`); driving the listener — polling stdin and the request channel once a port is open — is `qpl-cli`'s job, not the library's |
+| `interrupt` | Ctrl-C flag (`Interrupt`, an `Arc` of two atomics on `Vm`). `qpl-cli`'s handler sets it; the interpreter polls `vm.interrupt.check()` (each backward `JUMP`, `CALL`, around Polars `collect`s, IPC waits) and returns `QplError::Interrupted`. One `interrupt.statement()` guard covers a whole `run_source` call (a full script or one REPL line), however many statements it contains |
 | `ipc` | `ipc` feature only (`#[cfg(feature = "ipc")]`, `pub mod ipc;` in `lib.rs` is itself gated). Client (`hopen`/`dispatch`/`async dispatch`/`await`) and server (`\port`) over a plain `zeromq` REQ/REP pair — see the IPC subsection below |
 
 ### VM state and evaluation model
@@ -255,8 +275,8 @@ do it in the same change:
   keyword/operator to the relevant list (`statementKeywords`, `builtinKeywords`,
   `joinOperators`, `wordOperators`, `aggregates`) and give it an entry in
   `keywordDetail`/`aggregateDetail`. `src/vocabulary.ts` is a typed re-export of
-  this file and needs no edit; the crate `include_str!`s the same file for
-  `qplLangConfig()` (`wasm` feature), so both editors stay in sync automatically.
+  this file and needs no edit; `qpl-wasm` `include_str!`s the same file for
+  `qplLangConfig()`, so both editors stay in sync automatically.
 - `syntaxes/qpl.tmLanguage.json` — add it to the matching grammar rule so it
   highlights (validate with `python3 -c "import json; json.load(open(...))"`).
 - `src/extension.ts` — only if the new vocabulary list isn't already wired
@@ -335,7 +355,7 @@ running the source. `qpl -c '<command>'` runs a short ad hoc command and
 exits (`repl::run_command`, source text through the same
 parse→compile→run path as a script, reported unprefixed like `<main>` REPL
 input); `-C`, `-c`, `-d`, `-i`, and a `file` argument all conflict with each other
-in `cli.rs`'s clap `Cli`.
+in `qpl-cli`'s clap `Cli` (`qpl-cli/src/lib.rs`).
 
 `Program::to_bytes`/`from_bytes` (`program.rs`) serialise `code`/`operands`/
 `lines` (recursing into an embedded `Operand::Program`), gated by a `u16

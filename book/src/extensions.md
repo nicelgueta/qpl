@@ -33,6 +33,7 @@ that builds its own `qpl` binary with its functions added:
 # Cargo.toml
 [dependencies]
 qpl = { git = "https://github.com/nicelgueta/qpl" }
+qpl-cli = { git = "https://github.com/nicelgueta/qpl" }
 ```
 
 ```rust
@@ -47,11 +48,11 @@ fn km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 
 fn main() {
     let geo = qpl::ext::Extension::new("geo").with::<km>();
-    qpl::cli::run(vec![geo]);
+    qpl_cli::run(vec![geo]);
 }
 ```
 
-`qpl::cli::run` is the whole `qpl` command line, the same one the stock
+`qpl_cli::run` is the whole `qpl` command line, the same one the stock
 binary uses. So the result takes every flag `qpl` does, including `-w`, and
 behaves identically apart from the new functions:
 
@@ -60,15 +61,15 @@ cargo build --release
 ./target/release/geo-qpl -c '.geo.km[51.51;-0.13;40.71;-74.01]'
 ```
 
-The qpl repository has two complete versions of this. `examples/extension.rs`
-is the one above plus a write function. `examples/extension_toolkit.rs`
+The qpl repository has two complete versions of this in `qpl-cli/examples/`:
+`extension.rs` is the one above plus a write function. `extension_toolkit.rs`
 registers two extensions with several functions each, covering every kind of
 argument and result: lists in and out, a table in and out, a lazy plan, a
 function with no arguments, a renamed function, and errors from a `Result`.
 
 ```bash
-cargo run --example extension -- -c '.geo.km[51.51;-0.13;40.71;-74.01]'
-cargo run --example extension_toolkit -- --load-demo -c '.stats.top[trades; `price; 3]'
+cargo run -p qpl-cli --example extension -- -c '.geo.km[51.51;-0.13;40.71;-74.01]'
+cargo run -p qpl-cli --example extension_toolkit -- --load-demo -c '.stats.top[trades; `price; 3]'
 ```
 
 An extension with several functions chains `with` once per function, and a
@@ -80,7 +81,7 @@ let stats = Extension::new("stats")
     .with::<zscore>()
     .with::<top_n>();
 let files = Extension::new("files").with::<exists>().with::<append>();
-qpl::cli::run(vec![stats, files]);
+qpl_cli::run(vec![stats, files]);
 ```
 
 One namespace can mix read and write functions. Each function's own

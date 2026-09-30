@@ -13,9 +13,9 @@ use polars_arrow::io::ipc::read::{StreamReader, StreamState, read_stream_metadat
 use polars_arrow::io::ipc::write::{StreamWriter, WriteOptions};
 use std::io::Cursor;
 
-use crate::ast;
-use crate::errors::QplError;
-use crate::vm::Vm;
+use qpl::ast;
+use qpl::errors::QplError;
+use qpl::vm::Vm;
 
 fn rt(e: impl std::fmt::Display) -> QplError {
     QplError::Runtime(e.to_string())
@@ -118,7 +118,7 @@ pub fn row_count(vm: &Vm, name: &str) -> Result<usize, QplError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repl::eval_capture_table;
+    use qpl::repl::eval_capture_table;
 
     fn sample() -> DataFrame {
         df![

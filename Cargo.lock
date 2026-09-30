@@ -2366,29 +2366,44 @@ dependencies = [
 name = "qpl"
 version = "0.1.35"
 dependencies = [
- "clap",
- "ctrlc",
- "js-sys",
- "mimalloc",
  "polars",
- "polars-arrow",
  "polars-ops",
  "qpl-macros",
  "regex",
- "rustyline",
- "serde_json",
  "tokio",
- "wasm-bindgen",
  "zeromq",
 ]
 
 [[package]]
+name = "qpl-cli"
+version = "0.1.35"
+dependencies = [
+ "clap",
+ "ctrlc",
+ "mimalloc",
+ "qpl",
+ "rustyline",
+]
+
+[[package]]
 name = "qpl-macros"
-version = "0.1.0"
+version = "0.1.35"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "qpl-wasm"
+version = "0.1.35"
+dependencies = [
+ "js-sys",
+ "polars",
+ "polars-arrow",
+ "qpl",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]

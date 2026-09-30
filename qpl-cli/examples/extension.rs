@@ -1,8 +1,8 @@
 //! A `qpl` binary with a Rust extension: every `qpl` feature, plus a `.geo`
 //! namespace. Run from the repo root:
 //!
-//!   cargo run --example extension -- -c '.geo.km[51.51;-0.13;40.71;-74.01]'
-//!   cargo run --example extension -- -w -c '.geo.note["notes.txt"; "hello"]'
+//!   cargo run -p qpl-cli --example extension -- -c '.geo.km[51.51;-0.13;40.71;-74.01]'
+//!   cargo run -p qpl-cli --example extension -- -w -c '.geo.note["notes.txt"; "hello"]'
 //!
 //! `.geo.km` is a read, so it works in every session. `.geo.note` writes to a
 //! file, so it's refused unless the session was started with `-w`.
@@ -11,7 +11,7 @@ use std::io::Write;
 
 // the same allocator the stock `qpl` binary uses (optional)
 #[global_allocator]
-static GLOBAL: qpl::cli::MiMalloc = qpl::cli::MiMalloc;
+static GLOBAL: qpl_cli::MiMalloc = qpl_cli::MiMalloc;
 
 /// Great-circle distance in km between two latitude/longitude points.
 #[qpl::native(read)]
@@ -35,5 +35,5 @@ fn note(path: String, text: String) -> std::io::Result<()> {
 
 fn main() {
     let geo = qpl::ext::Extension::new("geo").with::<km>().with::<note>();
-    qpl::cli::run(vec![geo]);
+    qpl_cli::run(vec![geo]);
 }

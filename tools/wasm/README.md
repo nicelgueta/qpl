@@ -1,9 +1,11 @@
-# qpl in the browser (`wasm` feature)
+# qpl in the browser (`qpl-wasm`)
 
-`src/wasm.rs` exposes the interpreter to JavaScript through `wasm-bindgen`. It is
-a front-end over the same library the CLI uses (`src/lib.rs`), not a
-reimplementation: `Repl.eval` calls `repl::eval_capture`, which wraps the same
-`run_line` that `repl::start` feeds from rustyline.
+`qpl-wasm/src/wasm.rs` exposes the interpreter to JavaScript through
+`wasm-bindgen`. It is a front-end over the same `qpl` library the CLI
+(`qpl-cli`) uses, not a reimplementation: `Repl.eval` calls
+`qpl::repl::eval_capture`, which runs a line through the same
+parse/compile/run pipeline as every other front-end, with output captured
+instead of printed.
 
 > **Status: it builds and links.** `wasm-pack` produces a working `pkg/`
 > (`qpl_bg.wasm`, `qpl.js`, `qpl.d.ts`), but only against a **patched Polars** —
@@ -48,7 +50,7 @@ Arrow readers can't read yet) and categoricals as dictionaries. Compressed IPC
 bodies are not supported in either direction: Polars' IPC compression needs the
 C `lz4` / `zstd` builds, which don't target wasm. `apache-arrow` doesn't
 compress by default, so this only matters for a producer that opts in. The
-implementation is `src/arrow_io.rs`, on `polars-arrow`'s `io_ipc` rather than
+implementation is `qpl-wasm/src/arrow_io.rs`, on `polars-arrow`'s `io_ipc` rather than
 Polars' `ipc` feature (which forces `streaming`).
 
 `ipc` is off in this build, so `hopen` / `dispatch` / `await` / `\port` don't
@@ -174,7 +176,7 @@ If Polars is bumped without the patch being rebased onto the new `rs-<version>`
 tag, `make wasm` stops with a message saying so rather than building against a
 stale checkout.
 
-`wasm-opt` is disabled in `Cargo.toml`: wasm-pack's bundled binaryen rejects
+`wasm-opt` is disabled in `qpl-wasm/Cargo.toml`: wasm-pack's bundled binaryen rejects
 the `memory.copy` rustc emits (it predates bulk-memory being on by default),
 and even with `--enable-bulk-memory` an `-O` pass over a Polars-sized module
 takes far longer than the compile. The commented-out flag list next to it is
@@ -184,7 +186,7 @@ The JS-facing logic is unit-tested on the host target, where it compiles
 without any of the above:
 
 ```bash
-cargo test --no-default-features --features wasm
+cargo test -p qpl-wasm
 ```
 
 Note that `[profile.release]` sets `panic = "abort"`; a panic inside Polars
@@ -282,8 +284,8 @@ filesystem to scan anyway.
   rotting again.
 - **Target `wasm32-unknown-emscripten`**, the one Polars supports. This costs
   `wasm-bindgen`: the JS glue would have to come from Emscripten
-  (`ccall`/Embind), `src/wasm.rs` would need a matching `extern "C"` surface,
+  (`ccall`/Embind), `qpl-wasm/src/wasm.rs` would need a matching `extern "C"` surface,
   and the build needs `emsdk` + a matching LLVM. Note that even Polars' own
   Pyodide job is disabled, so this path isn't currently exercised either.
 - **Wait for upstream**, then drop the patch and the `[patch.crates-io]` block.
-  Nothing in `src/wasm.rs` or the feature split changes when that happens.
+  Nothing in `qpl-wasm/src/wasm.rs` or the feature split changes when that happens.

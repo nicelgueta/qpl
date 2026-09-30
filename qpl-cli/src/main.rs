@@ -1,7 +1,7 @@
 // matches Polars' official builds (see `mimalloc` in Cargo.toml)
 #[global_allocator]
-static GLOBAL: qpl::cli::MiMalloc = qpl::cli::MiMalloc;
+static GLOBAL: qpl_cli::MiMalloc = qpl_cli::MiMalloc;
 
 fn main() {
-    qpl::cli::run(Vec::new());
+    qpl_cli::run(Vec::new());
 }

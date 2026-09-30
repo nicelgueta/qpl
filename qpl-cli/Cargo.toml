@@ -1,0 +1,37 @@
+[package]
+name = "qpl-cli"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "qpl_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qpl"
+path = "src/main.rs"
+
+# `examples/extension.rs`: a `qpl` binary with a Rust extension (see `qpl::ext`)
+[[example]]
+name = "extension"
+
+# `examples/extension_toolkit.rs`: two extensions, one of each kind of function
+[[example]]
+name = "extension_toolkit"
+
+[dependencies]
+qpl = { path = "..", default-features = false }
+clap = { version = "4.6.6", features = ["derive"] }
+rustyline = "18.0.1"
+# global allocator (see `main.rs`) — Polars' own official builds do the same;
+# the default system allocator is measurably slower for its allocation-heavy
+# workloads (CSV parsing, hash tables for group-by, ...). Cut a real script's
+# wall time by ~25% in testing, on top of `opt-level = 3` in the root profile.
+mimalloc = "0.1.52"
+# turns Ctrl-C during a running statement into a cooperative interrupt (see
+# `qpl::interrupt` / `main.rs`) instead of killing the session.
+ctrlc = "3.5.2"
+
+[features]
+default = ["ipc"]
+ipc = ["qpl/ipc"]
