@@ -20,6 +20,13 @@ Python functions is an option for consideration further down the line.
 language itself, with its own literal and semantics, is still an open design
 question.
 
+**Float list literals.** Ints, strings and symbols can be written directly
+as lists (`1 2 3`, `("a" "b")`, `` `x`y ``), but floats can't: `1.5 2.5` is a
+parse error. For now a float list comes from a table column
+(``trades`price``) or a computation, and an int list works wherever a float
+list is expected. Writing one directly should work the same way as it does
+for the other types.
+
 **More of the language.** The gaps that exist today are called out in the
 chapter each one belongs to rather than collected here, on the grounds that a
 missing feature is most useful to know about while you're reading about the

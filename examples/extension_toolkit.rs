@@ -11,7 +11,6 @@
 //! (`append`), which is refused unless the session was started with `-w`.
 
 use std::io::Write;
-
 use qpl::ext::Extension;
 use qpl::ext::polars::prelude::*;
 
