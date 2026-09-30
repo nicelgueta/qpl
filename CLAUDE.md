@@ -30,6 +30,8 @@ cargo qpl -c 'select avg price by sym from trades' --load-demo   # run an ad hoc
 cargo qpl -C script.qpl                      # compile to script.qplc (add -o to redirect)
 cargo qpl script.qplc                        # run a compiled artifact — no lexing/parsing/compiling
 cargo build -p qpl --no-default-features        # the library alone, drop `ipc` (hopen/dispatch/await, \port — see Architecture)
+cargo test -p qpl-std                           # `.std`: string/list/filesystem/env functions
+cargo test -p qpl-std --no-default-features     # drop `os` (fs/env) and the ipc-only test feature
 cargo test -p qpl-wasm                          # browser bindings, host-side tests
 cargo run -p qpl-cli --example extension -- -c '.geo.km[51.51;-0.13;40.71;-74.01]'   # a qpl binary with a Rust extension
 cargo run -p qpl-cli --example extension_toolkit -- --load-demo -c '.stats.top[trades; `price; 3]'   # two extensions, every arg/result kind
@@ -46,25 +48,31 @@ wasm-bindgen/js-sys/serde_json) are thin front-ends over it in their own
 crates, so neither pulls the other's dependencies in and neither needs to be
 a dependency of the library itself. A binary with Rust extensions
 (`qpl-cli/examples/extension.rs`) gets the identical front-end by depending on
-`qpl-cli` and calling `qpl_cli::run(extensions)`.
+`qpl-cli` and calling `qpl_cli::run(extensions)`. `qpl-std` (`.std`: string,
+list, filesystem and environment functions — see the `ext` row below) is
+itself an ordinary Rust extension crate, built only on the public extension
+API; `qpl-cli` registers it before any user extension, and `qpl-wasm`
+registers it with its `os` feature (filesystem/env) off, since a browser has
+neither.
 
-The repo is a Cargo workspace of four crates: `qpl` (the root package, the
+The repo is a Cargo workspace of five crates: `qpl` (the root package, the
 pure interpreter library), `qpl-macros/` (the `#[qpl::native]` proc macro,
-re-exported as `qpl::native`), `qpl-cli/` (the `qpl` binary) and `qpl-wasm/`
-(browser bindings). `[workspace.package].version` is the one version number,
-shared by every crate via `version.workspace = true`. Plain `cargo
-build`/`test`/`run` at the root operate on `qpl` and `qpl-cli` (`[workspace]
-default-members` in the root `Cargo.toml`) — the obvious "build/test/run the
-interpreter and its CLI" default; `qpl-macros` and `qpl-wasm` need an explicit
-`-p` or `--workspace`. `cargo qpl` is a `.cargo/config.toml` alias for `cargo
-run -p qpl-cli --`. Workspace-wide checks need `--workspace` (`cargo clippy
---workspace --all-targets`).
+re-exported as `qpl::native`), `qpl-std/` (`.std`), `qpl-cli/` (the `qpl`
+binary) and `qpl-wasm/` (browser bindings). `[workspace.package].version` is
+the one version number, shared by every crate via `version.workspace = true`.
+Plain `cargo build`/`test`/`run` at the root operate on `qpl`, `qpl-std` and
+`qpl-cli` (`[workspace] default-members` in the root `Cargo.toml`) — the
+obvious "build/test/run the interpreter and its CLI" default; `qpl-macros`
+and `qpl-wasm` need an explicit `-p` or `--workspace`. `cargo qpl` is a
+`.cargo/config.toml` alias for `cargo run -p qpl-cli --`. Workspace-wide
+checks need `--workspace` (`cargo clippy --workspace --all-targets`).
 
 There is no separate lint step configured; use `cargo clippy --all-targets` and
 `cargo fmt` as normal. `cargo clippy --workspace --all-targets` is expected to
 be **warning-free**, as is `cargo clippy -p qpl --all-targets` for
-`--no-default-features` and `--no-default-features --features wasm` — check
-all three before calling a change done.
+`--no-default-features` and `--no-default-features --features wasm`, and
+`cargo clippy -p qpl-std --all-targets --no-default-features` — check all
+four before calling a change done.
 
 Tests are colocated with the code they cover (`#[cfg(test)] mod tests` at the
 bottom of each source file). There is no `tests/` directory. `vm.rs`,
@@ -78,7 +86,8 @@ deliberate, reviewed output change, never to make a red test green).
 
 Releases are fully automated by GitHub Actions and driven by the workspace
 version in `Cargo.toml`. On a push to `main` that touches `Cargo.toml`,
-`Cargo.lock`, `src/**`, `qpl-macros/**`, `qpl-cli/**` or `qpl-wasm/**`,
+`Cargo.lock`, `src/**`, `qpl-macros/**`, `qpl-std/**`, `qpl-cli/**` or
+`qpl-wasm/**`,
 [`.github/workflows/tag.yml`](.github/workflows/tag.yml) reads
 `workspace.package.version` and pushes a `v<version>` tag. That tag triggers
 [`release.yml`](.github/workflows/release.yml), which creates the GitHub release
@@ -120,9 +129,11 @@ is reused.
 
 Every module below lives in the `qpl` library (`src/`) unless said otherwise.
 `qpl-cli/src/` holds the command line (`lib.rs`, `main.rs`, `interactive.rs`
-— the terminal REPL loop) and `qpl-wasm/src/` the browser bindings
-(`wasm.rs`, `arrow_io.rs`). The library's own `wasm` feature enables nothing
-but `vm::Vm`'s `capture_table`/`last_table` fields — the plumbing a
+— the terminal REPL loop), `qpl-wasm/src/` the browser bindings (`wasm.rs`,
+`arrow_io.rs`), and `qpl-std/src/` the standard library (`str.rs`, `arr.rs`,
+`fs.rs`, `env.rs`, one module per `.std` namespace, plus `lib.rs`'s
+`extensions()`/`register()`). The library's own `wasm` feature enables
+nothing but `vm::Vm`'s `capture_table`/`last_table` fields — the plumbing a
 non-terminal front-end needs to get a `DataFrame` back instead of printed
 text — and has no dependencies of its own; `qpl-wasm` enables it on its `qpl`
 dependency.

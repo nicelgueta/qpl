@@ -2382,6 +2382,7 @@ dependencies = [
  "ctrlc",
  "mimalloc",
  "qpl",
+ "qpl-std",
  "rustyline",
 ]
 
@@ -2395,6 +2396,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "qpl-std"
+version = "0.1.35"
+dependencies = [
+ "qpl",
+]
+
+[[package]]
 name = "qpl-wasm"
 version = "0.1.35"
 dependencies = [
@@ -2402,6 +2410,7 @@ dependencies = [
  "polars",
  "polars-arrow",
  "qpl",
+ "qpl-std",
  "serde_json",
  "wasm-bindgen",
 ]

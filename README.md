@@ -696,6 +696,24 @@ refuses `load`, assignment and `.qpl.cfg`, on top of writes.
 | `.qpl.cfg` | session config |
 | `hopen` `` `w!hopen `` `dispatch` `async dispatch` `await` | IPC client |
 
+## Standard library · [chapter][stdlib]
+
+`.std` ships with every build (`qpl-std`, registered before any user
+extension): string functions (`.std.str`, a string, symbol, or list of
+either), list functions that keep their list's kind (`.std.arr`), and,
+outside the browser, filesystem and environment variable access
+(`.std.fs`/`.std.env`, gated behind read/iread/write like any extension).
+
+```q
+.std.str.slice["hello"; 1; 4]      / "ell"
+.std.arr.rotate[1 2 3 4; 1]        / 2 3 4 1
+.std.fs.exists "Cargo.toml"        / true
+.std.env.r "HOME"
+```
+
+It's built entirely on the public [Rust extension API][extensions] — no
+access to VM internals — so it also serves as that API's reference example.
+
 ## Rust extensions · [chapter][extensions]
 
 Add your own native functions in Rust. Each one declares its permission, and
@@ -819,7 +837,6 @@ wasm`. [The full story](tools/wasm/README.md).
 
 - Drop the Polars patch from the WASM build, once upstream builds for
   `wasm32-unknown-unknown` unaided.
-- A basic standard library of commonly needed functions, shipped with qpl.
 - Python extensions, with the same read/write permissions as
   [Rust extensions][extensions].
 - Extension functions inside queries, built on Polars' own framework for
@@ -854,4 +871,5 @@ wasm`. [The full story](tools/wasm/README.md).
 [operators]: https://nicelgueta.github.io/qpl/language/operator-reference.html
 [read-only]: https://nicelgueta.github.io/qpl/language/read-only.html
 [extensions]: https://nicelgueta.github.io/qpl/extensions.html
+[stdlib]: https://nicelgueta.github.io/qpl/language/stdlib.html
 [architecture]: https://nicelgueta.github.io/qpl/architecture.html

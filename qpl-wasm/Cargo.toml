@@ -12,6 +12,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 qpl = { path = "..", default-features = false, features = ["wasm"] }
+# no `os`: a browser has no filesystem or environment variables, so `.std.fs`
+# and `.std.env` are dropped; `.std.str`/`.std.arr` still register.
+qpl-std = { path = "../qpl-std", default-features = false }
 # `df <-> Arrow IPC` (see `arrow_io.rs`) goes through polars-arrow's `io_ipc`
 # directly, NOT polars' `ipc`/`ipc_streaming` features, which force
 # `streaming` / enable the C lz4+zstd builds and so don't compile for wasm.

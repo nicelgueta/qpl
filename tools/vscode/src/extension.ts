@@ -5,7 +5,8 @@ import * as path from 'path';
 import { spawnSync } from 'child_process';
 import {
   AGGREGATES, AGGREGATE_DETAIL, BUILTIN_KEYWORDS, CAST_TYPES,
-  JOIN_OPERATORS, KEYWORD_DETAIL, STATEMENT_KEYWORDS, WORD_OPERATORS,
+  JOIN_OPERATORS, KEYWORD_DETAIL, STATEMENT_KEYWORDS, STDLIB, STDLIB_DETAIL,
+  WORD_OPERATORS,
 } from './vocabulary';
 import { demoTables, scanDocument } from './docScan';
 
@@ -217,6 +218,10 @@ class QplCompletionProvider implements vscode.CompletionItemProvider {
 
     for (const agg of AGGREGATES) {
       items.push(this.item(agg, vscode.CompletionItemKind.Function, AGGREGATE_DETAIL[agg] ?? `${agg}(expr) — aggregate`));
+    }
+
+    for (const fn of STDLIB) {
+      items.push(this.item(fn, vscode.CompletionItemKind.Function, STDLIB_DETAIL[fn]));
     }
 
     const { assigned } = scanDocument(document);

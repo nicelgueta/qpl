@@ -21,6 +21,7 @@ name = "extension_toolkit"
 
 [dependencies]
 qpl = { path = "..", default-features = false }
+qpl-std = { path = "../qpl-std" }
 clap = { version = "4.6.6", features = ["derive"] }
 rustyline = "18.0.1"
 # global allocator (see `main.rs`) — Polars' own official builds do the same;

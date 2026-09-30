@@ -96,6 +96,14 @@ pub fn run(extensions: Vec<Extension>) {
     } else {
         vm::Vm::new()
     };
+    // registered before any user extension, so a user extension can't claim
+    // the `std` namespace root.
+    for ext in qpl_std::extensions() {
+        if let Err(e) = vm.register(ext) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
     for ext in extensions {
         if let Err(e) = vm.register(ext) {
             eprintln!("{e}");
@@ -538,5 +546,36 @@ mod tests {
         let path = scratch_path(name);
         let f = std::fs::File::create(&path).expect("create scratch file");
         (path, f)
+    }
+
+    /// `examples/stdlib.qpl`, run through the built `qpl` binary (which
+    /// registers `.std` — see `run`), diffed against
+    /// `examples/golden/stdlib.out`. `UPDATE_GOLDEN=1 cargo test -p qpl-cli
+    /// stdlib_example` regenerates it, same convention as the library's own
+    /// golden tests (`src/repl.rs`, which can't see `qpl-std`).
+    #[test]
+    fn stdlib_example_matches_golden_output() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("qpl-cli has a parent directory");
+        let script = root.join("examples/stdlib.qpl");
+        let golden = root.join("examples/golden/stdlib.out");
+
+        let out = qpl().arg(&script).output().expect("run qpl");
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+
+        if std::env::var("UPDATE_GOLDEN").is_ok() {
+            std::fs::write(&golden, &stdout).expect("write golden file");
+            return;
+        }
+        let expected = std::fs::read_to_string(&golden).unwrap_or_else(|_| {
+            panic!("missing golden file {golden:?}; run with UPDATE_GOLDEN=1 to create it")
+        });
+        assert_eq!(stdout, expected, "golden output mismatch for 'stdlib'");
     }
 }

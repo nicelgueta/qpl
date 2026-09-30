@@ -1,9 +1,9 @@
 [workspace]
-members = ["qpl-macros", "qpl-cli", "qpl-wasm"]
+members = ["qpl-macros", "qpl-std", "qpl-cli", "qpl-wasm"]
 # `qpl-macros` is skipped by a plain `cargo test`/`cargo build` (needs
 # `--workspace`); `qpl-wasm` needs the patched-Polars wasm32 toolchain (see
 # `scripts/build-wasm.sh`) to build for real, so it's opted in with `-p`.
-default-members = [".", "qpl-cli"]
+default-members = [".", "qpl-std", "qpl-cli"]
 
 [workspace.package]
 version = "0.1.35"

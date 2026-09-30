@@ -9,6 +9,7 @@ on:
       - Cargo.lock
       - src/**
       - qpl-macros/**
+      - qpl-std/**
       - qpl-cli/**
       - qpl-wasm/**
 

@@ -51,7 +51,11 @@ pub struct Repl {
 impl Repl {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Repl {
-        Repl { vm: Vm::new() }
+        let mut vm = Vm::new();
+        for ext in qpl_std::extensions() {
+            vm.register(ext).expect("qpl-std registers cleanly");
+        }
+        Repl { vm }
     }
 
     /// Evaluate one statement. Returns `{ output, error }`: what the CLI would
@@ -258,6 +262,10 @@ fn completions(vocab: &Json, snippets: &Json) -> Json {
     for word in list(vocab, "aggregates") {
         push(word, "Function", aggregate_detail[word].as_str());
     }
+    let stdlib_detail = &vocab["stdlibDetail"];
+    for word in list(vocab, "stdlib") {
+        push(word, "Function", stdlib_detail[word].as_str());
+    }
     for word in list(vocab, "castTypes") {
         push(word, "TypeParameter", Some("cast target type"));
     }
@@ -379,11 +387,13 @@ mod tests {
             "aggregates",
             "castTypes",
             "replCommands",
+            "stdlib",
         ] {
             assert!(!list(&vocab, key).is_empty(), "{key} is missing or empty");
         }
         assert!(vocab["keywordDetail"]["select"].is_string());
         assert!(vocab["aggregateDetail"]["sum"].is_string());
+        assert!(vocab["stdlibDetail"][".std.str.u"].is_string());
         serde_json::from_str::<Json>(LANG_CONFIG).unwrap();
         serde_json::from_str::<Json>(SNIPPETS).unwrap();
     }
@@ -479,6 +489,7 @@ mod tests {
         );
         assert_eq!(labelled("lj")["kind"], "Operator");
         assert_eq!(labelled("sum")["kind"], "Function");
+        assert_eq!(labelled(".std.str.u")["kind"], "Function");
         assert_eq!(labelled("f64")["kind"], "TypeParameter");
         // `sel` is the `select` snippet's prefix in snippets/qpl.json
         assert_eq!(labelled("sel")["kind"], "Snippet");

@@ -8,10 +8,6 @@ doesn't compile for `wasm32-unknown-unknown`, so the build currently applies
 a small patch to Polars first. The goal is to drop that patch once upstream
 builds for the target unaided.
 
-**A basic standard library.** A set of commonly needed functions shipped
-with qpl itself, so everyday helpers don't have to be rewritten in every
-script or passed around as `\i` imports.
-
 **Python extensions.** [Rust extensions](extensions.md) declare a read or
 write permission that every session enforces. Extending the same model to
 Python functions is an option for consideration further down the line.

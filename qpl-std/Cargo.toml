@@ -1,0 +1,25 @@
+[package]
+name = "qpl-std"
+version.workspace = true
+edition.workspace = true
+
+# `.std`: string, list, filesystem and environment helpers, registered as a
+# Rust extension (see `qpl::ext`) — no access to VM internals.
+[lib]
+name = "qpl_std"
+path = "src/lib.rs"
+
+[dependencies]
+# no Polars dependency of its own: everything goes through `qpl::ext::polars`,
+# the exact version qpl itself is built against.
+qpl = { path = "..", default-features = false }
+
+[features]
+default = ["os", "ipc"]
+# gates `fs` and `env`, the two modules that touch the world outside the
+# session; a `qpl-wasm` build drops it (no filesystem or env vars in a browser).
+os = []
+# only exercised by tests, which check `iread` functions are refused over a
+# read-only IPC handle (`Vm::with_request_permission`); qpl-std itself never
+# opens a connection.
+ipc = ["qpl/ipc"]

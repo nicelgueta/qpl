@@ -1,0 +1,31 @@
+bool: true
+bool: true
+bool: true
+str: "ell"
+str: "olleh"
+str: "hello"
+str: "HELLO"
+i64: 5
+str: "hi"
+str[3]: "a" "b" "c"
+str: "a-b-c"
+str: "a-b-c"
+i64: 2
+bool[2]: 10
+i64[3]: 3 2 1
+i64[3]: 1 2 0
+i64[3]: 0 2 1
+bool: true
+i64: 1
+i64[2]: 1 3
+i64[4]: 1 2 1 3
+i64[4]: 2 3 4 1
+i64[4]: 1 2 3 4
+str: "a/b"
+str: "a/b.txt"
+str: "c.txt"
+str: "txt"
+bool: true
+bool: true
+bool: false
+str: ""

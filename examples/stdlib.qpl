@@ -1,0 +1,43 @@
+/ `.std`: string, list, filesystem and environment helpers (see
+/ book/src/language/stdlib.md). Read-only functions only — this script is
+/ run read-only by the golden test.
+
+/ .std.str: string functions work on a string, a symbol, or a list of either
+.std.str.startswith["hello"; "he"]
+.std.str.endswith["hello"; "lo"]
+.std.str.contains["hello"; "ell"]
+.std.str.slice["hello"; 1; 4]
+.std.str.rv "hello"
+.std.str.l "HELLO"
+.std.str.u "hello"
+.std.str.len "hello"
+.std.str.trim "  hi  "
+.std.str.split["a,b,c"; ","]
+.std.str.join[("a" "b" "c"); "-"]
+.std.str.replace["a.b.c"; "."; "-"]
+.std.str.find["hello"; "ll"]
+.std.str.startswith[("ab" "ba"); "a"]
+
+/ .std.arr: list functions work on any list kind, keeping it
+.std.arr.rv 1 2 3
+.std.arr.iasc 3 1 2
+.std.arr.idesc 3 1 2
+.std.arr.has[1 2 3; 2]
+.std.arr.find[1 2 3 2; 2]
+.std.arr.findall[1 2 3 2; 2]
+.std.arr.dedup 1 1 2 2 1 3
+.std.arr.rotate[1 2 3 4; 1]
+.std.arr.cat[1 2; 3 4]
+
+/ .std.fs: `parent`/`join`/`name`/`ext` are lexical, never touching the
+/ filesystem; `.` always exists, so `isdir`/`exists` stay deterministic here
+.std.fs.parent "a/b/c.txt"
+.std.fs.join["a"; "b.txt"]
+.std.fs.name "a/b/c.txt"
+.std.fs.ext "a/b/c.txt"
+.std.fs.isdir "."
+.std.fs.exists "."
+
+/ .std.env: a name this script doesn't set stays unset
+.std.env.has "QPL_STD_EXAMPLE_UNSET_VAR"
+.std.env.r "QPL_STD_EXAMPLE_UNSET_VAR"

@@ -31,7 +31,13 @@ export const CAST_TYPES: string[] = vocabulary.castTypes;
 
 export const REPL_COMMANDS: string[] = vocabulary.replCommands;
 
+// `.std.<ns>.<fn>` — qpl's standard library (`qpl-std`), registered before
+// any user extension.
+export const STDLIB: string[] = vocabulary.stdlib;
+
 /** Detail strings shown alongside completion items, keyed by identifier. */
 export const AGGREGATE_DETAIL: Record<string, string> = vocabulary.aggregateDetail;
 
 export const KEYWORD_DETAIL: Record<string, string> = vocabulary.keywordDetail;
+
+export const STDLIB_DETAIL: Record<string, string> = vocabulary.stdlibDetail;

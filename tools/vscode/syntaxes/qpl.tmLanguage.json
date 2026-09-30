@@ -11,6 +11,7 @@
     { "include": "#assignment" },
     { "include": "#function" },
     { "include": "#builtin" },
+    { "include": "#stdlib" },
     { "include": "#namespace" },
     { "include": "#keyword" },
     { "include": "#cast" },
@@ -102,6 +103,11 @@
       "comment": "`.qpl.*` namespaced builtin functions (e.g. `.qpl.cfg`) — coloured like load / sink / cols",
       "name": "keyword.other.qpl",
       "match": "\\.qpl\\.[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*"
+    },
+    "stdlib": {
+      "comment": "`.std.str.*` / `.std.arr.*` / `.std.fs.*` / `.std.env.*` — the standard library (qpl-std), coloured like load / sink / cols",
+      "name": "keyword.other.qpl",
+      "match": "\\.std\\.(str|arr|fs|env)\\.\\w+"
     },
     "namespace": {
       "comment": "a user namespace reference (e.g. `.utils.helper`, from `\\i \"utils.qpl\"`) — any other dotted name, coloured like a plain identifier",
