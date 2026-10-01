@@ -2366,6 +2366,7 @@ dependencies = [
 name = "qpl"
 version = "0.1.35"
 dependencies = [
+ "js-sys",
  "polars",
  "polars-ops",
  "qpl-macros",
