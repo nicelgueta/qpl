@@ -13,6 +13,7 @@ path = "src/lib.rs"
 # no Polars dependency of its own: everything goes through `qpl::ext::polars`,
 # the exact version qpl itself is built against.
 qpl = { path = "..", default-features = false }
+regex = "1.13.1"
 
 [features]
 default = ["os", "ipc"]

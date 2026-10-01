@@ -1,7 +1,7 @@
 /target
 
 # output written by the example scripts
-/examples/data/*
+/examples/data/*.parquet
 
 # stdout logs written by examples/logging.qpl (and \1 in general)
 *.log

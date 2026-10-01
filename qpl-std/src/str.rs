@@ -4,8 +4,11 @@
 //! not bytes. Every function is `read`.
 
 use qpl::ast::Value;
+use qpl::errors::QplError;
 use qpl::ext::polars::prelude::*;
 use qpl::ext::{Extension, StrArg};
+
+use regex::Regex;
 
 /// Apply a `&str -> bool` predicate, scalar in, scalar out; a null element
 /// of a list argument is treated as not matching.
@@ -45,6 +48,28 @@ fn char_find(s: &str, p: &str) -> i64 {
     }
 }
 
+/// regex match
+fn regex_find(s: &StrArg, pattern: &str) -> Result<Value, QplError> {
+    Ok(match s {
+        StrArg::One(s2) => {
+            let re = Regex::new(pattern)
+                .map_err(|e| QplError::Runtime(format!("Invalid regex: {}", e.to_string())))?;
+            match re.find(s2) {
+                Some(m) => Value::Str(m.as_str().to_string()),
+                None => Value::Str(String::new()),
+            }
+        }
+        StrArg::Many(sv) => {
+            let pat = StringChunked::from_slice(pattern.into(), &[pattern]);
+            let res = sv
+                .str()?
+                .extract(&pat, 0)
+                .map_err(|e| QplError::Runtime(format!("Invalid regex: {}", e.to_string())))?;
+            Value::StrVec(res.into())
+        }
+    })
+}
+
 /// `s`'s characters `start..end` (exclusive), negative indices counting
 /// from the end, clamped to `s`'s length.
 fn char_slice(s: &str, start: i64, end: i64) -> String {
@@ -54,6 +79,15 @@ fn char_slice(s: &str, start: i64, end: i64) -> String {
     let (a, b) = (norm(start), norm(end));
     let b = b.max(a);
     chars[a as usize..b as usize].iter().collect()
+}
+
+/// take n chars from the front or the back of the string
+fn _take(s: &str, n: i64) -> String {
+    if n < 0 {
+        char_slice(s, n, s.chars().count() as i64)
+    } else {
+        char_slice(s, 0, n)
+    }
 }
 
 #[qpl::native(read)]
@@ -74,6 +108,11 @@ fn contains(s: StrArg, p: String) -> Value {
 #[qpl::native(read)]
 fn slice(s: StrArg, start: i64, end: i64) -> Value {
     s.map(|s| char_slice(s, start, end))
+}
+
+#[qpl::native(read)]
+fn take(s: StrArg, n: i64) -> Value {
+    s.map(|s| _take(s, n))
 }
 
 #[qpl::native(read)]
@@ -98,7 +137,7 @@ fn len(s: StrArg) -> Value {
 
 #[qpl::native(read)]
 fn trim(s: StrArg) -> Value {
-    s.map(|s| s.trim().to_string())
+    s.map(|s: &str| s.trim().to_string())
 }
 
 #[qpl::native(read)]
@@ -121,6 +160,11 @@ fn find(s: StrArg, p: String) -> Value {
     map_int(&s, -1, |s| char_find(s, p.as_str()))
 }
 
+#[qpl::native(read)]
+fn rfind(s: StrArg, p: String) -> Result<Value, QplError> {
+    regex_find(&s, &p)
+}
+
 pub fn extension() -> Extension {
     Extension::new("std.str")
         .owner("qpl-std")
@@ -128,6 +172,7 @@ pub fn extension() -> Extension {
         .with::<endswith>()
         .with::<contains>()
         .with::<slice>()
+        .with::<take>()
         .with::<rv>()
         .with::<l>()
         .with::<u>()
@@ -137,6 +182,7 @@ pub fn extension() -> Extension {
         .with::<join>()
         .with::<replace>()
         .with::<find>()
+        .with::<rfind>()
 }
 
 #[cfg(test)]
@@ -277,6 +323,68 @@ mod tests {
             scalar(&mut vm, r#".std.str.find["hello"; "xyz"]"#),
             Value::Int(-1)
         );
+    }
+
+    #[test]
+    fn take_front_and_back() {
+        let mut vm = vm();
+        assert_eq!(
+            scalar(&mut vm, r#".std.str.take["hello"; 2]"#),
+            Value::Str("he".into())
+        );
+        assert_eq!(
+            scalar(&mut vm, r#".std.str.take["hello"; -2]"#),
+            Value::Str("lo".into())
+        );
+        assert_eq!(
+            scalar(&mut vm, r#".std.str.take["hi"; 100]"#),
+            Value::Str("hi".into())
+        );
+    }
+
+    #[test]
+    fn take_list() {
+        let mut vm = vm();
+        let EvalResult::Scalar(Value::StrVec(s)) =
+            eval(&mut vm, r#".std.str.take[("ab" "cde");1]"#)
+        else {
+            panic!("expected a string list");
+        };
+        let v: Vec<Option<&str>> = s.str().unwrap().iter().collect();
+        assert_eq!(v, vec![Some("a"), Some("c")]);
+    }
+
+    #[test]
+    fn rfind_matches_a_regex_scalar() {
+        let mut vm = vm();
+        assert_eq!(
+            scalar(&mut vm, r#".std.str.rfind["room 12b"; "\\d+"]"#),
+            Value::Str("12".into())
+        );
+        assert_eq!(
+            scalar(&mut vm, r#".std.str.rfind["no digits here"; "\\d+"]"#),
+            Value::Str("".into())
+        );
+    }
+
+    #[test]
+    fn rfind_matches_a_regex_list() {
+        let mut vm = vm();
+        let EvalResult::Scalar(Value::StrVec(s)) = eval(
+            &mut vm,
+            r#".std.str.rfind[("room 12b" "no digits here");"\\d+"]"#,
+        ) else {
+            panic!("expected a string list");
+        };
+        let v: Vec<Option<&str>> = s.str().unwrap().iter().collect();
+        assert_eq!(v, vec![Some("12"), None]);
+    }
+
+    #[test]
+    fn rfind_rejects_an_invalid_regex() {
+        let mut vm = vm();
+        let err = run_vm(r#".std.str.rfind["abc"; "("]"#, &mut vm).unwrap_err();
+        assert!(err.to_string().contains("Invalid regex"), "{err}");
     }
 
     #[test]

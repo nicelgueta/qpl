@@ -1,0 +1,10 @@
+/  example script showing how to read a file into a table
+/ for analysis.
+raw: read0 "examples/data/dpkg.log.1"
+tbl: zip `lineno`dt`tm`line`line_length!
+    (til count raw) / create index
+    (`date$.std.str.take[raw;10]) /take first 10 chars and cast to date
+    (`time$.std.str.rfind[raw;"\\d{2}:\\d{2}:\\d{2}"]) / pull out regex pat and cast to time
+    (.std.str.slice[raw;20;max .std.str.len raw]) / take rest of line
+    (.std.str.len raw) / set length of line
+tbl

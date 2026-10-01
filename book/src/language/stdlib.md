@@ -25,6 +25,7 @@ lengths count characters, not bytes.
 | `endswith[s; p]` | bool | literal suffix match |
 | `contains[s; p]` | bool | literal substring match — no glob or regex |
 | `slice[s; start; end]` | string | `end` exclusive; negative indices count from the end; out-of-range is clamped |
+| `take[s; n]` | string | first `n` characters, or the last `n` if `n` is negative; out-of-range is clamped |
 | `rv[s]` | string | reversed |
 | `l[s]` | string | lowercase (Unicode) |
 | `u[s]` | string | uppercase (Unicode) |
@@ -33,12 +34,15 @@ lengths count characters, not bytes.
 | `split[s; sep]` | string list | `s` must be a single string, not a list |
 | `join[xs; sep]` | string | joins a string list |
 | `replace[s; a; b]` | string | every literal occurrence of `a` replaced with `b` |
-| `find[s; p]` | int | character index of the first match, or `-1` |
+| `find[s; p]` | int | character index of the first literal match, or `-1` |
+| `rfind[s; p]` | string | the first substring matching regex `p`, or `""` if none match |
 
 ```q
 .std.str.slice["hello"; 1; 4]           / "ell"
+.std.str.take["hello"; -2]              / "lo"
 .std.str.startswith[("ab"; "ba"); "a"] / 10b
 .std.str.split["a,b,c"; ","]           / ("a";"b";"c")
+.std.str.rfind["room 12b"; "\\d+"]      / "12"
 ```
 
 ## `.std.arr`

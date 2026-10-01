@@ -2400,6 +2400,7 @@ name = "qpl-std"
 version = "0.1.35"
 dependencies = [
  "qpl",
+ "regex",
 ]
 
 [[package]]
