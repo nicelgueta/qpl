@@ -2364,7 +2364,7 @@ dependencies = [
 
 [[package]]
 name = "qpl"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "js-sys",
  "polars",
@@ -2377,7 +2377,7 @@ dependencies = [
 
 [[package]]
 name = "qpl-cli"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "clap",
  "ctrlc",
@@ -2389,7 +2389,7 @@ dependencies = [
 
 [[package]]
 name = "qpl-macros"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2398,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "qpl-std"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "qpl",
  "regex",
@@ -2406,7 +2406,7 @@ dependencies = [
 
 [[package]]
 name = "qpl-wasm"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "js-sys",
  "polars",

@@ -6,7 +6,7 @@ members = ["qpl-macros", "qpl-std", "qpl-cli", "qpl-wasm"]
 default-members = [".", "qpl-std", "qpl-cli"]
 
 [workspace.package]
-version = "0.1.35"
+version = "0.1.36"
 edition = "2024"
 
 [package]
