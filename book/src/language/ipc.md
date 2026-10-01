@@ -115,9 +115,10 @@ A client that can run arbitrary statements on a server can also modify it, or
 read things the server can see that it shouldn't have to expose, so qpl
 defaults to the cautious option. A bare `hopen` gives a **read-only**
 connection, and the server refuses anything beyond a plain read: `load`,
-assignments, changing a [`.qpl.cfg`](config.md) setting, and `sink`. Queries
-of every kind still work. (A bare `.qpl.cfg` is allowed too, but it prints
-the settings on the *server's* console. The client just gets `true` back.)
+`read0`/`read1`, assignments, changing a [`.qpl.cfg`](config.md) setting,
+and `sink`/`write0`/`write1`. Queries of every kind still work. (A bare
+`.qpl.cfg` is allowed too, but it prints the settings on the *server's*
+console. The client just gets `true` back.)
 
 ```qpl
 ro: hopen 5001                          / read-only, the default

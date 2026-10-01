@@ -4,6 +4,16 @@
     "body": "select ${1:cols} from ${2:table} where ${3:pred}",
     "description": "select <cols> from <table> where <pred>"
   },
+  "read lines": {
+    "prefix": "read0",
+    "body": "read0 \"${1:path}\"",
+    "description": "a file's lines as a string list"
+  },
+  "write lines": {
+    "prefix": "write0",
+    "body": "${1:lines} write0 \"${2:path}\"",
+    "description": "write a string list, one line per element (needs -w)"
+  },
   "select by": {
     "prefix": "selby",
     "body": "select ${1:total}: ${2:sum} ${3:col} by ${4:keys} from ${5:table}",

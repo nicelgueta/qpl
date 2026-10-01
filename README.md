@@ -306,12 +306,18 @@ select price, bid from trades `sym lj (select sym, bid from quotes where bid > 0
 
 `load` reads parquet or CSV and is eager on its own; `sink` streams a table
 expression out to a file (in a session started with `-w`); `cols` shows a
-schema without reading data.
+schema without reading data. `read0`/`read1` and `write0`/`write1` are the
+line- and byte-level equivalents for anything that isn't tabular: `read0`
+returns a file's lines as a string list, `read1` its bytes as a `ByteVec`
+(printed as `0x` plus hex, no scalar counterpart); `write0`/`write1` write
+them back out.
 
 ```q
 t: load "data/trades.parquet"
 select sym, price from trades where size > 100 sink "big_trades.parquet"
 cols trades
+read0 "notes.txt"
+("line one" "line two") write0 "notes.txt"   / needs -w
 ```
 
 ### Expressions · [chapter][expressions]

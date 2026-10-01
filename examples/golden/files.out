@@ -1,0 +1,5 @@
+str[3]: "first line" "second line" "third line"
+i64: 3
+str[1]: "line"
+byte[5]: 0x6669727374
+i64: 102

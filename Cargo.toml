@@ -35,7 +35,8 @@ qpl-macros = { path = "qpl-macros" }
 # `-duration` features are separate and power qpl's date/time literals & casts.
 # The feature list is split per target (see the two `[target...dependencies.polars]`
 # blocks below `[features]`): `fmt` and `parquet`/`csv` cannot be used on wasm.
-polars = { version = "0.55.2", default-features = false, features = ["temporal", "lazy", "strings", "is_in", "abs", "dtype-categorical", "dtype-date", "dtype-datetime", "dtype-time", "dtype-duration", "round_series", "rank", "mode", "moment", "diff",
+# `dtype-u8` backs `ByteVec` (`read1`'s result type).
+polars = { version = "0.55.2", default-features = false, features = ["temporal", "lazy", "strings", "is_in", "abs", "dtype-categorical", "dtype-date", "dtype-datetime", "dtype-time", "dtype-duration", "dtype-u8", "round_series", "rank", "mode", "moment", "diff",
     "pct_change", "cum_agg", "rolling_window", "product", "regex"] }
 # pulled in only to name `RoundMode` (the `polars` facade re-exports it crate-privately);
 # already compiled as a transitive dep, same version.

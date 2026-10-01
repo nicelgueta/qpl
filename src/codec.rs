@@ -135,6 +135,7 @@ enum ValueTag {
     SecondVec = 21,
     TimestampVec = 22,
     TimespanVec = 23,
+    ByteVec = 24,
 }
 
 impl TryFrom<u8> for ValueTag {
@@ -166,6 +167,7 @@ impl TryFrom<u8> for ValueTag {
             21 => SecondVec,
             22 => TimestampVec,
             23 => TimespanVec,
+            24 => ByteVec,
             other => {
                 return Err(rt(format!("corrupt bytecode: unknown value tag {other}")));
             }
@@ -334,6 +336,20 @@ pub fn encode_value(v: &Value, out: &mut Vec<u8>) -> Result<(), QplError> {
             push_u8(out, ValueTag::TimespanVec as u8);
             encode_nullable_vec!(out, s.i64().map_err(rt)?, push_i64);
         }
+        ByteVec(s) => {
+            push_u8(out, ValueTag::ByteVec as u8);
+            let ca = s.u8().map_err(rt)?;
+            push_u32(out, ca.len() as u32);
+            for opt in ca.iter() {
+                match opt {
+                    Some(v) => {
+                        push_u8(out, 1);
+                        push_u8(out, v);
+                    }
+                    None => push_u8(out, 0),
+                }
+            }
+        }
         Handle(_) | Future(_) | Closure(_) | Table(_) | Lazy(_) => {
             return Err(rt(format!(
                 "cannot serialise a {} value",
@@ -439,6 +455,21 @@ pub fn decode_value(r: &mut Reader) -> Result<Value, QplError> {
             let v: Vec<Option<i64>> = decode_nullable_vec!(r, Reader::i64);
             ast::Value::TimespanVec(Series::new("".into(), v))
         }
+        ByteVec => {
+            let n = r.u32()? as usize;
+            let mut v: Vec<Option<i64>> = Vec::with_capacity(n.min(r.remaining()));
+            for _ in 0..n {
+                v.push(if r.u8()? != 0 {
+                    Some(r.u8()? as i64)
+                } else {
+                    None
+                });
+            }
+            let s = Series::new("".into(), v)
+                .cast(&DataType::UInt8)
+                .map_err(rt)?;
+            ast::Value::ByteVec(s)
+        }
     })
 }
 
@@ -492,6 +523,7 @@ mod tests {
             ast::second_vec(vec![1, 2]),
             ast::timestamp_vec(vec![1, 2]),
             ast::timespan_vec(vec![1, 2]),
+            ast::byte_vec(vec![0, 1, 255]),
         ];
         for v in cases {
             assert_eq!(roundtrip(v.clone()), v);
@@ -528,6 +560,7 @@ mod tests {
         check!(Value::SecondVec, i32);
         check!(Value::TimestampVec, i64);
         check!(Value::TimespanVec, i64);
+        check!(Value::ByteVec, u8);
 
         let sym = Series::new(
             "".into(),

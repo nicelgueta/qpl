@@ -411,6 +411,8 @@ pub fn tokenise(src: &str) -> Result<Vec<Token>, QplError> {
                         "sink" => TokenKind::Sink,
                         "lazy" => TokenKind::Lazy,
                         "collect" => TokenKind::Collect,
+                        "write0" => TokenKind::Write0,
+                        "write1" => TokenKind::Write1,
                         _ => TokenKind::Name(name),
                     };
                     tokens.push(Token { kind, pos: start });

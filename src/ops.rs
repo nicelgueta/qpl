@@ -692,6 +692,8 @@ fn any_value_to_scalar(kind: ast::VecKind, av: AnyValue) -> Result<Value, QplErr
         Second => Value::Second(av.extract::<i32>().ok_or_else(bad)?),
         Timestamp => Value::Timestamp(av.extract::<i64>().ok_or_else(bad)?),
         Timespan => Value::Timespan(av.extract::<i64>().ok_or_else(bad)?),
+        // no byte scalar: a `ByteVec` element indexes to a plain int
+        Byte => Value::Int(av.extract::<i64>().ok_or_else(bad)?),
     })
 }
 

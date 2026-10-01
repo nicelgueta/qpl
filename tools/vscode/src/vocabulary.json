@@ -28,7 +28,9 @@
     "zip",
     "hopen",
     "await",
-    "async"
+    "async",
+    "read0",
+    "read1"
   ],
   "joinOperators": [
     "lj",
@@ -37,7 +39,9 @@
   ],
   "wordOperators": [
     "like",
-    "dispatch"
+    "dispatch",
+    "write0",
+    "write1"
   ],
   "aggregates": [
     "sum",
@@ -209,6 +213,10 @@
     "drop": "`col drop <table> \u2014 drop named columns; <n> drop <xs> \u2014 drop the first/last n elements of a list (same as n _ xs)",
     "load": "load <path> \u2014 read a table from disk",
     "sink": "sink <table> <path> \u2014 write a table to disk",
+    "read0": "read0 <path> / read0[<path>; <off>; <len>] \u2014 a file's lines as a string list",
+    "read1": "read1 <path> / read1[<path>; <off>; <len>] \u2014 a file's bytes as a ByteVec",
+    "write0": "<lines> write0 <path> \u2014 write a string list, one line per element (needs -w)",
+    "write1": "<bytes> write1 <path> \u2014 write a ByteVec, or an int list of byte values (needs -w)",
     "cols": "cols <table> \u2014 list column names",
     "lazy": "bind a lazy query plan instead of a materialised table",
     "collect": "collect a lazy plan into a table",

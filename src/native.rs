@@ -39,6 +39,10 @@ pub enum NativeId {
     /// `\port [<n>]`: close any open listener, then open one on `n` if given.
     /// Servicing requests is left to the run loop (`repl::start`).
     Port,
+    /// `<value> write0 <path>`: a string list, one line per element.
+    Write0,
+    /// `<value> write1 <path>`: a `ByteVec` (or an int list of byte values).
+    Write1,
 }
 
 /// The signature every native shares: evaluated argument slots in, one slot out.
@@ -121,6 +125,22 @@ pub(crate) fn builtins() -> HashMap<String, Builtin> {
             call: NativeCall::Internal(now_fn(TemporalNowFuncType::Timespan)),
         },
     );
+    m.insert(
+        "read0".to_string(),
+        Builtin {
+            arity: 1..=3,
+            effect: Effect::IRead,
+            call: NativeCall::Internal(crate::vm::native_read0),
+        },
+    );
+    m.insert(
+        "read1".to_string(),
+        Builtin {
+            arity: 1..=3,
+            effect: Effect::IRead,
+            call: NativeCall::Internal(crate::vm::native_read1),
+        },
+    );
     m
 }
 
@@ -138,10 +158,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_builtin_is_callable_and_matches_its_arity() {
+    fn every_niladic_builtin_is_callable() {
         let mut vm = Vm::new();
         for (name, b) in builtins() {
-            assert_eq!(b.arity, 0..=0, "{name} is niladic");
+            if b.arity != (0..=0) {
+                continue;
+            }
             let NativeCall::Internal(call) = b.call else {
                 panic!("{name} is an extension");
             };

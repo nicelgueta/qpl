@@ -299,7 +299,19 @@ impl Parser {
     }
 
     fn parse_scalar_stmt(&mut self) -> Result<Stmt, QplError> {
-        Ok(Stmt::SingleVar(self.parse_expr()?))
+        let expr = self.parse_expr()?;
+        // `<value> write0 <path>` / `<value> write1 <path>`
+        if matches!(self.peek(), TokenKind::Write0 | TokenKind::Write1) {
+            let bytes = self.peek() == &TokenKind::Write1;
+            self.next();
+            let path = self.parse_expr()?;
+            return Ok(Stmt::WriteFile {
+                bytes,
+                value: expr,
+                path,
+            });
+        }
+        Ok(Stmt::SingleVar(expr))
     }
 
     fn parse_table_expr(&mut self) -> Result<TableExpr, QplError> {
@@ -1847,6 +1859,8 @@ fn render_tokens(tokens: &[Token]) -> String {
             TokenKind::Cols => "cols".to_string(),
             TokenKind::Lazy => "lazy".to_string(),
             TokenKind::Collect => "collect".to_string(),
+            TokenKind::Write0 => "write0".to_string(),
+            TokenKind::Write1 => "write1".to_string(),
             TokenKind::Name(n) => n.clone(),
             TokenKind::Int(n) => n.to_string(),
             TokenKind::Float(f) => f.to_string(),
@@ -2805,6 +2819,54 @@ mod tests {
                 assert_eq!(path, Expr::Lit(Value::Str("out.parquet".into())));
             }
             other => panic!("expected sink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write0_parses_as_a_terminal_statement_with_value_and_path() {
+        match p("lines write0 \"out.txt\"") {
+            Stmt::WriteFile { bytes, value, path } => {
+                assert!(!bytes);
+                assert_eq!(value, Expr::ColRef("lines".into()));
+                assert_eq!(path, Expr::Lit(Value::Str("out.txt".into())));
+            }
+            other => panic!("expected WriteFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write1_parses_with_bytes_true() {
+        match p("bytes write1 \"out.bin\"") {
+            Stmt::WriteFile { bytes, .. } => assert!(bytes),
+            other => panic!("expected WriteFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write0_accepts_a_parenthesised_list_literal_on_the_left() {
+        match p("(\"a\" \"b\") write0 \"out.txt\"") {
+            Stmt::WriteFile { bytes, .. } => assert!(!bytes),
+            other => panic!("expected WriteFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read0_bareword_parses_as_a_unary_call() {
+        assert!(matches!(
+            p("read0 \"f\""),
+            Stmt::SingleVar(Expr::Call { func, args })
+                if func == "read0" && args.len() == 1
+        ));
+    }
+
+    #[test]
+    fn read0_bracket_call_accepts_offset_and_length() {
+        match p("read0[\"f\"; 0; 4]") {
+            Stmt::SingleVar(Expr::Apply { func, args }) => {
+                assert_eq!(*func, Expr::ColRef("read0".into()));
+                assert_eq!(args.len(), 3);
+            }
+            other => panic!("expected a 3-arg read0 call, got {other:?}"),
         }
     }
 

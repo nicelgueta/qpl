@@ -40,6 +40,11 @@ one per temporal type. A column whose type has no list equivalent, or which
 contains nulls, will refuse to materialise rather than quietly losing
 information. Use `fill` or `dropnull` first; see [Nulls](expressions.md#nulls).
 
+`ByteVec` is the one list type with no atomic counterpart: there's no byte
+scalar, so indexing a `ByteVec` gives a plain int. It's what
+[`read1`](files.md#read0-and-read1-text-and-bytes) returns, not something a
+column materialises into.
+
 A column expression can carry a `where` of its own, which filters the table's
 rows before the column is extracted:
 

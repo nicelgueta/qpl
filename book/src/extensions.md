@@ -176,6 +176,7 @@ Parameters and return values convert to and from qpl values by type:
 | `bool` | bool |
 | `String` | string, or a symbol as an argument |
 | `Vec<i64>`, `Vec<f64>`, `Vec<bool>`, `Vec<String>` | a list of that type |
+| `Vec<u8>` | a `ByteVec`, as an argument also an int list whose values are all 0-255 |
 | `Series` | any list, as an argument |
 | `qpl::ext::StrArg` | a string/symbol or a list of either, as an argument |
 | `DataFrame` | a table (a lazy argument is collected first) |

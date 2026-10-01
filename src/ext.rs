@@ -316,6 +316,28 @@ impl FromValue for Vec<i64> {
     }
 }
 
+/// A `ByteVec`, or an int list whose values are all 0-255.
+impl FromValue for Vec<u8> {
+    fn from_value(v: Value) -> Result<Self, String> {
+        match v {
+            Value::ByteVec(s) => Ok(s
+                .u8()
+                .map_err(|e| e.to_string())?
+                .into_no_null_iter()
+                .collect()),
+            v @ Value::IntVec(_) => {
+                let ints = Vec::<i64>::from_value(v)?;
+                ints.into_iter()
+                    .map(|n| {
+                        u8::try_from(n).map_err(|_| format!("int {n} is out of byte range 0-255"))
+                    })
+                    .collect()
+            }
+            other => Err(expected("a byte list", &other)),
+        }
+    }
+}
+
 impl FromValue for Vec<f64> {
     fn from_value(v: Value) -> Result<Self, String> {
         list(
@@ -456,6 +478,12 @@ impl IntoValue for Vec<bool> {
 impl IntoValue for Vec<String> {
     fn into_value(self) -> Value {
         ast::str_vec(self)
+    }
+}
+
+impl IntoValue for Vec<u8> {
+    fn into_value(self) -> Value {
+        ast::byte_vec(self)
     }
 }
 
@@ -861,5 +889,33 @@ mod tests {
             Value::Int(1).map_vec(|s| Ok(s.clone())).unwrap_err(),
             "expected a list, got Int(1)"
         );
+    }
+
+    #[test]
+    fn vec_u8_from_value_accepts_a_byte_vec() {
+        let v = ast::byte_vec(vec![1, 2, 255]);
+        assert_eq!(Vec::<u8>::from_value(v).unwrap(), vec![1, 2, 255]);
+    }
+
+    #[test]
+    fn vec_u8_from_value_accepts_an_int_list_in_range() {
+        let v = ast::int_vec(vec![0, 128, 255]);
+        assert_eq!(Vec::<u8>::from_value(v).unwrap(), vec![0, 128, 255]);
+    }
+
+    #[test]
+    fn vec_u8_from_value_rejects_an_out_of_range_int_list() {
+        let v = ast::int_vec(vec![0, 300]);
+        assert!(Vec::<u8>::from_value(v).is_err());
+    }
+
+    #[test]
+    fn vec_u8_from_value_rejects_a_non_list() {
+        assert!(Vec::<u8>::from_value(Value::Int(1)).is_err());
+    }
+
+    #[test]
+    fn vec_u8_into_value_makes_a_byte_vec() {
+        assert_eq!(vec![1u8, 2, 3].into_value(), ast::byte_vec(vec![1, 2, 3]));
     }
 }

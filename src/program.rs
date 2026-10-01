@@ -512,7 +512,7 @@ pub const MAGIC: &[u8; 4] = b"QPLC";
 
 /// The `.qplc` format version. Bump on any change to `Op`, `Operand`,
 /// `OperandTag`, `NativeId` or codec tags.
-pub const FORMAT_VERSION: u16 = 2;
+pub const FORMAT_VERSION: u16 = 3;
 
 /// Which [`Operand`] variant follows in a `.qplc`. Part of the format.
 #[repr(u8)]
@@ -755,6 +755,8 @@ fn native_id_to_u8(id: NativeId) -> u8 {
         LoadScript => 5,
         ImportScript => 6,
         Port => 7,
+        Write0 => 8,
+        Write1 => 9,
     }
 }
 
@@ -769,6 +771,8 @@ fn u8_to_native_id(b: u8) -> Result<NativeId, QplError> {
         5 => LoadScript,
         6 => ImportScript,
         7 => Port,
+        8 => Write0,
+        9 => Write1,
         other => {
             return Err(rt(format!(
                 "corrupt bytecode: unknown native id tag {other}"
@@ -1210,6 +1214,19 @@ mod tests {
             assert_eq!(a.ip, b.ip);
             assert_eq!(a.line, b.line);
             assert_eq!(&*a.path, &*b.path);
+        }
+    }
+
+    #[test]
+    fn qplc_round_trip_preserves_write0_and_write1_native_ids() {
+        for src in [r#"("a") write0 "f""#, r#"(1 2 3) write1 "f""#] {
+            let stmt =
+                crate::parser::parse(crate::lexer::tokenise(src).expect("lex")).expect("parse");
+            let p = crate::compiler::compile(&stmt).expect("compile");
+            let before = disassemble(&p);
+            let bytes = p.to_bytes().expect("to_bytes");
+            let p2 = Program::from_bytes(&bytes).expect("from_bytes");
+            assert_eq!(before, disassemble(&p2));
         }
     }
 

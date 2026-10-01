@@ -1798,6 +1798,8 @@ impl Vm {
                     crate::native::NativeId::LoadScript => self.native_load_script(args)?,
                     crate::native::NativeId::ImportScript => self.native_import_script(args)?,
                     crate::native::NativeId::Port => self.native_port(args)?,
+                    crate::native::NativeId::Write0 => self.native_write0(args)?,
+                    crate::native::NativeId::Write1 => self.native_write1(args)?,
                 };
                 self.stack.push(result);
             }
@@ -1880,6 +1882,56 @@ impl Vm {
             })?;
             self.config.set(key.trim(), value.trim())?;
         }
+        Ok(Slot::Noop)
+    }
+
+    /// `<value> write0 <path>`: each string element followed by `\n`,
+    /// truncating (or creating) the file. A single string is one line.
+    fn native_write0(&mut self, mut args: Vec<Slot>) -> Result<Slot, QplError> {
+        self.authorize(Effect::Write, "write0")?;
+        let path = match args.remove(1).unwrap_scalar()? {
+            Value::Str(s) | Value::Sym(s) => s,
+            other => {
+                return Err(QplError::Runtime(format!(
+                    "expected a string path for write0, got {other:?}"
+                )));
+            }
+        };
+        let lines = match args.remove(0).unwrap_scalar()? {
+            Value::Str(s) | Value::Sym(s) => vec![s],
+            v @ (Value::StrVec(_) | Value::SymVec(_)) => {
+                v.vec_strings().map_err(QplError::Runtime)?
+            }
+            other => {
+                return Err(QplError::Runtime(format!(
+                    "expected a string or string list for write0, got {other:?}"
+                )));
+            }
+        };
+        let mut text = String::new();
+        for line in &lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        write_file_bytes(&path, text.as_bytes())?;
+        Ok(Slot::Noop)
+    }
+
+    /// `<value> write1 <path>`: a `ByteVec` (or an int list of byte values),
+    /// truncating (or creating) the file.
+    fn native_write1(&mut self, mut args: Vec<Slot>) -> Result<Slot, QplError> {
+        self.authorize(Effect::Write, "write1")?;
+        let path = match args.remove(1).unwrap_scalar()? {
+            Value::Str(s) | Value::Sym(s) => s,
+            other => {
+                return Err(QplError::Runtime(format!(
+                    "expected a string path for write1, got {other:?}"
+                )));
+            }
+        };
+        let bytes = <Vec<u8> as crate::ext::FromValue>::from_value(args.remove(0).unwrap_scalar()?)
+            .map_err(QplError::Runtime)?;
+        write_file_bytes(&path, &bytes)?;
         Ok(Slot::Noop)
     }
 
@@ -2172,6 +2224,7 @@ pub(crate) fn ast_val_to_expr(val: ast::Value) -> Result<Expr, QplError> {
         ast::Value::TimestampVec(s) => (s.lit() + lit(temporal::NS_2000_TO_1970))
             .cast(DataType::Datetime(TimeUnit::Nanoseconds, None)),
         ast::Value::TimespanVec(s) => s.lit().cast(DataType::Duration(TimeUnit::Nanoseconds)),
+        ast::Value::ByteVec(s) => s.lit(),
     })
 }
 
@@ -2274,6 +2327,97 @@ fn sink_file(lf: LazyFrame, path: &str) -> Result<(), QplError> {
     .collect_with_engine(Engine::Streaming)
     .map_err(|e| QplError::Runtime(e.to_string()))?;
     Ok(())
+}
+
+/// A `read0`/`read1` path, plus kdb's optional `(off; len)`: `len` bytes
+/// starting at byte `off`. Arity 2 (`off` given, no `len`) reads to the end.
+/// Out-of-range offsets/lengths are clamped rather than erroring.
+#[cfg(target_family = "wasm")]
+fn read_file_range(path: &str, _off: Option<i64>, _len: Option<i64>) -> Result<Vec<u8>, QplError> {
+    Err(QplError::Runtime(format!(
+        "cannot read '{path}': file I/O is not available in this build"
+    )))
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn read_file_range(path: &str, off: Option<i64>, len: Option<i64>) -> Result<Vec<u8>, QplError> {
+    let bytes =
+        std::fs::read(path).map_err(|e| QplError::Runtime(format!("cannot read '{path}': {e}")))?;
+    let n = bytes.len() as i64;
+    let off = off.unwrap_or(0).clamp(0, n);
+    let end = match len {
+        Some(l) => (off + l.max(0)).min(n),
+        None => n,
+    };
+    Ok(bytes[off as usize..end as usize].to_vec())
+}
+
+/// `write0`/`write1`: truncate (or create) `path` and write `bytes`.
+#[cfg(target_family = "wasm")]
+fn write_file_bytes(path: &str, _bytes: &[u8]) -> Result<(), QplError> {
+    Err(QplError::Runtime(format!(
+        "cannot write '{path}': file I/O is not available in this build"
+    )))
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn write_file_bytes(path: &str, bytes: &[u8]) -> Result<(), QplError> {
+    std::fs::write(path, bytes)
+        .map_err(|e| QplError::Runtime(format!("cannot write '{path}': {e}")))
+}
+
+/// Split `text` on `\n`, stripping a trailing `\r` from each line. A final
+/// trailing newline doesn't produce a trailing empty element.
+fn split_lines(text: &str) -> Vec<String> {
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    lines
+        .into_iter()
+        .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
+        .collect()
+}
+
+/// `read0`/`read1`'s arguments: a string/symbol path, and an optional
+/// `(off, len)` pair (arity 1..=3, checked by the builtin table).
+fn read0_1_args(args: Vec<Slot>) -> Result<(String, Option<i64>, Option<i64>), QplError> {
+    let mut it = args.into_iter();
+    let path = match ops::slot_to_scalar_value(it.next().expect("arity checked by call_builtin"))? {
+        Value::Str(s) | Value::Sym(s) => s,
+        other => {
+            return Err(QplError::Runtime(format!(
+                "expected a string path, got {other:?}"
+            )));
+        }
+    };
+    let int_arg = |slot: Slot| -> Result<i64, QplError> {
+        match ops::slot_to_scalar_value(slot)? {
+            Value::Int(n) => Ok(n),
+            other => Err(QplError::Runtime(format!(
+                "expected an int offset/length, got {other:?}"
+            ))),
+        }
+    };
+    let off = it.next().map(int_arg).transpose()?;
+    let len = it.next().map(int_arg).transpose()?;
+    Ok((path, off, len))
+}
+
+/// `read0 "f"` / `read0[p; off; len]`: the file's lines as a string list.
+pub(crate) fn native_read0(_vm: &mut Vm, args: Vec<Slot>) -> Result<Slot, QplError> {
+    let (path, off, len) = read0_1_args(args)?;
+    let bytes = read_file_range(&path, off, len)?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| QplError::Runtime(format!("'{path}' is not valid UTF-8")))?;
+    Ok(Slot::Scalar(ast::str_vec(split_lines(&text))))
+}
+
+/// `read1 "f"` / `read1[p; off; len]`: the file's bytes as a `ByteVec`.
+pub(crate) fn native_read1(_vm: &mut Vm, args: Vec<Slot>) -> Result<Slot, QplError> {
+    let (path, off, len) = read0_1_args(args)?;
+    let bytes = read_file_range(&path, off, len)?;
+    Ok(Slot::Scalar(ast::byte_vec(bytes)))
 }
 
 /// `.over(partition)`, sorting each partition by the `order` keys first if
@@ -2674,6 +2818,140 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn read0_splits_lines_strips_crlf_and_drops_a_final_trailing_newline() {
+        let path = std::env::temp_dir().join("qpl_vm_test_read0_lines.txt");
+        std::fs::write(&path, "a\r\nb\n\nc\n").unwrap();
+        let path_str = path.to_str().unwrap();
+
+        match run_vm(&format!("read0 \"{path_str}\""), &mut Vm::new()).expect("read0") {
+            EvalResult::Scalar(v) => {
+                assert_eq!(
+                    v,
+                    ast::str_vec(vec!["a".into(), "b".into(), "".into(), "c".into()])
+                );
+            }
+            other => panic!("expected a scalar, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn read0_with_no_trailing_newline_keeps_the_last_line() {
+        let path = std::env::temp_dir().join("qpl_vm_test_read0_no_trailing_nl.txt");
+        std::fs::write(&path, "a\nb").unwrap();
+        let path_str = path.to_str().unwrap();
+
+        match run_vm(&format!("read0 \"{path_str}\""), &mut Vm::new()).expect("read0") {
+            EvalResult::Scalar(v) => assert_eq!(v, ast::str_vec(vec!["a".into(), "b".into()])),
+            other => panic!("expected a scalar, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn read0_rejects_invalid_utf8() {
+        let path = std::env::temp_dir().join("qpl_vm_test_read0_bad_utf8.txt");
+        std::fs::write(&path, [0x61u8, 0xff, 0x62]).unwrap();
+        let path_str = path.to_str().unwrap();
+
+        assert!(run_vm(&format!("read0 \"{path_str}\""), &mut Vm::new()).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn read0_with_offset_and_length_reads_a_byte_range() {
+        let path = std::env::temp_dir().join("qpl_vm_test_read0_offset.txt");
+        std::fs::write(&path, "0123456789\n").unwrap();
+        let path_str = path.to_str().unwrap();
+
+        match run_vm(&format!("read0[\"{path_str}\";2;4]"), &mut Vm::new()).expect("read0") {
+            EvalResult::Scalar(v) => assert_eq!(v, ast::str_vec(vec!["2345".into()])),
+            other => panic!("expected a scalar, got {other:?}"),
+        }
+        // arity 2: offset to end
+        match run_vm(&format!("read0[\"{path_str}\";8]"), &mut Vm::new()).expect("read0") {
+            EvalResult::Scalar(v) => assert_eq!(v, ast::str_vec(vec!["89".into()])),
+            other => panic!("expected a scalar, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn read1_returns_a_byte_vec_of_the_files_bytes() {
+        let path = std::env::temp_dir().join("qpl_vm_test_read1.bin");
+        std::fs::write(&path, [0u8, 1, 255]).unwrap();
+        let path_str = path.to_str().unwrap();
+
+        match run_vm(&format!("read1 \"{path_str}\""), &mut Vm::new()).expect("read1") {
+            EvalResult::Scalar(v) => assert_eq!(v, ast::byte_vec(vec![0, 1, 255])),
+            other => panic!("expected a scalar, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn write0_and_write1_round_trip_with_read0_and_read1() {
+        let txt = std::env::temp_dir().join("qpl_vm_test_write0_round_trip.txt");
+        let bin = std::env::temp_dir().join("qpl_vm_test_write1_round_trip.bin");
+        let txt_str = txt.to_str().unwrap();
+        let bin_str = bin.to_str().unwrap();
+
+        let mut vm = Vm::new_writable();
+        run_vm(&format!("(\"a\" \"b\") write0 \"{txt_str}\""), &mut vm).expect("write0");
+        match run_vm(&format!("read0 \"{txt_str}\""), &mut vm).expect("read0") {
+            EvalResult::Scalar(v) => assert_eq!(v, ast::str_vec(vec!["a".into(), "b".into()])),
+            other => panic!("expected a scalar, got {other:?}"),
+        }
+
+        run_vm(
+            &format!("read1[\"{txt_str}\";0;1] write1 \"{bin_str}\""),
+            &mut vm,
+        )
+        .expect("write1");
+        match run_vm(&format!("read1 \"{bin_str}\""), &mut vm).expect("read1") {
+            EvalResult::Scalar(v) => assert_eq!(v, ast::byte_vec(vec![b'a'])),
+            other => panic!("expected a scalar, got {other:?}"),
+        }
+
+        // a single string is written as one line
+        run_vm(&format!("\"solo\" write0 \"{txt_str}\""), &mut vm).expect("write0 on a string");
+        match run_vm(&format!("read0 \"{txt_str}\""), &mut vm).expect("read0") {
+            EvalResult::Scalar(v) => assert_eq!(v, ast::str_vec(vec!["solo".into()])),
+            other => panic!("expected a scalar, got {other:?}"),
+        }
+
+        std::fs::remove_file(&txt).ok();
+        std::fs::remove_file(&bin).ok();
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn write1_accepts_an_int_list_of_byte_values_but_rejects_out_of_range_ones() {
+        let path = std::env::temp_dir().join("qpl_vm_test_write1_int_list.bin");
+        let path_str = path.to_str().unwrap();
+        let mut vm = Vm::new_writable();
+        run_vm(&format!("(1 2 255) write1 \"{path_str}\""), &mut vm).expect("write1");
+        match run_vm(&format!("read1 \"{path_str}\""), &mut vm).expect("read1") {
+            EvalResult::Scalar(v) => assert_eq!(v, ast::byte_vec(vec![1, 2, 255])),
+            other => panic!("expected a scalar, got {other:?}"),
+        }
+        assert!(run_vm(&format!("(1 2 300) write1 \"{path_str}\""), &mut vm).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn byte_vec_prints_as_hex_with_a_byte_tag() {
+        let v = ast::byte_vec(vec![0x68, 0x65, 0x6c, 0x6c, 0x6f]);
+        assert_eq!(crate::repl::fmt_val(&v), "byte[5]: 0x68656c6c6f");
+    }
+
     // --- read-only sessions (the default; `qpl -w` for writes) ---
 
     mod read_only_session {
@@ -2710,6 +2988,17 @@ mod tests {
             let mut vm = read_only_vm();
             assert_write_refused(&mut vm, &format!(r#"t sink "{path}""#), "sink");
             assert!(!std::path::Path::new(path).exists());
+        }
+
+        #[test]
+        fn write0_and_write1_are_refused_and_write_nothing() {
+            let txt = "qpl_vm_test_read_only_session_write0.txt";
+            let bin = "qpl_vm_test_read_only_session_write1.bin";
+            let mut vm = read_only_vm();
+            assert_write_refused(&mut vm, &format!(r#"("a" "b") write0 "{txt}""#), "write0");
+            assert_write_refused(&mut vm, &format!(r#"(1 2 3) write1 "{bin}""#), "write1");
+            assert!(!std::path::Path::new(txt).exists());
+            assert!(!std::path::Path::new(bin).exists());
         }
 
         #[test]
@@ -2840,14 +3129,56 @@ mod tests {
             assert_read_only_rejects("`w!hopen 1");
         }
 
+        /// A file under the temp dir holding `contents`; returns its path.
+        fn temp_file(name: &str, contents: &str) -> String {
+            let path = std::env::temp_dir().join(format!("qpl_vm_test_{name}"));
+            std::fs::write(&path, contents).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+
+        fn temp_path(name: &str) -> String {
+            let path = std::env::temp_dir().join(format!("qpl_vm_test_{name}"));
+            std::fs::remove_file(&path).ok();
+            path.to_string_lossy().into_owned()
+        }
+
         #[test]
         fn read_handle_rejects_load() {
-            assert_read_only_rejects(r#"select from load "examples/data/trades.parquet""#);
+            let path = temp_file("rh_load.csv", "a,b\n1,2\n");
+            assert_read_only_rejects(&format!(r#"select from load "{path}""#));
+        }
+
+        #[test]
+        fn read_handle_rejects_read0() {
+            let path = temp_file("rh_read0.txt", "x\n");
+            assert_read_only_rejects(&format!(r#"read0 "{path}""#));
+        }
+
+        #[test]
+        fn read_handle_rejects_write0() {
+            let path = temp_path("rh_write0.txt");
+            assert_read_only_rejects(&format!(r#"("a") write0 "{path}""#));
+            assert!(!std::path::Path::new(&path).exists());
         }
 
         #[test]
         fn write_handle_allows_load() {
-            assert_write_allows(r#"select from load "examples/data/trades.parquet""#);
+            let path = temp_file("wh_load.csv", "a,b\n1,2\n");
+            assert_write_allows(&format!(r#"select from load "{path}""#));
+        }
+
+        #[test]
+        fn write_handle_allows_read0() {
+            let path = temp_file("wh_read0.txt", "x\n");
+            assert_write_allows(&format!(r#"read0 "{path}""#));
+        }
+
+        #[test]
+        fn write_handle_allows_write0() {
+            let path = temp_path("wh_write0.txt");
+            assert_write_allows(&format!(r#"("a") write0 "{path}""#));
+            assert!(std::path::Path::new(&path).exists());
+            std::fs::remove_file(&path).ok();
         }
 
         #[test]
@@ -3587,6 +3918,7 @@ mod tests {
             (Second, ast::second_vec(vec![0, 1, 2])),
             (Timestamp, ast::timestamp_vec(vec![0, 1, 2])),
             (Timespan, ast::timespan_vec(vec![0, 1, 2])),
+            (Byte, ast::byte_vec(vec![0, 1, 2])),
         ];
         for (kind, v) in cases {
             let (got_kind, s) = v.as_vec().expect("is a vector");
@@ -4297,6 +4629,15 @@ mod tests {
         assert_eq!(scalar(&mut vm, "-2#v"), ast::int_vec(vec![30, 40]));
         assert_eq!(scalar(&mut vm, "v[1]"), Value::Int(20));
         assert_eq!(scalar(&mut vm, "v[1 3]"), ast::int_vec(vec![20, 40]));
+    }
+
+    #[test]
+    fn indexing_a_byte_vec_gives_a_plain_int() {
+        let mut vm = Vm::new();
+        vm.globals
+            .insert("v".into(), ast::byte_vec(vec![10, 20, 30]));
+        assert_eq!(scalar(&mut vm, "v[1]"), Value::Int(20));
+        assert_eq!(scalar(&mut vm, "count v"), Value::Int(3));
     }
 
     #[test]

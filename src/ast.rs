@@ -1,4 +1,4 @@
-use polars::prelude::{DataFrame, JoinType, LazyFrame, NamedFrom, PolarsResult, Series};
+use polars::prelude::{DataFrame, DataType, JoinType, LazyFrame, NamedFrom, PolarsResult, Series};
 
 use crate::builtins::BuiltIn;
 
@@ -50,6 +50,9 @@ pub enum Value {
     SecondVec(Series),
     TimestampVec(Series),
     TimespanVec(Series),
+    /// A byte vector (`read1`'s result), backed by a `UInt8` Series. There is
+    /// no byte scalar: indexing one gives an `Int`.
+    ByteVec(Series),
 }
 
 /// Manual because `LazyFrame` has no `Debug`; otherwise identical to `derive`.
@@ -86,6 +89,7 @@ impl std::fmt::Debug for Value {
             SecondVec(v) => f.debug_tuple("SecondVec").field(v).finish(),
             TimestampVec(v) => f.debug_tuple("TimestampVec").field(v).finish(),
             TimespanVec(v) => f.debug_tuple("TimespanVec").field(v).finish(),
+            ByteVec(v) => f.debug_tuple("ByteVec").field(v).finish(),
         }
     }
 }
@@ -125,6 +129,7 @@ impl PartialEq for Value {
             (SecondVec(a), SecondVec(b)) => a == b,
             (TimestampVec(a), TimestampVec(b)) => a == b,
             (TimespanVec(a), TimespanVec(b)) => a == b,
+            (ByteVec(a), ByteVec(b)) => a == b,
             _ => false,
         }
     }
@@ -145,6 +150,7 @@ pub enum VecKind {
     Second,
     Timestamp,
     Timespan,
+    Byte,
 }
 
 impl Value {
@@ -164,6 +170,7 @@ impl Value {
             SecondVec(s) => (VecKind::Second, s),
             TimestampVec(s) => (VecKind::Timestamp, s),
             TimespanVec(s) => (VecKind::Timespan, s),
+            ByteVec(s) => (VecKind::Byte, s),
             _ => return None,
         })
     }
@@ -233,8 +240,17 @@ impl Value {
             VecKind::Second => Value::SecondVec(s),
             VecKind::Timestamp => Value::TimestampVec(s),
             VecKind::Timespan => Value::TimespanVec(s),
+            VecKind::Byte => Value::ByteVec(s),
         }
     }
+}
+
+pub fn byte_vec(v: Vec<u8>) -> Value {
+    let ints: Vec<i64> = v.into_iter().map(i64::from).collect();
+    let s = Series::new("".into(), ints)
+        .cast(&DataType::UInt8)
+        .expect("byte values always fit UInt8");
+    Value::ByteVec(s)
 }
 
 pub fn int_vec(v: Vec<i64>) -> Value {
@@ -434,6 +450,14 @@ pub enum Stmt {
     System {
         cmd: char,
         arg: String,
+    },
+    /// `<value> write0 <path>` (`bytes: false`, a string list) or
+    /// `<value> write1 <path>` (`bytes: true`, a `ByteVec`). Terminal:
+    /// nothing is printed.
+    WriteFile {
+        bytes: bool,
+        value: Expr,
+        path: Expr,
     },
 }
 

@@ -21,6 +21,8 @@ pub enum TokenKind {
     Cols,
     Lazy,
     Collect,
+    Write0,
+    Write1,
 
     // literals
     Name(String),

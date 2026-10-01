@@ -295,6 +295,7 @@ fn vec_tag(kind: ast::VecKind) -> &'static str {
         Second => "second",
         Timestamp => "timestamp",
         Timespan => "timespan",
+        Byte => "byte",
     }
 }
 
@@ -372,6 +373,17 @@ fn fmt_vec_elems(kind: ast::VecKind, s: &polars::prelude::Series, quote_str: boo
             .map(|n| temporal::format_temporal(&temporal_scalar_of(kind, n)).unwrap())
             .collect::<Vec<_>>()
             .join(" "),
+        // one hex blob for the whole vector, not space-separated elements
+        Byte => {
+            let hex: String = s
+                .u8()
+                .expect("ByteVec backed by a UInt8 Series")
+                .iter()
+                .flatten()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!("0x{hex}")
+        }
     }
 }
 
@@ -455,6 +467,7 @@ mod golden {
         "column_expressions",
         "config_and_round",
         "control_flow",
+        "files",
         "lazy_and_collect",
         "lazy_join_pipeline",
         "logging",

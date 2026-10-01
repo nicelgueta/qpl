@@ -1,0 +1,14 @@
+/ read0/read1: the line- and byte-level equivalents of load/sink, for
+/ anything on disk that isn't tabular data.
+
+lines: read0 "examples/notes.txt"
+lines
+count lines
+
+/ a byte range: `len` bytes starting at byte `off`
+read0["examples/notes.txt"; 6; 4]
+
+/ the same range, as raw bytes
+bytes: read1["examples/notes.txt"; 0; 5]
+bytes
+bytes[0]

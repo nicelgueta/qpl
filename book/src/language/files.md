@@ -95,3 +95,46 @@ cols select from trades where size > 100
 Because `cols` reads only the schema, it stays cheap no matter how large the
 underlying data is, and it works on deferred pipelines that haven't read a
 single row yet.
+
+## read0 and read1: text and bytes
+
+`load`/`sink` are for tabular data. `read0`, `read1`, `write0` and `write1`
+are the line- and byte-level equivalents, for anything else on disk.
+
+`read0` reads a file as text and returns its lines as a string list, split
+on `\n` with a trailing `\r` stripped from each line (so CRLF files read the
+same as LF ones). A final trailing newline doesn't produce a trailing empty
+element:
+
+```qpl
+read0 "notes.txt"
+```
+
+`read1` reads the same file as raw bytes, returned as a `ByteVec` — a byte
+list with no scalar counterpart. It prints as `0x` followed by the lowercase
+hex of every byte (`byte[5]: 0x68656c6c6f`), and indexing one gives a plain
+int, since there's no byte scalar to index into:
+
+```qpl
+read1 "notes.txt"
+(read1 "notes.txt")[0]
+```
+
+Both take an optional byte range, kdb-style: `read0[p; off; len]` reads
+`len` bytes starting at byte `off`, then splits the result into lines (or
+bytes, for `read1`); `read0[p; off]` reads from `off` to the end of the
+file. An offset or length past the end of the file is clamped rather than
+erroring. `read0` requires the bytes it reads to be valid UTF-8.
+
+`write0` and `write1` go the other way, and need a session started with
+`qpl -w` (see [Read-only sessions](read-only.md)):
+
+```qpl
+("line one" "line two") write0 "notes.txt"
+read1 "notes.txt" write1 "copy.bin"
+```
+
+`write0` takes a string list (or a single string, written as one line) and
+writes each element followed by `\n`, truncating the file first. `write1`
+takes a `ByteVec`, or an int list whose values are all 0-255, and writes the
+raw bytes, also truncating first. Neither prints anything.

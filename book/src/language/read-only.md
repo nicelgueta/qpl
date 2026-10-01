@@ -17,8 +17,8 @@ Everything in the language has a permission, and there are three of them:
 | Permission | Allows | Examples |
 |---|---|---|
 | **read** | reads session data only | queries, maths, functions, `log`, `.qpl.dt`, `hopen`, `dispatch`, `await` |
-| **iread** | reads outside the session, or changes the session | `load`, assignment, `.qpl.cfg` |
-| **write** | anything | `sink`, `\1 <path>` (the stdout log), `` `w!hopen `` (a write handle to another server) |
+| **iread** | reads outside the session, or changes the session | `load`, `read0`, `read1`, assignment, `.qpl.cfg` |
+| **write** | anything | `sink`, `write0`, `write1`, `\1 <path>` (the stdout log), `` `w!hopen `` (a write handle to another server) |
 
 Every session allows `read` and `iread`; only `write` needs `-w` (below).
 `iread` matters over IPC: a read-only connection refuses it as well as
@@ -120,11 +120,12 @@ matters, or use Claude Code's [sandbox](https://code.claude.com/docs/en/sandboxi
 
 A read-only session can still open a [`\port`](ipc.md). The session's
 permission applies to every request it serves, on top of the per-connection
-one. Over a read handle, clients can only query — `load` is refused, so a
-remote client can't have the server read a file for it, only query tables
-that are already loaded. Over a `` `w!hopen `` handle, they can also `load`,
-assign and change settings, but a `sink` is still refused. A server whose
-clients should be able to write has to be started with `-w`.
+one. Over a read handle, clients can only query — `load`, `read0` and
+`read1` are refused, so a remote client can't have the server read a file
+for it, only query tables that are already loaded. Over a `` `w!hopen ``
+handle, they can also `load`/`read0`/`read1`, assign and change settings,
+but `sink`/`write0`/`write1` are still refused. A server whose clients
+should be able to write has to be started with `-w`.
 
 ## What it doesn't cover
 

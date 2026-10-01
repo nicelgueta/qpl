@@ -56,9 +56,9 @@ fn compile_function_body(body: &[Stmt], out: &mut Program) -> Result<(), QplErro
             ));
         }
         // unreachable: these only come from top-level parsing
-        Stmt::Log(_) | Stmt::Cfg(_) | Stmt::System { .. } => {
+        Stmt::Log(_) | Stmt::Cfg(_) | Stmt::System { .. } | Stmt::WriteFile { .. } => {
             return Err(QplError::Compile(
-                "a `log`/`.qpl.cfg`/`\\`-command statement cannot end a function body".into(),
+                "a `log`/`.qpl.cfg`/`\\`-command/`write0`/`write1` statement cannot end a function body".into(),
             ));
         }
     }
@@ -86,6 +86,7 @@ fn compile_stmt(stmt: &Stmt, out: &mut Program) -> Result<(), QplError> {
             compile_value_expr(expr, out)?;
             Ok(())
         }
+        Stmt::WriteFile { bytes, value, path } => compile_write_file(*bytes, value, path, out),
         // top-level only; handled by `compile_program_stmt`
         Stmt::Log(_) | Stmt::Cfg(_) | Stmt::System { .. } => Err(QplError::Compile(
             "a `log`/`.qpl.cfg`/`\\`-command statement is only valid at the top level".into(),
@@ -97,6 +98,27 @@ fn compile_stmt(stmt: &Stmt, out: &mut Program) -> Result<(), QplError> {
 /// consumes it). If the tree references the virtual column `i`, a `RowIndex`
 /// is inserted after each `Source`/`LoadFile`. Inserting a no-operand opcode
 /// is safe since only `Push` reads the operand stream.
+/// `<value> write0/write1 <path>`: pushes the native's `Noop` result, like a
+/// call to any other niladic-returning native.
+fn compile_write_file(
+    bytes: bool,
+    value: &Expr,
+    path: &Expr,
+    out: &mut Program,
+) -> Result<(), QplError> {
+    compile_value_expr(value, out)?;
+    compile_value_expr(path, out)?;
+    out.push_operand(Operand::Count(2));
+    let id = if bytes {
+        NativeId::Write1
+    } else {
+        NativeId::Write0
+    };
+    out.push_operand(Operand::Native(id));
+    out.emit(Op::Call);
+    Ok(())
+}
+
 pub(crate) fn compile_tbl_expr(tbl_expr: &TableExpr, out: &mut Program) -> Result<(), QplError> {
     let start = out.code.len();
     compile_tbl_expr_inner(tbl_expr, out)?;
@@ -737,6 +759,11 @@ fn compile_stmt_for_effect(st: &Stmt, out: &mut Program) -> Result<(), QplError>
             out.emit(Op::Pop);
             Ok(())
         }
+        Stmt::WriteFile { bytes, value, path } => {
+            compile_write_file(*bytes, value, path, out)?;
+            out.emit(Op::Pop);
+            Ok(())
+        }
         Stmt::Log(_) | Stmt::Cfg(_) | Stmt::System { .. } => Err(QplError::Compile(
             "a `log`/`.qpl.cfg`/`\\`-command statement is only valid at the top level".into(),
         )),
@@ -1139,6 +1166,10 @@ fn compile_program_stmt(
             compile_system(*cmd, arg, out, ctx)?;
             out.emit(Op::Pop);
         }
+        Stmt::WriteFile { bytes, value, path } => {
+            compile_write_file(*bytes, value, path, out)?;
+            out.emit(Op::Pop);
+        }
     }
     Ok(())
 }
@@ -1322,6 +1353,10 @@ fn qualify_stmt_refs(stmt: &mut Stmt, ns: &str, names: &HashSet<String>, locals:
                 qualify_expr(a, ns, names, locals);
             }
         }
+        Stmt::WriteFile { value, path, .. } => {
+            qualify_expr(value, ns, names, locals);
+            qualify_expr(path, ns, names, locals);
+        }
         Stmt::Cfg(_) | Stmt::System { .. } => {}
     }
 }
@@ -1495,6 +1530,10 @@ fn collect_locals_stmt(st: &Stmt, out: &mut HashSet<String>) {
             for a in args {
                 collect_locals_expr(a, out);
             }
+        }
+        Stmt::WriteFile { value, path, .. } => {
+            collect_locals_expr(value, out);
+            collect_locals_expr(path, out);
         }
         Stmt::Cfg(_) | Stmt::System { .. } => {}
     }

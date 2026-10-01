@@ -122,7 +122,7 @@
         },
         {
           "name": "keyword.other.qpl",
-          "match": "\\b(load|sink|cols|lazy|collect|til|enlist|noop|zip|hopen|await|async)\\b"
+          "match": "\\b(load|sink|cols|lazy|collect|til|enlist|noop|zip|hopen|await|async|read0|read1|write0|write1)\\b"
         }
       ]
     },
